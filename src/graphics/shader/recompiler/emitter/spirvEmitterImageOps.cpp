@@ -33,13 +33,13 @@ uint32_t ConstantImageGatherHorizontalOffsets(EmitterState& state, ImageViewKind
 }
 
 uint32_t LoadStorageImageDescriptorAtIndex(EmitterState& state, uint32_t resource,
-                                           uint32_t array_index, bool uint_image,
+                                           uint32_t array_index_id, bool uint_image,
                                            ImageViewKind view) {
 	const auto  kind        = StorageBindingKind(uint_image, view);
 	const auto& descriptors = state.storage_images[StorageImageIndex(uint_image, view)];
-	const auto  pointer =
-	    DescriptorElementPointer(state, descriptors.pointer_type, descriptors.variable, array_index,
-	                             kind, resource, "storage image descriptor array was not emitted");
+	const auto  pointer     = DescriptorElementPointerId(
+	    state, descriptors.pointer_type, descriptors.variable, array_index_id, kind, resource,
+	    "storage image descriptor array was not emitted");
 	const auto image = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, descriptors.image_type, image, pointer});
 	return image;
@@ -168,12 +168,38 @@ void EmitImageStore(EmitterState& state, const IR::Instruction& inst) {
 	const auto view       = StorageImageViewKind(state, inst.memory, uint_image, inst.pc);
 	const auto binding =
 	    ResourceForDescriptor(state, StorageBindingKind(uint_image, view), inst.memory.resource);
-	const auto image = LoadStorageImageDescriptorAtIndex(state, inst.memory.resource,
-	                                                     binding.array_index, uint_image, view);
+	const auto emit_write = [&](uint32_t descriptor_index, bool non_uniform) {
+		if (non_uniform) {
+			state.builder.AddAnnotation({OpDecorate, descriptor_index, DecorationNonUniform});
+		}
+		const auto image = LoadStorageImageDescriptorAtIndex(state, inst.memory.resource,
+		                                                     descriptor_index, uint_image, view);
+		if (non_uniform) {
+			state.builder.AddAnnotation({OpDecorate, image, DecorationNonUniform});
+		}
+		state.builder.AddFunction({OpImageWrite, image, EmitImageCoordU32(state, inst, view),
+		                           uint_image ? EmitImageStoreTexelU32(state, inst)
+		                                      : EmitImageStoreTexelF32(state, inst)});
+	};
+	if (!inst.memory.image_has_mip) {
+		emit_write(ConstantU32(state, binding.array_index), false);
+		return;
+	}
 
+	const auto& resource = state.program.info.images[inst.memory.resource];
+	const auto  mip      = EmitImageMipLodU32(state, inst, inst.src[1], view);
+	const auto  in_range = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpImageWrite, image, EmitImageCoordU32(state, inst, view),
-	     uint_image ? EmitImageStoreTexelU32(state, inst) : EmitImageStoreTexelF32(state, inst)});
+	    {OpULessThan, state.bool_type, in_range, mip, ConstantU32(state, resource.mip_levels)});
+	EmitIfCondition(state, in_range, [&] {
+		auto descriptor_index = mip;
+		if (binding.array_index != 0) {
+			descriptor_index = state.builder.AllocateId();
+			state.builder.AddFunction({OpIAdd, state.uint_type, descriptor_index,
+			                           ConstantU32(state, binding.array_index), mip});
+		}
+		emit_write(descriptor_index, true);
+	});
 }
 
 void EmitImageSampleResult(EmitterState& state, const IR::Instruction& inst, uint32_t sample,

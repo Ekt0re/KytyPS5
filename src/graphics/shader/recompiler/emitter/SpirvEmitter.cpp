@@ -237,8 +237,14 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		if (!ImageBinding(program.info.images[i], kind)) {
 			return Fail(error, "native shader plan has an invalid image class");
 		}
+		const auto bindings = program.info.images[i].NumBindings();
+		if (bindings == 0 || bindings > IR::ImageResource::MaxMipLevels) {
+			return Fail(error, "native shader plan has an invalid image descriptor count");
+		}
 		present[static_cast<size_t>(kind)] = true;
-		expected[static_cast<size_t>(kind)].push_back(i);
+		for (uint32_t binding = 0; binding < bindings; binding++) {
+			expected[static_cast<size_t>(kind)].push_back(i);
+		}
 	}
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
@@ -315,6 +321,11 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 			     program.info.images[inst.memory.resource].dimension !=
 			         inst.memory.image_dimension)) {
 				return Fail(error, "image instruction has an invalid dense resource");
+			}
+			if (inst.op == IR::Opcode::ImageStore &&
+			    ((program.info.images[inst.memory.resource].mip_mode ==
+			      IR::ImageMipMode::DynamicStorage) != inst.memory.image_has_mip)) {
+				return Fail(error, "storage image mip mode does not match the instruction");
 			}
 			const bool address =
 			    inst.op == IR::Opcode::SLoadDword || memory == IR::ResourceKind::Flat ||

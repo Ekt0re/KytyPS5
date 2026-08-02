@@ -94,10 +94,11 @@ vk::DescriptorBufferInfo BufferInfo(const BufferView& view) {
 
 } // namespace
 
-vk::DescriptorImageInfo DescriptorCache::MakeImageInfo(const TextureBinding& texture) {
-	EXIT_IF(!texture.image_id || texture.image_view == nullptr ||
-	        texture.layout == vk::ImageLayout::eUndefined);
-	return {nullptr, texture.image_view, texture.layout};
+vk::DescriptorImageInfo DescriptorCache::MakeImageInfo(const TextureBinding& texture,
+                                                       uint32_t              mip) {
+	const auto view = texture.mip_views.empty() ? texture.image_view : texture.mip_views.at(mip);
+	EXIT_IF(!texture.image_id || view == nullptr || texture.layout == vk::ImageLayout::eUndefined);
+	return {nullptr, view, texture.layout};
 }
 
 DescriptorCache::~DescriptorCache() {
@@ -154,7 +155,8 @@ void DescriptorCache::CreatePool() {
 	     MaxSets * (ShaderRecompiler::IR::ShaderInfo::MaxBuffers +
 	                ShaderRecompiler::IR::ShaderInfo::MaxAddresses + 3u)},
 	    {vk::DescriptorType::eSampledImage, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
-	    {vk::DescriptorType::eStorageImage, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages},
+	    {vk::DescriptorType::eStorageImage, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxImages *
+	                                            ShaderRecompiler::IR::ImageResource::MaxMipLevels},
 	    {vk::DescriptorType::eSampler, MaxSets * ShaderRecompiler::IR::ShaderInfo::MaxSamplers},
 	};
 	vk::DescriptorPoolCreateInfo info {};
@@ -229,8 +231,10 @@ VulkanDescriptorSet& DescriptorCache::GetDescriptor(Stage                       
 	auto* set = Allocate(stage, program);
 	EXIT_NOT_IMPLEMENTED(set == nullptr);
 
-	const auto descriptor_count = program.info.buffers.size() + program.info.images.size() +
-	                              program.info.samplers.size() + program.info.addresses.size() + 3u;
+	uint32_t descriptor_count = 0;
+	for (const auto& binding: program.bindings.descriptors) {
+		descriptor_count += DescriptorCount(binding);
+	}
 	std::vector<vk::DescriptorBufferInfo> buffer_infos;
 	std::vector<vk::DescriptorImageInfo>  image_infos;
 	std::vector<vk::WriteDescriptorSet>   writes;
@@ -238,6 +242,7 @@ VulkanDescriptorSet& DescriptorCache::GetDescriptor(Stage                       
 	image_infos.reserve(descriptor_count);
 	writes.reserve(program.bindings.descriptors.size());
 
+	std::vector<uint32_t> image_mips(program.info.images.size());
 	for (const auto& binding: program.bindings.descriptors) {
 		vk::WriteDescriptorSet write {};
 		write.sType             = vk::StructureType::eWriteDescriptorSet;
@@ -273,7 +278,11 @@ VulkanDescriptorSet& DescriptorCache::GetDescriptor(Stage                       
 			default: {
 				for (const auto resource: binding.resources) {
 					const auto& texture = data.images.at(resource);
-					image_infos.push_back(MakeImageInfo(texture));
+					const auto  mip     = program.info.images.at(resource).mip_mode ==
+					                              ShaderRecompiler::IR::ImageMipMode::DynamicStorage
+					                          ? image_mips.at(resource)++
+					                          : 0u;
+					image_infos.push_back(MakeImageInfo(texture, mip));
 				}
 				break;
 			}

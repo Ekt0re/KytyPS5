@@ -287,6 +287,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("shaderStorageImageReadWithoutFormat is not supported\n");
 			skip_device = true;
 		}
+		if (features12.shaderStorageImageArrayNonUniformIndexing != VK_TRUE) {
+			LOGF("shaderStorageImageArrayNonUniformIndexing is not supported\n");
+			skip_device = true;
+		}
 
 		if (device_features2.features.shaderImageGatherExtended != VK_TRUE) {
 			LOGF("shaderImageGatherExtended is not supported\n");
@@ -514,6 +518,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	features12.sType                    = vk::StructureType::ePhysicalDeviceVulkan12Features;
 	features12.pNext                    = &depth_clip_control;
 	features12.samplerMirrorClampToEdge = VK_TRUE;
+	features12.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
 
 	vk::PhysicalDeviceSubgroupSizeControlFeatures subgroup_size_control {};
 	subgroup_size_control.sType = vk::StructureType::ePhysicalDeviceSubgroupSizeControlFeatures;

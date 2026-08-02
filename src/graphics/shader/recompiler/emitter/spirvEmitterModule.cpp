@@ -484,6 +484,13 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.needs_image_gather_extended) {
 		state.builder.AddCapability({CapabilityImageGatherExtended});
 	}
+	if (std::any_of(
+	        state.program.info.images.begin(), state.program.info.images.end(),
+	        [](const auto& image) { return image.mip_mode == IR::ImageMipMode::DynamicStorage; })) {
+		state.builder.AddCapability({CapabilityShaderNonUniform});
+		state.builder.AddCapability({CapabilityStorageImageArrayNonUniformIndexing});
+		state.builder.AddExtension("SPV_EXT_descriptor_indexing");
+	}
 	if (std::any_of(state.storage_images.begin(),
 	                state.storage_images.begin() + StorageImageViewKindCount,
 	                [](const auto& image) { return image.variable != 0; })) {

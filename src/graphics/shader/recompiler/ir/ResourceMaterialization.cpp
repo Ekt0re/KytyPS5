@@ -71,6 +71,17 @@ bool DescriptorIsCube(const DescriptorValue& descriptor) {
 	       Prospero::ImageType::kCube;
 }
 
+bool DescriptorMipRange(const DescriptorValue& descriptor, uint32_t& count) {
+	const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
+	const auto last_level = (descriptor.dwords[3] >> 16u) & 0xfu;
+	const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
+	if (base_level > last_level || last_level > max_mip) {
+		return false;
+	}
+	count = last_level - base_level + 1u;
+	return true;
+}
+
 bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResource& result) {
 	if (descriptor.dword_count != std::size(result.fields)) {
 		return false;
@@ -196,16 +207,31 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			}
 			continue;
 		}
+		if (image.mip_mode == ImageMipMode::DynamicStorage) {
+			uint32_t mip_levels = 0;
+			if (!DescriptorMipRange(descriptor, mip_levels) || mip_levels != image.mip_levels) {
+				if (error != nullptr) {
+					*error = fmt::format(
+					    "image descriptor {} no longer matches specialized storage mip count", i);
+				}
+				return false;
+			}
+		} else if (image.mip_levels != 1u) {
+			if (error != nullptr) {
+				*error = fmt::format("image descriptor {} has invalid non-storage mip count", i);
+			}
+			return false;
+		}
 		const auto dimension = DescriptorDimension(descriptor, image.dimension);
 		if (dimension == Decoder::ImageDimension::Unknown || dimension != image.dimension ||
 		    DescriptorIsCube(descriptor) != image.cube) {
 			if (error != nullptr) {
-				*error = fmt::format(
-				    "image descriptor {} no longer matches specialized dimension: "
-				    "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
-				    i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
-				    descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
-				    descriptor.dwords[6], descriptor.dwords[7]);
+				*error =
+				    fmt::format("image descriptor {} no longer matches specialized dimension: "
+				                "{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+				                i, descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2],
+				                descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5],
+				                descriptor.dwords[6], descriptor.dwords[7]);
 			}
 			return false;
 		}
@@ -224,10 +250,9 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			const bool raw_sint_storage =
 			    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt) &&
 			    !image.read && !image.atomic;
-			const bool uint_descriptor =
-			    Prospero::IsUintTextureFormat(format) || raw_sint_storage;
-			const auto uint_program = image.kind == ResourceKind::ImageUint ||
-			                          image.kind == ResourceKind::StorageImageUint;
+			const bool uint_descriptor = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+			const auto uint_program    = image.kind == ResourceKind::ImageUint ||
+			                             image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
 				if (error != nullptr) {
 					*error =
@@ -380,8 +405,9 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = next.images[i];
 		if (NullImageDescriptor(descriptor)) {
-			image.dimension = Decoder::ImageDimension::Dim2D;
-			image.cube      = false;
+			image.dimension  = Decoder::ImageDimension::Dim2D;
+			image.cube       = false;
+			image.mip_levels = 1;
 			switch (image.kind) {
 				case ResourceKind::ImageUint: image.kind = ResourceKind::Image; break;
 				case ResourceKind::StorageImageUint:
@@ -392,6 +418,16 @@ bool SpecializeResources(Program& program, const ResourceSnapshot& snapshot, std
 				default: break;
 			}
 			continue;
+		}
+		if (image.mip_mode == ImageMipMode::DynamicStorage) {
+			if (!DescriptorMipRange(descriptor, image.mip_levels)) {
+				if (error != nullptr) {
+					*error = fmt::format("image descriptor {} has invalid storage mip range", i);
+				}
+				return false;
+			}
+		} else {
+			image.mip_levels = 1;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, image.dimension);
 		if (descriptor_dimension == Decoder::ImageDimension::Unknown) {

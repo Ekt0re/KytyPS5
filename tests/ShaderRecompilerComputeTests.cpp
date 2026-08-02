@@ -275,8 +275,9 @@ struct RenderExecutorTestAccess {
 };
 
 struct DescriptorCacheTestAccess {
-	static vk::DescriptorImageInfo MakeImageInfo(const DescriptorCache::TextureBinding& binding) {
-		return DescriptorCache::MakeImageInfo(binding);
+	static vk::DescriptorImageInfo MakeImageInfo(const DescriptorCache::TextureBinding& binding,
+	                                             uint32_t mip = 0) {
+		return DescriptorCache::MakeImageInfo(binding, mip);
 	}
 };
 
@@ -692,6 +693,8 @@ struct TestCase {
 	u32                           storage_image_dwords_per_pixel = 4;
 	std::vector<u32>              storage_image_r32ui;
 	std::vector<u32>              expected_storage_image_r32ui;
+	std::vector<std::vector<u32>> storage_image_r32ui_mips;
+	std::vector<std::vector<u32>> expected_storage_image_r32ui_mips;
 	std::vector<std::string>      required_spirv;
 	std::vector<std::string>      forbidden_spirv;
 	ShaderComputeInputInfo        compute_info {};
@@ -709,11 +712,6 @@ struct TestCase {
 	std::optional<uint64_t>       flat_memory_base;
 	std::vector<u32>              gds_initial;
 	std::vector<u32>              expected_gds;
-};
-
-struct SkippedCase {
-	const char* name   = "";
-	const char* reason = "";
 };
 
 struct GraphicsCase {
@@ -1061,6 +1059,7 @@ public:
 		vk::Image        image            = nullptr;
 		vk::DeviceMemory memory           = nullptr;
 		vk::ImageView    view             = nullptr;
+		std::vector<vk::ImageView> mip_views;
 		vk::Format       format           = vk::Format::eUndefined;
 		vk::ImageLayout  layout           = vk::ImageLayout::eUndefined;
 		u32              width            = 0;
@@ -5166,6 +5165,59 @@ public:
 			        "non-array 1D specialization did not select the descriptor "
 			        "base layer from its 1D-array backing");
 
+			auto dynamic_storage = storage;
+			const uint64_t dynamic_storage_address = base + 0xf0000;
+			const auto encoded_dynamic_address      = dynamic_storage_address >> 8u;
+			dynamic_storage.fields[0] = static_cast<uint32_t>(encoded_dynamic_address);
+			dynamic_storage.fields[1] =
+			    static_cast<uint32_t>(encoded_dynamic_address >> 32u) | (stencil_format << 20u);
+			dynamic_storage.fields[3] |= 1u << 16u;
+			dynamic_storage.fields[5] |= 1u << 4u;
+			ShaderRecompiler::IR::DescriptorValue dynamic_storage_descriptor {};
+			std::copy(std::begin(dynamic_storage.fields), std::end(dynamic_storage.fields),
+			          dynamic_storage_descriptor.dwords.begin());
+			dynamic_storage_descriptor.dword_count = 8;
+
+			auto dynamic_program = storage_program;
+			dynamic_program.stage = ShaderType::Compute;
+			auto& dynamic_resource = dynamic_program.info.images[0];
+			dynamic_resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+			dynamic_resource.mip_levels = 2;
+			dynamic_program.bindings.descriptors.push_back(
+			    {ShaderRecompiler::IR::DescriptorBindingKind::StorageUint2D, 0, {0, 0}});
+			dynamic_program.binding_layout_complete = true;
+			auto dynamic_snapshot = std::make_shared<ShaderRecompiler::IR::ResourceSnapshot>();
+			dynamic_snapshot->images.push_back(dynamic_storage_descriptor);
+			ShaderStageRuntime dynamic_runtime {
+			    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(dynamic_program)),
+			    std::move(dynamic_snapshot)};
+			auto dynamic_bindings = executor.PrepareBindings(
+			    scheduler.Current(), dynamic_runtime, vk::ShaderStageFlagBits::eCompute,
+			    DescriptorCache::Stage::Compute);
+			executor.RebindImages(scheduler.Current(), dynamic_bindings);
+			auto& dynamic_binding = dynamic_bindings.resources.images[0];
+			Require(name, "dynamic mip singleton views",
+			        dynamic_binding.desc.view_info.level_count == 1 &&
+			            dynamic_binding.mip_views.size() == 2 &&
+			            dynamic_binding.mip_views[0] == dynamic_binding.image_view &&
+			            dynamic_binding.mip_views[0] != dynamic_binding.mip_views[1],
+			        "production rebind did not acquire one distinct storage view per mip");
+			dynamic_binding.layout = vk::ImageLayout::eGeneral;
+			const auto mip0_info = DescriptorCacheTestAccess::MakeImageInfo(dynamic_binding, 0);
+			const auto mip1_info = DescriptorCacheTestAccess::MakeImageInfo(dynamic_binding, 1);
+			Require(name, "dynamic mip descriptor selection",
+			        mip0_info.imageView == dynamic_binding.mip_views[0] &&
+			            mip1_info.imageView == dynamic_binding.mip_views[1] &&
+			            mip0_info.imageLayout == vk::ImageLayout::eGeneral &&
+			            mip1_info.imageLayout == vk::ImageLayout::eGeneral,
+			        "descriptor cache did not select the matching singleton mip view");
+			auto& descriptor_set = context.GetDescriptorCache().GetDescriptor(
+			    DescriptorCache::Stage::Compute, *dynamic_runtime.program, dynamic_bindings.resources);
+			Require(name, "dynamic mip descriptor update", descriptor_set.set != nullptr,
+			        "production descriptor update did not allocate the dynamic mip array");
+			context.GetDescriptorCache().Recycle(descriptor_set);
+			RenderExecutorTestAccess::ResetBindings(executor);
+
 			ShaderRecompiler::IR::ResourceSnapshot storage_snapshot {};
 			storage_snapshot.images.push_back(storage_descriptor);
 			ShaderStageRuntime storage_runtime {
@@ -6153,6 +6205,14 @@ public:
 		view_info.subresourceRange.layerCount     = view_layers;
 		RequireVk(shader_name, "dispatch", m_device.createImageView(&view_info, nullptr, &ret.view),
 		          "vkCreateImageView");
+		ret.mip_views.resize(ret.mip_levels);
+		view_info.subresourceRange.levelCount = 1;
+		for (u32 level = 0; level < ret.mip_levels; level++) {
+			view_info.subresourceRange.baseMipLevel = level;
+			RequireVk(shader_name, "dispatch",
+			          m_device.createImageView(&view_info, nullptr, &ret.mip_views[level]),
+			          "vkCreateImageView(mip)");
+		}
 
 		if (!initial_mips.empty()) {
 			size_t total_dwords = 0;
@@ -6186,6 +6246,10 @@ public:
 		if (image == nullptr) {
 			return;
 		}
+		for (auto view: image->mip_views) {
+			m_device.destroyImageView(view, nullptr);
+		}
+		image->mip_views.clear();
 		if (image->view != nullptr) {
 			m_device.destroyImageView(image->view, nullptr);
 			image->view = nullptr;
@@ -6200,10 +6264,12 @@ public:
 		}
 	}
 
-	std::vector<u32> ReadImage(const char* shader_name, Image* image) {
-		const auto dword_count = static_cast<size_t>(image->width) *
-		                         static_cast<size_t>(image->height) * image->layers *
-		                         image->dwords_per_pixel;
+	std::vector<u32> ReadImage(const char* shader_name, Image* image, u32 mip_level = 0) {
+		Require(shader_name, "readback", mip_level < image->mip_levels,
+		        "image mip level is out of bounds");
+		const auto dword_count = ImageMipDwordCount(image->width, image->height,
+		                                             image->dwords_per_pixel, mip_level,
+		                                             image->layers);
 		auto       staging     = CreateHostBuffer(shader_name, dword_count * sizeof(u32),
 		                                          vk::BufferUsageFlagBits::eTransferDst, {});
 
@@ -6216,11 +6282,11 @@ public:
 		vk::BufferImageCopy copy {};
 		copy.bufferOffset                    = 0;
 		copy.imageSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-		copy.imageSubresource.mipLevel       = 0;
+		copy.imageSubresource.mipLevel       = mip_level;
 		copy.imageSubresource.baseArrayLayer = 0;
 		copy.imageSubresource.layerCount     = image->layers;
-		copy.imageExtent.width               = image->width;
-		copy.imageExtent.height              = image->height;
+		copy.imageExtent.width               = MipExtent(image->width, mip_level);
+		copy.imageExtent.height              = MipExtent(image->height, mip_level);
 		copy.imageExtent.depth               = 1;
 		cmd.copyImageToBuffer(image->image, vk::ImageLayout::eTransferSrcOptimal, staging.buffer, 1,
 		                      &copy);
@@ -6579,13 +6645,32 @@ public:
 			storage_infos.resize(storage != nullptr ? storage->resources.size() : 0u);
 			storage_uint_infos.resize(storage_uint != nullptr ? storage_uint->resources.size()
 			                                                  : 0u);
-			for (auto& info: storage_infos) {
-				info.imageView   = storage_image->view;
-				info.imageLayout = storage_image->layout;
+			const auto fill_storage_infos = [&](const auto* binding, const Image* image,
+			                                    auto& infos) {
+				std::vector<u32> resource_mips(compiled.program.info.images.size());
+				for (u32 i = 0; i < infos.size(); i++) {
+					const u32 resource_index = binding->resources[i];
+					Require(test.name, "dispatch",
+					        resource_index < compiled.program.info.images.size(),
+					        "storage binding resource index is out of bounds");
+					const auto& resource = compiled.program.info.images[resource_index];
+					auto&       info     = infos[i];
+					if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+						const u32 mip = resource_mips[resource_index]++;
+						Require(test.name, "dispatch", mip < image->mip_views.size(),
+						        "dynamic storage mip descriptor is out of bounds");
+						info.imageView = image->mip_views[mip];
+					} else {
+						info.imageView = image->view;
+					}
+					info.imageLayout = image->layout;
+				}
+			};
+			if (storage != nullptr) {
+				fill_storage_infos(storage, storage_image, storage_infos);
 			}
-			for (auto& info: storage_uint_infos) {
-				info.imageView   = storage_image_uint->view;
-				info.imageLayout = storage_image_uint->layout;
+			if (storage_uint != nullptr) {
+				fill_storage_infos(storage_uint, storage_image_uint, storage_uint_infos);
 			}
 			if (storage != nullptr) {
 				vk::WriteDescriptorSet write {};
@@ -7860,6 +7945,9 @@ private:
 		Require("VulkanHarness", "dispatch",
 		        available_features.shaderStorageImageReadWithoutFormat == true,
 		        "shaderStorageImageReadWithoutFormat is not supported");
+		Require("VulkanHarness", "dispatch",
+		        available_features12.shaderStorageImageArrayNonUniformIndexing == true,
+		        "shaderStorageImageArrayNonUniformIndexing is not supported");
 		Require("VulkanHarness", "dispatch", available_features12.timelineSemaphore == true,
 		        "timeline semaphores are not supported");
 		Require("VulkanHarness", "dispatch", available_features13.dynamicRendering == true,
@@ -7883,6 +7971,7 @@ private:
 		vk::PhysicalDeviceVulkan12Features device_features12 {};
 		device_features12.sType             = vk::StructureType::ePhysicalDeviceVulkan12Features;
 		device_features12.timelineSemaphore = true;
+		device_features12.shaderStorageImageArrayNonUniformIndexing = true;
 		vk::PhysicalDeviceVulkan13Features device_features13 {};
 		device_features13.sType            = vk::StructureType::ePhysicalDeviceVulkan13Features;
 		device_features13.pNext            = &device_features12;
@@ -8236,10 +8325,14 @@ void RunCase(VulkanHarness* vulkan, const TestCase& test) {
 		    test.name, test.image_width, test.image_height, test.storage_image_format,
 		    vk::ImageUsageFlagBits::eStorage, test.storage_image_rgba,
 		    test.storage_image_dwords_per_pixel, vk::ImageLayout::eGeneral);
-		storage_image_uint =
-		    vulkan->CreateImage2D(test.name, test.image_width, test.image_height,
-		                          vk::Format::eR32Uint, vk::ImageUsageFlagBits::eStorage,
-		                          test.storage_image_r32ui, 1, vk::ImageLayout::eGeneral);
+		auto storage_uint_mips = test.storage_image_r32ui_mips;
+		if (storage_uint_mips.empty() && !test.storage_image_r32ui.empty()) {
+			storage_uint_mips.push_back(test.storage_image_r32ui);
+		}
+		storage_image_uint = vulkan->CreateImageMips(
+		    test.name, test.image_width, test.image_height, vk::Format::eR32Uint,
+		    vk::ImageUsageFlagBits::eStorage, storage_uint_mips, 1, vk::ImageLayout::eGeneral,
+		    vk::ImageType::e2D, vk::ImageViewType::e2D, 1);
 	}
 	if (needs_sampler) {
 		sampler = vulkan->CreateNearestSampler(test.name);
@@ -8265,6 +8358,12 @@ void RunCase(VulkanHarness* vulkan, const TestCase& test) {
 		image_actual.resize(test.expected_storage_image_r32ui.size());
 		CompareWords(test, "uint storage image readback", test.expected_storage_image_r32ui,
 		             image_actual);
+	}
+	for (u32 mip = 0; mip < test.expected_storage_image_r32ui_mips.size(); mip++) {
+		auto image_actual = vulkan->ReadImage(test.name, &storage_image_uint, mip);
+		const auto& expected = test.expected_storage_image_r32ui_mips[mip];
+		image_actual.resize(expected.size());
+		CompareWords(test, "uint storage image mip readback", expected, image_actual);
 	}
 	if (sampler != nullptr) {
 		vulkan->Device().destroySampler(sampler, nullptr);
@@ -13643,10 +13742,65 @@ TestCase ImageGetResinfoDmaskMipLevels() {
 	return test;
 }
 
-SkippedCase ImageStoreMipWritesExplicitMip2D() {
-	return {"ImageStoreMipWritesExplicitMip2D",
-	        "requires per-mip storage-image view descriptors; Vulkan "
-	        "OpImageWrite cannot take Lod"};
+TestCase ImageStoreMipWritesExplicitMip2D() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 20, 1);
+	AppendVMovU32(&code, 21, 1);
+	code.push_back(EncodeVop1(0x01, 22, Vgpr(0)));
+	AppendVMovLiteral(&code, 0, 0x12345678u);
+	code.push_back(EncodeMimg0(0x09, 0x1));
+	code.push_back(EncodeMimg1(0, 20));
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name      = "ImageStoreMipWritesExplicitMip2D";
+	test.code      = code;
+	test.opcodes   = {O::VMovB32, O::ImageStoreMip, O::SEndpgm};
+	test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+	test.user_data[3] |= 1u << 16u;
+	test.user_data[5] |= 1u << 4u;
+	test.has_user_data = true;
+	test.storage_image_r32ui_mips = {std::vector<u32>(16, 0), std::vector<u32>(4, 0)};
+	test.expected_storage_image_r32ui_mips = test.storage_image_r32ui_mips;
+	test.expected_storage_image_r32ui_mips[0][5] = 0x12345678u;
+	test.expected_storage_image_r32ui_mips[1][3] = 0x12345678u;
+	test.required_spirv = {"OpCapability ShaderNonUniform",
+	                       "OpCapability StorageImageArrayNonUniformIndexing", "NonUniform",
+	                       "OpULessThan", "OpAccessChain", "OpImageWrite", "storage_uint_2d"};
+	test.compute_info.threads_num[0] = 2;
+	test.compute_info.threads_num[1] = 1;
+	test.compute_info.threads_num[2] = 1;
+	test.compute_info.thread_ids_num = 1;
+	test.has_compute_info            = true;
+	return test;
+}
+
+TestCase ImageStoreMipOutOfRangeIsDiscarded() {
+	using O = ShaderOpcode;
+
+	std::vector<u32> code;
+	AppendVMovU32(&code, 20, 0);
+	AppendVMovU32(&code, 21, 0);
+	AppendVMovU32(&code, 22, 2);
+	AppendVMovLiteral(&code, 0, 0xdeadbeefu);
+	code.push_back(EncodeMimg0(0x09, 0x1));
+	code.push_back(EncodeMimg1(0, 20));
+	AppendEnd(&code);
+
+	TestCase test;
+	test.name      = "ImageStoreMipOutOfRangeIsDiscarded";
+	test.code      = code;
+	test.opcodes   = {O::VMovB32, O::ImageStoreMip, O::SEndpgm};
+	test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+	test.user_data[3] |= 1u << 16u;
+	test.user_data[5] |= 1u << 4u;
+	test.has_user_data = true;
+	test.storage_image_r32ui_mips = {std::vector<u32>(16, 0), std::vector<u32>(4, 0)};
+	test.expected_storage_image_r32ui_mips = test.storage_image_r32ui_mips;
+	test.required_spirv = {"OpULessThan", "OpImageWrite"};
+	return test;
 }
 
 TestCase ImageSampleAndGather() {
@@ -14598,6 +14752,8 @@ std::vector<TestCase> MakeCases() {
 	AddCase(ImageLoadA16UintCoordsOnGpu);
 	AddCase(ImageGetResinfoDmaskWidthHeight);
 	AddCase(ImageGetResinfoDmaskMipLevels);
+	AddCase(ImageStoreMipWritesExplicitMip2D);
+	AddCase(ImageStoreMipOutOfRangeIsDiscarded);
 	AddCase(ImageSampleAndGather);
 	AddCase(ImageSampleA16SamplerCoordsOnGpu);
 	AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
@@ -14633,10 +14789,6 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
 	    GraphicsFinalVmExportSupersedesEarlierVmMask(),
 	    GraphicsBranchPathFinalVmExportDiscardsInactiveExec(),
 	};
-}
-
-std::vector<SkippedCase> MakeSkippedCases() {
-	return {ImageStoreMipWritesExplicitMip2D()};
 }
 
 void CheckPs5GameExampleImageClearRuntimeShape() {
@@ -14943,8 +15095,15 @@ void CheckRenderTargetFormatContract() {
 			resource.atomic = true;
 		} else if (std::strcmp(kind, "storage-compare") == 0) {
 			resource.depth_compare = true;
-		} else if (std::strcmp(kind, "storage-mip") == 0) {
+		} else if (std::strcmp(kind, "storage-mip-count") == 0) {
 			resource.mip_mode = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+			resource.mip_levels = 0;
+		} else if (std::strcmp(kind, "storage-mip-atomic") == 0) {
+			resource.kind       = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+			resource.mip_mode   = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+			resource.mip_levels = 2;
+			resource.read       = true;
+			resource.atomic     = true;
 		} else if (std::strcmp(kind, "storage-dimension") == 0) {
 			resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Unknown;
 		} else {
@@ -15130,6 +15289,14 @@ void CheckSampledColorViews() {
 	Require("SampledColorViews", "atomic uint 2D storage resource",
 	        IsSupportedStorageImageResource(storage_resource),
 	        "atomic uint storage resource was rejected");
+	storage_resource.read       = false;
+	storage_resource.atomic     = false;
+	storage_resource.mip_mode   = ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+	storage_resource.mip_levels = 3;
+	Require("SampledColorViews", "dynamic uint 2D storage resource",
+	        IsSupportedStorageImageResource(storage_resource) &&
+	            storage_resource.NumBindings() == 3,
+	        "write-only IMAGE_STORE_MIP resource was rejected");
 
 	char path[MAX_PATH] {};
 	Require("SampledColorViews", "host", GetModuleFileNameA(nullptr, path, MAX_PATH) != 0,
@@ -15138,7 +15305,8 @@ void CheckSampledColorViews() {
 	     {"sampled-invalid-selector", "sampled-incompatible-format", "sampled-invalid-high",
 	      "sampled-depth-format", "sampled-depth-swizzle", "storage-incompatible-format",
 	      "storage-kind", "storage-no-write", "storage-nonuint-atomic", "storage-compare",
-	      "storage-mip", "storage-dimension", "volume-mip-count", "volume-slice-range"}) {
+	      "storage-mip-count", "storage-mip-atomic", "storage-dimension", "volume-mip-count",
+	      "volume-slice-range"}) {
 		std::string       command = std::string("\"") + path + "\" --image-view-death " + kind;
 		std::vector<char> mutable_command(command.begin(), command.end());
 		mutable_command.push_back('\0');
@@ -17256,6 +17424,12 @@ int main(int argc, char** argv) {
 		vulkan.CheckUnifiedImageViewCache();
 		return 0;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--storage-mip-only") == 0) {
+		VulkanHarness vulkan;
+		RunCase(&vulkan, ImageStoreMipWritesExplicitMip2D());
+		RunCase(&vulkan, ImageStoreMipOutOfRangeIsDiscarded());
+		return 0;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--depth-readback-only") == 0) {
 		CheckDepthTargetFootprints();
 		return 0;
@@ -17383,9 +17557,6 @@ int main(int argc, char** argv) {
 	CheckOpcodeCoverage(tests, graphics_tests);
 	for (const auto& test: tests) {
 		RunCase(&vulkan, test);
-	}
-	for (const auto& test: MakeSkippedCases()) {
-		std::printf("[skip]    %-32s %s\n", test.name, test.reason);
 	}
 	for (const auto& test: graphics_tests) {
 		RunGraphicsCase(&vulkan, test);

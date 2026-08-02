@@ -1468,6 +1468,32 @@ void TestNativeBindingLayoutOneDimensionalImages() {
 	      "binding allocator did not preserve first-class 1D image groups");
 }
 
+void TestNativeBindingLayoutExpandsDynamicStorageMips() {
+	Program program;
+	program.stage = ShaderType::Compute;
+	program.blocks.resize(1);
+	auto dynamic = ImageUse(8, Opcode::ImageStore, ResourceKind::StorageImageUint,
+	                        Decoder::ImageDimension::Dim2D, 4);
+	dynamic.memory.image_has_mip = true;
+	program.blocks[0].instructions = {
+	    dynamic, ImageUse(12, Opcode::ImageStore, ResourceKind::StorageImageUint,
+	                      Decoder::ImageDimension::Dim2D, 6)};
+	Prepare(program);
+
+	ShaderComputeInputInfo compute;
+	compute.thread_ids_num = 1;
+	std::string error;
+	Check(CollectShaderInfo(program, {.compute = &compute}, &error), error.c_str());
+	Check(program.info.images.size() == 2 &&
+	          program.info.images[0].mip_mode == ImageMipMode::DynamicStorage,
+	      "dynamic storage image was not tracked independently");
+	program.info.images[0].mip_levels = 3;
+	Check(AllocateBindings(program, {}, &error), error.c_str());
+	const auto* storage = FindBinding(program.bindings, DescriptorBindingKind::StorageUint2D);
+	Check(storage != nullptr && storage->resources == std::vector<uint32_t>({0, 0, 0, 1}),
+	      "dynamic storage mip span overlapped the following logical image");
+}
+
 void TestNativeBindingLayoutSrtAndUserDataOverflow() {
 	Program srt;
 	srt.stage = ShaderType::Compute;
@@ -1936,6 +1962,7 @@ int main() {
 		RUN(TestTrackedProgramIsImmutable);
 		RUN(TestNativeBindingLayout);
 		RUN(TestNativeBindingLayoutOneDimensionalImages);
+		RUN(TestNativeBindingLayoutExpandsDynamicStorageMips);
 		RUN(TestNativeBindingLayoutSrtAndUserDataOverflow);
 		RUN(TestNativeBindingLayoutGds);
 		RUN(TestNativeBindingLayoutIsTransactional);

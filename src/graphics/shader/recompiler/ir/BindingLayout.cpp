@@ -269,7 +269,10 @@ bool AllocateBindings(Program& program, const BindingLayoutOptions& options, std
 			}
 			return false;
 		}
-		image_groups[static_cast<size_t>(group - ImageBindingKinds.begin())].push_back(i);
+		auto& resources = image_groups[static_cast<size_t>(group - ImageBindingKinds.begin())];
+		for (uint32_t binding = 0; binding < program.info.images[i].NumBindings(); binding++) {
+			resources.push_back(i);
+		}
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {

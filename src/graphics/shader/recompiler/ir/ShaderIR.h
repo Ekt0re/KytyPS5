@@ -598,17 +598,24 @@ enum class ImageMipMode { None, DynamicStorage };
 constexpr uint32_t StorageImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
+	static constexpr uint32_t MaxMipLevels = 16;
+
 	uint32_t                source          = 0;
 	uint32_t                first_use_pc    = 0;
 	ResourceKind            kind            = ResourceKind::None;
 	Decoder::ImageDimension dimension       = Decoder::ImageDimension::Unknown;
 	ImageMipMode            mip_mode        = ImageMipMode::None;
+	uint32_t                mip_levels      = 1;
 	uint32_t                storage_swizzle = StorageImageIdentitySwizzle;
 	bool                    read            = false;
 	bool                    written         = false;
 	bool                    atomic          = false;
 	bool                    depth_compare   = false;
 	bool                    cube            = false;
+
+	[[nodiscard]] uint32_t NumBindings() const {
+		return mip_mode == ImageMipMode::DynamicStorage ? mip_levels : 1u;
+	}
 
 	bool operator==(const ImageResource& other) const = default;
 };

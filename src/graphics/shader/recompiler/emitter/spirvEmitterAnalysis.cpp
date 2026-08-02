@@ -560,12 +560,21 @@ uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
                                   uint32_t variable_id, uint32_t array_index,
                                   IR::DescriptorBindingKind kind, uint32_t resource,
                                   const char* variable_name) {
+	return DescriptorElementPointerId(state, result_ptr_type, variable_id,
+	                                  ConstantU32(state, array_index), kind, resource,
+	                                  variable_name);
+}
+
+uint32_t DescriptorElementPointerId(EmitterState& state, uint32_t result_ptr_type,
+                                    uint32_t variable_id, uint32_t array_index_id,
+                                    IR::DescriptorBindingKind kind, uint32_t resource,
+                                    const char* variable_name) {
 	if (variable_id == 0) {
 		ExitDescriptorBindingFailure(state, kind, resource, variable_name);
 	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpAccessChain, result_ptr_type, pointer, variable_id, ConstantU32(state, array_index)});
+	    {OpAccessChain, result_ptr_type, pointer, variable_id, array_index_id});
 	return pointer;
 }
 

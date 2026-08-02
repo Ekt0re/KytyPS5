@@ -113,6 +113,13 @@ inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_fo
 
 [[nodiscard]] inline bool
 IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
+	const bool supported_mip =
+	    (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
+	     resource.mip_levels == 1u) ||
+	    (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage &&
+	     resource.mip_levels > 0u &&
+	     resource.mip_levels <= ShaderRecompiler::IR::ImageResource::MaxMipLevels &&
+	     !resource.read && !resource.atomic);
 	return (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImage ||
 	        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint) &&
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
@@ -120,7 +127,7 @@ IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resou
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.written &&
+	       supported_mip && resource.written &&
 	       (!resource.atomic ||
 	        (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
 	         resource.read)) &&

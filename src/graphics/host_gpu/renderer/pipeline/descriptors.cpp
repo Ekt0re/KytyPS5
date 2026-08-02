@@ -391,9 +391,16 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool supported_swizzle =
 	    IsValidImageSwizzle(swizzle) &&
 	    (swizzle == DstSel(4, 5, 6, 7) || !resource.read || resource.atomic);
+	const auto base_level = static_cast<uint32_t>(descriptor.BaseLevel());
+	const auto last_level = static_cast<uint32_t>(descriptor.LastLevel());
+	const auto mip_levels = last_level >= base_level ? last_level - base_level + 1u : 0u;
+	const bool dynamic_mip =
+	    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
 	const bool supported_mip_view = descriptor.BaseLevel() == 0 || is_1d || is_2d;
 	return (is_1d || is_1d_array || is_2d || is_2d_array || is_3d) && supported_tile &&
-	       supported_mip_view && descriptor.BaseLevel() == descriptor.LastLevel() &&
+	       supported_mip_view && mip_levels != 0u &&
+	       ((dynamic_mip && mip_levels == resource.mip_levels) ||
+	        (!dynamic_mip && descriptor.BaseLevel() == descriptor.LastLevel())) &&
 	       descriptor.LastLevel() <= descriptor.MaxMip() && descriptor.MinLod() == 0 &&
 	       supported_swizzle && descriptor.BCSwizzle() == 0 && !descriptor.MsaaDepth();
 }
@@ -618,14 +625,15 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	const bool multisampled = IsMultisampledTexture(type);
 	const auto levels       = multisampled ? 1u : static_cast<uint32_t>(descriptor.MaxMip()) + 1u;
 	const auto tile         = descriptor.TileMode();
-	const bool depth_tile = tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
+	const bool depth_tile   = tile == Prospero::GpuEnumValue(Prospero::TileMode::kDepth);
 	const bool msaa_tile =
 	    depth_tile || tile == Prospero::GpuEnumValue(Prospero::TileMode::kRenderTarget);
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
 	if ((!multisampled && (base_level > last_level || last_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 ||
-	      descriptor.MaxMip() != last_level || !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
+	      descriptor.MaxMip() != last_level || !msaa_tile ||
+	      (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
 		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
 		     "kind=%u dimension=%u mip_mode=%u read=%d written=%d "
@@ -634,11 +642,15 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(resource.dimension),
 		     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written,
 		     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
-		     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+		     descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+		     descriptor.fields[7]);
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
-	    multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
+	    multisampled ||
+	            (storage && resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage)
+	        ? 1u
+	        : static_cast<uint32_t>(last_level - base_level) + 1u;
 	const auto depth  = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format = descriptor.Format();
 	const bool sampled_numeric_class =
@@ -661,8 +673,8 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 	TileSizeAlign size {};
 	if (multisampled) {
 		const auto bytes = Prospero::NumBytesPerElement(format);
-		pitch = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
-		                   : TileGetRenderTargetPitch(width, bytes, last_level);
+		pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
+		                              : TileGetRenderTargetPitch(width, bytes, last_level);
 		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
 		    size.size > UINT32_MAX / image_layers) {
 			EXIT("unsupported multisample texture layout\n");
@@ -679,8 +691,8 @@ RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   reso
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto              pixel_format = TextureGetFormat(format);
-	const auto              storage_view_format =
+	const auto pixel_format = TextureGetFormat(format);
+	const auto storage_view_format =
 	    storage && format == Prospero::GpuEnumValue(Prospero::BufferFormat::k32SInt)
 	        ? vk::Format::eR32Uint
 	        : SrgbStorageViewFormat(pixel_format);
@@ -893,7 +905,17 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 		}
 		auto& binding      = images[i];
 		binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
-		auto&      image   = texture_cache.GetImage(binding.image_id);
+		auto& image        = texture_cache.GetImage(binding.image_id);
+		binding.mip_views.clear();
+		if (program.info.images[i].mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
+			binding.mip_views.reserve(program.info.images[i].mip_levels);
+			for (uint32_t mip = 0; mip < program.info.images[i].mip_levels; mip++) {
+				auto view = binding.desc.view_info;
+				view.base_level += mip;
+				view.level_count = 1;
+				binding.mip_views.push_back(mip == 0 ? binding.image_view : image.FindView(view));
+			}
+		}
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
@@ -971,7 +993,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		auto&       image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 		auto&       binding = descriptors.images[i];
 		const auto& view    = binding.desc.view_info;
-		const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
+		const auto  level_count =
+		    program.info.images[i].mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage
+		        ? program.info.images[i].mip_levels
+		        : view.level_count;
+		const ImageSubresourceRange range {view.base_level, level_count, view.base_layer,
 		                                   view.layer_count};
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		if (image.info.data.Empty()) {

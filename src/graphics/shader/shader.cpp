@@ -1018,6 +1018,7 @@ static void ShaderAppendNativeSpecialization(std::vector<uint32_t>&             
 		ids.push_back(static_cast<uint32_t>(image.kind));
 		ids.push_back(static_cast<uint32_t>(image.dimension));
 		ids.push_back(static_cast<uint32_t>(image.mip_mode));
+		ids.push_back(image.mip_levels);
 		ids.push_back(image.storage_swizzle);
 	}
 	ids.push_back(static_cast<uint32_t>(program.info.addresses.size()));
