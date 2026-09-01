@@ -216,9 +216,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 			options.game_patch = value;
 		} else if (arg == "--screen-width") {
-			options.config.screen_width = static_cast<uint32_t>(Common::ToInt32(value));
+			const int32_t val = Common::ToInt32(value);
+			options.config.screen_width = val > 0 ? static_cast<uint32_t>(val) : 1280;
 		} else if (arg == "--screen-height") {
-			options.config.screen_height = static_cast<uint32_t>(Common::ToInt32(value));
+			const int32_t val = Common::ToInt32(value);
+			options.config.screen_height = val > 0 ? static_cast<uint32_t>(val) : 720;
 		} else if (arg == "--user-name") {
 			if (value.empty() || value.size() > Config::MAX_USER_NAME_LENGTH) {
 				::printf("invalid user name: must contain 1-%zu bytes\n",

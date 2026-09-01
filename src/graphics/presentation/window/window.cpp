@@ -400,7 +400,9 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 }
 
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
-	EXIT_IF(new_width == 0 || new_height == 0);
+	if (new_width == 0 || new_height == 0) {
+		return;
+	}
 	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = new_width;
 	graphic_ctx.screen_height = new_height;
@@ -452,6 +454,14 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			break;
 		case SDL_WINDOWEVENT_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
+			{
+				int w = 0;
+				int h = 0;
+				SDL_Vulkan_GetDrawableSize(window, &w, &h);
+				if (w > 0 && h > 0) {
+					Resize(static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+				}
+			}
 			break;
 		case SDL_WINDOWEVENT_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
@@ -808,8 +818,12 @@ void WindowContext::Run() {
 
 static void WindowCreate(WindowContext& context) {
 	EXIT_IF(context.window != nullptr);
-	EXIT_IF(context.graphic_ctx.screen_width == 0);
-	EXIT_IF(context.graphic_ctx.screen_height == 0);
+	if (context.graphic_ctx.screen_width == 0) {
+		context.graphic_ctx.screen_width = 1280;
+	}
+	if (context.graphic_ctx.screen_height == 0) {
+		context.graphic_ctx.screen_height = 720;
+	}
 
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
@@ -875,6 +889,13 @@ uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
 Presenter& WindowInit(uint32_t width, uint32_t height) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EXIT_IF(g_window != nullptr);
+
+	if (width == 0) {
+		width = Config::GetScreenWidth();
+	}
+	if (height == 0) {
+		height = Config::GetScreenHeight();
+	}
 
 	auto window = std::make_unique<WindowContext>();
 
