@@ -834,8 +834,9 @@ constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_0                   = 0xB2;
 constexpr uint32_t SPI_SHADER_USER_ACCUM_ESGS_3                   = 0xB5;
 constexpr uint32_t SPI_SHADER_PGM_LO_ES                           = 0xC8;
 constexpr uint32_t SPI_SHADER_PGM_HI_ES                           = 0xC9;
-// Retained only as an opaque AGC compiler-record tag; 0x100 is not a PS5 SH register.
+// Private AGC registers used by shader binaries submitted through SET_SH_REG_INDIRECT.
 constexpr uint32_t SPI_SHADER_PGM_CHKSUM_HS                       = 0x100;
+constexpr uint32_t SPI_SHADER_PGM_RSRC4_HS                        = 0x101;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_LO_HS                = 0x102;
 constexpr uint32_t SPI_SHADER_USER_DATA_ADDR_HI_HS                = 0x103;
 constexpr uint32_t SPI_GRAPHICS_SHADER_CONTROL_HS                 = 0x107;
