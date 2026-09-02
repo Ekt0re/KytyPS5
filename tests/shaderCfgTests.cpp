@@ -5086,8 +5086,7 @@ void TestNewShaderRecompilerImageViewDimensions() {
         "1D derivative sample did not emit scalar SPIR-V gradients");
   Check(Common::ContainsStr(source, "OpImageQuerySizeLod"),
         "1D resource query did not emit a scalar size query");
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                       "sampled_uint_1d"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_8 "),
         "integer 1D load did not access the uint 1D descriptor binding");
 }
 
@@ -5124,11 +5123,10 @@ void TestNewShaderRecompilerStorageImage1DDescriptorVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_1d "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_22 "),
         "1D store did not access the 1D storage descriptor binding");
   Check(
-      SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                     "storage_1d_array"),
+      SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_23 "),
       "1D-array store did not access the 1D-array storage descriptor binding");
 }
 
@@ -5146,9 +5144,9 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
   auto result = ShaderRecompiler::Recompile(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "sampled_2d "),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_3 "),
         "null image did not use the canonical 2D sampled descriptor binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "sampled_1d "),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_1 "),
         "null image retained the decoded 1D descriptor binding");
 }
 
@@ -5315,17 +5313,17 @@ void TestNewShaderRecompilerImageLoad2DMsaa() {
             result.program.info.images[0].dimension ==
                 ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa,
         "2D-MSAA descriptor specialization lost the multisample dimension");
-  Check(ShaderRecompiler::IR::FindBinding(
-            result.program.bindings,
-            ShaderRecompiler::IR::DescriptorBindingKind::Sampled2DMsaa) !=
-            nullptr,
+  const auto binding_kind = ShaderRecompiler::IR::DescriptorBindingForImage(
+      result.program.info.images[0]);
+  Check(binding_kind.has_value() &&
+            ShaderRecompiler::IR::FindBinding(result.program.bindings,
+                                              *binding_kind) != nullptr,
         "2D-MSAA image did not receive a multisampled descriptor binding");
   Check(SpirvContainsTypeImage(result.spirv, 1, 0, 1, 1),
         "SPIR-V binary does not contain a multisampled 2D image type");
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                       "sampled_2d_msaa"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_5 "),
         "2D-MSAA load did not access its multisampled descriptor");
   Check(SpirvSourceHasInstructionUsing(source, "OpImageFetch", " Sample "),
         "2D-MSAA load did not emit the fragment ID as a SPIR-V Sample operand");
@@ -5424,7 +5422,7 @@ void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_3d"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
         "storage image store did not access the 3D storage descriptor binding");
 }
 
@@ -5460,14 +5458,13 @@ void TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_2d"),
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_24 "),
         "2D descriptor storage image store did not access the base storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain",
-                                        "storage_2d_array"),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_25 "),
         "2D descriptor storage image store unexpectedly used the array storage "
         "binding");
-  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "storage_3d"),
+  Check(!SpirvSourceHasInstructionUsing(source, "OpAccessChain", "image_26 "),
         "2D descriptor storage image store unexpectedly used the 3D storage "
         "binding");
 }
@@ -8811,6 +8808,45 @@ void TestNewShaderRecompilerExpVertexOutputs() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerClipDisabledPosition() {
+  const uint32_t shader[] = {
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3), 0xbf810000u,
+  };
+  const auto compile = [&](const ShaderVertexInputInfo &vertex) {
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.input_info.vertex = &vertex;
+    return ShaderRecompiler::Recompile(shader, options);
+  };
+
+  ShaderVertexInputInfo regular{};
+  auto clipped = regular;
+  clipped.clip_space = {
+      .scale = {640.0f, 360.0f},
+      .offset = {640.0f, 360.0f},
+      .half_extent = {8192.0f, 8192.0f},
+      .enabled = true,
+  };
+  const auto regular_result = compile(regular);
+  const auto clipped_result = compile(clipped);
+  CheckSpirvBinaryValidates(clipped_result.spirv);
+  Check(SpirvInstructionOpcodeCount(regular_result.spirv, 136u) == 0u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 133u) == 2u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 129u) == 2u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 136u) == 2u &&
+            SpirvInstructionOpcodeCount(clipped_result.spirv, 131u) == 2u,
+        "clip-disabled position export did not convert both screen coordinates to NDC");
+  Check(MakeStageStaticKey(regular) != MakeStageStaticKey(clipped),
+        "clip-disabled vertex shader shared the regular shader cache key");
+  auto disabled = clipped;
+  disabled.clip_space.enabled = false;
+  Check(MakeStageStaticKey(regular) == MakeStageStaticKey(disabled),
+        "disabled clip-space payload affected the shader cache key");
+  auto shifted = clipped;
+  shifted.clip_space.offset[0] += 1.0f;
+  Check(MakeStageStaticKey(clipped) != MakeStageStaticKey(shifted),
+        "clip-disabled viewport transform is absent from the shader cache key");
+}
+
 void TestNewShaderRecompilerAuxPositionExports() {
   const auto compile = [](std::span<const uint32_t> shader, uint32_t control) {
     ShaderVertexInputInfo vertex{};
@@ -9755,46 +9791,6 @@ void TestNativeWideValueValidation() {
   }
   {
     auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageRead, {});
-    check_rejected(program, "storage kind for image read was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImageUint;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageQueryDimensions, {});
-    check_rejected(program, "storage uint kind for image query was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::Image;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageWrite, {});
-    check_rejected(program, "sampled image kind for image write was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageSampleRaw, {});
-    check_rejected(program, "storage kind for image sample was accepted");
-  }
-  {
-    auto program = make_program();
-    MemoryInfo memory;
-    memory.kind = ResourceKind::StorageImage;
-    program.memory_info.push_back(memory);
-    append_image(program, ValueOpcode::ImageAtomicIAdd32, {});
-    check_rejected(program, "untyped storage kind for image atomic was accepted");
-  }
-  {
-    auto program = make_program();
     IREmitter ir(program.blocks.front());
     const auto data = ir.Emit(ValueOpcode::CompositeConstructU32x4,
                               {Value(0u), Value(0u), Value(0u), Value(0u)});
@@ -10343,12 +10339,25 @@ void TestNewShaderRecompilerNativeBindingPlan() {
   auto result = ShaderRecompiler::Recompile(shader, options);
   const auto *buffers = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, BindingKind::Buffers);
-  const auto *sampled = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::Sampled2D);
-  const auto *storage = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::Storage2D);
-  const auto *atomic_storage = ShaderRecompiler::IR::FindBinding(
-      result.program.bindings, BindingKind::StorageAtomic2D);
+  const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
+  const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
+  const ShaderRecompiler::IR::DescriptorBinding *atomic_storage = nullptr;
+  for (const auto &image : result.program.info.images) {
+    const auto kind = ShaderRecompiler::IR::DescriptorBindingForImage(image);
+    if (!kind.has_value()) {
+      continue;
+    }
+    const auto *binding =
+        ShaderRecompiler::IR::FindBinding(result.program.bindings, *kind);
+    if (image.resource_class ==
+        ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+      sampled = binding;
+    } else if (image.atomic) {
+      atomic_storage = binding;
+    } else {
+      storage = binding;
+    }
+  }
   const auto *samplers = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, BindingKind::Samplers);
   Check(buffers != nullptr && buffers->resources.size() == 2,
@@ -10396,8 +10405,10 @@ void TestNewShaderRecompilerNativeBindingPlan() {
 
   uint32_t float_storage = UINT32_MAX;
   for (uint32_t i = 0; i < result.program.info.images.size(); i++) {
-    if (result.program.info.images[i].kind ==
-        ShaderRecompiler::IR::ResourceKind::StorageImage) {
+    const auto &image = result.program.info.images[i];
+    if (image.resource_class ==
+            ShaderRecompiler::IR::ImageResourceClass::Storage &&
+        image.numeric_class == Prospero::TextureNumericClass::Float) {
       float_storage = i;
       break;
     }
@@ -11908,6 +11919,7 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
   TestNewShaderRecompilerNativeWideBufferIr();

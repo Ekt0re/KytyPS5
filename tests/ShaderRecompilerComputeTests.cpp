@@ -2950,6 +2950,28 @@ public:
             "dynamic view identity omitted mapping, format, mip, layer, type, "
             "or storage usage");
 
+    auto video_out_info = color_info;
+    video_out_info.pixel_format = vk::Format::eA2R10G10B10UnormPack32;
+    video_out_info.guest_format = Prospero::BufferFormat::k10_10_10_2UNorm;
+    Libs::Graphics::Image video_out(m_runtime_context, scheduler,
+                                    video_out_info);
+    auto video_out_view_info = sampled;
+    video_out_view_info.format = video_out_info.pixel_format;
+    video_out_view_info.usage = vk::ImageUsageFlagBits::eTransferSrc;
+    const auto video_out_view = video_out.FindView(video_out_view_info);
+    auto storage_alias_info = video_out_view_info;
+    storage_alias_info.format = vk::Format::eA2B10G10R10UnormPack32;
+    storage_alias_info.usage = vk::ImageUsageFlagBits::eStorage;
+    const auto storage_alias_view = video_out.FindView(storage_alias_info);
+    Require(
+        name, "video-out storage alias usage",
+        ImageViewOps::FormatsCompatible(video_out_info.pixel_format,
+                                        storage_alias_info.format) &&
+            static_cast<bool>(video_out.backing.usage &
+                              vk::ImageUsageFlagBits::eStorage) &&
+            video_out_view != nullptr && storage_alias_view != nullptr,
+        "compatible video-out backing was created without storage usage");
+
     ImageInfo depth_info{};
     depth_info.pixel_format = vk::Format::eD32Sfloat;
     depth_info.guest_format = Prospero::BufferFormat::k32Float;
@@ -7699,7 +7721,9 @@ public:
       null_program.stage = ShaderType::Compute;
       null_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource null_resource{};
-      null_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      null_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      null_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       null_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       null_resource.read = true;
@@ -7708,7 +7732,8 @@ public:
       null_volume.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
       null_program.info.images.push_back(null_volume);
       auto null_storage = null_resource;
-      null_storage.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      null_storage.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
       null_storage.read = false;
       null_storage.written = true;
       null_program.info.images.push_back(null_storage);
@@ -7804,8 +7829,9 @@ public:
       storage_program.stage = ShaderType::Vertex;
       storage_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource storage_resource{};
-      storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
+      storage_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       storage_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       storage_resource.written = true;
@@ -7848,8 +7874,10 @@ public:
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
       mipped_storage_resource.mip_count = 3;
       auto sampled_overwide_resource = storage_resource;
-      sampled_overwide_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_overwide_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled_overwide_resource.numeric_class =
+          Prospero::TextureNumericClass::Uint;
       sampled_overwide_resource.read = true;
       sampled_overwide_resource.written = false;
       auto plain_mipped_storage_binding =
@@ -7957,8 +7985,10 @@ public:
                 srgb_storage_descriptor.dwords.begin());
       srgb_storage_descriptor.dword_count = 8;
       auto srgb_storage_resource = storage_resource;
-      srgb_storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImage;
+      srgb_storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
+      srgb_storage_resource.numeric_class =
+          Prospero::TextureNumericClass::Float;
       const auto srgb_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(
               executor, srgb_storage_resource, srgb_storage_descriptor);
@@ -8001,8 +8031,9 @@ public:
                 sint_storage_descriptor.dwords.begin());
       sint_storage_descriptor.dword_count = 8;
       auto sint_storage_resource = srgb_storage_resource;
-      sint_storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      sint_storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
+      sint_storage_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       const auto sint_storage_binding =
           RenderExecutorTestAccess::ResolveTexture(
               executor, sint_storage_resource, sint_storage_descriptor);
@@ -8083,7 +8114,9 @@ public:
       sampled_program.stage = ShaderType::Pixel;
       sampled_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource sampled_resource{};
-      sampled_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       sampled_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_resource.read = true;
@@ -8529,8 +8562,10 @@ public:
                 sampled_depth_value.dwords.begin());
       sampled_depth_value.dword_count = 8;
       ShaderRecompiler::IR::ImageResource sampled_depth_resource{};
-      sampled_depth_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::ImageUint;
+      sampled_depth_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      sampled_depth_resource.numeric_class =
+          Prospero::TextureNumericClass::Uint;
       sampled_depth_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       sampled_depth_resource.read = true;
@@ -8639,7 +8674,9 @@ public:
       array_program.stage = ShaderType::Compute;
       array_program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource array_resource{};
-      array_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      array_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      array_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       array_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
       array_resource.read = true;
@@ -9056,7 +9093,9 @@ public:
       program.stage = ShaderType::Compute;
       program.resource_tracking_complete = true;
       ShaderRecompiler::IR::ImageResource stencil_resource{};
-      stencil_resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+      stencil_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
+      stencil_resource.numeric_class = Prospero::TextureNumericClass::Uint;
       stencil_resource.dimension =
           ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       stencil_resource.read = true;
@@ -9129,8 +9168,8 @@ public:
       stencil_storage_program->stage = ShaderType::Compute;
       stencil_storage_program->resource_tracking_complete = true;
       auto stencil_storage_resource = stencil_resource;
-      stencil_storage_resource.kind =
-          ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+      stencil_storage_resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Storage;
       stencil_storage_resource.read = false;
       stencil_storage_resource.written = true;
       stencil_storage_program->info.images.push_back(stencil_storage_resource);
@@ -9495,34 +9534,26 @@ public:
     auto Native = [](Kind kind) {
       return ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, kind);
     };
-    auto Count = [&](Kind kind) {
-      const auto *binding = Binding(kind);
-      if (binding == nullptr) {
-        return 0u;
+    for (const auto &binding : layout.descriptors) {
+      const auto resource_class =
+          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
+        continue;
       }
-      if (kind == Kind::Gds) {
-        return 1u;
+      const auto &image =
+          compiled.program.info.images.at(binding.resources.front());
+      bool supported =
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+        supported = supported ||
+                    image.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
+                    image.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
       }
-      return static_cast<u32>(binding->resources.size());
-    };
-    Require(
-        test.name, "dispatch",
-        Count(Kind::Sampled2DArray) == 0 && Count(Kind::Sampled3D) == 0 &&
-            Count(Kind::SampledUint2DArray) == 0 &&
-            Count(Kind::SampledUint3D) == 0 && Count(Kind::Storage1D) == 0 &&
-            Count(Kind::Storage1DArray) == 0 &&
-            Count(Kind::Storage2DArray) == 0 && Count(Kind::Storage3D) == 0 &&
-            Count(Kind::StorageUint1D) == 0 &&
-            Count(Kind::StorageUint1DArray) == 0 &&
-            Count(Kind::StorageUint2DArray) == 0 &&
-            Count(Kind::StorageUint3D) == 0 &&
-            Count(Kind::StorageAtomic1D) == 0 &&
-            Count(Kind::StorageAtomic1DArray) == 0 &&
-            Count(Kind::StorageAtomic2DArray) == 0 &&
-            Count(Kind::StorageAtomic3D) == 0,
-        "unsupported array/3D image cases must provide matching Vulkan test "
-        "views "
-        "before dispatch");
+      Require(test.name, "dispatch", supported,
+              "unsupported image dimension needs a matching Vulkan test view");
+    }
 
     vk::ShaderModuleCreateInfo module_info{};
     module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
@@ -9611,31 +9642,10 @@ public:
       }
       pool_sizes.push_back({type, count});
     };
-    add_pool_size(vk::DescriptorType::eStorageBuffer,
-                  Count(Kind::Buffers) +
-                      (Binding(Kind::BdaPagetable) != nullptr ? 1u : 0u) +
-                      (Binding(Kind::FaultBuffer) != nullptr ? 1u : 0u) +
-                      Count(Kind::Gds) +
-                      (Binding(Kind::FlattenedSrt) != nullptr ? 1u : 0u) +
-                      (Binding(Kind::UserData) != nullptr ? 1u : 0u));
-    add_pool_size(
-        vk::DescriptorType::eSampledImage,
-        Count(Kind::Sampled1D) + Count(Kind::Sampled1DArray) +
-            Count(Kind::Sampled2D) + Count(Kind::Sampled2DArray) +
-            Count(Kind::Sampled3D) + Count(Kind::SampledUint1D) +
-            Count(Kind::SampledUint1DArray) + Count(Kind::SampledUint2D) +
-            Count(Kind::SampledUint2DArray) + Count(Kind::SampledUint3D));
-    add_pool_size(
-        vk::DescriptorType::eStorageImage,
-        Count(Kind::Storage1D) + Count(Kind::Storage1DArray) +
-            Count(Kind::Storage2D) + Count(Kind::Storage2DArray) +
-            Count(Kind::Storage3D) + Count(Kind::StorageUint1D) +
-            Count(Kind::StorageUint1DArray) + Count(Kind::StorageUint2D) +
-            Count(Kind::StorageUint2DArray) + Count(Kind::StorageUint3D) +
-            Count(Kind::StorageAtomic1D) + Count(Kind::StorageAtomic1DArray) +
-            Count(Kind::StorageAtomic2D) + Count(Kind::StorageAtomic2DArray) +
-            Count(Kind::StorageAtomic3D));
-    add_pool_size(vk::DescriptorType::eSampler, Count(Kind::Samplers));
+    for (const auto &binding : layout.descriptors) {
+      add_pool_size(NativeDescriptorType(binding.kind),
+                    NativeDescriptorCount(binding));
+    }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
     pool_info.maxSets = 1;
@@ -9766,16 +9776,28 @@ public:
       writes.push_back(write);
     }
     const ShaderRecompiler::IR::DescriptorBinding *sampled = nullptr;
-    constexpr std::array sampled_kinds{
-        Kind::Sampled1D,     Kind::Sampled1DArray,     Kind::Sampled2D,
-        Kind::SampledUint1D, Kind::SampledUint1DArray, Kind::SampledUint2D,
-    };
-    for (const auto kind : sampled_kinds) {
-      if (const auto *candidate = Binding(kind); candidate != nullptr) {
+    const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
+    const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
+    const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
+    for (const auto &binding : layout.descriptors) {
+      const auto resource_class =
+          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
+        continue;
+      }
+      const auto &image =
+          compiled.program.info.images.at(binding.resources.front());
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         Require(test.name, "dispatch", sampled == nullptr,
                 "Vulkan test harness needs separate sampled images for mixed "
                 "descriptor classes");
-        sampled = candidate;
+        sampled = &binding;
+      } else if (image.atomic) {
+        storage_atomic = &binding;
+      } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
+        storage = &binding;
+      } else {
+        storage_uint = &binding;
       }
     }
     if (sampled != nullptr) {
@@ -9796,9 +9818,6 @@ public:
       write.pImageInfo = sampled_infos.data();
       writes.push_back(write);
     }
-    const auto *storage = Binding(Kind::Storage2D);
-    const auto *storage_uint = Binding(Kind::StorageUint2D);
-    const auto *storage_atomic = Binding(Kind::StorageAtomic2D);
     const auto BindStorage =
         [&](const ShaderRecompiler::IR::DescriptorBinding *binding,
             const Image *image, std::vector<vk::DescriptorImageInfo> *infos) {
@@ -10712,8 +10731,8 @@ public:
                                      {16, 0}, {8, 16}, {0, 24}};
       bool valid = built && Prospero::NumBytesPerElement(format) == 4 &&
                    Prospero::BlockCompressedBytesPerBlock(format) == 0 &&
-                   Prospero::IsSampledTextureFormat(format) &&
-                   Prospero::IsUintTextureFormat(format) &&
+                   Prospero::SampledTextureNumericClass(format) ==
+                       Prospero::TextureNumericClass::Uint &&
                    Prospero::RemapTextureFormat(format) ==
                        Prospero::BufferFormat::k32UInt &&
                    surface_format.vk_format == vk::Format::eR32Uint &&
@@ -10734,18 +10753,17 @@ public:
               "PS5 packed integer texture metadata or Standard64KB mip tail "
               "changed");
 
-      const auto storage_only_format = Prospero::BufferFormat::k32SInt;
-      const auto storage_only_surface =
-          TextureGetSurfaceFormatInfo(storage_only_format);
-      Require(name, "storage-only surface mapping",
-              !Prospero::IsSampledTextureFormat(storage_only_format) &&
-                  !Prospero::IsUintTextureFormat(storage_only_format) &&
-                  Prospero::RemapTextureFormat(storage_only_format) ==
-                      storage_only_format &&
-                  storage_only_surface.vk_format == vk::Format::eR32Sint &&
-                  storage_only_surface.conversion_format ==
+      const auto signed_format = Prospero::BufferFormat::k32SInt;
+      const auto signed_surface = TextureGetSurfaceFormatInfo(signed_format);
+      Require(name, "signed sampled surface mapping",
+              Prospero::SampledTextureNumericClass(signed_format) ==
+                      Prospero::TextureNumericClass::Sint &&
+                  Prospero::RemapTextureFormat(signed_format) ==
+                      signed_format &&
+                  signed_surface.vk_format == vk::Format::eR32Sint &&
+                  signed_surface.conversion_format ==
                       Prospero::BufferFormat::kInvalid,
-              "storage-only native backing was conflated with sampled support");
+              "signed sampled texture class or native backing changed");
     }
 
     {
@@ -11793,21 +11811,18 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   VulkanHarness::Image storage_image_uint;
   VulkanHarness::Buffer gds_buffer;
   vk::Sampler sampler = nullptr;
-  const bool needs_sampled_image =
-      Has(Kind::Sampled1D) || Has(Kind::Sampled1DArray) ||
-      Has(Kind::Sampled2D) || Has(Kind::Sampled2DArray) ||
-      Has(Kind::Sampled3D) || Has(Kind::SampledUint2D) ||
-      Has(Kind::SampledUint1D) || Has(Kind::SampledUint1DArray) ||
-      Has(Kind::SampledUint2DArray) || Has(Kind::SampledUint3D);
-  const bool needs_storage_image =
-      Has(Kind::Storage1D) || Has(Kind::Storage1DArray) ||
-      Has(Kind::Storage2D) || Has(Kind::Storage2DArray) ||
-      Has(Kind::Storage3D) || Has(Kind::StorageUint2D) ||
-      Has(Kind::StorageUint1D) || Has(Kind::StorageUint1DArray) ||
-      Has(Kind::StorageUint2DArray) || Has(Kind::StorageUint3D) ||
-      Has(Kind::StorageAtomic1D) || Has(Kind::StorageAtomic1DArray) ||
-      Has(Kind::StorageAtomic2D) || Has(Kind::StorageAtomic2DArray) ||
-      Has(Kind::StorageAtomic3D);
+  bool needs_sampled_image = false;
+  bool needs_storage_image = false;
+  for (const auto &binding : compiled.program.bindings.descriptors) {
+    const auto resource_class =
+        ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+    if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+      needs_sampled_image = true;
+    } else if (resource_class ==
+               ShaderRecompiler::IR::ImageResourceClass::Storage) {
+      needs_storage_image = true;
+    }
+  }
   const bool needs_sampler = Has(Kind::Samplers);
   const bool needs_gds = Has(Kind::Gds);
   if (needs_gds) {
@@ -12653,6 +12668,76 @@ TestCase ScalarAbsI32UpdatesScc() {
           {0, 0, 5, 1},
           {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_ABS_I32, O::S_CSELECT_B32,
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase ScalarAbsdiffBitset64AndSetprio() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  auto capture_scc = [&](u32 dst_sgpr) {
+    code.push_back(
+        EncodeSop2(0x0a, dst_sgpr, InlineU32(1), InlineU32(0)));
+  };
+
+  code.push_back(EncodeSMovB32(0, InlineU32(2)));
+  code.push_back(EncodeSMovB32(1, InlineU32(5)));
+  code.push_back(EncodeSop2(0x2c, 10, 0, 1));
+  capture_scc(20);
+  AppendSMovLiteral(&code, 0, 0xffffffffu);
+  code.push_back(EncodeSMovB32(1, InlineU32(0)));
+  code.push_back(EncodeSop2(0x2c, 11, 0, 1));
+  capture_scc(21);
+  AppendSMovLiteral(&code, 0, 0x80000000u);
+  code.push_back(EncodeSop2(0x2c, 12, 0, 1));
+  capture_scc(22);
+  code.push_back(EncodeSMovB32(1, InlineU32(1)));
+  code.push_back(EncodeSop2(0x2c, 13, 0, 1));
+  capture_scc(23);
+  code.push_back(EncodeSop2(0x2c, 14, 0, 0));
+  capture_scc(24);
+
+  AppendSMovLiteral(&code, 2, 65u);
+  AppendSMovLiteral(&code, 3, 101u);
+  code.push_back(EncodeSMovB32(4, InlineU32(0)));
+  code.push_back(EncodeSMovB32(5, InlineU32(0)));
+  code.push_back(EncodeSop1(0x1e, 4, 2));
+  AppendStoreSgprPair(&code, 4, 10);
+  code.push_back(EncodeSop1(0x1e, 4, 3));
+  AppendStoreSgprPair(&code, 4, 12);
+  code.push_back(EncodeSop1(0x1c, 4, 2));
+  AppendStoreSgprPair(&code, 4, 14);
+  code.push_back(EncodeSop1(0x1c, 4, 3));
+  AppendStoreSgprPair(&code, 4, 16);
+  code.push_back(EncodeSopp(0x0f, 3));
+
+  AppendStoreSgpr(&code, 10, 0);
+  AppendStoreSgpr(&code, 11, 1);
+  AppendStoreSgpr(&code, 12, 2);
+  AppendStoreSgpr(&code, 13, 3);
+  AppendStoreSgpr(&code, 14, 4);
+  AppendStoreSgpr(&code, 20, 5);
+  AppendStoreSgpr(&code, 21, 6);
+  AppendStoreSgpr(&code, 22, 7);
+  AppendStoreSgpr(&code, 23, 8);
+  AppendStoreSgpr(&code, 24, 9);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarAbsdiffBitset64AndSetprio";
+  test.code = std::move(code);
+  test.expected = {3u, 1u, 0x80000000u, 0x7fffffffu, 0u,
+                   1u, 1u, 1u,          1u,          0u,
+                   2u, 0u, 2u,          32u,         0u,
+                   32u, 0u, 0u};
+  test.opcodes = {O::S_MOV_B32,     O::S_ABSDIFF_I32, O::S_CSELECT_B32,
+                  O::S_BITSET1_B64, O::S_BITSET0_B64, O::S_SETPRIO,
+                  O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"S_ABSDIFF_I32", 5},
+                         {"S_BITSET1_B64", 2},
+                         {"S_BITSET0_B64", 2},
+                         {"S_SETPRIO 0x00000003", 1}};
+  return test;
 }
 
 TestCase ScalarShiftLeftAddSccCarryEdges() {
@@ -14155,6 +14240,55 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
   return test;
 }
 
+TestCase VectorSubCoCiU32CompactAndVop3() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 1, 4);
+  code.push_back(EncodeVop2(0x25, 5, InlineU32(16), 4));
+  AppendBufferLoadDword(&code, 2, 5);
+  code.push_back(EncodeVop2(0x1b, 3, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc5, InlineU32(0), 3));
+  code.push_back(EncodeSop1(0x04, 20, 106));
+  code.push_back(EncodeVop2(0x29, 10, Vgpr(1), 2));
+  AppendVMovU32(&code, 6, 1);
+  code.push_back(EncodeVop2(0x01, 11, InlineU32(0), 6));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 11, 0, 4);
+
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 6));
+  AppendVop3B(&code, 0x129u, 12, 22, Vgpr(1), Vgpr(2), 20);
+  AppendVop3(&code, 0x101u, 13, InlineU32(0), Vgpr(6), 22);
+  code.push_back(EncodeVop2(0x01, 14, InlineU32(0), 6));
+  AppendStoreVgprAtLaneDwordOffset(&code, 12, 0, 8);
+  AppendStoreVgprAtLaneDwordOffset(&code, 13, 0, 12);
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 0, 16);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorSubCoCiU32CompactAndVop3";
+  test.code = std::move(code);
+  test.initial = {5u, 5u, 3u, 3u, 3u, 3u, 5u, 3u, 0u, 0u,
+                  0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u};
+  test.expected = {2u, 1u, 0xfffffffeu, 0xffffffffu, 0u, 0u, 1u,
+                   1u, 2u, 1u, 0xfffffffeu, 0xffffffffu, 0u, 0u,
+                   1u, 1u, 0u, 0u, 0u, 0u};
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_AND_B32, O::V_CMP_NE_U32, O::V_CMP_EQ_U32,
+                  O::V_SUB_CO_CI_U32, O::V_CNDMASK_B32, O::S_MOV_B64,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_SUB_CO_CI_U32", 2}};
+  test.required_spirv = {"OpISub", "OpUGreaterThan", "OpLogicalOr"};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorSubrevCoCiU32ExactRawOnGpu() {
   using O = ShaderOpcode;
 
@@ -15111,6 +15245,31 @@ TestCase VectorDppQuadPermuteReverse() {
   test.name = "VectorDppQuadPermuteReverse";
   test.code = code;
   test.expected = {103, 102, 101, 100, 107, 106, 105, 104};
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDppRowXmask() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x164));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppRowXmask";
+  test.code = code;
+  test.expected = {104, 105, 106, 107, 100, 101, 102, 103};
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
@@ -19569,8 +19728,36 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   test.sampled_image_dwords_per_pixel = 1;
   test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32UInt);
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_2d", "OpTypeImage %uint",
+  test.required_spirv = {"image_10", "OpTypeImage %uint",
                          "OpImageFetch %v4uint"};
+  return test;
+}
+
+TestCase ImageLoadR32SintUsesSignedSampledImage() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadR32SintUsesSignedSampledImage";
+  test.code = code;
+  test.expected = {0xffffff80u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.resize(16);
+  test.sampled_image_rgba[6] = 0xffffff80u;
+  test.sampled_image_format = vk::Format::eR32Sint;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32SInt);
+  test.has_user_data = true;
+  test.required_spirv = {"image_17", "OpTypeImage %int", "OpImageFetch %v4int",
+                         "OpBitcast %uint"};
   return test;
 }
 
@@ -19695,7 +19882,7 @@ TestCase ImageLoad1DUsesScalarCoordinate() {
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
                       << 28u;
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_1d"};
+  test.required_spirv = {"image_8"};
   return test;
 }
 
@@ -19731,7 +19918,7 @@ TestCase ImageGather2DInstructionWith1DDescriptor() {
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1D)
                       << 28u;
   test.has_user_data = true;
-  test.required_spirv = {"sampled_1d", "OpImageQuerySizeLod",
+  test.required_spirv = {"image_1", "OpImageQuerySizeLod",
                          "OpImageSampleExplicitLod", "Floor"};
   test.forbidden_spirv = {"OpImageGather"};
   return test;
@@ -19766,7 +19953,7 @@ TestCase ImageLoad1DArrayUsesLayerCoordinate() {
   test.user_data[3] = static_cast<uint32_t>(Prospero::ImageType::kColor1DArray)
                       << 28u;
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_1d_array"};
+  test.required_spirv = {"image_9"};
   return test;
 }
 
@@ -19803,7 +19990,7 @@ TestCase ImageLoad1DArrayDescriptorUsesSelectedLayer() {
                       << 28u;
   test.user_data[4] = 1u | (1u << 16u);
   test.has_user_data = true;
-  test.required_spirv = {"sampled_uint_1d"};
+  test.required_spirv = {"image_8"};
   return test;
 }
 
@@ -20307,7 +20494,8 @@ void CheckIndirectImageKeySwitch() {
   ImageResource root{};
   root.source = 0;
   root.first_use_pc = 0x10f0u;
-  root.kind = ResourceKind::Image;
+  root.resource_class = ImageResourceClass::Sampled;
+  root.numeric_class = Prospero::TextureNumericClass::Float;
   root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   root.read = true;
   root.indirect_root = 0;
@@ -20547,7 +20735,7 @@ TestCase ImageStoreR32SintUsesRawUintView() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d"};
+                         "image_29"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20577,7 +20765,7 @@ TestCase ImageStoreR32UintUsesFormatlessStorageImage() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = expected_image;
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d"};
+                         "image_29"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20611,7 +20799,7 @@ TestCase ImageStorePackedUintSaturatesChannels() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d", "OpULessThan", "OpSelect"};
+                         "image_29", "OpULessThan", "OpSelect"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20643,7 +20831,7 @@ TestCase ImageStorePackedUintHonorsSparseDmask() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpCapability StorageImageWriteWithoutFormat",
-                         "storage_uint_2d"};
+                         "image_29"};
   test.forbidden_spirv = {"R32ui"};
   return test;
 }
@@ -20704,9 +20892,9 @@ TestCase ImageStoreAndAtomicShareTypedBinding() {
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   test.expected_storage_image_r32ui = std::move(expected_image);
   test.required_spirv = {"OpImageWrite", "OpImageTexelPointer", "R32ui",
-                         "storage_atomic_2d"};
+                         "image_34"};
   test.forbidden_spirv = {"StorageImageReadWithoutFormat",
-                          "StorageImageWriteWithoutFormat", "storage_uint_2d"};
+                          "StorageImageWriteWithoutFormat", "image_29"};
   return test;
 }
 
@@ -20745,8 +20933,8 @@ TestCase ImageStoreAndAtomicUseSeparateBindings() {
                          "OpImageWrite",
                          "OpImageTexelPointer",
                          "R32ui",
-                         "storage_uint_2d",
-                         "storage_atomic_2d"};
+                         "image_29",
+                         "image_34"};
   return test;
 }
 
@@ -20777,10 +20965,10 @@ TestCase ImageAtomicVariants() {
                   O::IMAGE_ATOMIC_UMIN,  O::IMAGE_ATOMIC_AND,
                   O::IMAGE_ATOMIC_OR,    O::IMAGE_ATOMIC_XOR,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpImageTexelPointer", "R32ui", "storage_atomic_2d"};
+  test.required_spirv = {"OpImageTexelPointer", "R32ui", "image_34"};
   test.forbidden_spirv = {"OpTypeSampler", "OpTypeSampledImage",
                           "StorageImageReadWithoutFormat",
-                          "StorageImageWriteWithoutFormat", "storage_uint_2d"};
+                          "StorageImageWriteWithoutFormat", "image_29"};
   test.storage_image_rgba = MakeRgbaImage(4, 4);
   test.storage_image_r32ui = std::vector<u32>(16, 0);
   for (u32 i = 0; i < static_cast<u32>(std::size(initial)); i++) {
@@ -21121,6 +21309,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarArithmeticSccCarryBorrowOverflow);
   AddCase(ScalarMinMaxSccComparisonEdges);
   AddCase(ScalarAbsI32UpdatesScc);
+  AddCase(ScalarAbsdiffBitset64AndSetprio);
   AddCase(ScalarShiftLeftAddSccCarryEdges);
   AddCase(ScalarCompareOps);
   AddCase(ScalarShiftAddAndMaskOps);
@@ -21166,6 +21355,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
+  AddCase(VectorSubCoCiU32CompactAndVop3);
   AddCase(VectorSubrevCoCiU32ExactRawOnGpu);
   AddCase(VectorVop3BSubrevCoCiUsesEncodedMasks);
   AddCase(VectorVop3BCarryOutWritesSgprMask);
@@ -21194,6 +21384,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
   AddCase(VectorDppQuadPermuteReverse);
+  AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3LdexpSourceModifier);
@@ -21342,6 +21533,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
@@ -21757,11 +21949,13 @@ void CheckRenderTargetFormatContract() {
     (void)volume.FindView(view);
   } else {
     ShaderRecompiler::IR::ImageResource resource{};
-    resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
     resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
     resource.written = true;
     if (std::strcmp(kind, "storage-kind") == 0) {
-      resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+      resource.resource_class =
+          ShaderRecompiler::IR::ImageResourceClass::Sampled;
     } else if (std::strcmp(kind, "storage-no-write") == 0) {
       resource.written = false;
     } else if (std::strcmp(kind, "storage-nonuint-atomic") == 0) {
@@ -21786,7 +21980,9 @@ void CheckSampledColorViews() {
                                  DstSel(4, 5, 6, 7)) == DstSel(4, 5, 6, 7),
           "RGBA did not select the identity view");
   ShaderRecompiler::IR::ImageResource cube_resource{};
-  cube_resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  cube_resource.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  cube_resource.numeric_class = Prospero::TextureNumericClass::Float;
   cube_resource.dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   cube_resource.read = true;
@@ -21958,7 +22154,9 @@ void CheckSampledColorViews() {
                                  DstSel(4, 0, 0, 1)) == DstSel(4, 0, 0, 1),
           "D32S8 depth target did not select its R001 depth-aspect view");
   ShaderRecompiler::IR::ImageResource storage_resource{};
-  storage_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
+  storage_resource.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Storage;
+  storage_resource.numeric_class = Prospero::TextureNumericClass::Float;
   storage_resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   storage_resource.written = true;
   Require("SampledColorViews", "storage resource",
@@ -21975,7 +22173,7 @@ void CheckSampledColorViews() {
   Require("SampledColorViews", "write-only 2D-array storage resource",
           IsSupportedStorageImageResource(storage_resource),
           "basic write-only 2D-array storage resource was rejected");
-  storage_resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  storage_resource.numeric_class = Prospero::TextureNumericClass::Uint;
   Require("SampledColorViews", "write-only uint 2D-array storage resource",
           IsSupportedStorageImageResource(storage_resource),
           "basic write-only uint 2D-array storage resource was rejected");
@@ -22031,7 +22229,8 @@ void CheckSampledColorViews() {
 
 void CheckSampledDepthResource() {
   ShaderRecompiler::IR::ImageResource resource{};
-  resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   resource.read = true;
   resource.depth_compare = true;
@@ -22083,7 +22282,7 @@ void CheckSampledDepthResource() {
           static_cast<vk::ImageViewType>(VK_IMAGE_VIEW_TYPE_MAX_ENUM),
       "array shader resource accepted a non-array descriptor view");
   resource = basic;
-  resource.kind = ShaderRecompiler::IR::ResourceKind::ImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   Require("SampledDepthResource", "integer read",
           IsSupportedSampledDepthResource(resource),
           "read-only uint depth resource was rejected");
@@ -22104,7 +22303,8 @@ void CheckSampledVideoOutView(RenderContext &renderer) {
   auto &context = renderer.GetGraphics();
   CommandScheduler scheduler(renderer, context);
   ShaderRecompiler::IR::ImageResource resource{};
-  resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   resource.read = true;
 
@@ -22552,7 +22752,9 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
                              Prospero::ImageType::kColor2D));
   cube_image.usage.depth_target = true;
   ShaderRecompiler::IR::ImageResource cube_resource{};
-  cube_resource.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  cube_resource.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Sampled;
+  cube_resource.numeric_class = Prospero::TextureNumericClass::Float;
   cube_resource.dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
   cube_resource.read = true;
@@ -22639,7 +22841,8 @@ void CheckSampledDepthDescriptor(RenderContext &renderer) {
 
 ShaderRecompiler::IR::ImageResource BasicStorageTextureResource() {
   ShaderRecompiler::IR::ImageResource resource{};
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImage;
+  resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+  resource.numeric_class = Prospero::TextureNumericClass::Float;
   resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
   resource.read = true;
   resource.written = true;
@@ -22697,7 +22900,7 @@ ShaderTextureResource Ppsa01340OverwideMipStorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource Ppsa01530MaxMipStorageTextureResource() {
   auto resource = BasicBgraStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   return resource;
 }
 
@@ -22734,7 +22937,7 @@ ShaderTextureResource BasicArrayStorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource BasicUintArrayStorageTextureResource() {
   auto resource = BasicArrayStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   return resource;
 }
 
@@ -22769,7 +22972,7 @@ ShaderTextureResource Ppsa10112D16StorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource BasicUintVolumeStorageTextureResource() {
   auto resource = BasicStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   resource.read = false;
   return resource;
 }
@@ -22781,7 +22984,7 @@ ShaderTextureResource BasicUintVolumeStorageTextureDescriptor() {
 
 ShaderRecompiler::IR::ImageResource AtomicStorageTextureResource() {
   auto resource = BasicLinearStorageTextureResource();
-  resource.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  resource.numeric_class = Prospero::TextureNumericClass::Uint;
   resource.read = true;
   resource.atomic = true;
   return resource;
@@ -23140,8 +23343,7 @@ void CheckBasicStorageTextureDescriptor() {
       0x00000000u,
   }};
   auto standard256b_resource = BasicBgraStorageTextureResource();
-  standard256b_resource.kind =
-      ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+  standard256b_resource.numeric_class = Prospero::TextureNumericClass::Uint;
   TileSizeAlign standard256b_size{};
   TileGetTextureTotalSize(standard256b.Format(), standard256b.Width5() + 1u,
                           standard256b.Height5() + 1u,
@@ -23413,6 +23615,7 @@ void CheckStorageTextureDepthTileUploadLayout() {
           "1x1 R8_UINT depth tile lost its 64 KiB source footprint");
   std::printf("[host]    %-32s ok\n", "StorageTextureDepthTileUpload");
 }
+
 void CheckImageSamplerSpecialization() {
   ShaderSamplerResource filtered_sampler{};
   filtered_sampler.fields[2] =
@@ -23438,18 +23641,52 @@ void CheckImageSamplerSpecialization() {
   ShaderRecompiler::IR::Program mixed_sampler_program;
   mixed_sampler_program.resource_tracking_complete = true;
   ShaderRecompiler::IR::ImageResource sampled_image;
-  sampled_image.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  sampled_image.resource_class =
+      ShaderRecompiler::IR::ImageResourceClass::Sampled;
   sampled_image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   sampled_image.read = true;
-  mixed_sampler_program.info.images = {sampled_image, sampled_image};
+  mixed_sampler_program.info.images = {sampled_image, sampled_image,
+                                       sampled_image};
   mixed_sampler_program.info.samplers.push_back({0u, 4u});
-  mixed_sampler_program.info.sampled_pairs = {{0u, 0u, 8u}, {1u, 0u, 12u}};
+  mixed_sampler_program.info.sampled_pairs = {
+      {0u, 0u, 8u}, {1u, 0u, 12u}, {2u, 0u, 16u}};
+  ShaderRecompiler::IR::MemoryInfo signed_memory;
+  signed_memory.kind = ShaderRecompiler::IR::ResourceKind::Image;
+  signed_memory.resource = 2u;
+  signed_memory.sampler = 0u;
+  mixed_sampler_program.memory_info.push_back(signed_memory);
+  mixed_sampler_program.block_storage.push_back(
+      std::make_unique<ShaderRecompiler::IR::Block>());
+  auto *mixed_sampler_block = mixed_sampler_program.block_storage.back().get();
+  mixed_sampler_program.blocks.push_back(mixed_sampler_block);
+  using ShaderRecompiler::IR::Value;
+  using ShaderRecompiler::IR::ValueOpcode;
+  auto &image_handle = mixed_sampler_block->AppendNewInst(
+      ValueOpcode::GetImageResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)});
+  auto &sampler_handle = mixed_sampler_block->AppendNewInst(
+      ValueOpcode::GetSamplerResource,
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &image_address = mixed_sampler_block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u)});
+  const ShaderRecompiler::IR::MemoryFlags signed_memory_flags{0u, 16u};
+  uint64_t signed_memory_flag_bits = 0;
+  std::memcpy(&signed_memory_flag_bits, &signed_memory_flags,
+              sizeof(signed_memory_flags));
+  mixed_sampler_block->AppendNewInst(
+      ValueOpcode::ImageSampleRaw,
+      {Value(&image_handle), Value(&sampler_handle), Value(&image_address)},
+      signed_memory_flag_bits);
 
   ShaderRecompiler::IR::DescriptorValue native_image_descriptor{};
   native_image_descriptor.dword_count = 8;
   native_image_descriptor.dwords[0] = 0x1000u;
   native_image_descriptor.dwords[1] =
-      static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u;
+      static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u;
   native_image_descriptor.dwords[2] = 3u | (3u << 14u);
   native_image_descriptor.dwords[3] =
       DstSel(4, 5, 6, 7) |
@@ -23458,10 +23695,15 @@ void CheckImageSamplerSpecialization() {
   packed_image_descriptor.dwords[0] = 0x2000u;
   packed_image_descriptor.dwords[1] =
       static_cast<uint32_t>(Prospero::BufferFormat::k11_11_10UInt) << 20u;
+  auto signed_image_descriptor = native_image_descriptor;
+  signed_image_descriptor.dwords[0] = 0x3000u;
+  signed_image_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) << 20u;
 
   ShaderRecompiler::IR::ResourceSnapshot mixed_sampler_snapshot;
   mixed_sampler_snapshot.images = {native_image_descriptor,
-                                   packed_image_descriptor};
+                                   packed_image_descriptor,
+                                   signed_image_descriptor};
   ShaderRecompiler::IR::DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
   mixed_sampler_snapshot.samplers.push_back(sampler_descriptor);
@@ -23473,15 +23715,57 @@ void CheckImageSamplerSpecialization() {
               mixed_sampler_program.info.samplers[1].force_point_filtering &&
               mixed_sampler_program.info.sampled_pairs[0].sampler == 0u &&
               mixed_sampler_program.info.sampled_pairs[1].sampler == 1u &&
+              mixed_sampler_program.info.sampled_pairs[2].sampler == 1u &&
+              mixed_sampler_program.memory_info[0].sampler == 1u &&
               mixed_sampler_snapshot.samplers.size() == 2u,
-          "a shared native/bit-packed sampler was not split into point and "
-          "native variants");
+          "a shared float/integer sampler was not split into point and native "
+          "variants or the signed instruction retained the native sampler");
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
 
+void CheckNativeImageDescriptorTypes() {
+  using ShaderRecompiler::IR::DescriptorBindingKind;
+  using ShaderRecompiler::IR::FirstImageBinding;
+  using ShaderRecompiler::IR::FirstStorageImageBinding;
+
+  for (uint32_t value = FirstImageBinding;
+       value < static_cast<uint32_t>(DescriptorBindingKind::Samplers);
+       value++) {
+    const auto expected = value < FirstStorageImageBinding
+                              ? vk::DescriptorType::eSampledImage
+                              : vk::DescriptorType::eStorageImage;
+    Require("NativeImageDescriptorTypes", "image binding",
+            NativeDescriptorType(static_cast<DescriptorBindingKind>(value)) ==
+                expected,
+            "generated image binding has the wrong Vulkan descriptor type");
+  }
+  Require("NativeImageDescriptorTypes", "non-image bindings",
+          NativeDescriptorType(DescriptorBindingKind::Samplers) ==
+                  vk::DescriptorType::eSampler &&
+              NativeDescriptorType(DescriptorBindingKind::Buffers) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::Gds) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::BdaPagetable) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::FaultBuffer) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::FlattenedSrt) ==
+                  vk::DescriptorType::eStorageBuffer &&
+              NativeDescriptorType(DescriptorBindingKind::UserData) ==
+                  vk::DescriptorType::eStorageBuffer,
+          "non-image binding has the wrong Vulkan descriptor type");
+  std::printf("[host]    %-32s ok\n", "NativeImageDescriptorTypes");
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void CheckShaderRecompilerFatalContracts() {
+  ExpectFatal("InvalidDescriptorBindingRejection", [] {
+    (void)NativeDescriptorType(
+        ShaderRecompiler::IR::DescriptorBindingKind::Count);
+  });
+
   ExpectFatal("WritableFlatStoreRejection", [] {
     const auto test = FlatStoreVariants();
     (void)CompileCase(test);
@@ -23492,7 +23776,8 @@ void CheckShaderRecompilerFatalContracts() {
     program.resource_tracking_complete = true;
 
     ShaderRecompiler::IR::ImageResource image;
-    image.kind = ShaderRecompiler::IR::ResourceKind::StorageImageUint;
+    image.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+    image.numeric_class = Prospero::TextureNumericClass::Uint;
     image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
     image.read = true;
     image.written = true;
@@ -24723,6 +25008,54 @@ void CheckPm4PolygonOffsetRegisters(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4PolygonOffset");
 }
 
+void CheckPm4DepthControlHighBits(RenderContext &renderer) {
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+
+  std::array<uint32_t, 3> direct{
+      KYTY_PM4(3, Pm4::IT_SET_CONTEXT_REG, Pm4::R_ZERO),
+      Pm4::DB_DEPTH_CONTROL,
+      0x80000072u,
+  };
+  Pm4Execution direct_execution;
+  const bool direct_complete =
+      processor.Process(direct_execution, direct) == Pm4ProcessResult::Complete;
+  const auto &direct_control = processor.GetCtx().GetDepthControl();
+  const bool direct_decoded =
+      !direct_control.stencil_enable && direct_control.z_enable &&
+      !direct_control.z_write_enable && !direct_control.depth_bounds_enable &&
+      direct_control.zfunc == 7u && !direct_control.backface_enable &&
+      direct_control.stencilfunc == 0u && direct_control.stencilfunc_bf == 0u;
+
+  std::array<uint32_t, 2> registers{
+      Pm4::DB_DEPTH_CONTROL,
+      0x4070078du,
+  };
+  const auto address = reinterpret_cast<uint64_t>(registers.data());
+  std::array<uint32_t, 5> indirect{
+      KYTY_PM4(5, Pm4::IT_SET_CONTEXT_REG_INDIRECT, Pm4::R_ZERO),
+      static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
+      0x80000000u, 1u,
+  };
+  Pm4Execution indirect_execution;
+  const bool indirect_complete =
+      processor.Process(indirect_execution, indirect) ==
+      Pm4ProcessResult::Complete;
+  const auto &indirect_control = processor.GetCtx().GetDepthControl();
+  const bool indirect_decoded =
+      indirect_control.stencil_enable && !indirect_control.z_enable &&
+      indirect_control.z_write_enable && indirect_control.depth_bounds_enable &&
+      indirect_control.zfunc == 0u && indirect_control.backface_enable &&
+      indirect_control.stencilfunc == 7u &&
+      indirect_control.stencilfunc_bf == 7u;
+
+  Require("Pm4DepthControlHighBits", "preserved high bits",
+          direct_complete && direct_decoded && indirect_complete &&
+              indirect_decoded,
+          "DB_DEPTH_CONTROL high bits rejected or changed decoded PS5 state");
+  std::printf("[host]    %-32s ok\n", "Pm4DepthControlHighBits");
+}
+
 struct AgcCommandBufferLayout {
   using Callback = KYTY_SYSV_ABI bool (*)(Gen5::CommandBuffer *, uint32_t,
                                           void *);
@@ -25325,6 +25658,7 @@ int main(int argc, char **argv) {
     CheckPm4PrivateAgcUconfigRegisters(vulkan.RuntimeRenderer());
     CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
     CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
+    CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
@@ -25480,7 +25814,6 @@ int main(int argc, char **argv) {
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
-  CheckImageSamplerSpecialization();
   CheckStandard64RenderTargetTileRoundTrip();
   CheckStorageTextureVolumeUploadLayout();
   CheckStorageTextureVolumeMipRegions();
@@ -25501,6 +25834,8 @@ int main(int argc, char **argv) {
   CheckShaderRecompilerFatalContracts();
   VulkanHarness vulkan;
 #endif
+  CheckImageSamplerSpecialization();
+  CheckNativeImageDescriptorTypes();
   CheckClipControlDepthClipState();
   CheckReferenceClockScale();
   CheckVulkan13FeatureRequirements();
@@ -25514,6 +25849,7 @@ int main(int argc, char **argv) {
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
+  CheckPm4DepthControlHighBits(vulkan.RuntimeRenderer());
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());

@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <filesystem>
 #include <fmt/format.h>
@@ -571,7 +572,10 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
-		LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attrib[in.semantic]);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
+			     attrib[in.semantic]);
+		}
 
 		size_t index = attrib[in.semantic] & 0x1fu;
 		auto   format =
@@ -894,6 +898,18 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.resources_num);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
+	if (info.clip_space.enabled) {
+		for (const float value: info.clip_space.scale) {
+			key.push_back(std::bit_cast<uint32_t>(value));
+		}
+		for (const float value: info.clip_space.offset) {
+			key.push_back(std::bit_cast<uint32_t>(value));
+		}
+		for (const float value: info.clip_space.half_extent) {
+			key.push_back(std::bit_cast<uint32_t>(value));
+		}
+	}
 
 	for (int i = 0; i < info.resources_num; i++) {
 		const auto& resource    = info.resources[i];

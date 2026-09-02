@@ -187,38 +187,23 @@ void DefineDescriptorVariables(EmitterState& state) {
 		state.flattened_srt_variable = state.builder.DefineGlobalVariable(
 		    TypeStorageBufferPointer(state), StorageClassStorageBuffer);
 	}
-	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
-		const auto view    = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		const bool integer = i >= SampledImageViewKindCount;
-		const auto kind    = SampledBindingKind(integer, view);
-		if (DescriptorBinding(state, kind) == nullptr) {
+	for (const auto& binding: state.program.bindings.descriptors) {
+		if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::None) {
 			continue;
 		}
-		const auto count        = ConstantU32(state, DescriptorCount(state, kind));
-		const auto image_type   = ImageViewImageType(state, view, integer);
-		const auto array_type   = state.builder.Type(OpTypeArray, {image_type, count});
-		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
-		state.sampled_image_variables[i] =
+		const auto& image        = state.program.info.images.at(binding.resources.front());
+		const auto  count        = ConstantU32(state, DescriptorCount(state, binding.kind));
+		const auto  image_type   = ImageType(state, image);
+		const auto  array_type   = state.builder.Type(OpTypeArray, {image_type, count});
+		const auto  pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
+		state.image_variables[IR::ImageBindingIndex(binding.kind)] =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
-		if (view == ImageViewKind::Dim1D || view == ImageViewKind::Dim1DArray) {
-			state.builder.RequireCapability(CapabilitySampled1D);
-		}
-	}
-	for (uint32_t i = 0; i < state.storage_image_variables.size(); i++) {
-		const auto view        = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		const auto image_class = static_cast<StorageImageClass>(i / StorageImageViewKindCount);
-		const auto kind        = StorageBindingKind(image_class, view);
-		if (DescriptorBinding(state, kind) == nullptr) {
-			continue;
-		}
-		const auto count        = ConstantU32(state, DescriptorCount(state, kind));
-		const auto image_type   = StorageImageType(state, image_class, view);
-		const auto array_type   = state.builder.Type(OpTypeArray, {image_type, count});
-		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
-		state.storage_image_variables[i] =
-		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
-		if (view == ImageViewKind::Dim1D || view == ImageViewKind::Dim1DArray) {
-			state.builder.RequireCapability(CapabilityImage1D);
+		if (image.dimension == ImageDimension::Dim1D ||
+		    image.dimension == ImageDimension::Dim1DArray) {
+			const auto capability = image.resource_class == IR::ImageResourceClass::Sampled
+			                            ? CapabilitySampled1D
+			                            : CapabilityImage1D;
+			state.builder.RequireCapability(capability);
 		}
 	}
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::Samplers) != nullptr) {
@@ -594,45 +579,13 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 		Decorate(state.fault_buffer_variable, "fault_buffer",
 		         IR::DescriptorBindingKind::FaultBuffer);
 	}
-	constexpr const char* SampledNames[] = {"sampled_1d",
-	                                        "sampled_1d_array",
-	                                        "sampled_2d",
-	                                        "sampled_2d_array",
-	                                        "sampled_3d",
-	                                        "sampled_2d_msaa",
-	                                        "sampled_2d_msaa_array",
-	                                        "sampled_uint_1d",
-	                                        "sampled_uint_1d_array",
-	                                        "sampled_uint_2d",
-	                                        "sampled_uint_2d_array",
-	                                        "sampled_uint_3d",
-	                                        "sampled_uint_2d_msaa",
-	                                        "sampled_uint_2d_msaa_array"};
-	for (uint32_t i = 0; i < state.sampled_image_variables.size(); i++) {
-		const auto view = static_cast<ImageViewKind>(i % SampledImageViewKindCount);
-		Decorate(state.sampled_image_variables[i], SampledNames[i],
-		         SampledBindingKind(i >= SampledImageViewKindCount, view));
-	}
-	constexpr const char* StorageNames[] = {"storage_1d",
-	                                        "storage_1d_array",
-	                                        "storage_2d",
-	                                        "storage_2d_array",
-	                                        "storage_3d",
-	                                        "storage_uint_1d",
-	                                        "storage_uint_1d_array",
-	                                        "storage_uint_2d",
-	                                        "storage_uint_2d_array",
-	                                        "storage_uint_3d",
-	                                        "storage_atomic_1d",
-	                                        "storage_atomic_1d_array",
-	                                        "storage_atomic_2d",
-	                                        "storage_atomic_2d_array",
-	                                        "storage_atomic_3d"};
-	for (uint32_t i = 0; i < state.storage_image_variables.size(); i++) {
-		const auto view        = static_cast<ImageViewKind>(i % StorageImageViewKindCount);
-		const auto image_class = static_cast<StorageImageClass>(i / StorageImageViewKindCount);
-		Decorate(state.storage_image_variables[i], StorageNames[i],
-		         StorageBindingKind(image_class, view));
+	for (const auto& binding: state.program.bindings.descriptors) {
+		if (IR::ImageBindingResourceClass(binding.kind) == IR::ImageResourceClass::None) {
+			continue;
+		}
+		const auto name = "image_" + std::to_string(static_cast<uint32_t>(binding.kind));
+		Decorate(state.image_variables[IR::ImageBindingIndex(binding.kind)], name.c_str(),
+		         binding.kind);
 	}
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
