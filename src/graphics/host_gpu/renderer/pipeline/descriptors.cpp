@@ -204,7 +204,7 @@ TargetTextureViewInfo ResolveTargetTextureView(const ShaderRecompiler::IR::Image
 			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
 			               base_layer == 0 && image_layers == 1
 			           ? TargetTextureViewInfo {vk::ImageViewType::e2D, 0, 1}
-			           : TargetTextureViewInfo {};
+					   : TargetTextureViewInfo {};
 		case Prospero::ImageType::kCube:
 			if (resource.dimension != ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
 			    base_layer >= image_layers || (image_layers - base_layer) % 6u != 0) {
@@ -219,13 +219,13 @@ TargetTextureViewInfo ResolveTargetTextureView(const ShaderRecompiler::IR::Image
 			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
 			               base_layer < image_layers
 			           ? TargetTextureViewInfo {vk::ImageViewType::e2DArray, base_layer,
-			                                    image_layers - base_layer}
-			           : TargetTextureViewInfo {};
+					                            image_layers - base_layer}
+					   : TargetTextureViewInfo {};
 		case Prospero::ImageType::kColor2DMsaa:
 			return resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
 			               base_layer == 0 && image_layers == 1
 			           ? TargetTextureViewInfo {vk::ImageViewType::e2D, 0, 1}
-			           : TargetTextureViewInfo {};
+					   : TargetTextureViewInfo {};
 		case Prospero::ImageType::kColor2DMsaaArray:
 			if (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa &&
 			    base_layer == 0 && image_layers == 1) {
@@ -235,8 +235,8 @@ TargetTextureViewInfo ResolveTargetTextureView(const ShaderRecompiler::IR::Image
 			                   ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray &&
 			               base_layer < image_layers
 			           ? TargetTextureViewInfo {vk::ImageViewType::e2DArray, base_layer,
-			                                    image_layers - base_layer}
-			           : TargetTextureViewInfo {};
+					                            image_layers - base_layer}
+					   : TargetTextureViewInfo {};
 		default: return {};
 	}
 }
@@ -259,7 +259,7 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	const auto samples      = multisampled ? 1u << descriptor.LastLevel() : 1u;
 	const auto pitch =
 	    multisampled ? TileGetDepthPitch(width, image.info.bytes_per_block, descriptor.LastLevel())
-	                 : TileGetTexturePitch(descriptor.Format(), width, descriptor.TileMode());
+		             : TileGetTexturePitch(descriptor.Format(), width, descriptor.TileMode());
 	const bool supported_2d    = type == Prospero::ImageType::kColor2D &&
 	                             image.info.resources.layers == 1 && descriptor.Depth() == 0 &&
 	                             descriptor.BaseArray5() == 0;
@@ -282,8 +282,8 @@ bool IsSupportedDepthTargetDescriptor(const ShaderTextureResource& descriptor, c
 	                       descriptor.LastLevel() <= 3 &&
 	                       (r128 || descriptor.MaxMip() == descriptor.LastLevel()) &&
 	                       image.info.resources.levels == 1 && image.info.samples == samples
-	                 : descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
-	                       (r128 || descriptor.MaxMip() == 0) && image.info.samples == 1;
+		             : descriptor.BaseLevel() == 0 && descriptor.LastLevel() == 0 &&
+		                   (r128 || descriptor.MaxMip() == 0) && image.info.samples == 1;
 	return image.info.IsDepth() && width == image.info.extent.width &&
 	       height == image.info.extent.height &&
 	       (supported_2d || supported_array || supported_cube || supported_msaa_2d ||
@@ -345,7 +345,7 @@ static void ValidateDepthTargetBinding(const ShaderRecompiler::IR::ImageResource
 	}
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
-	                        descriptor.TileMode());
+		                    descriptor.TileMode());
 	EXIT("unsupported sampled depth target: resource=%d descriptor=%d encoding=%d format=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
@@ -395,7 +395,7 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	const bool is_2d_array =
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
 	    ((!resource.cube && is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth()) ||
-	     is_cube);
+		 is_cube);
 	const bool is_3d = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D &&
 	                   descriptor.Type() == Prospero::ImageType::kColor3D &&
 	                   descriptor.BaseArray5() == 0;
@@ -587,7 +587,7 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 		    size,
 		    padded[level].width != 0 ? padded[level].width : std::max(info.pitch >> level, 1u),
 		    padded[level].height != 0 ? padded[level].height
-		                              : std::max(info.extent.height >> level, 1u),
+			                          : std::max(info.extent.height >> level, 1u),
 		};
 	}
 }
@@ -597,8 +597,12 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
                                      bool shader_conversion, bool storage, uint32_t view_levels,
                                      uint32_t image_layers) {
 	ImageViewInfo view {};
-	view.format      = format;
-	view.aspect      = vk::ImageAspectFlagBits::eColor;
+	view.format = format;
+	// view.aspect      = vk::ImageAspectFlagBits::eColor;
+
+	view.aspect      = DepthAspectTransferFormat(format) != vk::Format::eUndefined
+	                       ? vk::ImageAspectFlagBits::eDepth
+	                       : vk::ImageAspectFlagBits::eColor;
 	view.base_level  = descriptor.BaseLevel();
 	view.level_count = view_levels;
 	view.usage   = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
@@ -743,7 +747,24 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	const auto pixel_format        = surface_format.vk_format;
+	// const auto pixel_format        = surface_format.vk_format;
+	
+	//  Format override for depth-comparison sampling (depth_compare).
+	//  On PS5/RDNA2, k16UNorm and k32Float can be used as depth textures;
+	//  in Vulkan, the color formats (eR16Unorm, eR32Sfloat) do not have the
+	//  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT flag required by VUID-06479.
+	auto pixel_format = surface_format.vk_format;
+	if (!storage && resource.depth_compare) {
+		if (const auto* depth_policy = FindGuestDepthFormatPolicy(format)) {
+			pixel_format = depth_policy->depth_attachment_format;
+		} else if (format == Prospero::BufferFormat::k16UNorm ||
+		           format == Prospero::BufferFormat::k16UInt) {
+			pixel_format = vk::Format::eD16Unorm;
+		} else if (format == Prospero::BufferFormat::k32Float ||
+		           format == Prospero::BufferFormat::k32UInt) {
+			pixel_format = vk::Format::eD32Sfloat;
+		}
+	}
 	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
@@ -799,7 +820,13 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	if (!program.info.samplers[index].depth_compare) {
+	const bool depth_compare = std::any_of(program.info.sampled_pairs.begin(),
+	                                       program.info.sampled_pairs.end(), [&](const auto& pair) {
+		                                       return pair.sampler == index &&
+		                                              pair.image < program.info.images.size() &&
+		                                              program.info.images[pair.image].depth_compare;
+	                                       });
+	if (!depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
 	if (program.info.samplers[index].force_point_filtering) {
@@ -907,7 +934,6 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_sources.emplace_back(descriptor, cache.FindBuffer(address, size));
 	}
-
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -1029,13 +1055,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
-	size_t descriptor_count = 0;
-	size_t write_count      = 0;
+	auto           vk_buffer        = buffer.Handle();
+	size_t         descriptor_count = 0;
+	size_t         write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
 	constexpr auto GraphicsStages =
 	    vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+	const auto push_constant_stages =
+	    pipeline_bind_point == vk::PipelineBindPoint::eGraphics
+	        ? vk::ShaderStageFlags {GraphicsStages}
+	        : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
 	for (const auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->program == nullptr ||
 		        prepared->snapshot == nullptr);
@@ -1190,13 +1220,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (has_push_data) {
-		const auto stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
-		                        ? vk::ShaderStageFlags {GraphicsStages}
-		                        : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute};
-		vk_buffer.pushConstants(pipeline.pipeline_layout, stages, 0, sizeof(push_data),
+		vk_buffer.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
 	}
-
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {

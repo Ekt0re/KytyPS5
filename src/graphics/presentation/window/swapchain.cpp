@@ -1,3 +1,5 @@
+#include "SDL_video.h"
+#include "SDL_vulkan.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -325,14 +327,24 @@ struct Presenter::Impl {
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
-		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		const uint32_t   image_count = swapchain.ImageCount() > 0 ? swapchain.ImageCount() : 3u;
+		const vk::Format format      = swapchain.Format() != vk::Format::eUndefined
+		                                   ? swapchain.Format()
+		                                   : vk::Format::eB8G8R8A8Unorm;
+		frames.Initialize(image_count, format);
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
+		if (window.window != nullptr &&
+		    (SDL_GetWindowFlags(window.window) & SDL_WINDOW_MINIMIZED)) {
+			return;
+		}
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
-		frames.SetFormat(swapchain.Format());
+		if (swapchain.Format() != vk::Format::eUndefined) {
+			frames.SetFormat(swapchain.Format());
+		}
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -370,20 +382,60 @@ void Swapchain::Create() {
 	EXIT_IF(m_window.surface == nullptr);
 
 	Common::LockGuard lock(m_window.mutex);
-	EXIT_IF(graphics.screen_width == 0);
-	EXIT_IF(graphics.screen_height == 0);
-	const auto&       surface = m_window.surface_capabilities;
+
+	if (m_window.window != nullptr &&
+	    (SDL_GetWindowFlags(m_window.window) & SDL_WINDOW_MINIMIZED)) {
+		LOGF("Swapchain::Create: window is minimized, skipping swapchain creation\n");
+		return;
+	}
+
+	int drawable_w = 0;
+	int drawable_h = 0;
+	if (m_window.window != nullptr) {
+		SDL_Vulkan_GetDrawableSize(m_window.window, &drawable_w, &drawable_h);
+	}
+
+	if (drawable_w > 0 && drawable_h > 0) {
+		graphics.screen_width  = static_cast<uint32_t>(drawable_w);
+		graphics.screen_height = static_cast<uint32_t>(drawable_h);
+	} else {
+		if (graphics.screen_width == 0) {
+			graphics.screen_width = 1280;
+		}
+		if (graphics.screen_height == 0) {
+			graphics.screen_height = 720;
+		}
+	}
+
+	const auto& surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
 	m_extent = surface.capabilities.currentExtent;
-	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
-		m_extent.width =
-		    std::clamp(graphics.screen_width, surface.capabilities.minImageExtent.width,
-		               surface.capabilities.maxImageExtent.width);
-		m_extent.height =
-		    std::clamp(graphics.screen_height, surface.capabilities.minImageExtent.height,
-		               surface.capabilities.maxImageExtent.height);
+	if (m_extent.width == std::numeric_limits<uint32_t>::max() || m_extent.width == 0 ||
+	    m_extent.height == 0) {
+		uint32_t width  = graphics.screen_width;
+		uint32_t height = graphics.screen_height;
+		if (surface.capabilities.maxImageExtent.width > 0 &&
+		    surface.capabilities.maxImageExtent.height > 0) {
+			m_extent.width =
+			    std::clamp(width, surface.capabilities.minImageExtent.width,
+			               surface.capabilities.maxImageExtent.width);
+			m_extent.height =
+			    std::clamp(height, surface.capabilities.minImageExtent.height,
+			               surface.capabilities.maxImageExtent.height);
+		} else {
+			m_extent.width  = width;
+			m_extent.height = height;
+		}
 	}
+
+	// Guard clause: assicurarsi che le dimensioni siano strettamente maggiori di zero prima di creare la swapchain
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		LOGF("Swapchain::Create: invalid extent (%ux%u), skipping swapchain creation\n",
+		     m_extent.width, m_extent.height);
+		return;
+	}
+
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
 	if (surface.capabilities.maxImageCount != 0) {
 		image_count = std::min(image_count, surface.capabilities.maxImageCount);
@@ -539,6 +591,11 @@ void Swapchain::Destroy() {
 }
 
 void Swapchain::Recreate(bool surface_lost) {
+	if (m_window.window != nullptr &&
+	    (SDL_GetWindowFlags(m_window.window) & SDL_WINDOW_MINIMIZED)) {
+		LOGF("Swapchain::Recreate: window is minimized, skipping swapchain recreation\n");
+		return;
+	}
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
@@ -554,7 +611,9 @@ void Swapchain::Recreate(bool surface_lost) {
 }
 
 Swapchain::Status Swapchain::AcquireNextImage() {
-	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	if (m_handle == nullptr || m_images.empty() || m_frame_index >= m_image_acquired.size()) {
+		return Status::Recreate;
+	}
 	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
@@ -675,7 +734,9 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 }
 
 Swapchain::Status Swapchain::Present() {
-	EXIT_IF(m_image_index >= m_render_complete.size());
+	if (m_handle == nullptr || m_images.empty() || m_image_index >= m_render_complete.size()) {
+		return Status::Recreate;
+	}
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
 	present.sType              = vk::StructureType::ePresentInfoKHR;
@@ -774,6 +835,12 @@ RenderContext& Presenter::Renderer() const noexcept {
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+
+	if (m_impl->window.window != nullptr &&
+	    (SDL_GetWindowFlags(m_impl->window.window) & SDL_WINDOW_MINIMIZED)) {
+		m_impl->frames.Release(&frame, reuse);
+		return;
+	}
 
 	const auto ime_visual = GetImeVisualState();
 	auto&      swapchain  = m_impl->swapchain;

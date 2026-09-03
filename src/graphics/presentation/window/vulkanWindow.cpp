@@ -320,6 +320,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("largePoints is not supported\n");
 			skip_device = true;
 		}
+		if (features12.shaderOutputViewportIndex != VK_TRUE) {
+			LOGF("shaderOutputViewportIndex is not supported\n");
+			skip_device = true;
+		}
 		if (device_features2.features.fragmentStoresAndAtomics != VK_TRUE) {
 			LOGF("fragmentStoresAndAtomics is not supported\n");
 			skip_device = true;
@@ -631,9 +635,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features12.bufferDeviceAddress != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 	                     supported_features12.shaderBufferInt64Atomics != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features12.shaderOutputViewportIndex != VK_TRUE);
 #if !defined(__APPLE__)
 	EXIT_NOT_IMPLEMENTED(supported_fragment_barycentric.fragmentShaderBarycentric != VK_TRUE);
 #endif
+
+	features12.shaderOutputViewportIndex = VK_TRUE;
+
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
 	device_features.samplerAnisotropy        = VK_TRUE;
@@ -1075,6 +1083,9 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_SHADER_VIEWPORT_INDEX_LAYER_EXTENSION_NAME);
 		}
 	}
 

@@ -25,14 +25,20 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 
 	*g_config = cfg;
+	if (g_config->screen_width == 0) {
+		g_config->screen_width = 1280;
+	}
+	if (g_config->screen_height == 0) {
+		g_config->screen_height = 720;
+	}
 }
 
 uint32_t GetScreenWidth() {
-	return g_config->screen_width;
+	return (g_config != nullptr && g_config->screen_width > 0) ? g_config->screen_width : 1280;
 }
 
 uint32_t GetScreenHeight() {
-	return g_config->screen_height;
+	return (g_config != nullptr && g_config->screen_height > 0) ? g_config->screen_height : 720;
 }
 
 const std::string& GetUserName() {

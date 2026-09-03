@@ -951,6 +951,14 @@ void TextureCache::UploadImage(Image& image, const ImageDesc& desc, Buffer& sour
 			     info.extent.height, info.extent.depth, info.pitch, info.resources.levels,
 			     info.resources.layers, info.samples);
 		}
+		// If the host image is in a depth format (e.g., eD16Unorm created by the depth_compare path),
+        // TextureBuildImageCopies produces copies with a hardcoded eColor, which is invalid for depth images.
+        // Let's correct the aspect mask before uploading.
+		if (info.IsDepth()) {
+			for (auto& copy: plan.regions) {
+				copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
+			}
+		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (plan.tiled) {
 			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
