@@ -284,12 +284,7 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 
 class Swapchain final {
 public:
-	enum class Status : uint8_t {
-		Success,
-		Recreate,
-		SurfaceLost,
-		Minimized
-	}; // Add the Minimized Status
+	enum class Status : uint8_t { Success, Recreate, SurfaceLost, Minimized };
 
 	explicit Swapchain(WindowContext& window): m_window(window) {}
 	~Swapchain();
