@@ -749,9 +749,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
+	const auto unorm_compare_format = !storage && resource.depth_compare &&
+	                                  !IsDepthComparisonSupported(pixel_format)
+	                                      ? SrgbToUnorm(pixel_format)
+	                                      : pixel_format;
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
-	                                     : pixel_format;
+	                                     : unorm_compare_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};
@@ -790,7 +794,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
+		(void)SelectSampledColorView(image->info.pixel_format, view_format,
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};

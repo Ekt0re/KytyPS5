@@ -508,6 +508,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			if (!IsDepthComparisonSupported(surface_format.vk_format)) {
 				// Format doesn't support native depth-compare, enable manual emulation
 				image.needs_manual_depth_compare = true;
+				image.shader_swizzle             = DescriptorImageSwizzle(descriptor);
 			}
 		}
 		
@@ -769,6 +770,14 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
+
+	// Copy depth_compare_func from specialization to samplers before splitting
+	for (uint32_t index = 0; index < samplers.size(); index++) {
+		if (index < specialization.sampler_depth_compare_funcs.size()) {
+			samplers[index].depth_compare_func = specialization.sampler_depth_compare_funcs[index];
+		}
+	}
+
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
 		const auto target = sampler_plan.point_sampler[index];
@@ -791,14 +800,6 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
 	}
-
-	// Copy depth_compare_func from specialization to samplers
-	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
-		if (index < specialization.sampler_depth_compare_funcs.size()) {
-			samplers[index].depth_compare_func = specialization.sampler_depth_compare_funcs[index];
-		}
-	}
-	// Split samplers (if any) inherit from their original, which we just set above
 
 	auto memory_info = program.memory_info;
 	for (const auto* block: program.blocks) {
