@@ -239,11 +239,11 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
                                         vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
 	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, resource.r128);
-	const bool view_ok =
-	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW()) ||
-	    (image.info.HasStencil() &&
-	     IsSupportedSampledStencilView(image.info.pixel_format, view_format,
-	                                   descriptor.DstSelXYZW()));
+	const bool view_ok     = IsSupportedSampledDepthView(image.info.pixel_format, view_format,
+	                                                     descriptor.DstSelXYZW()) ||
+	                         (image.info.HasStencil() &&
+	                          IsSupportedSampledStencilView(image.info.pixel_format, view_format,
+	                                                        descriptor.DstSelXYZW()));
 	if (resource_ok && encoding_ok && view_ok) {
 		return;
 	}
@@ -688,19 +688,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
-	auto*      image               = &texture_cache.GetImage(id);
-	const bool stencil_association = static_cast<bool>(image->depth_id);
-	const auto* associated_image = stencil_association
-	                                   ? &texture_cache.GetImage(image->depth_id)
-	                                   : nullptr;
-	const bool depth_view = stencil_association && !storage &&
-	                        (IsSupportedSampledDepthFormat(associated_image->info.pixel_format,
-	                                                       pixel_format) ||
-                         (associated_image->info.HasStencil() &&
-                          IsSupportedSampledStencilView(associated_image->info.pixel_format,
-	                                                        pixel_format,
-	                                                        descriptor.DstSelXYZW())));
+	auto        id                  = texture_cache.FindImage(desc, shader_conversion);
+	auto*       image               = &texture_cache.GetImage(id);
+	const bool  stencil_association = static_cast<bool>(image->depth_id);
+	const auto* associated_image =
+	    stencil_association ? &texture_cache.GetImage(image->depth_id) : nullptr;
+	const bool depth_view =
+	    stencil_association && !storage &&
+	    (IsSupportedSampledDepthFormat(associated_image->info.pixel_format, pixel_format) ||
+	     (associated_image->info.HasStencil() &&
+	      IsSupportedSampledStencilView(associated_image->info.pixel_format, pixel_format,
+	                                    descriptor.DstSelXYZW())));
 	if (depth_view) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
