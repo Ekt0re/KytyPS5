@@ -36,8 +36,11 @@ struct FormattedSource {
 constexpr FormattedSource ResolveFormattedSource(const BufferFormatInfo& info, uint32_t selector) {
 	if (selector == 0u) return {};
 	if (selector == 1u) return {FormattedSourceKind::One, 0};
-	if (selector < 4u || selector > 7u || info.component_count == 0u) {
-		return {FormattedSourceKind::Invalid, 0};
+	if (selector == 2u || selector == 3u || info.component_count == 0u) {
+		return {};
+	}
+	if (selector < 4u || selector > 7u) {
+		return {};
 	}
 	// Formatted decoding expands source channels before applying the swizzle.
 	return {FormattedSourceKind::Memory, (selector - 4u) % info.component_count};
