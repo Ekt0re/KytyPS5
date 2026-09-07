@@ -863,23 +863,31 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 	return true;
 }
 
-static bool ResolvePrimitiveRestart(const CommandBuffer& buffer, vk::PrimitiveTopology topology,
-                                    uint32_t index_type_and_size) {
+struct PrimitiveRestartInfo {
+	bool     enable       = false;
+	bool     remap_needed = false;
+	uint32_t reset_index  = 0;
+};
+
+static PrimitiveRestartInfo ResolvePrimitiveRestart(const CommandBuffer& buffer,
+                                                    vk::PrimitiveTopology topology,
+                                                    uint32_t index_type_and_size) {
+	PrimitiveRestartInfo info {};
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
 	EXIT_NOT_IMPLEMENTED((control & ~0x3u) != 0);
 	if ((control & 0x1u) == 0) {
-		return false;
+		return info;
 	}
 	switch (buffer.GetUserConfig().GetPrimType()) {
 		case Prospero::PrimitiveType::kLineStrip:
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip: break;
-		default: return false;
+		default: return info;
 	}
 	if (topology != vk::PrimitiveTopology::eLineStrip &&
 	    topology != vk::PrimitiveTopology::eTriangleStrip &&
 	    topology != vk::PrimitiveTopology::eTriangleFan) {
-		return false;
+		return info;
 	}
 
 	uint32_t index_mask = 0;
@@ -890,12 +898,18 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer, vk::PrimitiveTo
 		default: EXIT("unknown index_type_and_size: %u\n", index_type_and_size);
 	}
 
-	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
-	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
-		return false;
+	info.enable = true;
+	if ((control & 0x2u) == 0) {
+		info.reset_index  = index_mask;
+		info.remap_needed = false;
+		return info;
 	}
-	EXIT_NOT_IMPLEMENTED((reset_index & index_mask) != index_mask);
-	return true;
+
+	const auto     raw_reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
+	const uint32_t target_reset    = raw_reset_index & index_mask;
+	info.reset_index               = target_reset;
+	info.remap_needed              = (target_reset != index_mask);
+	return info;
 }
 
 bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& buffer,
@@ -1273,7 +1287,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	vk::IndexType index_type           = vk::IndexType::eUint16;
 	uint64_t      index_size           = 0;
 	bool          expand_index8_to_u16 = false;
-	const bool    primitive_restart =
+	const auto restart_info =
 	    ResolvePrimitiveRestart(buffer, topology, args.index_type_and_size);
 
 	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
@@ -1294,24 +1308,47 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
 	}
 
-	const DrawCallInfo    draw {"DrawIndex", CommandBufferDebugOp::DrawIndex, args.index_count,
-	                            args.instance_count, args.first_instance};
-	std::vector<uint16_t> expanded_indices;
+	const DrawCallInfo   draw {"DrawIndex", CommandBufferDebugOp::DrawIndex, args.index_count,
+	                           args.instance_count, args.first_instance};
+	std::vector<uint8_t> host_index_buffer;
 	if (expand_index8_to_u16) {
 		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
 		const auto* src = static_cast<const uint8_t*>(args.index_addr);
-		expanded_indices.resize(args.index_count);
+		host_index_buffer.resize(args.index_count * sizeof(uint16_t));
+		auto*      dst       = reinterpret_cast<uint16_t*>(host_index_buffer.data());
+		const auto reset_val = static_cast<uint8_t>(restart_info.reset_index);
 		for (uint32_t i = 0; i < args.index_count; i++) {
-			expanded_indices[i] = primitive_restart && src[i] == 0xffu ? 0xffffu : src[i];
+			dst[i] = (restart_info.enable && src[i] == reset_val) ? 0xffffu
+			                                                      : static_cast<uint16_t>(src[i]);
+		}
+	} else if (restart_info.enable && restart_info.remap_needed) {
+		EXIT_NOT_IMPLEMENTED(args.index_addr == nullptr);
+		if (static_cast<Prospero::IndexType>(args.index_type_and_size) ==
+		    Prospero::IndexType::kIndex16) {
+			const auto* src = static_cast<const uint16_t*>(args.index_addr);
+			host_index_buffer.resize(args.index_count * sizeof(uint16_t));
+			auto*      dst       = reinterpret_cast<uint16_t*>(host_index_buffer.data());
+			const auto reset_val = static_cast<uint16_t>(restart_info.reset_index);
+			for (uint32_t i = 0; i < args.index_count; i++) {
+				dst[i] = (src[i] == reset_val) ? 0xffffu : src[i];
+			}
+		} else if (static_cast<Prospero::IndexType>(args.index_type_and_size) ==
+		           Prospero::IndexType::kIndex32) {
+			const auto* src = static_cast<const uint32_t*>(args.index_addr);
+			host_index_buffer.resize(args.index_count * sizeof(uint32_t));
+			auto*      dst       = reinterpret_cast<uint32_t*>(host_index_buffer.data());
+			const auto reset_val = restart_info.reset_index;
+			for (uint32_t i = 0; i < args.index_count; i++) {
+				dst[i] = (src[i] == reset_val) ? 0xffffffffu : src[i];
+			}
 		}
 	}
 
 	DrawIndexBufferSource index_source {};
 	index_source.address = reinterpret_cast<uint64_t>(args.index_addr);
 	index_source.host_data =
-	    expanded_indices.empty() ? nullptr : static_cast<const void*>(expanded_indices.data());
-	index_source.size =
-	    expanded_indices.empty() ? index_size : expanded_indices.size() * sizeof(uint16_t);
+	    host_index_buffer.empty() ? nullptr : static_cast<const void*>(host_index_buffer.data());
+	index_source.size = host_index_buffer.empty() ? index_size : host_index_buffer.size();
 	index_source.type = index_type;
 	index_source.guest_element_size = static_cast<uint32_t>(index_size / args.index_count);
 
@@ -1340,7 +1377,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	    indirect ? args.first_instance : ResolveInstanceOffset(state.vs_input_info);
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart, true, true, false);
+	                    restart_info.enable, true, true, false);
 	ResetBindings();
 }
 
