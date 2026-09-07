@@ -134,7 +134,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
                     uint32_t slot, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
-	const auto& [address, size, id] = source;
+	const auto address = source.address;
+	const auto size    = source.size;
+	const auto id      = source.id;
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
@@ -238,7 +240,10 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
 	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, resource.r128);
 	const bool view_ok =
-	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
+	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW()) ||
+	    (image.info.HasStencil() &&
+	     IsSupportedSampledStencilView(image.info.pixel_format, view_format,
+	                                   descriptor.DstSelXYZW()));
 	if (resource_ok && encoding_ok && view_ok) {
 		return;
 	}
@@ -686,7 +691,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
-	if (stencil_association && !storage) {
+	const auto* associated_image = stencil_association
+	                                   ? &texture_cache.GetImage(image->depth_id)
+	                                   : nullptr;
+	const bool depth_view = stencil_association && !storage &&
+	                        (IsSupportedSampledDepthFormat(associated_image->info.pixel_format,
+	                                                       pixel_format) ||
+                         (associated_image->info.HasStencil() &&
+                          IsSupportedSampledStencilView(associated_image->info.pixel_format,
+	                                                        pixel_format,
+	                                                        descriptor.DstSelXYZW())));
+	if (depth_view) {
 		id    = image->depth_id;
 		image = &texture_cache.GetImage(id);
 	}
@@ -809,11 +824,11 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		const auto records    = descriptor.NumRecords();
 		// The descriptor has a 14-bit stride and 32-bit record count, so the product fits u64.
 		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
-		if (address == 0 || requested_size == 0) {
+		const auto size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+		if (size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
