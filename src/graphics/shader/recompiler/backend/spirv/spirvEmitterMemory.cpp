@@ -1,6 +1,5 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
-
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
 
@@ -115,20 +114,19 @@ uint32_t AddU64Low(EmitterState& state, uint32_t low, uint32_t high, uint32_t ad
 
 uint32_t ScratchByteAddress(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t low,
                             uint32_t high) {
-	auto& state     = ctx.state;
-	auto  immediate = static_cast<int32_t>(mem.offset);
+	auto&      state          = ctx.state;
+	auto       immediate      = static_cast<int32_t>(mem.offset);
 	const auto immediate_low  = ConstantU32(state, static_cast<uint32_t>(immediate));
 	const auto immediate_high = ConstantU32(state, immediate < 0 ? UINT32_MAX : 0u);
-	low                      = AddU64Low(state, low, high, immediate_low, immediate_high, high);
-	const auto valid =
-	    Binary(state, OpIEqual, TypeBool(state), high, ConstantU32(state, 0));
+	low                       = AddU64Low(state, low, high, immediate_low, immediate_high, high);
+	const auto valid = Binary(state, OpIEqual, TypeBool(state), high, ConstantU32(state, 0));
 	return Select(state, TypeU32(state), valid, low, ConstantU32(state, UINT32_MAX));
 }
 
 uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value) {
-	return state.builder.Constant(OpConstant, TypeDeviceAddress(state),
-	                              {static_cast<uint32_t>(value),
-	                               static_cast<uint32_t>(value >> 32u)});
+	return state.builder.Constant(
+	    OpConstant, TypeDeviceAddress(state),
+	    {static_cast<uint32_t>(value), static_cast<uint32_t>(value >> 32u)});
 }
 
 uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high) {
@@ -156,8 +154,8 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 			return ConstantDeviceAddress(state, 0);
 		}
 		const auto base = DeviceAddressFromWords(state, ctx.Arg(*handle, 0), ctx.Arg(*handle, 1));
-		address = Binary(state, OpIAdd, TypeDeviceAddress(state), base,
-		                 Unary(state, OpUConvert, TypeDeviceAddress(state), low));
+		address         = Binary(state, OpIAdd, TypeDeviceAddress(state), base,
+		                         Unary(state, OpUConvert, TypeDeviceAddress(state), low));
 	}
 	auto immediate = static_cast<int32_t>(mem.offset);
 	if (mem.kind == IR::ResourceKind::ScalarAddress) {
@@ -166,8 +164,8 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 	return immediate == 0
 	           ? address
 	           : Binary(state, OpIAdd, TypeDeviceAddress(state), address,
-	                    ConstantDeviceAddress(state,
-	                                          static_cast<uint64_t>(static_cast<int64_t>(immediate))));
+	                    ConstantDeviceAddress(
+	                        state, static_cast<uint64_t>(static_cast<int64_t>(immediate))));
 }
 
 uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
@@ -178,11 +176,11 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 }
 
 void RecordBdaFault(EmitterState& state, uint32_t page) {
-	const auto word = Binary(state, OpShiftRightLogical, TypeU32(state), page,
-	                         ConstantU32(state, 5));
-	const auto bit = Binary(
-	    state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
-	    Binary(state, OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	const auto word =
+	    Binary(state, OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5));
+	const auto bit =
+	    Binary(state, OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
 	const auto pointer = FaultElementPointer(state, word);
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
@@ -199,14 +197,13 @@ uint32_t GetBdaPointer(ValueEmitContext& ctx, uint32_t address) {
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
-	auto&      state   = ctx.state;
-	const auto bda     = GetBdaPointer(ctx, address);
-	const auto present = Binary(state, OpINotEqual, TypeBool(state), bda,
-	                            ConstantDeviceAddress(state, 0));
+	auto&      state = ctx.state;
+	const auto bda   = GetBdaPointer(ctx, address);
+	const auto present =
+	    Binary(state, OpINotEqual, TypeBool(state), bda, ConstantDeviceAddress(state, 0));
 	return EmitValueOrZeroIfCondition(state, present, [&]() {
 		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(
-		    {OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda});
+		state.builder.AddFunction({OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, bda});
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    {OpLoad, TypeU32(state), value, pointer, MemoryAccessAlignedMask, sizeof(uint32_t)});
@@ -215,7 +212,7 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 }
 
 uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
-	             uint32_t bits) {
+                 uint32_t bits) {
 	auto&      state   = ctx.state;
 	const auto address = GuestAddress(ctx, inst, mem);
 	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
@@ -223,35 +220,32 @@ uint32_t LoadBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryIn
 		const auto aligned = Binary(state, OpBitwiseAnd, TypeDeviceAddress(state), address,
 		                            ConstantDeviceAddress(state, ~uint64_t {3}));
 		const auto first   = LoadBdaDword(ctx, aligned);
-		const auto byte = Binary(state, OpBitwiseAnd, TypeU32(state),
-		                         Unary(state, OpUConvert, TypeU32(state), address),
-		                         ConstantU32(state, 3));
-		const auto crosses = bits == 8u
-		                          ? ConstantBool(state, false)
-		                          : Binary(state, bits == 16u ? OpUGreaterThan : OpINotEqual,
-		                                   TypeBool(state), byte,
-		                                   ConstantU32(state, bits == 16u ? 2u : 0u));
-		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
-			return LoadBdaDword(
-			    ctx, Binary(state, OpIAdd, TypeDeviceAddress(state), aligned,
-			                ConstantDeviceAddress(state, sizeof(uint32_t))));
-		});
-		const auto shift = Binary(state, OpShiftLeftLogical, TypeU32(state), byte,
-		                          ConstantU32(state, 3));
-		const auto upper_shift = Binary(
-		    state, OpShiftLeftLogical, TypeU32(state),
+		const auto byte =
 		    Binary(state, OpBitwiseAnd, TypeU32(state),
-		           Binary(state, OpISub, TypeU32(state), ConstantU32(state, 4), byte),
-		           ConstantU32(state, 3)),
-		    ConstantU32(state, 3));
-		const auto merged = Binary(
-		    state, OpBitwiseOr, TypeU32(state),
-		    Binary(state, OpShiftRightLogical, TypeU32(state), first, shift),
-		    Binary(state, OpShiftLeftLogical, TypeU32(state), second, upper_shift));
-		return bits == 32u
-		           ? merged
-		           : Binary(state, OpBitwiseAnd, TypeU32(state), merged,
-		                    ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+		           Unary(state, OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
+		const auto crosses =
+		    bits == 8u ? ConstantBool(state, false)
+		               : Binary(state, bits == 16u ? OpUGreaterThan : OpINotEqual, TypeBool(state),
+		                        byte, ConstantU32(state, bits == 16u ? 2u : 0u));
+		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
+			return LoadBdaDword(ctx, Binary(state, OpIAdd, TypeDeviceAddress(state), aligned,
+			                                ConstantDeviceAddress(state, sizeof(uint32_t))));
+		});
+		const auto shift =
+		    Binary(state, OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
+		const auto upper_shift =
+		    Binary(state, OpShiftLeftLogical, TypeU32(state),
+		           Binary(state, OpBitwiseAnd, TypeU32(state),
+		                  Binary(state, OpISub, TypeU32(state), ConstantU32(state, 4), byte),
+		                  ConstantU32(state, 3)),
+		           ConstantU32(state, 3));
+		const auto merged =
+		    Binary(state, OpBitwiseOr, TypeU32(state),
+		           Binary(state, OpShiftRightLogical, TypeU32(state), first, shift),
+		           Binary(state, OpShiftLeftLogical, TypeU32(state), second, upper_shift));
+		return bits == 32u ? merged
+		                   : Binary(state, OpBitwiseAnd, TypeU32(state), merged,
+		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
 	});
 }
 
@@ -399,10 +393,12 @@ FormattedSource ResolveFormattedSource(ValueEmitContext& ctx, const IR::MemoryIn
 	}
 	const auto selector = GetDstSel(ctx.state.program.info.buffers[mem.resource].descriptor_swizzle,
 	                                output_component);
-	const auto source = Format::ResolveFormattedSource(info, selector);
+	auto       source   = Format::ResolveFormattedSource(info, selector);
 	if (source.kind == FormattedSourceKind::Invalid) {
-		ExitDescriptorBindingFailure(ctx.state, IR::DescriptorBindingKind::Buffers, mem.resource,
-		                             "buffer descriptor has reserved dst_sel");
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "buffer descriptor has reserved dst_sel %u for resource %u component %u\n",
+		           selector, mem.resource, output_component);
+		source = {FormattedSourceKind::Zero, 0};
 	}
 	return source;
 }
@@ -607,14 +603,14 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
 		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
 		ctx.state.builder.AddFunction(
-		    {OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer, ConstantU32(ctx.state, scope),
-		     ConstantU32(ctx.state, MemorySemanticsNone),
+		    {OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
+		     ConstantU32(ctx.state, scope), ConstantU32(ctx.state, MemorySemanticsNone),
 		     ConstantU32(ctx.state, MemorySemanticsNone), desired, comparator});
 	} else {
 		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		ctx.state.builder.AddFunction(
-		    {SpirvAtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old, pointer,
-		     ConstantU32(ctx.state, scope), ConstantU32(ctx.state, MemorySemanticsNone), value});
+		ctx.state.builder.AddFunction({SpirvAtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old,
+		                               pointer, ConstantU32(ctx.state, scope),
+		                               ConstantU32(ctx.state, MemorySemanticsNone), value});
 	}
 	return old;
 }
@@ -665,10 +661,10 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
 			        const auto old   = state.builder.AllocateId();
 			        state.builder.AddFunction(
 			            {SpirvAtomicOpcode(inst.GetOpcode()), TypeScalarU64(state), old,
-			             EmitStorageBufferElementPointer(
-			                 state, resource, index, TypeStorageBufferU64ElementPointer(state)),
-			             ConstantU32(state, ScopeDevice),
-			             ConstantU32(state, MemorySemanticsNone), value});
+			             EmitStorageBufferElementPointer(state, resource, index,
+			                                             TypeStorageBufferU64ElementPointer(state)),
+			             ConstantU32(state, ScopeDevice), ConstantU32(state, MemorySemanticsNone),
+			             value});
 			        EmitDeviceAtomicMemoryBarrier(state);
 			        return Unary(state, OpBitcast, TypeU64(state), old);
 		        });
@@ -722,11 +718,11 @@ uint32_t SharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR
 }
 
 uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append) {
-	auto&      state = ctx.state;
+	auto& state = ctx.state;
 	if (ctx.half == 1) {
 		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 	}
-	const auto m0    = ctx.Arg(inst, 0);
+	const auto m0 = ctx.Arg(inst, 0);
 	const auto base =
 	    Binary(state, OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
 	const auto size = Binary(state, OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
@@ -739,8 +735,8 @@ uint32_t AppendConsume(ValueEmitContext& ctx, const IR::Inst& inst, bool append)
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const auto exec   = ctx.Arg(inst, 1);
 	const auto ballot = ctx.Ballot(inst.Arg(1));
-	const auto low  = state.builder.AllocateId();
-	const auto high = state.builder.AllocateId();
+	const auto low    = state.builder.AllocateId();
+	const auto high   = state.builder.AllocateId();
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
 	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
 	const auto count =
@@ -1015,10 +1011,9 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction({OpFunctionParameter, type, address});
 	EmitLabel(state, entry_label);
 
-	const auto page64 = Binary(
-	    state, OpShiftRightLogical, type, address,
-	    ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
-	const auto page = Unary(state, OpUConvert, TypeU32(state), page64);
+	const auto page64        = Binary(state, OpShiftRightLogical, type, address,
+	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
+	const auto page          = Unary(state, OpUConvert, TypeU32(state), page64);
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction({OpAccessChain, TypeDeviceAddressStoragePointer(state), entry_pointer,
 	                           state.bda_pagetable_variable, ConstantU32(state, 0), page});
@@ -1030,17 +1025,15 @@ void DefineGetBdaPointer(EmitterState& state) {
 	const auto available_label = state.builder.AllocateId();
 	const auto merge_label     = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
-	state.builder.AddFunction(
-	    {OpBranchConditional, missing, fault_label, available_label});
+	state.builder.AddFunction({OpBranchConditional, missing, fault_label, available_label});
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
 	state.builder.AddFunction({OpBranch, merge_label});
 
 	EmitLabel(state, available_label);
-	const auto offset = Binary(
-	    state, OpBitwiseAnd, type, address,
-	    ConstantDeviceAddress(state, BufferCache::CACHING_PAGESIZE - 1));
+	const auto offset    = Binary(state, OpBitwiseAnd, type, address,
+	                              ConstantDeviceAddress(state, BufferCache::CACHING_PAGESIZE - 1));
 	const auto available = Binary(state, OpIAdd, type, base, offset);
 	state.builder.AddFunction({OpBranch, merge_label});
 
@@ -1117,10 +1110,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, LoadBda(ctx, inst, ctx.Memory(inst), address_info.data_bits));
 		return true;
 	}
-	const bool load_buffer  = op == IR::ValueOpcode::LoadBufferU8 ||
-	                          op == IR::ValueOpcode::LoadBufferU16 ||
-	                          op == IR::ValueOpcode::LoadBufferU32;
-	const bool load_shared  = IR::SharedAccessOf(op) == IR::SharedAccess::Read;
+	const bool load_buffer = op == IR::ValueOpcode::LoadBufferU8 ||
+	                         op == IR::ValueOpcode::LoadBufferU16 ||
+	                         op == IR::ValueOpcode::LoadBufferU32;
+	const bool load_shared = IR::SharedAccessOf(op) == IR::SharedAccess::Read;
 	if (load_address || load_buffer || load_shared) {
 		const auto mem   = ctx.Memory(inst);
 		uint32_t   value = 0;
@@ -1188,11 +1181,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 			target = EmitDsSwizzleTargetLane(state, EmitSubgroupLocalInvocationId(state),
 			                                 inst.Arg(1).IsImmediate() ? inst.Arg(1).U32() : 0);
 		} else {
-			const auto index = Binary(
-			    state, OpBitwiseAnd, TypeU32(state),
-			    Binary(state, OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
-			           ConstantU32(state, 2)),
-			    ConstantU32(state, 31));
+			const auto index = Binary(state, OpBitwiseAnd, TypeU32(state),
+			                          Binary(state, OpShiftRightLogical, TypeU32(state),
+			                                 ctx.Arg(inst, 1), ConstantU32(state, 2)),
+			                          ConstantU32(state, 31));
 			const auto base =
 			    Binary(state, OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
 			           ConstantU32(state, ~31u));

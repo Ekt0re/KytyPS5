@@ -92,6 +92,18 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 	}
 }
 
+[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle) noexcept;
+
+[[nodiscard]] inline bool IsSupportedSampledStencilView(vk::Format image_format,
+                                                        vk::Format view_format,
+                                                        uint32_t   swizzle) noexcept {
+	if (DepthAspectTransferFormat(image_format) == vk::Format::eUndefined ||
+	    view_format != vk::Format::eR8Uint || !IsValidImageSwizzle(swizzle)) {
+		return false;
+	}
+	return true;
+}
+
 [[nodiscard]] inline bool
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	if (resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled) {
