@@ -407,6 +407,25 @@ void Swapchain::Create() {
 		     static_cast<int>(m_format));
 	}
 
+	// Primary, explicit signal: set directly by WindowContext from
+	// SDL_WINDOWEVENT_MINIMIZED/RESTORED and from Resize() (see windowInternal.h).
+	// This is checked first and independently of screen_width/height below,
+	// because Resize() intentionally leaves screen_width/height at their last
+	// known-good (non-zero) values when it receives a non-positive size, so
+	// those fields alone cannot be trusted to reflect "currently minimized" —
+	// e.g. if currentExtent is later reported as UINT32_MAX (Wayland's
+	// "undefined" case) while still minimized, clamping against those stale
+	// dimensions would otherwise produce a non-zero extent and this function
+	// would proceed straight into vkCreateSwapchainKHR.
+	if (m_window.minimized.load(std::memory_order_acquire)) {
+		m_minimized = true;
+		return;
+	}
+
+	// Fallback signals, kept in addition to the flag above (not replaced by
+	// it): the window can end up with a zero-sized drawable area without ever
+	// going through WindowContext's SDL event path (e.g. programmatic resize,
+	// or a platform/compositor quirk this flag doesn't yet cover).
 	// `screen_width`/`screen_height` (tracked by the window backend) and
 	// `surface.capabilities.currentExtent` (reported by the platform's WSI) can
 	// independently go to zero while the window is minimized/iconified/hidden:

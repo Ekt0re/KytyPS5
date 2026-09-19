@@ -396,21 +396,27 @@ void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 	// nothing guarantees that across SDL versions/drivers).
 	//
 	// Ignore the update and keep the last known-good size instead of crashing
-	// or propagating {0,0} into graphic_ctx.screen_width/height, which
-	// Swapchain::Create() would otherwise also have to treat as "minimized"
-	// (see graphics/presentation/window/swapchain.cpp). The real drawable
-	// surface state is already tracked independently via Vulkan's
-	// surface_capabilities.currentExtent, which is refreshed and checked on
-	// every Swapchain::Create()/Recreate() regardless of what happens here.
+	// or propagating {0,0} into graphic_ctx.screen_width/height. Because the
+	// stale, last-known-positive screen_width/height are deliberately left
+	// untouched here, they are not by themselves a reliable "is the window
+	// minimized" signal (see the `minimized` member in WindowContext for why).
+	// Set that flag explicitly instead, so Swapchain::Create() has a direct
+	// signal independent of stale dimensions or of what Vulkan's
+	// surface_capabilities.currentExtent happens to report on this platform.
 	if (new_width == 0 || new_height == 0) {
 		LOGF("WindowContext::Resize(): ignoring 0-sized resize request (%" PRIu32 "x%" PRIu32
 		     "); window is likely minimized/hidden\n",
 		     new_width, new_height);
+		minimized.store(true, std::memory_order_release);
 		return;
 	}
 	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = new_width;
 	graphic_ctx.screen_height = new_height;
+	// A valid resize is direct proof the window is drawable again, even
+	// without an explicit SDL_WINDOWEVENT_RESTORED (some window managers go
+	// straight to a positive SDL_WINDOWEVENT_SIZE_CHANGED).
+	minimized.store(false, std::memory_order_release);
 }
 
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
@@ -450,6 +456,9 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			} else {
 				LOGF("Window %" PRIu32 " ignoring non-positive resize %" PRId32 "x%" PRId32 "\n",
 				     window_event.windowID, window_event.data1, window_event.data2);
+				// This path bypasses Resize() entirely (the guard above never calls
+				// it), so it must set the flag itself.
+				minimized.store(true, std::memory_order_release);
 			}
 
 			break;
@@ -466,18 +475,30 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 				LOGF("Window %" PRIu32 " ignoring non-positive size change %" PRId32 "x%" PRId32
 				     "\n",
 				     window_event.windowID, window_event.data1, window_event.data2);
+				minimized.store(true, std::memory_order_release);
 			}
 
 			break;
 
 		case SDL_WINDOWEVENT_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
+			// The most direct, timely signal that the window has no drawable area:
+			// unlike a resize event, this is guaranteed to fire on minimize on every
+			// platform SDL supports, regardless of whether a {0,0} size event also
+			// happens to accompany it.
+			minimized.store(true, std::memory_order_release);
 			break;
 		case SDL_WINDOWEVENT_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
+			minimized.store(false, std::memory_order_release);
 			break;
 		case SDL_WINDOWEVENT_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
+			// Optimistic: the window is drawable again. Swapchain::Create() still
+			// independently validates the real extent before creating anything, so
+			// this is just what allows it to try in the first place instead of
+			// being short-circuited by this flag.
+			minimized.store(false, std::memory_order_release);
 			break;
 		case SDL_WINDOWEVENT_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
