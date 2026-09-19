@@ -29,13 +29,20 @@ struct WriterState {
 	std::atomic_size_t            queue_bytes {0};
 	AsyncWriter::QueueConfig      queue_config;
 	AsyncWriter::RetryPolicy      retry_policy;
+	std::atomic_size_t            in_flight {0};
+	bool                          accepting = true;
 };
 
-static WriterState*             g_writer = nullptr;
-static std::mutex               g_init_mutex;
-static AsyncWriter::QueueConfig s_queue_config;
-static AsyncWriter::RetryPolicy s_retry_policy;
-static bool                     s_config_set = false;
+static std::shared_ptr<WriterState> g_writer;
+static std::mutex                   g_init_mutex;
+static AsyncWriter::QueueConfig     s_queue_config;
+static AsyncWriter::RetryPolicy     s_retry_policy;
+static bool                         s_config_set = false;
+static std::atomic_size_t           g_final_dropped_count {0}; // Snapshot taken at shutdown
+
+#if defined(__cpp_exceptions) || defined(_CPPUNWIND)
+#define KYTY_ASYNC_WRITER_HAS_EXCEPTIONS 1
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <share.h>
@@ -53,133 +60,179 @@ static FILE* OpenFile(const std::filesystem::path& path, const char* mode) {
 #endif
 }
 
-static void ProcessTask(const AsyncWriter::Task& task) noexcept {
-	switch (task.type) {
-		case AsyncWriter::TaskType::FileWrite: {
-			if (!task.path.empty()) {
-				std::error_code ec;
-				const auto      parent = task.path.parent_path();
-				if (!parent.empty()) {
-					std::filesystem::create_directories(parent, ec);
-				}
+static void ProcessTask(const AsyncWriter::Task& task, WriterState* state,
+                        bool emergency_mode) noexcept {
+	// Pass state explicitly to avoid race with Shutdown (1.1)
+	// Catch all exceptions to honor noexcept (1.3)
+#if defined(KYTY_ASYNC_WRITER_HAS_EXCEPTIONS)
+	try {
+#endif
+		switch (task.type) {
+			case AsyncWriter::TaskType::FileWrite: {
+				if (!task.path.empty()) {
+					std::error_code ec;
+					const auto      parent = task.path.parent_path();
+					if (!parent.empty()) {
+						std::filesystem::create_directories(parent, ec);
+					}
 
-				int retry_count = 0;
-				int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
-				int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
+					int retry_count = 0;
+					int max_retries =
+					    emergency_mode ? 0 : (state ? state->retry_policy.max_retries : 3);
+					int backoff_ms = state ? state->retry_policy.backoff_ms : 100;
 
-				while (retry_count <= max_retries) {
-					FILE* fp = OpenFile(task.path, "wb");
-					if (fp != nullptr) {
-						if (!task.data.empty()) {
-							std::fwrite(task.data.data(), 1, task.data.size(), fp);
+					while (retry_count <= max_retries) {
+						FILE* fp = OpenFile(task.path, "wb");
+						if (fp != nullptr) {
+							bool write_success = true;
+							if (!task.data.empty()) {
+								size_t written =
+								    std::fwrite(task.data.data(), 1, task.data.size(), fp);
+								if (written != task.data.size()) {
+									write_success = false; // Partial write (2.1)
+								}
+							}
+							int close_result = std::fclose(fp);
+							if (close_result != 0) {
+								write_success = false; // fclose error (2.1)
+							}
+							if (write_success) {
+								break; // Success
+							}
 						}
-						std::fclose(fp);
-						break; // Success
-					}
 
-					retry_count++;
-					if (retry_count <= max_retries) {
-						std::this_thread::sleep_for(
-						    std::chrono::milliseconds(backoff_ms * retry_count));
-					}
-				}
-
-				if (retry_count > max_retries && g_writer) {
-					g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
-				}
-			}
-			break;
-		}
-		case AsyncWriter::TaskType::FileAppend: {
-			if (!task.path.empty()) {
-				std::error_code ec;
-				const auto      parent = task.path.parent_path();
-				if (!parent.empty()) {
-					std::filesystem::create_directories(parent, ec);
-				}
-
-				int retry_count = 0;
-				int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
-				int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
-
-				while (retry_count <= max_retries) {
-					FILE* fp = OpenFile(task.path, "ab");
-					if (fp != nullptr) {
-						if (!task.data.empty()) {
-							std::fwrite(task.data.data(), 1, task.data.size(), fp);
+						retry_count++;
+						if (retry_count <= max_retries && !emergency_mode) {
+							std::this_thread::sleep_for(
+							    std::chrono::milliseconds(backoff_ms * retry_count));
 						}
-						std::fclose(fp);
-						break; // Success
 					}
 
-					retry_count++;
-					if (retry_count <= max_retries) {
-						std::this_thread::sleep_for(
-						    std::chrono::milliseconds(backoff_ms * retry_count));
+					if (retry_count > max_retries && state) {
+						state->dropped_count.fetch_add(1, std::memory_order_relaxed);
 					}
 				}
-
-				if (retry_count > max_retries && g_writer) {
-					g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
-				}
+				break;
 			}
-			break;
-		}
-		case AsyncWriter::TaskType::CustomTask: {
-			if (task.custom_fn) {
-				task.custom_fn();
-			}
-			break;
-		}
-		case AsyncWriter::TaskType::DualOutput: {
-			// Write to file
-			if (!task.path.empty()) {
-				std::error_code ec;
-				const auto      parent = task.path.parent_path();
-				if (!parent.empty()) {
-					std::filesystem::create_directories(parent, ec);
-				}
+			case AsyncWriter::TaskType::FileAppend: {
+				if (!task.path.empty()) {
+					std::error_code ec;
+					const auto      parent = task.path.parent_path();
+					if (!parent.empty()) {
+						std::filesystem::create_directories(parent, ec);
+					}
 
-				int retry_count = 0;
-				int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
-				int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
+					int retry_count = 0;
+					int max_retries =
+					    emergency_mode ? 0 : (state ? state->retry_policy.max_retries : 3);
+					int backoff_ms = state ? state->retry_policy.backoff_ms : 100;
 
-				while (retry_count <= max_retries) {
-					FILE* fp = OpenFile(task.path, "ab");
-					if (fp != nullptr) {
-						if (!task.data.empty()) {
-							std::fwrite(task.data.data(), 1, task.data.size(), fp);
+					while (retry_count <= max_retries) {
+						FILE* fp = OpenFile(task.path, "ab");
+						if (fp != nullptr) {
+							bool write_success = true;
+							if (!task.data.empty()) {
+								size_t written =
+								    std::fwrite(task.data.data(), 1, task.data.size(), fp);
+								if (written != task.data.size()) {
+									write_success = false; // Partial write (2.1)
+								}
+							}
+							int close_result = std::fclose(fp);
+							if (close_result != 0) {
+								write_success = false; // fclose error (2.1)
+							}
+							if (write_success) {
+								break; // Success
+							}
 						}
-						std::fclose(fp);
-						break; // Success
+
+						retry_count++;
+						if (retry_count <= max_retries && !emergency_mode) {
+							std::this_thread::sleep_for(
+							    std::chrono::milliseconds(backoff_ms * retry_count));
+						}
 					}
 
-					retry_count++;
-					if (retry_count <= max_retries) {
-						std::this_thread::sleep_for(
-						    std::chrono::milliseconds(backoff_ms * retry_count));
+					if (retry_count > max_retries && state) {
+						state->dropped_count.fetch_add(1, std::memory_order_relaxed);
+					}
+				}
+				break;
+			}
+			case AsyncWriter::TaskType::CustomTask: {
+				if (task.custom_fn) {
+					task.custom_fn();
+				}
+				break;
+			}
+			case AsyncWriter::TaskType::DualOutput: {
+				// Write to file
+				if (!task.path.empty()) {
+					std::error_code ec;
+					const auto      parent = task.path.parent_path();
+					if (!parent.empty()) {
+						std::filesystem::create_directories(parent, ec);
+					}
+
+					int retry_count = 0;
+					int max_retries =
+					    emergency_mode ? 0 : (state ? state->retry_policy.max_retries : 3);
+					int backoff_ms = state ? state->retry_policy.backoff_ms : 100;
+
+					while (retry_count <= max_retries) {
+						FILE* fp = OpenFile(task.path, "ab");
+						if (fp != nullptr) {
+							bool write_success = true;
+							if (!task.data.empty()) {
+								size_t written =
+								    std::fwrite(task.data.data(), 1, task.data.size(), fp);
+								if (written != task.data.size()) {
+									write_success = false; // Partial write (2.1)
+								}
+							}
+							int close_result = std::fclose(fp);
+							if (close_result != 0) {
+								write_success = false; // fclose error (2.1)
+							}
+							if (write_success) {
+								break; // Success
+							}
+						}
+
+						retry_count++;
+						if (retry_count <= max_retries && !emergency_mode) {
+							std::this_thread::sleep_for(
+							    std::chrono::milliseconds(backoff_ms * retry_count));
+						}
+					}
+
+					if (retry_count > max_retries && state) {
+						state->dropped_count.fetch_add(1, std::memory_order_relaxed);
 					}
 				}
 
-				if (retry_count > max_retries && g_writer) {
-					g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
+				// Write to console
+				if (!task.console_text.empty()) {
+					if (task.console_style != fmt::text_style {}) {
+						fmt::print(stdout, task.console_style, "{}", task.console_text);
+					} else {
+						std::fwrite(task.console_text.data(), 1, task.console_text.size(), stdout);
+					}
+					std::fflush(stdout);
 				}
+				break;
 			}
-
-			// Write to console
-			if (!task.console_text.empty()) {
-				if (task.console_style != fmt::text_style {}) {
-					fmt::print(stdout, task.console_style, "{}", task.console_text);
-				} else {
-					std::fwrite(task.console_text.data(), 1, task.console_text.size(), stdout);
-				}
-				std::fflush(stdout);
-			}
-			break;
+		}
+#if defined(KYTY_ASYNC_WRITER_HAS_EXCEPTIONS)
+	} catch (...) {
+		// Catch all exceptions to honor noexcept (1.3)
+		if (state) {
+			state->dropped_count.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
+#endif
 }
-} // namespace
 
 static void WorkerLoop(WriterState* state) {
 	while (true) {
@@ -198,17 +251,19 @@ static void WorkerLoop(WriterState* state) {
 				continue;
 			}
 
+			state->in_flight.fetch_add(batch.size(), std::memory_order_release);
 			batch.swap(state->queue);
 			state->queue_bytes.store(0, std::memory_order_relaxed);
 			state->is_working.store(true, std::memory_order_release);
 		}
 
 		for (const auto& task: batch) {
-			ProcessTask(task);
+			ProcessTask(task, state, false);
 		}
 
 		{
 			std::lock_guard lock(state->mutex);
+			state->in_flight.fetch_sub(batch.size(), std::memory_order_release);
 			state->is_working.store(false, std::memory_order_release);
 			if (state->queue.empty()) {
 				state->cv_flush.notify_all();
@@ -217,7 +272,7 @@ static void WorkerLoop(WriterState* state) {
 	}
 }
 
-} // namespace Common
+} // namespace
 
 void Common::AsyncWriter::SetQueueConfig(const QueueConfig& config) {
 	std::lock_guard init_lock(g_init_mutex);
@@ -241,21 +296,21 @@ void Common::AsyncWriter::Initialize() {
 	if (g_writer != nullptr) {
 		return;
 	}
+	g_final_dropped_count.store(0, std::memory_order_relaxed);
 
-	auto* state = new WriterState();
+	auto state = std::make_shared<WriterState>();
 	state->running.store(true, std::memory_order_release);
 	state->queue_config  = s_config_set ? s_queue_config : QueueConfig {};
 	state->retry_policy  = s_retry_policy;
-	state->worker_thread = std::thread(WorkerLoop, state);
+	state->worker_thread = std::thread(WorkerLoop, state.get());
 	g_writer             = state;
 }
 
 void Common::AsyncWriter::Shutdown() {
-	WriterState* state = nullptr;
+	std::shared_ptr<WriterState> state;
 	{
 		std::lock_guard init_lock(g_init_mutex);
-		state    = g_writer;
-		g_writer = nullptr;
+		state = g_writer;
 	}
 
 	if (state == nullptr) {
@@ -264,33 +319,84 @@ void Common::AsyncWriter::Shutdown() {
 
 	{
 		std::lock_guard lock(state->mutex);
+		state->accepting = false;
 		state->running.store(false, std::memory_order_release);
-		state->cv_work.notify_one();
+		state->cv_work.notify_all();
 	}
 
 	if (state->worker_thread.joinable()) {
 		state->worker_thread.join();
 	}
 
-	// Drain any remaining tasks
-	while (!state->queue.empty()) {
-		ProcessTask(state->queue.front());
-		state->queue.pop_front();
+	// Producers holding this shared state are rejected by accepting=false. Keep all
+	// queue mutations under the queue mutex while draining the final batch.
+	for (;;) {
+		AsyncWriter::Task task;
+		{
+			std::lock_guard lock(state->mutex);
+			if (state->queue.empty()) {
+				break;
+			}
+			task = std::move(state->queue.front());
+			state->queue.pop_front();
+		}
+		ProcessTask(task, state.get(), false);
 	}
 
-	delete state;
+	g_final_dropped_count.store(state->dropped_count.load(std::memory_order_relaxed),
+	                            std::memory_order_relaxed);
+	{
+		std::lock_guard init_lock(g_init_mutex);
+		if (g_writer == state) {
+			g_writer.reset();
+		}
+	}
+}
+
+// Helper function to apply queue limits uniformly (2.3)
+static bool ApplyQueueLimits(WriterState* state, size_t data_size, bool bypass_limit) {
+	if (bypass_limit) {
+		return true;
+	}
+
+	// Check if single payload exceeds max_bytes on empty queue (2.3)
+	if (state->queue.empty() && data_size > state->queue_config.max_bytes) {
+		state->dropped_count.fetch_add(1, std::memory_order_relaxed);
+		return false; // Reject task
+	}
+
+	while (state->queue.size() >= state->queue_config.max_messages ||
+	       state->queue_bytes.load(std::memory_order_relaxed) + data_size >
+	           state->queue_config.max_bytes) {
+		if (!state->queue.empty()) {
+			size_t oldest_size = state->queue.front().data.size();
+			state->queue.pop_front();
+			state->dropped_count.fetch_add(1, std::memory_order_relaxed);
+			state->queue_bytes.fetch_sub(oldest_size, std::memory_order_relaxed);
+		} else {
+			state->dropped_count.fetch_add(1, std::memory_order_relaxed);
+			return false; // Cannot fit even after dropping all
+		}
+	}
+	return true;
+}
+
+static std::shared_ptr<WriterState> AcquireWriterState() {
+	std::lock_guard init_lock(g_init_mutex);
+	if (g_writer == nullptr) {
+		auto state = std::make_shared<WriterState>();
+		state->running.store(true, std::memory_order_release);
+		state->queue_config  = s_config_set ? s_queue_config : AsyncWriter::QueueConfig {};
+		state->retry_policy  = s_retry_policy;
+		state->worker_thread = std::thread(WorkerLoop, state.get());
+		g_writer             = std::move(state);
+	}
+	return g_writer;
 }
 
 void Common::AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path,
                                            std::vector<uint8_t> data, bool append) {
-	if (g_writer == nullptr) {
-		Initialize();
-	}
-
-	auto* state = g_writer;
-	if (state == nullptr) {
-		return;
-	}
+	std::shared_ptr<WriterState> state = AcquireWriterState();
 
 	size_t data_size = data.size();
 	Task   task {
@@ -302,22 +408,12 @@ void Common::AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path,
 
 	{
 		std::lock_guard lock(state->mutex);
-
-		// Check queue limits and drop oldest if needed
-		while (state->queue.size() >= state->queue_config.max_messages ||
-		       state->queue_bytes.load(std::memory_order_relaxed) + data_size >
-		           state->queue_config.max_bytes) {
-			// Drop oldest message
-			if (!state->queue.empty()) {
-				size_t oldest_size = state->queue.front().data.size();
-				state->queue.pop_front();
-				state->dropped_count.fetch_add(1, std::memory_order_relaxed);
-				state->queue_bytes.fetch_sub(oldest_size, std::memory_order_relaxed);
-			} else {
-				break;
-			}
+		if (!state->accepting) {
+			return;
 		}
-
+		if (!ApplyQueueLimits(state.get(), data_size, false)) {
+			return; // Task rejected due to queue limits
+		}
 		state->queue.push_back(std::move(task));
 		state->queue_bytes.fetch_add(data_size, std::memory_order_relaxed);
 		state->cv_work.notify_one();
@@ -333,14 +429,7 @@ void Common::AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path, st
 void Common::AsyncWriter::EnqueueDualOutput(const std::filesystem::path& file_path,
                                             std::string_view text, const std::string& console_text,
                                             fmt::text_style style, bool bypass_queue_limit) {
-	if (g_writer == nullptr) {
-		Initialize();
-	}
-
-	auto* state = g_writer;
-	if (state == nullptr) {
-		return;
-	}
+	std::shared_ptr<WriterState> state = AcquireWriterState();
 
 	size_t data_size = text.size();
 	Task   task {
@@ -357,24 +446,12 @@ void Common::AsyncWriter::EnqueueDualOutput(const std::filesystem::path& file_pa
 
 	{
 		std::lock_guard lock(state->mutex);
-
-		if (!bypass_queue_limit) {
-			// Check queue limits and drop oldest if needed
-			while (state->queue.size() >= state->queue_config.max_messages ||
-			       state->queue_bytes.load(std::memory_order_relaxed) + data_size >
-			           state->queue_config.max_bytes) {
-				// Drop oldest message
-				if (!state->queue.empty()) {
-					size_t oldest_size = state->queue.front().data.size();
-					state->queue.pop_front();
-					state->dropped_count.fetch_add(1, std::memory_order_relaxed);
-					state->queue_bytes.fetch_sub(oldest_size, std::memory_order_relaxed);
-				} else {
-					break;
-				}
-			}
+		if (!state->accepting) {
+			return;
 		}
-
+		if (!ApplyQueueLimits(state.get(), data_size, bypass_queue_limit)) {
+			return; // Task rejected due to queue limits
+		}
 		state->queue.push_back(std::move(task));
 		state->queue_bytes.fetch_add(data_size, std::memory_order_relaxed);
 		state->cv_work.notify_one();
@@ -382,14 +459,7 @@ void Common::AsyncWriter::EnqueueDualOutput(const std::filesystem::path& file_pa
 }
 
 void Common::AsyncWriter::EnqueueTask(std::function<void()> task) {
-	if (g_writer == nullptr) {
-		Initialize();
-	}
-
-	auto* state = g_writer;
-	if (state == nullptr) {
-		return;
-	}
+	std::shared_ptr<WriterState> state = AcquireWriterState();
 
 	Task t {
 	    .type      = TaskType::CustomTask,
@@ -400,13 +470,25 @@ void Common::AsyncWriter::EnqueueTask(std::function<void()> task) {
 
 	{
 		std::lock_guard lock(state->mutex);
+		if (!state->accepting) {
+			return;
+		}
+		// Apply queue limits to custom tasks too (2.3)
+		if (!ApplyQueueLimits(state.get(), 0, false)) {
+			return; // Task rejected due to queue limits
+		}
 		state->queue.push_back(std::move(t));
 		state->cv_work.notify_one();
 	}
 }
 
 void Common::AsyncWriter::Flush() {
-	auto* state = g_writer;
+	std::shared_ptr<WriterState> state;
+	{
+		std::lock_guard init_lock(g_init_mutex);
+		state = g_writer;
+	}
+
 	if (state == nullptr) {
 		return;
 	}
@@ -418,7 +500,12 @@ void Common::AsyncWriter::Flush() {
 }
 
 void Common::AsyncWriter::EmergencyFlush() noexcept {
-	auto* state = g_writer;
+	std::shared_ptr<WriterState> state;
+	{
+		std::lock_guard init_lock(g_init_mutex);
+		state = g_writer;
+	}
+
 	if (state == nullptr) {
 		std::fflush(nullptr);
 		return;
@@ -431,41 +518,54 @@ void Common::AsyncWriter::EmergencyFlush() noexcept {
 		return;
 	}
 
-	// Drain all pending tasks synchronously
-	std::deque<Task> pending;
+	// Process tasks synchronously WITHOUT swapping the queue (1.2)
+	// We process only what we can safely access
 	{
 		std::unique_lock lock(state->mutex, std::defer_lock);
-		// Try to lock with a short timeout / immediate attempt; if failed due to crash in locked
-		// state, force stealing the queue
 		if (lock.try_lock()) {
-			pending.swap(state->queue);
-		} else {
-			// Emergency scenario: thread holding lock may be dead
-			pending.swap(state->queue);
+			// Lock acquired - process queue safely
+			while (!state->queue.empty()) {
+				ProcessTask(state->queue.front(), state.get(), true); // Emergency mode (2.2)
+				state->queue.pop_front();
+			}
 		}
-	}
-
-	while (!pending.empty()) {
-		ProcessTask(pending.front());
-		pending.pop_front();
+		// If lock cannot be acquired, we cannot safely access the queue (1.2)
+		// In this case, we just flush stdout and return
 	}
 
 	std::fflush(nullptr);
 }
 
 size_t Common::AsyncWriter::GetPendingCount() {
-	auto* state = g_writer;
+	std::shared_ptr<WriterState> state;
+	{
+		std::lock_guard init_lock(g_init_mutex);
+		state = g_writer;
+	}
+
 	if (state == nullptr) {
 		return 0;
 	}
 	std::lock_guard lock(state->mutex);
-	return state->queue.size() + (state->is_working.load(std::memory_order_acquire) ? 1 : 0);
+	return state->queue.size() + state->in_flight.load(std::memory_order_acquire);
 }
 
 size_t Common::AsyncWriter::GetDroppedCount() {
-	auto* state = g_writer;
+	std::shared_ptr<WriterState> state;
+	{
+		std::lock_guard init_lock(g_init_mutex);
+		state = g_writer;
+	}
+
 	if (state == nullptr) {
-		return 0;
+		return g_final_dropped_count.load(
+		    std::memory_order_relaxed); // Return snapshot after shutdown (2.4)
 	}
 	return state->dropped_count.load(std::memory_order_relaxed);
+}
+
+size_t Common::AsyncWriter::GetFinalDroppedCount() {
+	return g_final_dropped_count.load(std::memory_order_relaxed);
+}
+
 } // namespace Common

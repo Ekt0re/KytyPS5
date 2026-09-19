@@ -507,7 +507,8 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
-# These tests use exceptions.
+# These tests use exceptions. GCC/Clang need an explicit opt-in; clang-cl gets
+# /EHs from config_compiler_and_linker().
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 			virtual_memory_allocation_tests)

@@ -43,8 +43,8 @@ static void GlobalTerminateHandler() {
 }
 
 static void GlobalSignalHandler(int sig) {
-	Common::AsyncWriter::EmergencyFlush();
-	Log::Flush();
+	// POSIX signal handlers may not touch AsyncWriter, spdlog, filesystem, or stdio
+	// state. The terminate and Windows SEH paths perform the best-effort C++ flush.
 	std::signal(sig, SIG_DFL);
 	std::raise(sig);
 }

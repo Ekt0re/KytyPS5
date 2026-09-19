@@ -50,6 +50,9 @@ public:
 	static void SetQueueConfig(const QueueConfig& config);
 	static void SetRetryPolicy(const RetryPolicy& policy);
 
+	// Get final dropped count even after shutdown (snapshot taken at shutdown time)
+	static size_t GetFinalDroppedCount();
+
 	// Enqueue writing data to a file asynchronously
 	static void EnqueueFileWrite(const std::filesystem::path& path, std::vector<uint8_t> data,
 	                             bool append = false);
@@ -67,7 +70,8 @@ public:
 	// Wait until all currently queued items have been written
 	static void Flush();
 
-	// Synchronous emergency flush: safe to call from crash/signal handlers
+	// Synchronous best-effort flush for terminate/SEH handlers. It may use C++ locks and
+	// filesystem APIs; POSIX signal handlers must not call it.
 	static void EmergencyFlush() noexcept;
 
 	// Query pending task count

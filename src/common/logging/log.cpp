@@ -44,8 +44,9 @@ static bool HasStyle(fmt::text_style style) {
 	return style != fmt::text_style {};
 }
 
-static bool ShouldLog(Config::LogLevel message_level, Config::LogLevel sink_level) {
-	return static_cast<int>(message_level) >= static_cast<int>(sink_level) &&
+static bool ShouldLog(Config::LogLevel message_level, Config::LogLevel sink_level,
+                      bool sink_enabled) {
+	return sink_enabled && static_cast<int>(message_level) >= static_cast<int>(sink_level) &&
 	       sink_level != Config::LogLevel::Off;
 }
 
@@ -67,8 +68,10 @@ static Direction                       g_direction   = Direction::Console;
 static std::filesystem::path           g_output_file;
 static std::mutex                      g_logger_mutex;
 static std::shared_ptr<spdlog::logger> g_logger;
-static Config::LogLevel                g_console_level = Config::LogLevel::Info;
-static Config::LogLevel                g_file_level    = Config::LogLevel::Info;
+static Config::LogLevel                g_console_level   = Config::LogLevel::Info;
+static Config::LogLevel                g_file_level      = Config::LogLevel::Info;
+static bool                            g_console_enabled = true;
+static bool                            g_file_enabled    = true;
 
 void Flush() {
 	Common::AsyncWriter::Flush();
@@ -88,7 +91,8 @@ static void SetupLogger() {
 			g_logger = MakeLogger("kyty", std::make_shared<spdlog::sinks::null_sink_mt>());
 			break;
 		case Direction::Console:
-			g_logger = MakeLogger("kyty", std::make_shared<spdlog::sinks::stdout_sink_mt>());
+			// Use null logger since AsyncWriter handles console output (3.1)
+			g_logger = MakeLogger("kyty", std::make_shared<spdlog::sinks::null_sink_mt>());
 			break;
 		case Direction::File:
 			if (!g_output_file.empty()) {
@@ -125,16 +129,20 @@ static void WriteImpl(std::string_view text, fmt::text_style style = {},
 		return;
 	}
 
-	// Apply level filtering based on direction
+	// Apply level filtering based on direction and enabled flags (3.2)
 	bool should_write_console = false;
 	bool should_write_file    = false;
 
 	switch (g_direction) {
-		case Direction::Console: should_write_console = ShouldLog(level, g_console_level); break;
-		case Direction::File: should_write_file = ShouldLog(level, g_file_level); break;
+		case Direction::Console:
+			should_write_console = ShouldLog(level, g_console_level, g_console_enabled);
+			break;
+		case Direction::File:
+			should_write_file = ShouldLog(level, g_file_level, g_file_enabled);
+			break;
 		case Direction::ConsoleAndFile:
-			should_write_console = ShouldLog(level, g_console_level);
-			should_write_file    = ShouldLog(level, g_file_level);
+			should_write_console = ShouldLog(level, g_console_level, g_console_enabled);
+			should_write_file    = ShouldLog(level, g_file_level, g_file_enabled);
 			break;
 		default: break;
 	}
@@ -177,16 +185,18 @@ static void WriteImpl(std::string_view text, fmt::text_style style = {},
 
 void WriteToConsoleAndLog(std::string_view text) {
 	WriteImpl(text);
-	if (g_initialized && g_direction != Direction::Console) {
+	if (g_initialized && g_direction == Direction::File && g_console_enabled) {
 		WriteStdout(text);
 	}
 	Flush();
 }
 
 void WriteFatal(std::string_view text) {
-	WriteStdout(text);
+	if (!g_initialized || (g_direction != Direction::Silent && g_console_enabled)) {
+		WriteStdout(text);
+	}
 	if ((g_direction == Direction::File || g_direction == Direction::ConsoleAndFile) &&
-	    !g_output_file.empty()) {
+	    g_file_enabled && !g_output_file.empty()) {
 		Common::AsyncWriter::EnqueueFileWrite(g_output_file, text, true);
 	}
 	Common::AsyncWriter::EmergencyFlush();
@@ -194,9 +204,11 @@ void WriteFatal(std::string_view text) {
 }
 
 void WriteFatal(fmt::text_style style, std::string_view text) {
-	WriteStdout(text, style);
+	if (!g_initialized || (g_direction != Direction::Silent && g_console_enabled)) {
+		WriteStdout(text, style);
+	}
 	if ((g_direction == Direction::File || g_direction == Direction::ConsoleAndFile) &&
-	    !g_output_file.empty()) {
+	    g_file_enabled && !g_output_file.empty()) {
 		Common::AsyncWriter::EnqueueFileWrite(g_output_file, text, true);
 	}
 	Common::AsyncWriter::EmergencyFlush();
@@ -213,9 +225,11 @@ void Initialize() {
 	}
 
 	// Load log level configuration
-	auto log_config = Config::GetLogConfig();
-	g_console_level = log_config.console.level;
-	g_file_level    = log_config.file.level;
+	auto log_config   = Config::GetLogConfig();
+	g_console_level   = log_config.console.level;
+	g_file_level      = log_config.file.level;
+	g_console_enabled = log_config.console.enabled;
+	g_file_enabled    = log_config.file.enabled;
 
 	g_output_file = ((g_direction == Direction::File || g_direction == Direction::ConsoleAndFile)
 	                     ? Config::GetPrintfOutputFile()

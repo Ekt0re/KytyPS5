@@ -2,10 +2,12 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -47,7 +49,7 @@ void TestQueueLimits() {
 	// Set small queue limits
 	Common::AsyncWriter::QueueConfig queue_config;
 	queue_config.max_messages = 10;
-	queue_config.max_bytes = 1024;
+	queue_config.max_bytes = 8;
 	Common::AsyncWriter::SetQueueConfig(queue_config);
 
 	Common::AsyncWriter::Initialize();
@@ -67,6 +69,7 @@ void TestQueueLimits() {
 
 	// Clean up
 	std::filesystem::remove("_test_queue_limits.txt");
+	Common::AsyncWriter::SetQueueConfig(Common::AsyncWriter::QueueConfig {});
 
 	std::printf("AsyncLoggingTests: TestQueueLimits passed (dropped: %zu)\n", dropped);
 }
@@ -133,8 +136,16 @@ void TestRetryLogic() {
 
 	Common::AsyncWriter::Initialize();
 
-	// Try to write to an invalid path (should trigger retry logic)
-	Common::AsyncWriter::EnqueueFileWrite("/invalid/path/that/does/not/exist.txt", "test", false);
+	// A regular file cannot be a directory, so this fails with ENOTDIR on every platform.
+	const std::filesystem::path blocker = "_test_retry_blocker";
+	struct Cleanup {
+		std::filesystem::path path;
+		~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); }
+	} cleanup {blocker};
+	std::error_code ec;
+	std::filesystem::remove(blocker, ec);
+	std::ofstream(blocker).put('x');
+	Common::AsyncWriter::EnqueueFileWrite(blocker / "subpath.txt", "test", false);
 
 	Common::AsyncWriter::Flush();
 	Common::AsyncWriter::Shutdown();
@@ -144,6 +155,28 @@ void TestRetryLogic() {
 	Check(dropped > 0, "Message was not dropped after failed retries");
 
 	std::printf("AsyncLoggingTests: TestRetryLogic passed (dropped: %zu)\n", dropped);
+}
+
+void TestConcurrentShutdown() {
+	std::printf("AsyncLoggingTests: TestConcurrentShutdown...\n");
+
+	Common::AsyncWriter::Initialize();
+	std::thread producer([&] {
+		for (int i = 0; i < 10000; ++i) {
+			Common::AsyncWriter::EnqueueTask([] {});
+		}
+	});
+
+	std::thread shutdown_thread([] { Common::AsyncWriter::Shutdown(); });
+	producer.join();
+	shutdown_thread.join();
+	// A producer that starts after the first lifecycle has ended may create the
+	// next lifecycle; close it as well before checking the final state.
+	Common::AsyncWriter::Shutdown();
+
+	Check(Common::AsyncWriter::GetPendingCount() == 0,
+	      "Pending tasks remained after concurrent shutdown");
+	std::printf("AsyncLoggingTests: TestConcurrentShutdown passed\n");
 }
 
 void TestLogLevelFiltering() {
@@ -214,6 +247,7 @@ int main() {
 	TestLoadScenario();
 	TestDualOutput();
 	TestRetryLogic();
+	TestConcurrentShutdown();
 	TestLogLevelFiltering();
 	TestEmergencyFlush();
 	TestExplicitFlush();

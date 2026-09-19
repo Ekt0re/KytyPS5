@@ -94,6 +94,11 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+bool IsFileOutputEnabled(Config::LogDirection direction) {
+	return direction == Config::LogDirection::File ||
+	       direction == Config::LogDirection::ConsoleAndFile;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
@@ -102,7 +107,7 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled() &&
-	    Config::GetShaderLogDirection() != Config::LogDirection::File) {
+	    !IsFileOutputEnabled(Config::GetShaderLogDirection())) {
 		return;
 	}
 	static std::atomic_int id = 0;
@@ -116,7 +121,7 @@ void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code, const std::string& decoded_dump) {
 	if (!Config::GraphicsDebugDumpEnabled() &&
-	    Config::GetShaderLogDirection() != Config::LogDirection::File) {
+	    !IsFileOutputEnabled(Config::GetShaderLogDirection())) {
 		return;
 	}
 	EXIT_IF(code.empty());
@@ -142,10 +147,11 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 
 	static std::unordered_set<uint64_t> s_validated_hashes;
 	static std::mutex                   s_validation_mutex;
+	const uint64_t spirv_hash = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t));
 
 	{
 		std::lock_guard lock(s_validation_mutex);
-		if (s_validated_hashes.contains(shader_hash)) {
+		if (s_validated_hashes.contains(spirv_hash)) {
 			return true;
 		}
 	}
@@ -160,7 +166,7 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	});
 	if (tools.Validate(spirv)) {
 		std::lock_guard lock(s_validation_mutex);
-		s_validated_hashes.insert(shader_hash);
+		s_validated_hashes.insert(spirv_hash);
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -250,8 +256,7 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		if (Config::GetShaderLogDirection() == Config::LogDirection::File &&
-		    !result.ir_dump.empty()) {
+		if (IsFileOutputEnabled(Config::GetShaderLogDirection()) && !result.ir_dump.empty()) {
 			const auto ir_path = Config::GetShaderLogFolder() /
 			                     fmt::format("{:04d}_new_shader_{}_{:016x}.ir", next_shader_id + 1,
 			                                 stage_name, options.shader_hash);
