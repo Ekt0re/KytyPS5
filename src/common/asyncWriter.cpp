@@ -54,138 +54,132 @@ static FILE* OpenFile(const std::filesystem::path& path, const char* mode) {
 }
 
 static void ProcessTask(const AsyncWriter::Task& task) noexcept {
-	try {
-		switch (task.type) {
-			case AsyncWriter::TaskType::FileWrite: {
-				if (!task.path.empty()) {
-					std::error_code ec;
-					const auto      parent = task.path.parent_path();
-					if (!parent.empty()) {
-						std::filesystem::create_directories(parent, ec);
+	switch (task.type) {
+		case AsyncWriter::TaskType::FileWrite: {
+			if (!task.path.empty()) {
+				std::error_code ec;
+				const auto      parent = task.path.parent_path();
+				if (!parent.empty()) {
+					std::filesystem::create_directories(parent, ec);
+				}
+
+				int retry_count = 0;
+				int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
+				int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
+
+				while (retry_count <= max_retries) {
+					FILE* fp = OpenFile(task.path, "wb");
+					if (fp != nullptr) {
+						if (!task.data.empty()) {
+							std::fwrite(task.data.data(), 1, task.data.size(), fp);
+						}
+						std::fclose(fp);
+						break; // Success
 					}
 
-					int retry_count = 0;
-					int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
-					int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
-
-					while (retry_count <= max_retries) {
-						FILE* fp = OpenFile(task.path, "wb");
-						if (fp != nullptr) {
-							if (!task.data.empty()) {
-								std::fwrite(task.data.data(), 1, task.data.size(), fp);
-							}
-							std::fclose(fp);
-							break; // Success
-						}
-
-						retry_count++;
-						if (retry_count <= max_retries) {
-							std::this_thread::sleep_for(
-							    std::chrono::milliseconds(backoff_ms * retry_count));
-						}
-					}
-
-					if (retry_count > max_retries && g_writer) {
-						g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
+					retry_count++;
+					if (retry_count <= max_retries) {
+						std::this_thread::sleep_for(
+						    std::chrono::milliseconds(backoff_ms * retry_count));
 					}
 				}
-				break;
+
+				if (retry_count > max_retries && g_writer) {
+					g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
+				}
 			}
-			case AsyncWriter::TaskType::FileAppend: {
-				if (!task.path.empty()) {
-					std::error_code ec;
-					const auto      parent = task.path.parent_path();
-					if (!parent.empty()) {
-						std::filesystem::create_directories(parent, ec);
-					}
-
-					int retry_count = 0;
-					int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
-					int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
-
-					while (retry_count <= max_retries) {
-						FILE* fp = OpenFile(task.path, "ab");
-						if (fp != nullptr) {
-							if (!task.data.empty()) {
-								std::fwrite(task.data.data(), 1, task.data.size(), fp);
-							}
-							std::fclose(fp);
-							break; // Success
-						}
-
-						retry_count++;
-						if (retry_count <= max_retries) {
-							std::this_thread::sleep_for(
-							    std::chrono::milliseconds(backoff_ms * retry_count));
-						}
-					}
-
-					if (retry_count > max_retries && g_writer) {
-						g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
-					}
-				}
-				break;
-			}
-			case AsyncWriter::TaskType::CustomTask: {
-				if (task.custom_fn) {
-					task.custom_fn();
-				}
-				break;
-			}
-			case AsyncWriter::TaskType::DualOutput: {
-				// Write to file
-				if (!task.path.empty()) {
-					std::error_code ec;
-					const auto      parent = task.path.parent_path();
-					if (!parent.empty()) {
-						std::filesystem::create_directories(parent, ec);
-					}
-
-					int retry_count = 0;
-					int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
-					int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
-
-					while (retry_count <= max_retries) {
-						FILE* fp = OpenFile(task.path, "ab");
-						if (fp != nullptr) {
-							if (!task.data.empty()) {
-								std::fwrite(task.data.data(), 1, task.data.size(), fp);
-							}
-							std::fclose(fp);
-							break; // Success
-						}
-
-						retry_count++;
-						if (retry_count <= max_retries) {
-							std::this_thread::sleep_for(
-							    std::chrono::milliseconds(backoff_ms * retry_count));
-						}
-					}
-
-					if (retry_count > max_retries && g_writer) {
-						g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
-					}
-				}
-
-				// Write to console
-				if (!task.console_text.empty()) {
-					if (task.console_style != fmt::text_style {}) {
-						fmt::print(stdout, task.console_style, "{}", task.console_text);
-					} else {
-						std::fwrite(task.console_text.data(), 1, task.console_text.size(), stdout);
-					}
-					std::fflush(stdout);
-				}
-				break;
-			}
+			break;
 		}
-	} catch (...) {
-		// Ignore exceptions in worker thread to prevent crashing
-		if (g_writer) {
-			g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
+		case AsyncWriter::TaskType::FileAppend: {
+			if (!task.path.empty()) {
+				std::error_code ec;
+				const auto      parent = task.path.parent_path();
+				if (!parent.empty()) {
+					std::filesystem::create_directories(parent, ec);
+				}
+
+				int retry_count = 0;
+				int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
+				int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
+
+				while (retry_count <= max_retries) {
+					FILE* fp = OpenFile(task.path, "ab");
+					if (fp != nullptr) {
+						if (!task.data.empty()) {
+							std::fwrite(task.data.data(), 1, task.data.size(), fp);
+						}
+						std::fclose(fp);
+						break; // Success
+					}
+
+					retry_count++;
+					if (retry_count <= max_retries) {
+						std::this_thread::sleep_for(
+						    std::chrono::milliseconds(backoff_ms * retry_count));
+					}
+				}
+
+				if (retry_count > max_retries && g_writer) {
+					g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+			break;
+		}
+		case AsyncWriter::TaskType::CustomTask: {
+			if (task.custom_fn) {
+				task.custom_fn();
+			}
+			break;
+		}
+		case AsyncWriter::TaskType::DualOutput: {
+			// Write to file
+			if (!task.path.empty()) {
+				std::error_code ec;
+				const auto      parent = task.path.parent_path();
+				if (!parent.empty()) {
+					std::filesystem::create_directories(parent, ec);
+				}
+
+				int retry_count = 0;
+				int max_retries = g_writer ? g_writer->retry_policy.max_retries : 3;
+				int backoff_ms  = g_writer ? g_writer->retry_policy.backoff_ms : 100;
+
+				while (retry_count <= max_retries) {
+					FILE* fp = OpenFile(task.path, "ab");
+					if (fp != nullptr) {
+						if (!task.data.empty()) {
+							std::fwrite(task.data.data(), 1, task.data.size(), fp);
+						}
+						std::fclose(fp);
+						break; // Success
+					}
+
+					retry_count++;
+					if (retry_count <= max_retries) {
+						std::this_thread::sleep_for(
+						    std::chrono::milliseconds(backoff_ms * retry_count));
+					}
+				}
+
+				if (retry_count > max_retries && g_writer) {
+					g_writer->dropped_count.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+
+			// Write to console
+			if (!task.console_text.empty()) {
+				if (task.console_style != fmt::text_style {}) {
+					fmt::print(stdout, task.console_style, "{}", task.console_text);
+				} else {
+					std::fwrite(task.console_text.data(), 1, task.console_text.size(), stdout);
+				}
+				std::fflush(stdout);
+			}
+			break;
 		}
 	}
 }
+} // namespace
 
 static void WorkerLoop(WriterState* state) {
 	while (true) {
@@ -223,9 +217,9 @@ static void WorkerLoop(WriterState* state) {
 	}
 }
 
-} // namespace
+} // namespace Common
 
-void AsyncWriter::SetQueueConfig(const QueueConfig& config) {
+void Common::AsyncWriter::SetQueueConfig(const QueueConfig& config) {
 	std::lock_guard init_lock(g_init_mutex);
 	if (g_writer != nullptr) {
 		return; // Cannot change config after initialization
@@ -234,7 +228,7 @@ void AsyncWriter::SetQueueConfig(const QueueConfig& config) {
 	s_config_set   = true;
 }
 
-void AsyncWriter::SetRetryPolicy(const RetryPolicy& policy) {
+void Common::AsyncWriter::SetRetryPolicy(const RetryPolicy& policy) {
 	std::lock_guard init_lock(g_init_mutex);
 	if (g_writer != nullptr) {
 		return; // Cannot change policy after initialization
@@ -242,7 +236,7 @@ void AsyncWriter::SetRetryPolicy(const RetryPolicy& policy) {
 	s_retry_policy = policy;
 }
 
-void AsyncWriter::Initialize() {
+void Common::AsyncWriter::Initialize() {
 	std::lock_guard init_lock(g_init_mutex);
 	if (g_writer != nullptr) {
 		return;
@@ -256,7 +250,7 @@ void AsyncWriter::Initialize() {
 	g_writer             = state;
 }
 
-void AsyncWriter::Shutdown() {
+void Common::AsyncWriter::Shutdown() {
 	WriterState* state = nullptr;
 	{
 		std::lock_guard init_lock(g_init_mutex);
@@ -287,8 +281,8 @@ void AsyncWriter::Shutdown() {
 	delete state;
 }
 
-void AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path, std::vector<uint8_t> data,
-                                   bool append) {
+void Common::AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path,
+                                           std::vector<uint8_t> data, bool append) {
 	if (g_writer == nullptr) {
 		Initialize();
 	}
@@ -330,15 +324,15 @@ void AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path, std::vecto
 	}
 }
 
-void AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path, std::string_view text,
-                                   bool append) {
+void Common::AsyncWriter::EnqueueFileWrite(const std::filesystem::path& path, std::string_view text,
+                                           bool append) {
 	std::vector<uint8_t> bytes(text.begin(), text.end());
 	EnqueueFileWrite(path, std::move(bytes), append);
 }
 
-void AsyncWriter::EnqueueDualOutput(const std::filesystem::path& file_path, std::string_view text,
-                                    const std::string& console_text, fmt::text_style style,
-                                    bool bypass_queue_limit) {
+void Common::AsyncWriter::EnqueueDualOutput(const std::filesystem::path& file_path,
+                                            std::string_view text, const std::string& console_text,
+                                            fmt::text_style style, bool bypass_queue_limit) {
 	if (g_writer == nullptr) {
 		Initialize();
 	}
@@ -387,7 +381,7 @@ void AsyncWriter::EnqueueDualOutput(const std::filesystem::path& file_path, std:
 	}
 }
 
-void AsyncWriter::EnqueueTask(std::function<void()> task) {
+void Common::AsyncWriter::EnqueueTask(std::function<void()> task) {
 	if (g_writer == nullptr) {
 		Initialize();
 	}
@@ -411,7 +405,7 @@ void AsyncWriter::EnqueueTask(std::function<void()> task) {
 	}
 }
 
-void AsyncWriter::Flush() {
+void Common::AsyncWriter::Flush() {
 	auto* state = g_writer;
 	if (state == nullptr) {
 		return;
@@ -423,7 +417,7 @@ void AsyncWriter::Flush() {
 	});
 }
 
-void AsyncWriter::EmergencyFlush() noexcept {
+void Common::AsyncWriter::EmergencyFlush() noexcept {
 	auto* state = g_writer;
 	if (state == nullptr) {
 		std::fflush(nullptr);
@@ -459,7 +453,7 @@ void AsyncWriter::EmergencyFlush() noexcept {
 	std::fflush(nullptr);
 }
 
-size_t AsyncWriter::GetPendingCount() {
+size_t Common::AsyncWriter::GetPendingCount() {
 	auto* state = g_writer;
 	if (state == nullptr) {
 		return 0;
@@ -468,12 +462,10 @@ size_t AsyncWriter::GetPendingCount() {
 	return state->queue.size() + (state->is_working.load(std::memory_order_acquire) ? 1 : 0);
 }
 
-size_t AsyncWriter::GetDroppedCount() {
+size_t Common::AsyncWriter::GetDroppedCount() {
 	auto* state = g_writer;
 	if (state == nullptr) {
 		return 0;
 	}
 	return state->dropped_count.load(std::memory_order_relaxed);
-}
-
 } // namespace Common
