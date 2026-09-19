@@ -296,6 +296,7 @@ public:
 	// True when the surface currently has a zero-sized drawable area (minimized /
 	// iconified window, or the platform is reporting {0,0} for other reasons).
 	// While true, no Vulkan swapchain handle, images, or semaphores exist.
+	// True while the surface has no drawable area (minimized/zero-sized).
 	[[nodiscard]] bool IsMinimized() const noexcept { return m_minimized; }
 
 private:
@@ -316,6 +317,9 @@ private:
 };
 
 struct Presenter::Impl {
+	// Initializes the swapchain and frame pool. If the window starts already
+	// minimized, the swapchain has no images yet, so the frame pool falls
+	// back to a small fixed size instead of using swapchain.ImageCount() (0).
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
@@ -375,6 +379,10 @@ struct Presenter::Impl {
 	std::atomic<uint64_t> presented_overlay_revision {0};
 };
 
+// Creates the Vulkan swapchain for the current surface size, or, if the
+// window has no drawable area right now (minimized/zero-sized on any
+// signal — explicit flag, screen dimensions, or Vulkan's own extent),
+// marks the swapchain as minimized and returns without touching Vulkan.
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);

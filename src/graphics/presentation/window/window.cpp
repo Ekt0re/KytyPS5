@@ -387,6 +387,8 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
+// Updates the tracked window size, or, for a non-positive size, ignores the
+// request and marks the window as minimized instead of aborting.
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 	// A 0-sized resize is not a bug to abort on: some window managers deliver
 	// SDL_WINDOWEVENT_RESIZED/SIZE_CHANGED with {0,0} while a window is being
