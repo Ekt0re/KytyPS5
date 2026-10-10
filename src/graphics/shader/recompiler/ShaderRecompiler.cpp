@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <fmt/format.h>
 #include <functional>
 #include <map>
@@ -224,7 +225,7 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 	const bool                             track_vector_lanes = std::none_of(
 	    decoded.instructions.begin(), decoded.instructions.end(), [](const auto& inst) {
 		    return Decoder::IsDirectBranch(inst.opcode) ||
-			       inst.opcode == Decoder::Opcode::S_SETPC_B64;
+		           inst.opcode == Decoder::Opcode::S_SETPC_B64;
 	    });
 
 	if (attrib_reg >= 0 && attrib_reg < static_cast<int>(sgprs.size())) {
@@ -254,12 +255,12 @@ DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInp
 		const bool index_offset_add =
 		    (vertex_index_accumulator || instance_index_accumulator) && IsDecodedSgpr(inst.src0) &&
 		    ((inst.opcode == Decoder::Opcode::V_ADD_I32 && IsDecodedVgpr(inst.src1) &&
-			  inst.src1.reg == inst.dst.reg) ||
-			 (user_data_base == 8 &&
-			  (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
-			  inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
-			  inst.src2.reg == inst.dst.reg &&
-			  TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
+		      inst.src1.reg == inst.dst.reg) ||
+		     (user_data_base == 8 &&
+		      (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
+		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
+		      inst.src2.reg == inst.dst.reg &&
+		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
 		if (data.loads.empty() && index_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
 			if (reg >= user_data_base && reg - user_data_base < user_data_count) {
@@ -473,10 +474,44 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
-const ShaderSource::Call* FindCall(const ShaderSource& s, uint32_t instruction) {
-	for (const auto& c: s.calls)
-		if (c.instruction == instruction) return &c;
-	return nullptr;
+// ---- Helpers for S_SWAPPC_B64 diagnostics ----
+
+// Returns a human-readable name for a Decoder::Opcode via magic_enum.
+// This covers every opcode automatically without a manual switch.
+static std::string SwappcOpcodeStr(Decoder::Opcode op) {
+	auto name = magic_enum::enum_name(op);
+	if (!name.empty()) return std::string(name);
+	return "opcode_" + std::to_string(static_cast<int>(op));
+}
+
+// Returns a human-readable string for a decoded Operand (kind + value).
+static std::string DumpOperand(const Decoder::Operand& op) {
+	switch (op.kind) {
+		case Decoder::OperandKind::Sgpr: return "s" + std::to_string(op.reg);
+		case Decoder::OperandKind::Vgpr: return "v" + std::to_string(op.reg);
+		case Decoder::OperandKind::VccLo: return "vcc_lo";
+		case Decoder::OperandKind::VccHi: return "vcc_hi";
+		case Decoder::OperandKind::ExecLo: return "exec_lo";
+		case Decoder::OperandKind::ExecHi: return "exec_hi";
+		case Decoder::OperandKind::Scc: return "scc";
+		case Decoder::OperandKind::M0: return "m0";
+		case Decoder::OperandKind::Null: return "null";
+		case Decoder::OperandKind::VccZ: return "vccz";
+		case Decoder::OperandKind::ExecZ: return "execz";
+		case Decoder::OperandKind::SharedBase: return "shared_base";
+		case Decoder::OperandKind::PrivateBase: return "private_base";
+		case Decoder::OperandKind::PopsExitingWaveId: return "pops_exiting";
+		case Decoder::OperandKind::LiteralConstant:
+			return "lit:0x" + [&] {
+				char b[16];
+				std::snprintf(b, sizeof(b), "%08x", op.value);
+				return std::string(b);
+			}();
+		case Decoder::OperandKind::IntegerInlineConstant:
+			return "imm:" + std::to_string(op.signed_val);
+		case Decoder::OperandKind::FloatInlineConstant: return "fimm:" + std::to_string(op.value);
+		default: return "?";
+	}
 }
 
 void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
@@ -486,27 +521,62 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
 		EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
 		source.calls.push_back(ShaderSource::Call {.instruction = i});
-		printf("S_SWAPPC_B64 @%u (stage=%d, total so far=%zu)\n", i, (int)options.stage,
-		       source.calls.size());
+		if (options.diag_swappc) {
+			printf("S_SWAPPC_B64 @%u (stage=%d, total so far=%zu)\n", i, (int)options.stage,
+			       source.calls.size());
+		}
 	}
 	if (source.calls.empty()) return;
 	EXIT_IF(options.input_info.compute == nullptr);
 	const auto graph = CFG::BuildGraph(source.decoded);
 
-	// --- DIAGNOSTICA: dump dei blocchi del CFG ---
-	printf("CFG: %zu blocks, entry=%u\n", graph.blocks.size(), (unsigned)graph.entry_block);
-	for (const auto& b: graph.blocks) {
-		printf("  block id=%u [%u,%u) preds=", (unsigned)b.id, b.inst_begin, b.inst_end);
-		for (auto p: b.predecessors) printf(" %u", (unsigned)p);
-		printf("\n");
+	// --- DIAGNOSTIC: CFG block dump ---
+	if (options.diag_swappc) {
+		printf("CFG: %zu blocks, entry=%u\n", graph.blocks.size(), (unsigned)graph.entry_block);
+		for (const auto& b: graph.blocks) {
+			printf("  block id=%u [%u,%u) preds=", (unsigned)b.id, b.inst_begin, b.inst_end);
+			for (auto p: b.predecessors)
+				printf(" %u", (unsigned)p);
+			printf("\n");
+		}
 	}
+
+	// DumpInst: prints a single decoded instruction with opcode name and full operands.
+	// For immediates (LiteralConstant / InlineConstant), the actual value is shown.
 	auto DumpInst = [&](uint32_t k) {
-		const auto& x = source.decoded.instructions[k];
-		printf("   %5u: opcode=%d dst=(kind=%d,reg=%u) src0=(kind=%d,reg=%u) src1=(kind=%d,reg=%u)\n",
-		       k, (int)x.opcode, (int)x.dst.kind, (unsigned)x.dst.reg, (int)x.src0.kind,
-		       (unsigned)x.src0.reg, (int)x.src1.kind, (unsigned)x.src1.reg);
+		const auto& x        = source.decoded.instructions[k];
+		const auto  op_name  = SwappcOpcodeStr(x.opcode);
+		const auto  dst_str  = DumpOperand(x.dst);
+		const auto  src0_str = DumpOperand(x.src0);
+		const auto  src1_str = DumpOperand(x.src1);
+		printf("   %5u: %-30s  dst=%-12s  src0=%-12s  src1=%s\n", k, op_name.c_str(),
+		       dst_str.c_str(), src0_str.c_str(), src1_str.c_str());
+
+		// Print special operand details for certain opcodes
+		if (x.opcode == Decoder::Opcode::S_BUFFER_LOAD_DWORD ||
+		    x.opcode == Decoder::Opcode::S_BUFFER_LOAD_DWORDX2 ||
+		    x.opcode == Decoder::Opcode::S_BUFFER_LOAD_DWORDX4 ||
+		    x.opcode == Decoder::Opcode::S_BUFFER_LOAD_DWORDX8 ||
+		    x.opcode == Decoder::Opcode::S_BUFFER_LOAD_DWORDX16) {
+			printf("         S_BUFFER_LOAD src1: kind=%d reg=%u", static_cast<int>(x.src1.kind),
+			       x.src1.reg);
+			if (x.src1.kind == Decoder::OperandKind::LiteralConstant) {
+				printf(" lit=0x%08x", x.src1.value);
+			} else if (x.src1.kind == Decoder::OperandKind::IntegerInlineConstant) {
+				printf(" imm=%d", x.src1.signed_val);
+			}
+			printf("\n");
+		} else if (x.opcode == Decoder::Opcode::S_LSHL_B32) {
+			printf("         S_LSHL_B32: ");
+			if (x.src1.kind == Decoder::OperandKind::LiteralConstant) {
+				printf("shift imm=0x%08x / %u\n", x.src1.value, x.src1.value);
+			} else if (x.src1.kind == Decoder::OperandKind::IntegerInlineConstant) {
+				printf("shift imm=%d\n", x.src1.signed_val);
+			} else {
+				printf("shift src1 kind=%d reg=%u\n", (int)x.src1.kind, x.src1.reg);
+			}
+		}
 	};
-	// --- fine diagnostica ---
 
 	Program query;
 	query.stage           = options.stage;
@@ -588,10 +658,10 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	};
 
 	Register = [&](uint32_t before, uint32_t code) -> Value {
-		const auto index = CFG::FindScalarDefinition(
-		    source.decoded, graph, before, code, [&](uint32_t i) {
+		const auto index =
+		    CFG::FindScalarDefinition(source.decoded, graph, before, code, [&](uint32_t i) {
 			    const auto& p = EnsureProducer(i);
-			    EXIT_NOT_IMPLEMENTED(!p.ready);  // circular dependency
+			    EXIT_NOT_IMPLEMENTED(!p.ready); // circular dependency
 			    return p.values.contains(code);
 		    });
 		if (index == UINT32_MAX) {
@@ -603,57 +673,457 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		EXIT_IF(!producer.ready || !producer.values.contains(code));
 		return producer.values.at(code).Resolve();
 	};
+
+	// Summary table accumulated across all calls.
+	struct CallSummary {
+		uint32_t    instr_idx;
+		uint32_t    dst_reg;
+		uint32_t    src_reg;
+		uint32_t    wave_size;
+		bool        valid_lo;
+		bool        valid_hi;
+		const char* classification;
+	};
+	std::vector<CallSummary> call_summaries;
+	bool                     all_valid = true;
+
 	for (auto& c: source.calls) {
 		const auto& call = source.decoded.instructions[c.instruction];
 
-		// --- DIAGNOSTICA: contesto della call ---
-		printf("=== CALL @%u: dst=(kind=%d,reg=%u) src0=(kind=%d,reg=%u) wave_size=%u\n",
-		       c.instruction, (int)call.dst.kind, (unsigned)call.dst.reg, (int)call.src0.kind,
-		       (unsigned)call.src0.reg, (unsigned)options.wave_size);
-		for (uint32_t k = (c.instruction >= 12 ? c.instruction - 12 : 0); k <= c.instruction; ++k)
-			DumpInst(k);
-		// --- fine diagnostica ---
+		// --- DIAGNOSTIC: call context header ---
+		if (options.diag_swappc) {
+			printf("=== CALL @%u: dst=(kind=%d,reg=%u) src0=(kind=%d,reg=%u) wave_size=%u\n",
+			       c.instruction, (int)call.dst.kind, (unsigned)call.dst.reg, (int)call.src0.kind,
+			       (unsigned)call.src0.reg, (unsigned)options.wave_size);
+			// Print 14 instructions before the call (inclusive of the call itself)
+			const uint32_t ctx_start = (c.instruction >= 14u ? c.instruction - 14u : 0u);
+			for (uint32_t k = ctx_start; k <= c.instruction; ++k)
+				DumpInst(k);
+		}
 
 		EXIT_NOT_IMPLEMENTED(call.src0.kind != Decoder::OperandKind::Sgpr ||
 		                     call.dst.kind != Decoder::OperandKind::Sgpr || call.src0.reg >= 105u ||
 		                     call.dst.reg >= 105u);
 
-		std::function<void(Value, int)> DumpValue = [&](Value v, int depth) {
-			v = v.Resolve();
-			auto* inst = v.TryInstruction();
-			if (inst == nullptr) {
-				printf("%*s(const/other)\n", depth * 2, "");
+		// DumpValue: recursive IR tree dump up to depth 12.
+		// Safe version: only prints opcode and arguments, never queries the value directly.
+		auto PrintLeaf = [](const IR::Value& v) {
+			if (auto* i = v.TryInstruction()) {
+				printf("<inst %d>", static_cast<int>(i->GetOpcode()));
 				return;
 			}
-			printf("%*sop=%s(%d) nargs=%zu\n", depth * 2, "",
-			       IR::ValueOpcodeName(inst->GetOpcode()).data(), (int)inst->GetOpcode(),
-			       inst->NumArgs());
-			if (depth < 8) {
+			switch (v.GetType()) {
+				case IR::Type::U32: printf("U32(0x%08x)", v.U32()); break;
+				case IR::Type::U64: printf("U64(0x%016" PRIx64 ")", v.U64()); break;
+				case IR::Type::U1: printf("U1(%d)", static_cast<int>(v.U1())); break;
+				case IR::Type::U8: printf("U8(0x%02x)", v.U8()); break;
+				case IR::Type::U16: printf("U16(0x%04x)", v.U16()); break;
+				case IR::Type::ScalarReg:
+					printf("s%u", static_cast<uint32_t>(IR::RegIndex(v.ScalarRegister())));
+					break;
+				case IR::Type::VectorReg:
+					printf("v%u", static_cast<uint32_t>(IR::RegIndex(v.VectorRegister())));
+					break;
+				default: printf("<type %d>", static_cast<int>(v.GetType())); break;
+			}
+		};
+
+		std::function<void(Value, int)> DumpValue = [&](Value v, int depth) {
+			v          = v.Resolve();
+			auto* inst = v.TryInstruction();
+			if (inst == nullptr) {
+				printf("%*s", depth * 2, "");
+				PrintLeaf(v);
+				printf("\n");
+				return;
+			}
+			// For GetUserData, show which scalar register it reads from Arg(0).
+			if (inst->GetOpcode() == ValueOpcode::GetUserData && inst->NumArgs() == 1) {
+				const auto sr = inst->Arg(0).Resolve();
+				printf("%*sGetUserData(", depth * 2, "");
+				PrintLeaf(sr);
+				printf(")\n");
+				return;
+			}
+			// For GetVectorRegister, show the register from Arg(0).
+			if (inst->GetOpcode() == ValueOpcode::GetVectorRegister && inst->NumArgs() == 1) {
+				const auto sr = inst->Arg(0).Resolve();
+				printf("%*sGetVectorRegister(", depth * 2, "");
+				PrintLeaf(sr);
+				printf(")\n");
+				return;
+			}
+			// For memory ops, print the MemoryFlags index.
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer ||
+			    op == ValueOpcode::LoadBufferU32) {
+				const auto mflags = inst->Flags<MemoryFlags>();
+				printf("%*s%s nargs=%zu mem_idx=%u mem_pc=0x%x", depth * 2, "",
+				       IR::ValueOpcodeName(op).data(), inst->NumArgs(), mflags.index, mflags.pc);
+				if (inst->NumArgs() > 0) {
+					printf(" args[0]=");
+					PrintLeaf(inst->Arg(0).Resolve());
+				}
+				if (inst->NumArgs() > 1) {
+					printf(" args[1]=");
+					PrintLeaf(inst->Arg(1).Resolve());
+				}
+				printf("\n");
+			} else if (op == ValueOpcode::BitwiseAnd32 && inst->NumArgs() == 2) {
+				printf("%*sBitwiseAnd32(", depth * 2, "");
+				PrintLeaf(inst->Arg(0).Resolve());
+				printf(", ");
+				PrintLeaf(inst->Arg(1).Resolve());
+				printf(")\n");
+			} else if (op == ValueOpcode::ShiftLeftLogical32 && inst->NumArgs() == 2) {
+				printf("%*sShiftLeftLogical32(", depth * 2, "");
+				PrintLeaf(inst->Arg(0).Resolve());
+				printf(", ");
+				PrintLeaf(inst->Arg(1).Resolve());
+				printf(")\n");
+			} else {
+				printf("%*s%s nargs=%zu", depth * 2, "", IR::ValueOpcodeName(op).data(),
+				       inst->NumArgs());
+				for (size_t i = 0; i < inst->NumArgs(); ++i) {
+					printf(" args[%zu]=", i);
+					PrintLeaf(inst->Arg(i).Resolve());
+				}
+				printf("\n");
+			}
+			if (depth < 12) {
 				for (size_t i = 0; i < inst->NumArgs(); ++i) {
 					DumpValue(inst->Arg(i), depth + 1);
 				}
 			}
 		};
 
+		// Print the full CFG block that contains this call, and its immediate successors.
+		if (options.diag_swappc) {
+			const CFG::BasicBlock* call_block = nullptr;
+			for (const auto& b: graph.blocks) {
+				if (c.instruction >= b.inst_begin && c.instruction < b.inst_end) {
+					call_block = &b;
+					break;
+				}
+			}
+			if (call_block != nullptr) {
+				printf("  CFG block id=%u [%u,%u) containing call @%u:\n", call_block->id,
+				       call_block->inst_begin, call_block->inst_end, c.instruction);
+				for (uint32_t k = call_block->inst_begin; k < call_block->inst_end; ++k)
+					DumpInst(k);
+				printf("  Successors of block %u:", call_block->id);
+				for (auto s: call_block->successors) {
+					printf(" %u", s);
+					const auto* sb = graph.FindBlock(s);
+					if (sb != nullptr) {
+						printf("([%u,%u))", sb->inst_begin, sb->inst_end);
+					}
+				}
+				printf("\n");
+
+				// Print back-edge target block if any
+				for (const auto& be: graph.back_edges) {
+					if (be.to == call_block->id) {
+						const auto* back_block = graph.FindBlock(be.from);
+						if (back_block != nullptr) {
+							printf("  Back-edge from block %u [%u,%u):\n", back_block->id,
+							       back_block->inst_begin, back_block->inst_end);
+							for (uint32_t k = back_block->inst_begin; k < back_block->inst_end; ++k)
+								DumpInst(k);
+						}
+					}
+				}
+			} else {
+				printf("  call @%u not found in any CFG block\n", c.instruction);
+			}
+
+			// If options.user_data is non-empty, print its contents.
+			// user_data[i] holds the runtime value of s(user_data_base + i).
+			if (!options.user_data.empty()) {
+				printf("  user_data[0..%zu) = ", options.user_data.size());
+				for (size_t ud = 0; ud < options.user_data.size(); ++ud)
+					printf("%s0x%08x", ud ? " " : "", options.user_data[ud]);
+				printf("\n");
+			}
+		}
+
+		// Classify based on IR opcode of the resolved src0 value.
+		// We peek at the lo-half before committing to targets.
+		const char* classification = "ALTRO";
+		bool        valid_lo       = false;
+		bool        valid_hi       = false;
+		bool        call_ok        = true;
+
 		for (uint32_t i = 0; i < 2u; ++i) {
 			const auto value = Register(c.instruction, call.src0.reg + i);
-			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
-				printf("TARGET NOT VALID: call@%u reg=s%u\n", c.instruction, call.src0.reg + i);
-				DumpValue(value, 0);
+			const bool valid = ValidateRuntimeValue(query, value, RuntimeValueType::Integer);
+			if (i == 0)
+				valid_lo = valid;
+			else
+				valid_hi = valid;
+
+			// --- DIAGNOSTIC: ValidateRuntimeValue result per half ---
+			if (options.diag_swappc) {
+				printf("  ValidateRuntimeValue(s%u)=%s\n", call.src0.reg + i,
+				       valid ? "true" : "false");
+				printf("  IR tree for s%u:\n", call.src0.reg + i);
+				DumpValue(value, 2);
 			}
-			EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+
+			// Derive classification from the lo-half IR tree root opcode.
+			if (i == 0) {
+				const auto  resolved = value.Resolve();
+				const auto* top      = resolved.TryInstruction();
+				if (top == nullptr) {
+					// Immediate / constant folded value.
+					classification = "COSTANTE";
+				} else {
+					const auto top_op = top->GetOpcode();
+					if (top_op == ValueOpcode::GetUserData) {
+						classification = "SRT-ONLY";
+					} else if (top_op == ValueOpcode::ReadConstBuffer ||
+					           top_op == ValueOpcode::LoadAddressU32 ||
+					           top_op == ValueOpcode::ReadConst ||
+					           top_op == ValueOpcode::LoadBufferU32) {
+						classification = "TABELLA-INDICIZZATA";
+					} else {
+						classification = "ALTRO";
+					}
+				}
+			}
+
+			if (!valid) {
+				// Do NOT exit here: continue collecting diagnostics for all calls.
+				if (options.diag_swappc) {
+					printf("  TARGET NOT VALID: call@%u reg=s%u – skipping target assignment\n",
+					       c.instruction, call.src0.reg + i);
+				}
+				call_ok   = false;
+				all_valid = false;
+				continue; // Skip target assignment for this half.
+			}
 			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 			root.SetArg(0, value);
 			c.target[i] = Value(&root);
 		}
+
+		// If the lo-half holds a table pointer and user_data is available, attempt to
+		// evaluate the V# descriptor address from user_data at compile time (host read).
+		// This is pure diagnostics: no side effects, no functional change.
+		if (options.diag_swappc && !options.user_data.empty()) {
+			const auto lo_val = Register(c.instruction, call.src0.reg);
+			// Walk the lo-half IR to find a GetUserData leaf and use it as the SRT base.
+			std::function<const IR::Inst*(const IR::Value&)> FindUserData =
+			    [&](const IR::Value& v) -> const IR::Inst* {
+				const auto  rv = v.Resolve();
+				const auto* ip = rv.TryInstruction();
+				if (ip == nullptr) return nullptr;
+				if (ip->GetOpcode() == ValueOpcode::GetUserData) return ip;
+				for (size_t a = 0; a < ip->NumArgs(); ++a) {
+					const auto* found = FindUserData(ip->Arg(a));
+					if (found != nullptr) return found;
+				}
+				return nullptr;
+			};
+			const auto* ud_inst = FindUserData(lo_val);
+			if (ud_inst != nullptr && ud_inst->NumArgs() == 1 &&
+			    ud_inst->Arg(0).Resolve().GetType() == IR::Type::ScalarReg) {
+				const auto ud_abs =
+				    static_cast<uint32_t>(IR::RegIndex(ud_inst->Arg(0).Resolve().ScalarRegister()));
+				if (ud_abs >= query.user_data_base &&
+				    ud_abs - query.user_data_base + 1 < options.user_data.size()) {
+					const auto     ud_rel = ud_abs - query.user_data_base;
+					const uint64_t base_addr =
+					    static_cast<uint64_t>(options.user_data[ud_rel]) |
+					    (static_cast<uint64_t>(options.user_data[ud_rel + 1]) << 32u);
+					printf("  SRT base from s%u:s%u = 0x%016" PRIx64 "\n", ud_abs, ud_abs + 1,
+					       base_addr);
+					// Attempt direct host read of a 16-byte V# descriptor at base_addr.
+					// The emulator maps guest memory directly so a bare pointer cast is valid
+					// if base_addr is within the mapped VA window (same approach as
+					// SrtReadCapture).
+					if (base_addr >= 0x1000ull && base_addr <= 0x0000ffffffffffffull) {
+						uint32_t desc[4]  = {};
+						bool     readable = false;
+						try {
+							std::memcpy(desc, reinterpret_cast<const void*>(base_addr), 16);
+							readable = true;
+						} catch (...) {
+							// Memory not readable at compile time - will be readable in
+							// RefreshShaderSource
+						}
+						if (readable) {
+							const uint64_t buf_base =
+							    (static_cast<uint64_t>(desc[1] & 0x0000ffffu) << 32u) | desc[0];
+							const uint32_t stride      = (desc[1] >> 16u) & 0x3fffu; // in dwords
+							const uint32_t num_records = desc[2];
+							const uint32_t flags       = desc[3];
+							printf("  V# at 0x%016" PRIx64 ": base=0x%012" PRIx64
+							       " stride=%u dwords num_records=%u flags=0x%08x\n",
+							       base_addr, buf_base, stride, num_records, flags);
+							const uint32_t n_entries =
+							    num_records; // num_records is already the count
+							printf("  N_entries=%u\n", n_entries);
+							// Print first min(n_entries, 16) entry pointers.
+							const uint32_t to_print = std::min(n_entries, 16u);
+							for (uint32_t e = 0; e < to_print; ++e) {
+								const uint64_t entry_addr =
+								    buf_base + (static_cast<uint64_t>(e) * stride *
+								                4u); // stride in dwords, *4 for bytes
+								if ((entry_addr < 0x1000ull) ||
+								    (entry_addr > 0x0000ffffffffffffull)) {
+									break;
+								}
+								uint32_t entry[4] = {};
+								bool     entry_ok = false;
+								try {
+									std::memcpy(entry, reinterpret_cast<const void*>(entry_addr),
+									            16);
+									entry_ok = true;
+								} catch (...) {
+								}
+								if (!entry_ok) {
+									printf("  entry[%u]: unreadable\n", e);
+									break;
+								}
+								const uint64_t ptr =
+								    (static_cast<uint64_t>(entry[1] & 0x0000ffffu) << 32u) |
+								    entry[0];
+								printf("  entry[%u]: addr=0x%012" PRIx64
+								       " dw0=0x%08x dw1=0x%08x dw2=0x%08x dw3=0x%08x\n",
+								       e, ptr, entry[0], entry[1], entry[2], entry[3]);
+
+								// Try to read first 8 instructions from this address
+								if (ptr >= 0x1000ull && ptr <= 0x0000ffffffffffffull) {
+									printf("  entry[%u]: instructions:", e);
+									for (uint32_t inst_idx = 0; inst_idx < 8u; ++inst_idx) {
+										const uint64_t inst_addr =
+										    ptr + (static_cast<uint64_t>(inst_idx) * 4u);
+										if ((inst_addr < 0x1000ull) ||
+										    (inst_addr > 0x0000ffffffffffffull)) {
+											break;
+										}
+										uint32_t inst_word = 0;
+										bool     inst_ok   = false;
+										try {
+											std::memcpy(&inst_word,
+											            reinterpret_cast<const void*>(inst_addr),
+											            4);
+											inst_ok = true;
+										} catch (...) {
+											// Instruction not readable
+										}
+										if (!inst_ok) {
+											printf(" [unreadable]");
+											break;
+										}
+										const auto family =
+										    Decoder::GetInstructionFamily(inst_word);
+										if (family == Decoder::Family::SOP1 ||
+										    family == Decoder::Family::SOP2 ||
+										    family == Decoder::Family::SOPC ||
+										    family == Decoder::Family::SOPK ||
+										    family == Decoder::Family::SOPP) {
+											std::array<uint32_t, 2> words = {inst_word, 0};
+											Decoder::Instruction    inst;
+											Decoder::DecodeInstruction(std::span(words), 0, inst);
+											const auto op_name = SwappcOpcodeStr(inst.opcode);
+											printf(" %s", op_name.c_str());
+											if (inst.word_count == 2u) {
+												// Read second word
+												const uint64_t inst_addr2 =
+												    ptr +
+												    (static_cast<uint64_t>(inst_idx + 1u) * 4u);
+												if ((inst_addr2 < 0x1000ull) ||
+												    (inst_addr2 > 0x0000ffffffffffffull)) {
+													break;
+												}
+												try {
+													std::memcpy(
+													    &words.at(1),
+													    reinterpret_cast<const void*>(inst_addr2),
+													    4);
+													++inst_idx;
+												} catch (...) {
+													break;
+												}
+											}
+										} else {
+											printf(" [unknown fam=%d]", static_cast<int>(family));
+											break;
+										}
+									}
+									printf("\n");
+								}
+							}
+						} else {
+							printf("  V# at 0x%016" PRIx64
+							       ": host read failed in PrepareCallTarget\n",
+							       base_addr);
+							printf("  Note: V# becomes readable in RefreshShaderSource via "
+							       "SrtReadCapture\n");
+						}
+					}
+				}
+			}
+
+			// Extract shift and offset register from IR tree
+			std::function<void(const IR::Value&, uint32_t*, uint32_t*)> find_shift_and_offset =
+			    [&](const IR::Value& v, uint32_t* shift, uint32_t* offset_reg) {
+				    const auto  resolved = v.Resolve();
+				    const auto* inst     = resolved.TryInstruction();
+				    if (inst == nullptr) return;
+				    if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+				        inst->NumArgs() == 2) {
+					    const auto arg1 = inst->Arg(1).Resolve();
+					    if (arg1.GetType() == IR::Type::U32) {
+						    *shift = arg1.U32();
+					    }
+				    }
+				    for (size_t i = 0; i < inst->NumArgs(); ++i) {
+					    const auto arg = inst->Arg(i).Resolve();
+					    if (arg.GetType() == IR::Type::ScalarReg) {
+						    *offset_reg = IR::RegIndex(arg.ScalarRegister());
+					    }
+					    find_shift_and_offset(inst->Arg(i), shift, offset_reg);
+				    }
+			    };
+			uint32_t shift      = UINT32_MAX;
+			uint32_t offset_reg = UINT32_MAX;
+			find_shift_and_offset(lo_val, &shift, &offset_reg);
+			if (shift != UINT32_MAX || offset_reg != UINT32_MAX) {
+				printf("  Shift=%u OffsetReg=%s\n", shift,
+				       offset_reg != UINT32_MAX ? std::to_string(offset_reg).c_str() : "N/A");
+				if (c.instruction == 646 && offset_reg != 106u) { // 106 = vcc_lo
+					printf("  WARNING: @646 offset is not vcc_lo - this call is static!\n");
+				}
+			}
+		}
+
+		if (options.diag_swappc) {
+			printf("  Classification: %s  call_ok=%s\n", classification, call_ok ? "yes" : "NO");
+		}
+		call_summaries.push_back({c.instruction, call.dst.reg, call.src0.reg, options.wave_size,
+		                          valid_lo, valid_hi, classification});
 	}
+
+	// Check if all calls were valid - stop before any further processing if not
+	if (!all_valid) {
+		if (options.diag_swappc) {
+			printf("PrepareCallTarget: almeno un target non risolvibile staticamente\n");
+		}
+		EXIT_NOT_IMPLEMENTED(true);
+	}
+
 	RewriteToSsa(query.blocks);
 	ConstantPropagationPass(query.blocks, query.wave_size);
 	RemoveIdentities(query.blocks);
 	EliminateDeadCode(query.blocks);
 	for (auto& c: source.calls)
-		for (auto& value: c.target)
+		for (auto& value: c.target) {
+			EXIT_IF(value.IsEmpty());
 			value = value.Instruction()->Arg(0).Resolve();
+		}
 	query.value_storage.clear();
 	for (auto& inst: block) {
 		inst.SetParent(nullptr);
@@ -663,6 +1133,19 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	}
 	query.value_storage.splice(query.value_storage.end(), block.Instructions());
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
+
+	// --- DIAGNOSTIC: summary table of all SWAPPC calls ---
+	if (options.diag_swappc) {
+		printf("\n=== S_SWAPPC_B64 CALL SUMMARY ===\n");
+		printf("%-8s %-8s %-8s %-9s %-9s %-9s %-22s\n", "PC_idx", "dst_reg", "src_reg", "wave_size",
+		       "valid_lo", "valid_hi", "classification");
+		for (const auto& s: call_summaries) {
+			printf("%-8u %-8u %-8u %-9u %-9s %-9s %-22s\n", s.instr_idx, s.dst_reg, s.src_reg,
+			       s.wave_size, s.valid_lo ? "true" : "false", s.valid_hi ? "true" : "false",
+			       s.classification);
+		}
+		printf("=================================\n\n");
+	}
 }
 
 } // namespace
@@ -977,7 +1460,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			if (op == IR::ValueOpcode::GetBufferResource) {
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
 					    return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-						       IR::ResourceKind::IndirectBuffer;
+					           IR::ResourceKind::IndirectBuffer;
 				    })) {
 					continue;
 				}
