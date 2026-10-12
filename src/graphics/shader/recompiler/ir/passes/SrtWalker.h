@@ -49,6 +49,9 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// Compiles SRT reads into a more efficient form for evaluation.
+void CompileSrtWalker(ResourcePlan& program);
+
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
