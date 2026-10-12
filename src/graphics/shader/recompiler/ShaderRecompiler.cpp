@@ -2,6 +2,10 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -1052,13 +1056,16 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 					if (base_addr >= 0x1000ull && base_addr <= 0x0000ffffffffffffull) {
 						uint32_t desc[4]  = {};
 						bool     readable = false;
-						try {
+#ifdef _WIN32
+						if (!IsBadReadPtr(reinterpret_cast<const void*>(base_addr), 16)) {
 							std::memcpy(desc, reinterpret_cast<const void*>(base_addr), 16);
 							readable = true;
-						} catch (...) {
-							// Memory not readable at compile time - will be readable in
-							// RefreshShaderSource
 						}
+#else
+						// On Linux, we assume valid addresses are readable for diagnostic purposes
+						std::memcpy(desc, reinterpret_cast<const void*>(base_addr), 16);
+						readable = true;
+#endif
 						if (readable) {
 							const uint64_t buf_base =
 							    (static_cast<uint64_t>(desc[1] & 0x0000ffffu) << 32u) | desc[0];
@@ -1080,12 +1087,16 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 								}
 								uint32_t entry[4] = {};
 								bool     entry_ok = false;
-								try {
+#ifdef _WIN32
+								if (!IsBadReadPtr(reinterpret_cast<const void*>(entry_addr), 16)) {
 									std::memcpy(entry, reinterpret_cast<const void*>(entry_addr),
 									            16);
 									entry_ok = true;
-								} catch (...) {
 								}
+#else
+								std::memcpy(entry, reinterpret_cast<const void*>(entry_addr), 16);
+								entry_ok = true;
+#endif
 								if (!entry_ok) {
 									printf("  entry[%u]: unreadable\n", e);
 									break;
@@ -1101,16 +1112,25 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 									printf(" entry[%u] code @0x%012" PRIx64 ":", e, ptr);
 									for (uint32_t w = 0; w < 64u; ++w) {
 										uint32_t word = 0;
-										try {
+#ifdef _WIN32
+										if (!IsBadReadPtr(
+										        reinterpret_cast<const void*>(ptr + w * 4ull), 4)) {
 											std::memcpy(
 											    &word,
 											    reinterpret_cast<const void*>(ptr + w * 4ull), 4);
-										} catch (...) {
+											if (w % 8 == 0) printf("\n +%03x:", w * 4);
+											printf(" %08x", word);
+										} else {
 											printf(" [unreadable]");
 											break;
 										}
+#else
+										std::memcpy(&word,
+										            reinterpret_cast<const void*>(ptr + w * 4ull),
+										            4);
 										if (w % 8 == 0) printf("\n +%03x:", w * 4);
 										printf(" %08x", word);
+#endif
 									}
 									printf("\n");
 								}
