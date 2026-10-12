@@ -46,11 +46,25 @@ struct ShaderSource {
 	struct Call {
 		uint32_t                 instruction;
 		std::array<IR::Value, 2> target;
+		// “Call from table”: the target depends on a uniform selector (ReadFirstLane) that is
+		// unknown to the CPU. Empty selector = static call.
+		IR::Value selector;                   // the ReadFirstLane statement (free variable)
+		IR::Value selector_offset;            // offset of S_BUFFER_LOAD, function of the selector
+		uint32_t  selector_sgpr = UINT32_MAX; // cod scalar that contain selector_offset form call
 	};
 	struct Linked {
-		std::vector<uint32_t> code;
-		Decoder::Program      decoded;
-		std::vector<uint32_t> observed_function;
+		struct Function {
+			uint64_t              address = 0;
+			std::vector<uint32_t> observed; // window [0, extent) read from guest memory
+		};
+		struct Entry {
+			uint32_t offset   = 0; // The value of `selector_offset` that selects this callee
+			uint32_t function = 0; // index in `functions`
+		};
+		std::vector<uint32_t>           code;
+		Decoder::Program                decoded;
+		std::vector<Function>           functions;
+		std::vector<std::vector<Entry>> entries; // for call (order of source.calls)
 	};
 	std::vector<uint32_t>                      code;
 	Decoder::Program                           decoded;
