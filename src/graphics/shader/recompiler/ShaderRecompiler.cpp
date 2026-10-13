@@ -510,7 +510,10 @@ bool FindTableLoad(const Decoder::Program& program, const CFG::Graph& graph, uin
 	if (block == graph.blocks.end()) return false;
 	uint32_t code = reg;
 	for (uint32_t i = call_index; i > block->inst_begin;) {
-		const auto& inst = program.instructions[--i];
+		const uint32_t inst_index = --i;
+		// Bounds check for instructions array access
+		if (inst_index >= program.instructions.size()) return false;
+		const auto& inst = program.instructions[inst_index];
 		if (!CFG::MayWriteScalarRegister(inst, code)) continue;
 		uint32_t dst = 0;
 		if (inst.opcode == Decoder::Opcode::S_MOV_B32 && TableScalarCode(inst.dst, dst) &&
@@ -532,6 +535,8 @@ bool FindTableLoad(const Decoder::Program& program, const CFG::Graph& graph, uin
 bool SelectorUnchanged(const Decoder::Program& program, uint32_t load_index, uint32_t call_index,
                        uint32_t code) {
 	for (uint32_t i = load_index + 1u; i < call_index; ++i) {
+		// Bounds check for instructions array access
+		if (i >= program.instructions.size()) return false;
 		if (CFG::MayWriteScalarRegister(program.instructions[i], code)) return false;
 	}
 	return true;
@@ -625,6 +630,8 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	SwappcDiag diag(options.diag_swappc);
 	source.calls.clear();
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
+		// Bounds check is implicit in the loop condition, but explicit check for safety
+		if (i >= source.decoded.instructions.size()) break;
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
 		source.calls.push_back(ShaderSource::Call {.instruction = i});
 		diag("S_SWAPPC_B64 @%u (stage=%d, total so far=%zu)\n", i, (int)options.stage,
@@ -662,6 +669,11 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	// DumpInst: prints a single decoded instruction with opcode name and full operands.
 	// For immediates (LiteralConstant / InlineConstant), the actual value is shown.
 	auto DumpInst = [&](uint32_t k) {
+		// Bounds check for instructions array access
+		if (k >= source.decoded.instructions.size()) {
+			diag("   %5u: <out of bounds>\n", k);
+			return;
+		}
 		const auto& x        = source.decoded.instructions[k];
 		const auto  op_name  = SwappcOpcodeStr(x.opcode);
 		const auto  dst_str  = DumpOperand(x.dst);
@@ -738,6 +750,11 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 		auto [entry, inserted] = producers.try_emplace(index);
 		auto& producer         = entry->second;
 		if (inserted) {
+			// Bounds check for instructions array access
+			if (index >= source.decoded.instructions.size()) {
+				EXIT("instruction index %u out of bounds (size=%zu)", index,
+				     source.decoded.instructions.size());
+			}
 			EXIT_NOT_IMPLEMENTED(source.decoded.instructions[index].opcode ==
 			                     Decoder::Opcode::S_SWAPPC_B64);
 			Block                translated;
@@ -844,7 +861,9 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			    FindTableLoad(source.decoded, graph, c.instruction, call.src0.reg, load_lo) &&
 			    FindTableLoad(source.decoded, graph, c.instruction, call.src0.reg + 1u, load_hi) &&
 			    load_lo == load_hi &&
-			    TableScalarCode(source.decoded.instructions[load_lo].src1, sel) &&
+			    // Bounds check for load_lo before accessing instructions
+			    (load_lo < source.decoded.instructions.size() &&
+			     TableScalarCode(source.decoded.instructions[load_lo].src1, sel)) &&
 			    SelectorUnchanged(source.decoded, load_lo, c.instruction, sel) &&
 			    ValidateRuntimeValue(query, lo, RuntimeValueType::Integer, found[0]) &&
 			    ValidateRuntimeValue(query, hi, RuntimeValueType::Integer, found[0])) {
@@ -963,8 +982,11 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			if (call_block != nullptr) {
 				diag("  CFG block id=%u [%u,%u) containing call @%u:\n", call_block->id,
 				     call_block->inst_begin, call_block->inst_end, c.instruction);
-				for (uint32_t k = call_block->inst_begin; k < call_block->inst_end; ++k)
+				for (uint32_t k = call_block->inst_begin; k < call_block->inst_end; ++k) {
+					// Bounds check is implicit in loop range, but explicit check for safety
+					if (k >= source.decoded.instructions.size()) break;
 					DumpInst(k);
+				}
 				diag("  Successors of block %u:", call_block->id);
 				for (auto s: call_block->successors) {
 					diag(" %u", s);
@@ -982,8 +1004,12 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 						if (back_block != nullptr) {
 							diag("  Back-edge from block %u [%u,%u):\n", back_block->id,
 							     back_block->inst_begin, back_block->inst_end);
-							for (uint32_t k = back_block->inst_begin; k < back_block->inst_end; ++k)
+							for (uint32_t k = back_block->inst_begin; k < back_block->inst_end;
+							     ++k) {
+								// Bounds check for instructions array access
+								if (k >= source.decoded.instructions.size()) break;
 								DumpInst(k);
+							}
 						}
 					}
 				}
@@ -1025,6 +1051,48 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 				DumpValue(value, 2);
 			}
 
+			// Guard stub: check for sentinel values in the register value
+			const auto resolved = value.Resolve();
+			if (resolved.IsImmediate()) {
+				uint64_t imm_value = 0;
+				switch (resolved.GetType()) {
+					case IR::Type::U32: imm_value = resolved.U32(); break;
+					case IR::Type::U64: imm_value = resolved.U64(); break;
+					default: break;
+				}
+				// Check for NULL pointer
+				if (imm_value == 0x0000000000000000ull) {
+					if (options.diag_swappc) {
+						diag("  GUARD: NULL pointer detected in s%u - will use guard stub\n",
+						     call.src0.reg + i);
+					}
+					call_ok = false;
+					break;
+				}
+				// Check for AGC placeholder addresses (0x0020XXXXXXXX)
+				if ((imm_value & 0xFFFF000000000000ull) == 0x0020000000000000ull) {
+					if (options.diag_swappc) {
+						diag("  GUARD: AGC placeholder address detected in s%u (0x%016" PRIx64
+						     ") - will use guard stub\n",
+						     call.src0.reg + i, imm_value);
+					}
+					call_ok = false;
+					break;
+				}
+				// Check for sentinel values (32-bit sentinel in low/high halves)
+				uint32_t sentinel_check = static_cast<uint32_t>(imm_value);
+				if (sentinel_check == 0xFFFFFFFF || sentinel_check == 0xBAADF00D ||
+				    sentinel_check == 0xCDCDCDCD || sentinel_check == 0xDEADBEEF) {
+					if (options.diag_swappc) {
+						diag("  GUARD: Sentinel value detected in s%u (0x%08x) - will use guard "
+						     "stub\n",
+						     call.src0.reg + i, sentinel_check);
+					}
+					call_ok = false;
+					break;
+				}
+			}
+
 			// Derive classification from the lo-half IR tree root opcode.
 			if (i == 0) {
 				const auto  resolved = value.Resolve();
@@ -1062,6 +1130,30 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			c.target[i] = Value(&root);
 		}
 
+		// Guard stub handling: if the call is invalid due to sentinel values or NULL,
+		// replace with a NO-OP or fallback to interpreter
+		if (!call_ok) {
+			if (options.diag_swappc) {
+				diag("  GUARD STUB: call@%u invalid - using guard stub (NO-OP)\n", c.instruction);
+			}
+			// Mark the call as needing guard stub treatment
+			c.guard_stub = true;
+			// Set targets to invalid/placeholder values that will be caught later
+			c.target[0] = IR::Value {};
+			c.target[1] = IR::Value {};
+			all_valid   = false;
+			call_summaries.push_back({
+			    .instr_idx      = c.instruction,
+			    .dst_reg        = call.dst.reg,
+			    .src_reg        = call.src0.reg,
+			    .wave_size      = options.wave_size,
+			    .valid_lo       = false,
+			    .valid_hi       = false,
+			    .classification = "GUARD_STUB",
+			});
+			continue;
+		}
+
 		// If the lo-half holds a table pointer and user_data is available, attempt to
 		// evaluate the V# descriptor address from user_data at compile time (host read).
 		// This is pure diagnostics: no side effects, no functional change.
@@ -1085,9 +1177,17 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			    ud_inst->Arg(0).Resolve().GetType() == IR::Type::ScalarReg) {
 				const auto ud_abs =
 				    static_cast<uint32_t>(IR::RegIndex(ud_inst->Arg(0).Resolve().ScalarRegister()));
-				if (ud_abs >= query.user_data_base &&
-				    ud_abs - query.user_data_base + 1 < options.user_data.size()) {
-					const auto     ud_rel = ud_abs - query.user_data_base;
+				if (ud_abs >= query.user_data_base) {
+					const auto ud_rel = ud_abs - query.user_data_base;
+					// Explicit bounds check for user_data span access
+					if (ud_rel >= options.user_data.size() ||
+					    ud_rel + 1 >= options.user_data.size()) {
+						if (options.diag_swappc) {
+							diag("  user_data bounds check failed: ud_rel=%zu size=%zu\n", ud_rel,
+							     options.user_data.size());
+						}
+						continue;
+					}
 					const uint64_t base_addr =
 					    static_cast<uint64_t>(options.user_data[ud_rel]) |
 					    (static_cast<uint64_t>(options.user_data[ud_rel + 1]) << 32u);
@@ -1468,9 +1568,12 @@ bool LinkedStillValid(const ShaderSource::Linked&                linked,
 	if (linked.entries.size() != candidates.size()) return false;
 	std::vector<uint32_t> scratch;
 	for (size_t call = 0; call < candidates.size(); ++call) {
+		if (call >= linked.entries.size()) return false;
 		const auto& entries = linked.entries[call];
 		if (entries.size() != candidates[call].size()) return false;
 		for (size_t j = 0; j < entries.size(); ++j) {
+			// Bounds check for functions array access
+			if (entries[j].function >= linked.functions.size()) return false;
 			const auto& fn = linked.functions[entries[j].function];
 			if (entries[j].offset != candidates[call][j].offset ||
 			    fn.address != candidates[call][j].address)
@@ -1542,6 +1645,11 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		std::map<uint64_t, std::pair<uint32_t, uint32_t>>
 		                                           by_address; // address -> (entry_pc, function)
 		std::vector<std::pair<uint32_t, uint32_t>> cases;      // (offset, entry_pc)
+		// Bounds check for entries array access
+		if (call_idx >= linked.entries.size()) {
+			EXIT("call_idx %zu out of bounds for entries.size() %zu", call_idx,
+			     linked.entries.size());
+		}
 		for (const auto& cand: candidates[call_idx]) {
 			uint32_t entry_pc = 0, function_index = 0;
 			if (const auto it = by_address.find(cand.address); it != by_address.end()) {
@@ -1726,8 +1834,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			uint32_t   first = 0;
 			if (op == IR::ValueOpcode::GetBufferResource) {
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					    return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-					           IR::ResourceKind::IndirectBuffer;
+					    const auto mem_index = use.user->Flags<IR::MemoryFlags>().index;
+					    if (mem_index >= ir.memory_info.size()) return false;
+					    return ir.memory_info[mem_index].kind == IR::ResourceKind::IndirectBuffer;
 				    })) {
 					continue;
 				}

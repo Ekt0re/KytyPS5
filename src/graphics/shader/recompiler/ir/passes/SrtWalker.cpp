@@ -4,8 +4,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <xbyak/xbyak.h>
-
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -13,6 +11,7 @@
 #include <map>
 #include <unordered_map>
 #include <unordered_set>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -57,6 +56,11 @@ namespace {
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
+	// Check for sentinel values in base address
+	if (base == 0x0000000000000000ull ||                           // NULL pointer
+	    (base & 0xFFFF000000000000ull) == 0x0020000000000000ull) { // AGC placeholder
+		return false;
+	}
 	if (base > AddressMask) {
 		return false;
 	}
@@ -370,33 +374,39 @@ private:
 void CompileSrtWalker(ResourcePlan& program) {
 	if (!program.resource_tracking_complete || !program.srt_plan_complete ||
 	    program.capture_specialization_reads || !program.control_flow.empty() ||
-	    program.srt_reads.empty()) return;
+	    program.srt_reads.empty())
+		return;
 
 	using Reads = std::map<int32_t, const SrtRead*>;
-	std::map<uint32_t, Reads> roots;
-	std::unordered_map<const Inst*, Reads> pointer_uses;
+	std::map<uint32_t, Reads>                roots;
+	std::unordered_map<const Inst*, Reads>   pointer_uses;
 	std::unordered_map<const Inst*, int32_t> offsets;
 	for (const auto& read: program.srt_reads) {
 		const auto* inst = read.value.Resolve().TryInstruction();
 		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::LoadAddressU32 ||
 		    inst->NumArgs() < 2 || !IsRawRead(program, *inst) ||
-		    read.flat_offset >= program.srt_reads.size()) return;
+		    read.flat_offset >= program.srt_reads.size())
+			return;
 		const auto offset = inst->Arg(1).Resolve();
 		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
-		const auto& memory = program.memory_info[inst->Flags<SrtReadFlags>().index];
-		const auto relative =
+		const auto mem_index = inst->Flags<SrtReadFlags>().index;
+		if (mem_index >= program.memory_info.size()) return;
+		const auto& memory = program.memory_info[mem_index];
+		const auto  relative =
 		    (static_cast<int64_t>(static_cast<int32_t>(memory.offset)) & ~int64_t {3}) +
 		    static_cast<int64_t>(offset.U32() & ~3u);
 		if (relative < INT32_MIN || relative > INT32_MAX ||
-		    !offsets.emplace(inst, static_cast<int32_t>(relative)).second) return;
+		    !offsets.emplace(inst, static_cast<int32_t>(relative)).second)
+			return;
 	}
 	uint32_t user_data_count = 0;
 	for (const auto& read: program.srt_reads) {
-		const auto* inst = read.value.ResolveInstruction();
+		const auto* inst   = read.value.ResolveInstruction();
 		const auto* handle = inst->Arg(0).Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
-		    handle->NumArgs() != 2) return;
-		const auto* low = handle->Arg(0).Resolve().TryInstruction();
+		    handle->NumArgs() != 2)
+			return;
+		const auto* low  = handle->Arg(0).Resolve().TryInstruction();
 		const auto* high = handle->Arg(1).Resolve().TryInstruction();
 		if (low == nullptr || high == nullptr) return;
 		Reads* uses = nullptr;
@@ -405,28 +415,30 @@ void CompileSrtWalker(ResourcePlan& program) {
 		    high->NumArgs() == 1 && low->Arg(0).GetType() == Type::ScalarReg &&
 		    high->Arg(0).GetType() == Type::ScalarReg) {
 			const auto reg = RegIndex(low->Arg(0).ScalarRegister());
-			if (reg < program.user_data_base ||
-			    RegIndex(high->Arg(0).ScalarRegister()) != reg + 1u) return;
+			if (reg < program.user_data_base || RegIndex(high->Arg(0).ScalarRegister()) != reg + 1u)
+				return;
 			const auto base = reg - program.user_data_base;
 			user_data_count = std::max(user_data_count, base + 2u);
-			uses = &roots[base];
+			uses            = &roots[base];
 		} else {
 			const auto lo = offsets.find(low);
 			const auto hi = offsets.find(high);
 			if (lo == offsets.end() || hi == offsets.end() ||
 			    static_cast<int64_t>(lo->second) + 4 != hi->second ||
-			    !EquivalentValue(program, low->Arg(0), high->Arg(0))) return;
+			    !EquivalentValue(program, low->Arg(0), high->Arg(0)))
+				return;
 			uses = &pointer_uses[low];
 		}
 		if (!uses->emplace(offsets.at(inst), &read).second) return;
 	}
 	std::unordered_set<const Inst*> visited;
-	const auto reachable = [&](auto&& self, const Reads& reads) -> bool {
+	const auto                      reachable = [&](auto&& self, const Reads& reads) -> bool {
 		for (const auto& [offset, read]: reads) {
-			const auto* inst = read->value.ResolveInstruction();
-			const auto child = pointer_uses.find(inst);
+			const auto* inst  = read->value.ResolveInstruction();
+			const auto  child = pointer_uses.find(inst);
 			if (child != pointer_uses.end() &&
-			    (!visited.insert(inst).second || !self(self, child->second))) return false;
+			    (!visited.insert(inst).second || !self(self, child->second)))
+				return false;
 		}
 		return true;
 	};
@@ -435,8 +447,8 @@ void CompileSrtWalker(ResourcePlan& program) {
 	}
 	if (visited.size() != pointer_uses.size()) return;
 
-	program.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
-	auto& code = *program.srt_code;
+	program.srt_code  = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
+	auto&        code = *program.srt_code;
 	Xbyak::Label failed, finished;
 	code.push(code.rbp);
 	code.mov(code.rbp, code.rsp);
@@ -450,7 +462,7 @@ void CompileSrtWalker(ResourcePlan& program) {
 		code.mov(code.rdi, code.qword[code.rdi + pointer_offset]);
 		code.and_(code.rdi, code.r9);
 		const auto first = reads.begin()->first;
-		const auto last = reads.rbegin()->first;
+		const auto last  = reads.rbegin()->first;
 		if (first < 0) {
 			code.mov(code.r10, -static_cast<int64_t>(first));
 			code.cmp(code.rdi, code.r10);
@@ -462,8 +474,9 @@ void CompileSrtWalker(ResourcePlan& program) {
 			code.ja(failed, Xbyak::CodeGenerator::T_NEAR);
 		}
 		for (const auto& [offset, read]: reads) {
-			const auto index = read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
-			using Entry = ResourcePlan::EvaluationContext::Entry;
+			const auto index =
+			    read->value.ResolveInstruction()->EvaluationIndex(program.evaluation_value_count);
+			using Entry     = ResourcePlan::EvaluationContext::Entry;
 			const auto slot = code.rdx + index * sizeof(Entry);
 			code.mov(code.r10d, code.dword[code.rdi + offset]);
 			code.mov(code.dword[code.rsi + read->flat_offset * sizeof(uint32_t)], code.r10d);
@@ -717,7 +730,14 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
 				return false;
 			}
-			result = m_runtime.user_data[reg - m_program.user_data_base];
+			const auto ud_value = m_runtime.user_data[reg - m_program.user_data_base];
+			// Check for sentinel values in user_data reads
+			if (ud_value == 0xFFFFFFFF || ud_value == 0xBAADF00D || ud_value == 0xCDCDCDCD ||
+			    ud_value == 0xDEADBEEF) {
+				// Return false to indicate invalid value - caller should handle gracefully
+				return false;
+			}
+			result = ud_value;
 			return true;
 		}
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
@@ -1094,10 +1114,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		flat.resize(m_program.srt_reads.size());
 		m_program.active_sources.clear();
 		m_context.values.resize(m_program.evaluation_value_count);
-		using Walker = bool KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*,
-		    ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
+		using Walker = bool KYTY_SYSV_ABI (*)(
+		    const uint32_t*, uint32_t*, ResourcePlan::EvaluationContext::Entry*, uint64_t, size_t);
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
-		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
+		                                             m_context.values.data(), m_context.generation,
+		                                             m_runtime.user_data.size());
 	}
 	const auto refresh = [&](uint32_t slot) {
 		if (slot >= m_program.srt_reads.size()) return false;

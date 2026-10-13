@@ -15,10 +15,26 @@
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
-namespace {
 
 using Decoder::Instruction;
 using Decoder::Opcode;
+
+// Sentinel value detection for invalid/uninitialized memory reads
+bool IsSentinelValue(uint32_t value) {
+	return value == 0xFFFFFFFF || // Unmapped memory page read / underflow (-1)
+	       value == 0xBAADF00D || // Debug pattern (Microsoft)
+	       value == 0xCDCDCDCD || // Debug pattern (Microsoft)
+	       value == 0xDEADBEEF;   // Debug pattern (common)
+}
+
+// Check if an address is invalid (NULL or AGC placeholder)
+bool IsInvalidAddress(uint64_t address) {
+	return address == 0x0000000000000000ull || // NULL pointer
+	       (address & 0xFFFF000000000000ull) ==
+	           0x0020000000000000ull; // AGC placeholder (0x0020XXXXXXXX)
+}
+
+namespace {
 
 struct SetpcTargetInfo {
 	uint32_t              target        = 0;
@@ -201,6 +217,10 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 		if (candidate_index + 1u >= before_index) {
 			return false;
 		}
+		// Bounds check for instructions array access
+		if (candidate_index + 1u >= program.instructions.size()) {
+			return false;
+		}
 		const auto&             high       = program.instructions[candidate_index + 1u];
 		const Decoder::Operand* high_other = nullptr;
 		uint32_t                zero       = 0;
@@ -223,6 +243,8 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 			return false;
 		}
 
+		// Bounds check for getpc_index
+		if (getpc_index >= program.instructions.size()) return false;
 		const auto base = InstructionEndPc(program.instructions[getpc_index]);
 		*pc = adds ? base + static_cast<uint32_t>(imm) : base - static_cast<uint32_t>(imm);
 		*pc &= ~3u;
@@ -271,7 +293,11 @@ bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before
 
 	for (uint32_t i = before_index; i > 0; i--) {
 		const uint32_t shift_index = i - 1u;
-		const auto&    shift       = program.instructions[shift_index];
+		// Bounds checking: prevent out-of-range access and handle sentinel values
+		if (shift_index >= program.instructions.size() || shift_index == 0xFFFFFFFF) {
+			return false;
+		}
+		const auto& shift = program.instructions[shift_index];
 		if (!InstructionWritesScalarCode(shift, byte_offset_code)) {
 			continue;
 		}
@@ -316,6 +342,31 @@ void AddUnique(std::vector<uint32_t>& values, uint32_t value) {
 	}
 }
 
+// Check if an instruction loads a scalar register from memory and returns the loaded value if known
+bool IsScalarLoadWithSentinelCheck(const Decoder::Instruction& inst, uint32_t& loaded_value) {
+	loaded_value = 0;
+	switch (inst.opcode) {
+		case Decoder::Opcode::S_LOAD_DWORD:
+		case Decoder::Opcode::S_LOAD_DWORDX2:
+		case Decoder::Opcode::S_LOAD_DWORDX4:
+		case Decoder::Opcode::S_LOAD_DWORDX8:
+		case Decoder::Opcode::S_LOAD_DWORDX16:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORD:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX2:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
+		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16:
+			// If the source is a literal constant, check for sentinel values
+			if (inst.src1.kind == Decoder::OperandKind::LiteralConstant ||
+			    inst.src1.kind == Decoder::OperandKind::IntegerInlineConstant) {
+				loaded_value = inst.src1.value;
+				return true;
+			}
+			return false;
+		default: return false;
+	}
+}
+
 bool ScalarCodeWrittenInRange(const Decoder::Program& program, uint32_t begin_index,
                               uint32_t end_index, uint32_t code) {
 	const auto end =
@@ -341,6 +392,8 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 		return false;
 	}
 
+	// Bounds checks for arithmetic index accesses
+	if (setpc_index < 3u || setpc_index >= program.instructions.size()) return false;
 	const auto& getpc = program.instructions[setpc_index - 3u];
 	const auto& add   = program.instructions[setpc_index - 2u];
 	const auto& addc  = program.instructions[setpc_index - 1u];
@@ -367,6 +420,8 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	                            &load_index)) {
 		return false;
 	}
+	// Bounds check for load_index
+	if (load_index >= program.instructions.size()) return false;
 	const auto& load            = program.instructions[load_index];
 	uint32_t    table_base_code = 0;
 	if (!ScalarOperandCode(load.src0, table_base_code)) {
@@ -401,8 +456,18 @@ bool ResolveSetpcJumpTable(const Decoder::Program& program, uint32_t setpc_index
 	std::vector<uint32_t> selector_values;
 	std::vector<uint32_t> selector_target_pcs;
 	for (uint32_t i = 0; i < entry_count; i++) {
-		const uint32_t low  = program.code[table_word + i * 2u];
-		const uint32_t high = program.code[table_word + i * 2u + 1u];
+		// Bounds checking for table access
+		const size_t low_index  = table_word + i * 2u;
+		const size_t high_index = table_word + i * 2u + 1u;
+		if (low_index >= program.code.size() || high_index >= program.code.size()) {
+			return false;
+		}
+		const uint32_t low  = program.code[low_index];
+		const uint32_t high = program.code[high_index];
+		// Reject sentinel values and invalid entries
+		if (IsSentinelValue(low) || IsSentinelValue(high)) {
+			return false;
+		}
 		if (high != 0u && high != UINT32_MAX) {
 			return false;
 		}
@@ -454,6 +519,8 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	                            &load_index)) {
 		return false;
 	}
+	// Bounds check for load_index
+	if (load_index >= program.instructions.size()) return false;
 	const auto& load = program.instructions[load_index];
 	if (!IsScalarCode(load.src0, pc_reg)) {
 		return false;
@@ -488,7 +555,16 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	std::vector<uint32_t> selector_values;
 	std::vector<uint32_t> selector_target_pcs;
 	for (uint32_t i = 0; i < entry_count; i++) {
-		const uint32_t offset = program.code[table_word + i];
+		// Bounds checking for table access
+		const size_t offset_index = table_word + i;
+		if (offset_index >= program.code.size()) {
+			return false;
+		}
+		const uint32_t offset = program.code[offset_index];
+		// Reject sentinel values
+		if (IsSentinelValue(offset)) {
+			return false;
+		}
 		if (offset > target_base) {
 			return false;
 		}
@@ -523,6 +599,11 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 
 	const auto pc_reg = setpc.src0.reg;
 	if (setpc_index >= 2u) {
+		// Bounds checks for arithmetic index accesses
+		if (setpc_index - 1u >= program.instructions.size() ||
+		    setpc_index - 2u >= program.instructions.size()) {
+			return false;
+		}
 		const auto& arith = program.instructions[setpc_index - 1u];
 		const auto& getpc = program.instructions[setpc_index - 2u];
 		if (getpc.opcode == Opcode::S_GETPC_B64 && getpc.dst.kind == Decoder::OperandKind::Sgpr &&
@@ -1751,6 +1832,17 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 			const auto& inst = program.instructions[--i];
 			if (!MayWriteScalarRegister(inst, code)) {
 				continue;
+			}
+			// Check for sentinel values from failed memory reads
+			uint32_t loaded_value = 0;
+			if (IsScalarLoadWithSentinelCheck(inst, loaded_value) &&
+			    IsSentinelValue(loaded_value)) {
+				// Register contains a sentinel value - reject this as invalid for jump table use
+				if (fsd_trace) {
+					printf("    FSD:   sentinel value detected @%u (0x%08x) - rejecting\n", i,
+					       loaded_value);
+				}
+				return UINT32_MAX;
 			}
 			// --- DIAGNOSTIC: candidate found, check confirm ---
 			const bool confirmed = !confirm || confirm(i);

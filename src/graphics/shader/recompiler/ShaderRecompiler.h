@@ -51,6 +51,7 @@ struct ShaderSource {
 		IR::Value selector;                   // the ReadFirstLane statement (free variable)
 		IR::Value selector_offset;            // offset of S_BUFFER_LOAD, function of the selector
 		uint32_t  selector_sgpr = UINT32_MAX; // cod scalar that contain selector_offset form call
+		bool      guard_stub    = false;      // true if call uses guard stub due to invalid address
 	};
 	struct Linked {
 		struct Function {
