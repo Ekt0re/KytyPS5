@@ -39,6 +39,16 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Helper per accesso sicuro agli std::span
+template <typename T>
+constexpr auto safe_at(std::span<T> s, size_t index,
+                       typename std::span<T>::value_type default_value = {}) {
+	if (index < s.size()) {
+		return s[index];
+	}
+	return default_value;
+}
+
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kSrcAlpha:
@@ -233,9 +243,15 @@ struct PipelineCache::ProgramCache {
 		}
 
 		std::span<const uint32_t> FunctionCode() const {
-			return call_source ? std::span<const uint32_t>(call_source->linked->code)
-			                         .subspan(call_source->code.size())
-			                   : std::span<const uint32_t> {};
+			if (!call_source || !call_source->linked) {
+				return {};
+			}
+			const auto main_code_size   = call_source->code.size();
+			const auto linked_code_size = call_source->linked->code.size();
+			if (main_code_size >= linked_code_size) {
+				return {};
+			}
+			return std::span<const uint32_t>(call_source->linked->code).subspan(main_code_size);
 		}
 
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
@@ -333,7 +349,9 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
-		const auto user_data       = std::span(params.user_data).first(params.user_data_count);
+		const auto safe_count =
+		    std::min<size_t>(params.user_data_count, std::size(params.user_data));
+		const auto user_data       = std::span(params.user_data).first(safe_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;

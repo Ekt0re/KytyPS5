@@ -53,6 +53,16 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 
 namespace {
 
+// Helper per accesso sicuro agli std::span
+template <typename T>
+constexpr auto safe_at(std::span<T> s, size_t index,
+                       typename std::span<T>::value_type default_value = {}) {
+	if (index < s.size()) {
+		return s[index];
+	}
+	return default_value;
+}
+
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
@@ -726,11 +736,12 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
-			if (reg < m_program.user_data_base ||
-			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
+			if (reg < m_program.user_data_base) {
 				return false;
 			}
-			const auto ud_value = m_runtime.user_data[reg - m_program.user_data_base];
+			const auto ud_rel = reg - m_program.user_data_base;
+			// Use safe_at for bounds-checked access
+			const auto ud_value = safe_at(m_runtime.user_data, ud_rel, 0xFFFFFFFFu);
 			// Check for sentinel values in user_data reads
 			if (ud_value == 0xFFFFFFFF || ud_value == 0xBAADF00D || ud_value == 0xCDCDCDCD ||
 			    ud_value == 0xDEADBEEF) {

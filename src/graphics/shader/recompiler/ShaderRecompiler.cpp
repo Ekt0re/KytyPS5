@@ -38,6 +38,16 @@ namespace Libs::Graphics::ShaderRecompiler {
 
 namespace {
 
+// Helper per accesso sicuro agli std::span
+template <typename T>
+constexpr auto safe_at(std::span<T> s, size_t index,
+                       typename std::span<T>::value_type default_value = {}) {
+	if (index < s.size()) {
+		return s[index];
+	}
+	return default_value;
+}
+
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
 }
@@ -1179,18 +1189,11 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 				    static_cast<uint32_t>(IR::RegIndex(ud_inst->Arg(0).Resolve().ScalarRegister()));
 				if (ud_abs >= query.user_data_base) {
 					const auto ud_rel = ud_abs - query.user_data_base;
-					// Explicit bounds check for user_data span access
-					if (ud_rel >= options.user_data.size() ||
-					    ud_rel + 1 >= options.user_data.size()) {
-						if (options.diag_swappc) {
-							diag("  user_data bounds check failed: ud_rel=%zu size=%zu\n", ud_rel,
-							     options.user_data.size());
-						}
-						continue;
-					}
+					// Use safe_at for bounds-checked access
+					const uint32_t lo = safe_at(options.user_data, ud_rel, 0u);
+					const uint32_t hi = safe_at(options.user_data, ud_rel + 1, 0u);
 					const uint64_t base_addr =
-					    static_cast<uint64_t>(options.user_data[ud_rel]) |
-					    (static_cast<uint64_t>(options.user_data[ud_rel + 1]) << 32u);
+					    static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u);
 					diag("  SRT base from s%u:s%u = 0x%016" PRIx64 "\n", ud_abs, ud_abs + 1,
 					     base_addr);
 					// Attempt direct host read of a 16-byte V# descriptor at base_addr.

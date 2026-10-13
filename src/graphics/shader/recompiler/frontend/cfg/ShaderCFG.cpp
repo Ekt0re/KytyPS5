@@ -19,6 +19,16 @@ namespace Libs::Graphics::ShaderRecompiler::CFG {
 using Decoder::Instruction;
 using Decoder::Opcode;
 
+// Helper per accesso sicuro agli std::span
+template <typename T>
+constexpr auto safe_at(std::span<T> s, size_t index,
+                       typename std::span<T>::value_type default_value = {}) {
+	if (index < s.size()) {
+		return s[index];
+	}
+	return default_value;
+}
+
 // Sentinel value detection for invalid/uninitialized memory reads
 bool IsSentinelValue(uint32_t value) {
 	return value == 0xFFFFFFFF || // Unmapped memory page read / underflow (-1)
