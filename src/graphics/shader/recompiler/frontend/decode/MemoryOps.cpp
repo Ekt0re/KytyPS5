@@ -42,13 +42,17 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x0eu, Opcode::BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0fu, Opcode::BUFFER_LOAD_DWORDX3, 3, 32},
     {0x18u, Opcode::BUFFER_STORE_BYTE, 1, 8},
+    {0x19u, Opcode::BUFFER_STORE_BYTE_D16_HI, 1, 8},
     {0x1au, Opcode::BUFFER_STORE_SHORT, 1, 16},
+    {0x1bu, Opcode::BUFFER_STORE_SHORT_D16_HI, 1, 16},
     {0x1cu, Opcode::BUFFER_STORE_DWORD, 1, 32},
     {0x1du, Opcode::BUFFER_STORE_DWORDX2, 2, 32},
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
+    {0x20u, Opcode::BUFFER_LOAD_UBYTE_D16, 1, 8},
     {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
     {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
+    {0x27u, Opcode::BUFFER_STORE_FORMAT_D16_HI_X, 1, 16, false, false, true},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
     {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
@@ -66,7 +70,9 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
     {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true},
     {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
+    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -116,7 +122,8 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x3fu, Opcode::DS_ORDERED_COUNT, 1, 32},
     {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
-    {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
+    {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x68u, Opcode::DS_MAX_RTN_U64, 2, 32},
+    {0x70u, Opcode::DS_CMPST_RTN_B64, 2, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
     {0xa0u, Opcode::DS_WRITE_B8_D16_HI, 1, 8},
     {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
@@ -192,6 +199,8 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_MIN_RTN_U32:
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
+		case Opcode::DS_MAX_RTN_U64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
@@ -211,6 +220,7 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
 		case Opcode::DS_WRITE2ST64_B64:
+		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_MSKOR_B32: return 3u;
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
@@ -300,10 +310,20 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
+	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_XYZW ||
+	    inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_XYZW) {
+		inst.data_components = 4u;
+	}
 	if (inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_X ||
+	    inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
 		inst.dst.sdwa_sel = inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ? 5u : 4u;
+	} else if (inst.opcode == Opcode::BUFFER_STORE_BYTE_D16_HI) {
+		inst.dst.sdwa_sel = 2u;
+	} else if (inst.opcode == Opcode::BUFFER_STORE_SHORT_D16_HI ||
+	           inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_HI_X) {
+		inst.dst.sdwa_sel = 5u;
 	}
 	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1);

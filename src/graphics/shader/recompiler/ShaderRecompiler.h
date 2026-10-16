@@ -15,14 +15,16 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 struct CompileOptions {
-	ShaderType                stage          = ShaderType::Compute;
-	uint32_t                  wave_size      = 64;
-	uint32_t                  user_data_base = 0;
-	uint64_t                  shader_hash    = 0;
-	bool                      dump_ir        = true;
-	bool                      early_dump     = false;
-	bool                      diag_swappc    = true;
-	const char*               dump_label     = nullptr;
+	ShaderType                stage                = ShaderType::Compute;
+	uint32_t                  wave_size            = 64;
+	uint32_t                  user_data_base       = 0;
+	uint64_t                  shader_hash          = 0;
+	bool                      dump_ir              = true;
+	bool                      early_dump           = false;
+	bool                      emit_debug_info      = false;
+	bool                      maintenance8_enabled = false;
+	bool                      diag_swappc          = true;
+	const char*               dump_label           = nullptr;
 	std::span<const uint32_t> user_data;
 	std::span<const uint32_t> back_code;
 	ShaderStageInputInfo      input_info;

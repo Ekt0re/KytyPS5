@@ -15,6 +15,7 @@
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QLayout>
 #include <QLineEdit>
 #include <QListView>
@@ -273,12 +274,15 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	    info.gpu_index >= 0 && info.gpu_index < m_ui->comboBox_gpu->count() - 1 ? info.gpu_index + 1
 	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
+	m_ui->checkBox_hdr->setChecked(info.hdr_enabled);
 	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_sync_raw_image_buffers->setChecked(info.sync_raw_image_buffers);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->checkBox_skip_notice_screen->setChecked(info.skip_notice_screen);
+	m_ui->checkBox_network_connected->setChecked(info.network_connected);
 	m_ui->checkBox_trophy_notifications->setChecked(info.trophy_enabled);
+	m_ui->spinBox_trophy_duration->setValue(info.trophy_duration_seconds);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -344,6 +348,28 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	button_layout->addStretch(1);
 	group_layout->addLayout(button_layout);
 
+	group_layout->addWidget(new QLabel(tr("Add-ons folder"), m_game_dirs_group));
+	auto* addons_layout = new QHBoxLayout;
+	addons_layout->setContentsMargins(0, 0, 0, 0);
+	addons_layout->setSpacing(4);
+	m_addons_dir_edit = new QLineEdit(m_game_dirs_group);
+	m_addons_dir_edit->setPlaceholderText(tr("Folder containing extracted add-on (DLC) packages"));
+	addons_layout->addWidget(m_addons_dir_edit, 1);
+	auto* addons_button = new QToolButton(m_game_dirs_group);
+	addons_button->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
+	addons_button->setToolTip(tr("Select add-ons folder"));
+	addons_button->setAutoRaise(true);
+	addons_layout->addWidget(addons_button);
+	group_layout->addLayout(addons_layout);
+	connect(addons_button, &QToolButton::clicked, this, [this]() {
+		const auto dir = QFileDialog::getExistingDirectory(
+		    this, tr("Select add-ons folder"),
+		    m_addons_dir_edit->text().isEmpty() ? QDir::homePath() : m_addons_dir_edit->text());
+		if (!dir.isEmpty()) {
+			m_addons_dir_edit->setText(QDir::toNativeSeparators(dir));
+		}
+	});
+
 	m_ui->gridLayout->addWidget(m_game_dirs_group, 1, 0, 1, 1);
 	m_game_dirs_group->setVisible(false);
 
@@ -356,9 +382,10 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs, const QString& addons_dir) {
 	m_global_settings = true;
-	auto* menu        = new QMenu(m_ui->settings_button);
+	m_addons_dir_edit->setText(QDir::toNativeSeparators(addons_dir));
+	auto* menu = new QMenu(m_ui->settings_button);
 	menu->addAction(tr("Import..."), this, &ConfigurationEditDialog::ImportGameSettings);
 	menu->addAction(tr("Export..."), this, &ConfigurationEditDialog::ExportGameSettings);
 	m_ui->settings_button->setMenu(menu);
@@ -375,6 +402,10 @@ void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
+}
+
+QString ConfigurationEditDialog::GetAddonsDirectory() const {
+	return m_global_settings ? m_addons_dir_edit->text().trimmed() : QString();
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
@@ -434,12 +465,15 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
+	info.hdr_enabled               = ui.checkBox_hdr->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.sync_raw_image_buffers    = ui.checkBox_sync_raw_image_buffers->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.skip_notice_screen        = ui.checkBox_skip_notice_screen->isChecked();
+	info.network_connected         = ui.checkBox_network_connected->isChecked();
 	info.trophy_enabled            = ui.checkBox_trophy_notifications->isChecked();
+	info.trophy_duration_seconds   = ui.spinBox_trophy_duration->value();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
@@ -463,6 +497,14 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 }
 
 void ConfigurationEditDialog::save() {
+	for (auto* field: {m_ui->lineEdit_shader_log_folder, m_ui->lineEdit_printf_file,
+	                   m_ui->lineEdit_cmd_dump_folder}) {
+		if (field->isEnabled() && field->text().isEmpty()) {
+			m_ui->settings_tabs->setCurrentWidget(m_ui->debug_tab);
+			field->setFocus();
+			break;
+		}
+	}
 	if (MandatoryLineEdit::FindEmpty(this)) {
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
 		return;
