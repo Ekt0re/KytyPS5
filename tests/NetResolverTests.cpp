@@ -120,14 +120,16 @@ void TestLocalhostAndLiteralIp(NetResolverStartNtoaMultipleRecordsFn fn) {
 	CHECK(fn(rid, "localhost", &info, 0, 0, 0) == 0);
 
 	// Test Async lookup (flag 0x00000001)
-	std::memset(&info, 0, sizeof(info));
-	CHECK(fn(rid, "localhost", &info, 0, 0, 0x00000001) == 0);
+	// Use static storage to outlive the detached worker thread
+	static Net::NetResolverInfo async_info;
+	std::memset(&async_info, 0, sizeof(async_info));
+	CHECK(fn(rid, "localhost", &async_info, 0, 0, 0x00000001) == 0);
 	// Wait a moment for background thread
-	for (int i = 0; i < 50 && info.records == 0; ++i) {
+	for (int i = 0; i < 50 && async_info.records == 0; ++i) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
-	CHECK(info.records == 1);
-	CHECK(info.addrs[0].u.addr.inaddr_addr == expected_loopback);
+	CHECK(async_info.records == 1);
+	CHECK(async_info.addrs[0].u.addr.inaddr_addr == expected_loopback);
 
 	CHECK(Net::NetResolverDestroy(rid) == 0);
 	CHECK(Net::NetPoolDestroy(pool) == 0);
@@ -143,17 +145,19 @@ void TestResolveGoogle(NetResolverStartNtoaMultipleRecordsFn fn) {
 	const int rid = Net::NetResolverCreate("test_res_google", pool, 0);
 	CHECK(rid >= 0);
 
-	Net::NetResolverInfo info {};
-	const int            ret = fn(rid, "google.com", &info, 0, 0, 0);
+	// Use static storage to outlive the detached worker thread (if it runs async)
+	static Net::NetResolverInfo google_info;
+	std::memset(&google_info, 0, sizeof(google_info));
+	const int ret = fn(rid, "google.com", &google_info, 0, 0, 0);
 	CHECK(ret == 0);
-	CHECK(info.records > 0);
-	CHECK(info.recordsv4 > 0);
-	CHECK(info.records <= 10);
-	for (uint32_t i = 0; i < info.records; ++i) {
-		CHECK(info.addrs[i].af == 2); // AF_INET
-		CHECK(info.addrs[i].u.addr.inaddr_addr != 0);
+	CHECK(google_info.records > 0);
+	CHECK(google_info.recordsv4 > 0);
+	CHECK(google_info.records <= 10);
+	for (uint32_t i = 0; i < google_info.records; ++i) {
+		CHECK(google_info.addrs[i].af == 2); // AF_INET
+		CHECK(google_info.addrs[i].u.addr.inaddr_addr != 0);
 		char ip_str[32] = {0};
-		Net::NetInetNtop(2, &info.addrs[i].u.addr.inaddr_addr, ip_str, sizeof(ip_str));
+		Net::NetInetNtop(2, &google_info.addrs[i].u.addr.inaddr_addr, ip_str, sizeof(ip_str));
 		std::printf("Resolved google.com record %u: %s\n", i, ip_str);
 	}
 

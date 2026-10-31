@@ -46,6 +46,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -122,7 +123,8 @@ public:
 	bool ResolverAbort(int rid, int flags);
 	int  ResolverBeginLookup(int rid, bool is_async, uint32_t* out_gen);
 	void ResolverEndLookup(int rid, uint32_t gen, int result);
-	bool ResolverCheckValidForDelivery(int rid, uint32_t gen);
+	bool ResolverCheckValidForDelivery(int rid, uint32_t gen, const std::function<void()>& deliver);
+	int  ResolverDeliverResultSync(int rid, uint32_t gen, const std::function<void()>& deliver);
 
 	Id   SslInit(uint64_t pool_size);
 	bool SslTerm(Id ssl_ctx_id);
@@ -256,17 +258,27 @@ private:
 	std::vector<HttpRequest>    m_requests;
 };
 
-static Network* g_net = nullptr;
+static Common::Mutex             g_net_mutex;
+static std::shared_ptr<Network>  g_net;
+
+static std::shared_ptr<Network> GetNetwork() {
+	Common::LockGuard lock(g_net_mutex);
+	return g_net;
+}
 
 void Initialize() {
+	Common::LockGuard lock(g_net_mutex);
 	EXIT_IF(g_net != nullptr);
 
-	g_net = new Network;
+	g_net = std::make_shared<Network>();
 }
 
 void Shutdown() {
-	delete g_net;
-	g_net = nullptr;
+	std::shared_ptr<Network> network;
+	{
+		Common::LockGuard lock(g_net_mutex);
+		network = std::move(g_net);
+	}
 }
 
 int Network::PoolCreate(const char* name, int size) {
@@ -388,11 +400,31 @@ void Network::ResolverEndLookup(int rid, uint32_t gen, int result) {
 	}
 }
 
-bool Network::ResolverCheckValidForDelivery(int rid, uint32_t gen) {
+bool Network::ResolverCheckValidForDelivery(int rid, uint32_t gen, const std::function<void()>& deliver) {
 	Common::LockGuard lock(m_mutex);
 
-	return (rid >= 0 && rid < RESOLVERS_MAX && m_resolvers[rid].used &&
-	        m_resolvers[rid].generation == gen && !m_resolvers[rid].abort_requested);
+	if (rid < 0 || rid >= RESOLVERS_MAX || !m_resolvers[rid].used ||
+	    m_resolvers[rid].generation != gen || m_resolvers[rid].abort_requested) {
+		return false;
+	}
+
+	if (deliver) {
+		deliver();
+	}
+
+	return true;
+}
+
+int Network::ResolverDeliverResultSync(int rid, uint32_t gen, const std::function<void()>& deliver) {
+	Common::LockGuard lock(m_mutex);
+
+	if (rid < 0 || rid >= RESOLVERS_MAX || !m_resolvers[rid].used ||
+	    m_resolvers[rid].generation != gen || m_resolvers[rid].abort_requested) {
+		return NET_ERROR_EINTR;
+	}
+
+	deliver();
+	return OK;
 }
 
 Network::Id Network::SslInit(uint64_t pool_size) {
@@ -1465,12 +1497,13 @@ int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
 	     "\t flags = %d\n",
 	     name, size, flags);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(flags != 0);
 	EXIT_NOT_IMPLEMENTED(size == 0);
 
-	int id = g_net->PoolCreate(name, size);
+	int id = network->PoolCreate(name, size);
 
 	if (id < 0) {
 		return NET_ERROR_ENFILE;
@@ -1482,9 +1515,10 @@ int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags) {
 int KYTY_SYSV_ABI NetPoolDestroy(int memid) {
 	PRINT_NAME();
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->PoolDestroy(memid)) {
+	if (!network->PoolDestroy(memid)) {
 		return NET_ERROR_EBADF;
 	}
 
@@ -1503,9 +1537,10 @@ int KYTY_SYSV_ABI NetResolverCreate(const char* name, int memid, int flags) {
 		return NET_ERROR_EINVAL;
 	}
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	const int id = g_net->ResolverCreate(name, memid);
+	const int id = network->ResolverCreate(name, memid);
 	if (id < 0) {
 		return NET_ERROR_RESOLVER_ENOSPACE;
 	}
@@ -1518,8 +1553,9 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 
 	LOGF("\t rid = %d\n", rid);
 
-	EXIT_IF(g_net == nullptr);
-	if (!g_net->ResolverDestroy(rid)) {
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
+	if (!network->ResolverDestroy(rid)) {
 		return NET_ERROR_EBADF;
 	}
 
@@ -1530,8 +1566,9 @@ int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
 	PRINT_NAME();
 	LOGF("	 rid = %d\n	 flags = 0x%08x\n", rid, flags);
 
-	EXIT_IF(g_net == nullptr);
-	if (!g_net->ResolverAbort(rid, flags)) {
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
+	if (!network->ResolverAbort(rid, flags)) {
 		return NET_ERROR_EBADF;
 	}
 
@@ -1548,8 +1585,9 @@ static int ResolverStartNtoaInternal(int rid, const char* hostname, const Resolv
 	(void)timeout;
 	(void)retry;
 
-	EXIT_IF(g_net == nullptr);
-	if (!g_net->ResolverValid(rid)) {
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
+	if (!network->ResolverValid(rid)) {
 		return NET_ERROR_EBADF;
 	}
 
@@ -1570,7 +1608,7 @@ static int ResolverStartNtoaInternal(int rid, const char* hostname, const Resolv
 	const bool disable_ipaddress = (flags & ORBIS_NET_RESOLVER_START_NTOA_DISABLE_IPADDRESS) != 0;
 
 	uint32_t  generation = 0;
-	const int begin_ret  = g_net->ResolverBeginLookup(rid, is_async, &generation);
+	const int begin_ret  = network->ResolverBeginLookup(rid, is_async, &generation);
 	if (begin_ret != 0) {
 		return begin_ret;
 	}
@@ -1585,7 +1623,10 @@ static int ResolverStartNtoaInternal(int rid, const char* hostname, const Resolv
 			return NET_ERROR_RESOLVER_ENOHOST;
 		}
 
-		if (host.rfind("localhost", 0) == 0) {
+		std::string lowered = host;
+		std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+		               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (lowered == "localhost") {
 			out_addrs.push_back(htonl(0x7f000001));
 			return OK;
 		}
@@ -1674,12 +1715,12 @@ static int ResolverStartNtoaInternal(int rid, const char* hostname, const Resolv
 		if (out.info != nullptr) {
 			std::memset(out.info, 0, sizeof(NetResolverInfo));
 			const uint32_t count = static_cast<uint32_t>(std::min<size_t>(addrs.size(), 10));
-			out.info->records    = count;
-			out.info->recordsv4  = count;
 			for (size_t i = 0; i < count; ++i) {
 				out.info->addrs[i].af                 = 2; // ORBIS_NET_AF_INET
 				out.info->addrs[i].u.addr.inaddr_addr = addrs[i];
 			}
+			out.info->recordsv4 = count;
+			out.info->records   = count;
 		} else if (out.addr != nullptr && !addrs.empty()) {
 			std::memcpy(out.addr, &addrs[0], sizeof(uint32_t));
 		}
@@ -1689,21 +1730,26 @@ static int ResolverStartNtoaInternal(int rid, const char* hostname, const Resolv
 		std::vector<uint32_t> addrs;
 		const int             res = do_lookup(hostname, addrs);
 		if (res == OK) {
-			deliver_result(output, addrs);
+			const int deliver_res = network->ResolverDeliverResultSync(rid, generation, [&] {
+				deliver_result(output, addrs);
+			});
+			network->ResolverEndLookup(rid, generation, deliver_res);
+			return deliver_res;
 		}
-		g_net->ResolverEndLookup(rid, generation, res);
+		network->ResolverEndLookup(rid, generation, res);
 		return res;
 	}
 
 	std::string host_copy = hostname;
-	std::thread([rid, generation, output, host_copy, do_lookup, deliver_result]() {
+	std::thread([network, rid, generation, output, host_copy, do_lookup, deliver_result]() {
 		std::vector<uint32_t> addrs;
 		const int             res = do_lookup(host_copy, addrs);
-		if (g_net != nullptr && g_net->ResolverCheckValidForDelivery(rid, generation)) {
-			if (res == OK) {
-				deliver_result(output, addrs);
-			}
-			g_net->ResolverEndLookup(rid, generation, res);
+		if (network->ResolverCheckValidForDelivery(rid, generation, [&] {
+			    if (res == OK) {
+				    deliver_result(output, addrs);
+			    }
+		    })) {
+			network->ResolverEndLookup(rid, generation, res);
 		}
 	}).detach();
 
@@ -1720,6 +1766,10 @@ int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr
 	     "	 retry    = %d\n"
 	     "	 flags    = 0x%08x\n",
 	     rid, hostname != nullptr ? hostname : "<null>", timeout, retry, flags);
+
+	if ((flags & ~0x00010000) != 0) {
+		return NET_ERROR_EINVAL;
+	}
 
 	return ResolverStartNtoaInternal(rid, hostname, {addr, nullptr}, timeout, retry, flags);
 }
@@ -2933,11 +2983,12 @@ int KYTY_SYSV_ABI SslInit(uint64_t pool_size) {
 
 	LOGF("\t size = %" PRIu64 "\n", pool_size);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(pool_size == 0);
 
-	auto id = g_net->SslInit(pool_size);
+	auto id = network->SslInit(pool_size);
 
 	if (!id.IsValid()) {
 		return SSL_ERROR_OUT_OF_SIZE;
@@ -2949,9 +3000,10 @@ int KYTY_SYSV_ABI SslInit(uint64_t pool_size) {
 int KYTY_SYSV_ABI SslTerm(int ssl_ctx_id) {
 	PRINT_NAME();
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->SslTerm(Network::Id(ssl_ctx_id))) {
+	if (!network->SslTerm(Network::Id(ssl_ctx_id))) {
 		return SSL_ERROR_INVALID_ID;
 	}
 
@@ -2967,9 +3019,10 @@ int KYTY_SYSV_ABI SslGetCaCerts(int ssl_ctx_id, void* ca_certs) {
 		return SSL_ERROR_INVALID_ARG;
 	}
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+	if (!network->SslValid(Network::Id(ssl_ctx_id))) {
 		return SSL_ERROR_INVALID_ID;
 	}
 
@@ -2990,9 +3043,10 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 		return SSL_ERROR_INVALID_ARG;
 	}
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->SslValid(Network::Id(ssl_ctx_id))) {
+	if (!network->SslValid(Network::Id(ssl_ctx_id))) {
 		return SSL_ERROR_INVALID_ID;
 	}
 
@@ -3045,11 +3099,12 @@ int KYTY_SYSV_ABI HttpInit(int memid, int ssl_ctx_id, uint64_t pool_size) {
 	     "\t size       = %" PRIu64 "\n",
 	     memid, ssl_ctx_id, pool_size);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(pool_size == 0);
 
-	auto id = g_net->HttpInit(memid, Network::Id(ssl_ctx_id), pool_size);
+	auto id = network->HttpInit(memid, Network::Id(ssl_ctx_id), pool_size);
 
 	if (!id.IsValid()) {
 		return HTTP_ERROR_OUT_OF_MEMORY;
@@ -3061,9 +3116,10 @@ int KYTY_SYSV_ABI HttpInit(int memid, int ssl_ctx_id, uint64_t pool_size) {
 int KYTY_SYSV_ABI HttpTerm(int http_ctx_id) {
 	PRINT_NAME();
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpTerm(Network::Id(http_ctx_id))) {
+	if (!network->HttpTerm(Network::Id(http_ctx_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3080,10 +3136,11 @@ int KYTY_SYSV_ABI HttpCreateTemplate(int http_ctx_id, const char* user_agent, in
 	     "\t is_auto_proxy_conf = %d\n",
 	     http_ctx_id, user_agent, http_ver, is_auto_proxy_conf);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	auto id = g_net->HttpCreateTemplate(Network::Id(http_ctx_id), user_agent, http_ver,
-	                                    is_auto_proxy_conf != 0);
+	auto id = network->HttpCreateTemplate(Network::Id(http_ctx_id), user_agent, http_ver,
+	                                      is_auto_proxy_conf != 0);
 
 	if (!id.IsValid()) {
 		return HTTP_ERROR_OUT_OF_MEMORY;
@@ -3095,9 +3152,10 @@ int KYTY_SYSV_ABI HttpCreateTemplate(int http_ctx_id, const char* user_agent, in
 int KYTY_SYSV_ABI HttpDeleteTemplate(int tmpl_id) {
 	PRINT_NAME();
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpDeleteTemplate(Network::Id(tmpl_id))) {
+	if (!network->HttpDeleteTemplate(Network::Id(tmpl_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3111,7 +3169,8 @@ int KYTY_SYSV_ABI HttpSetNonblock(int id, int enable) {
 	     "\t enable = %d\n",
 	     id, enable);
 
-	if (!g_net->HttpSetNonblock(Network::Id(id), enable != 0)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetNonblock(Network::Id(id), enable != 0)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3123,7 +3182,8 @@ int KYTY_SYSV_ABI HttpsSetSslCallback(int id, HttpsCallback cbfunc, void* user_a
 
 	LOGF("\t id     = %d\n", id);
 
-	if (!g_net->HttpsSetSslCallback(Network::Id(id), cbfunc, user_arg)) {
+	const auto network = GetNetwork();
+	if (!network->HttpsSetSslCallback(Network::Id(id), cbfunc, user_arg)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3137,7 +3197,8 @@ int KYTY_SYSV_ABI HttpsSetMinSslVersion(int id, uint32_t ssl_version) {
 	     "\t ssl_version = %u\n",
 	     id, ssl_version);
 
-	if (!g_net->HttpsSetMinSslVersion(Network::Id(id), ssl_version)) {
+	const auto network = GetNetwork();
+	if (!network->HttpsSetMinSslVersion(Network::Id(id), ssl_version)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3151,7 +3212,8 @@ int KYTY_SYSV_ABI HttpsDisableOption(int id, uint32_t ssl_flags) {
 	     "\t ssl_flags = %u\n",
 	     id, ssl_flags);
 
-	if (!g_net->HttpsDisableOption(Network::Id(id), ssl_flags)) {
+	const auto network = GetNetwork();
+	if (!network->HttpsDisableOption(Network::Id(id), ssl_flags)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3165,7 +3227,8 @@ int KYTY_SYSV_ABI HttpSetResolveTimeOut(int id, uint32_t usec) {
 	     "\t usec = %u\n",
 	     id, usec);
 
-	if (!g_net->HttpSetResolveTimeOut(Network::Id(id), usec)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetResolveTimeOut(Network::Id(id), usec)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3179,7 +3242,8 @@ int KYTY_SYSV_ABI HttpSetResolveRetry(int id, int32_t retry) {
 	     "\t retry = %d\n",
 	     id, retry);
 
-	if (!g_net->HttpSetResolveRetry(Network::Id(id), retry)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetResolveRetry(Network::Id(id), retry)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3193,7 +3257,8 @@ int KYTY_SYSV_ABI HttpSetConnectTimeOut(int id, uint32_t usec) {
 	     "\t usec = %u\n",
 	     id, usec);
 
-	if (!g_net->HttpSetConnectTimeOut(Network::Id(id), usec)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetConnectTimeOut(Network::Id(id), usec)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3207,7 +3272,8 @@ int KYTY_SYSV_ABI HttpSetSendTimeOut(int id, uint32_t usec) {
 	     "\t usec = %u\n",
 	     id, usec);
 
-	if (!g_net->HttpSetSendTimeOut(Network::Id(id), usec)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetSendTimeOut(Network::Id(id), usec)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3221,7 +3287,8 @@ int KYTY_SYSV_ABI HttpSetRecvTimeOut(int id, uint32_t usec) {
 	     "\t usec = %u\n",
 	     id, usec);
 
-	if (!g_net->HttpSetRecvTimeOut(Network::Id(id), usec)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetRecvTimeOut(Network::Id(id), usec)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3235,7 +3302,8 @@ int KYTY_SYSV_ABI HttpSetAutoRedirect(int id, int enable) {
 	     "\t enable = %d\n",
 	     id, enable);
 
-	if (!g_net->HttpSetAutoRedirect(Network::Id(id), enable)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetAutoRedirect(Network::Id(id), enable)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3249,7 +3317,8 @@ int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable) {
 	     "\t enable = %d\n",
 	     id, enable);
 
-	if (!g_net->HttpSetAuthEnabled(Network::Id(id), enable)) {
+	const auto network = GetNetwork();
+	if (!network->HttpSetAuthEnabled(Network::Id(id), enable)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3257,9 +3326,10 @@ int KYTY_SYSV_ABI HttpSetAuthEnabled(int id, int enable) {
 }
 
 static int HttpCheckBase(int id) {
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	return g_net->HttpValidBase(Network::Id(id)) ? OK : HTTP_ERROR_INVALID_ID;
+	return network->HttpValidBase(Network::Id(id)) ? OK : HTTP_ERROR_INVALID_ID;
 }
 
 int KYTY_SYSV_ABI HttpSetRedirectCallback(int id, void* /*cbfunc*/, void* /*user_arg*/) {
@@ -3303,13 +3373,14 @@ int KYTY_SYSV_ABI HttpSetChunkedTransferEnabled(int id, int is_enabled) {
 	     "\t is_enabled = %d\n",
 	     id, is_enabled);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	if (is_enabled != 0 && is_enabled != 1) {
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	if (!g_net->HttpValidRequest(Network::Id(id))) {
+	if (!network->HttpValidRequest(Network::Id(id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3324,9 +3395,10 @@ int KYTY_SYSV_ABI HttpsLoadCert(int http_ctx_id, int ca_cert_num, const void** /
 	     "\t ca_cert_num = %d\n",
 	     http_ctx_id, ca_cert_num);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+	if (!network->HttpValid(Network::Id(http_ctx_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3338,9 +3410,10 @@ int KYTY_SYSV_ABI HttpsUnloadCert(int http_ctx_id) {
 
 	LOGF("\t http_ctx_id = %d\n", http_ctx_id);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpValid(Network::Id(http_ctx_id))) {
+	if (!network->HttpValid(Network::Id(http_ctx_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3362,9 +3435,10 @@ int KYTY_SYSV_ABI HttpsGetSslError(int request_id, int32_t* err_num, uint32_t* d
 	*err_num = 0;
 	*detail  = 0;
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
+	if (!network->HttpValidRequest(Network::Id(request_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3384,9 +3458,10 @@ int KYTY_SYSV_ABI HttpGetLastErrno(int request_id, int* err_num) {
 
 	*err_num = 0;
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
+	if (!network->HttpValidRequest(Network::Id(request_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3404,7 +3479,8 @@ int KYTY_SYSV_ABI HttpAddRequestHeader(int id, const char* name, const char* val
 
 	EXIT_NOT_IMPLEMENTED(mode != 0 && mode != 1);
 
-	if (!g_net->HttpAddRequestHeader(Network::Id(id), name, value, mode == 1)) {
+	const auto network = GetNetwork();
+	if (!network->HttpAddRequestHeader(Network::Id(id), name, value, mode == 1)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3416,11 +3492,12 @@ int KYTY_SYSV_ABI HttpCreateEpoll(int http_ctx_id, HttpEpollHandle* eh) {
 
 	LOGF("\t http_ctx_id = %d\n", http_ctx_id);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(eh == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValid(Network::Id(http_ctx_id)));
+	EXIT_NOT_IMPLEMENTED(!network->HttpValid(Network::Id(http_ctx_id)));
 
 	*eh = new HttpEpoll;
 
@@ -3434,11 +3511,12 @@ int KYTY_SYSV_ABI HttpDestroyEpoll(int http_ctx_id, HttpEpollHandle eh) {
 
 	LOGF("\t http_ctx_id = %d\n", http_ctx_id);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(eh == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValid(Network::Id(http_ctx_id)));
+	EXIT_NOT_IMPLEMENTED(!network->HttpValid(Network::Id(http_ctx_id)));
 
 	delete eh;
 
@@ -3452,7 +3530,8 @@ int KYTY_SYSV_ABI HttpSetEpoll(int id, HttpEpollHandle eh, void* user_arg) {
 
 	EXIT_NOT_IMPLEMENTED(eh == nullptr);
 
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValidRequest(Network::Id(id)));
+	const auto network = GetNetwork();
+	EXIT_NOT_IMPLEMENTED(!network->HttpValidRequest(Network::Id(id)));
 
 	eh->request_id = Network::Id(id);
 	eh->user_arg   = user_arg;
@@ -3465,7 +3544,8 @@ int KYTY_SYSV_ABI HttpUnsetEpoll(int id) {
 
 	LOGF("\t id = %d\n", id);
 
-	EXIT_NOT_IMPLEMENTED(!g_net->HttpValidRequest(Network::Id(id)));
+	const auto network = GetNetwork();
+	EXIT_NOT_IMPLEMENTED(!network->HttpValidRequest(Network::Id(id)));
 
 	return OK;
 }
@@ -3475,9 +3555,10 @@ int KYTY_SYSV_ABI HttpSendRequest(int request_id, const void* /*post_data*/, siz
 
 	LOGF("\t request_id = %d\n", request_id);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpMarkRequestSent(Network::Id(request_id), HTTP_ERROR_TIMEOUT)) {
+	if (!network->HttpMarkRequestSent(Network::Id(request_id), HTTP_ERROR_TIMEOUT)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3489,9 +3570,10 @@ int KYTY_SYSV_ABI HttpAbortRequest(int request_id) {
 
 	LOGF("\t request_id = %d\n", request_id);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpValidRequest(Network::Id(request_id))) {
+	if (!network->HttpValidRequest(Network::Id(request_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3508,7 +3590,8 @@ int KYTY_SYSV_ABI HttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int max
 	     "\t timeout   = %d\n",
 	     reinterpret_cast<uint64_t>(eh), reinterpret_cast<uint64_t>(nbev), maxevents, timeout);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	if (eh == nullptr || maxevents < 0 || (maxevents > 0 && nbev == nullptr)) {
 		return HTTP_ERROR_INVALID_VALUE;
@@ -3530,11 +3613,12 @@ int KYTY_SYSV_ABI HttpGetStatusCode(int request_id, int* status_code) {
 
 	*status_code = 0;
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	int send_result = HTTP_ERROR_BEFORE_SEND;
-	if (!g_net->HttpGetRequestResponse(Network::Id(request_id), &send_result, status_code, nullptr,
-	                                   nullptr, nullptr)) {
+	if (!network->HttpGetRequestResponse(Network::Id(request_id), &send_result, status_code, nullptr,
+	                                     nullptr, nullptr)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3556,13 +3640,14 @@ int KYTY_SYSV_ABI HttpGetAllResponseHeaders(int request_id, char** header, size_
 	*header      = nullptr;
 	*header_size = 0;
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	int         send_result  = HTTP_ERROR_BEFORE_SEND;
 	const char* headers      = nullptr;
 	size_t      headers_size = 0;
-	if (!g_net->HttpGetRequestResponse(Network::Id(request_id), &send_result, nullptr, &headers,
-	                                   &headers_size, nullptr)) {
+	if (!network->HttpGetRequestResponse(Network::Id(request_id), &send_result, nullptr, &headers,
+	                                     &headers_size, nullptr)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3589,11 +3674,12 @@ int KYTY_SYSV_ABI HttpGetResponseContentLength(int request_id, int* result,
 	*result         = 0;
 	*content_length = 0;
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	int send_result = HTTP_ERROR_BEFORE_SEND;
-	if (!g_net->HttpGetRequestResponse(Network::Id(request_id), &send_result, nullptr, nullptr,
-	                                   nullptr, content_length)) {
+	if (!network->HttpGetRequestResponse(Network::Id(request_id), &send_result, nullptr, nullptr,
+	                                     nullptr, content_length)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3612,14 +3698,15 @@ int KYTY_SYSV_ABI HttpCreateConnection(int tmpl_id, const char* server_name, con
 	     "\t enable_keep_alive = %d\n",
 	     tmpl_id, server_name, scheme, static_cast<unsigned>(port), enable_keep_alive);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	if (server_name == nullptr || scheme == nullptr) {
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	auto id = g_net->HttpCreateConnection(Network::Id(tmpl_id), server_name, scheme, port,
-	                                      enable_keep_alive != 0);
+	auto id = network->HttpCreateConnection(Network::Id(tmpl_id), server_name, scheme, port,
+	                                       enable_keep_alive != 0);
 
 	if (!id.IsValid()) {
 		return HTTP_ERROR_OUT_OF_MEMORY;
@@ -3636,13 +3723,14 @@ int KYTY_SYSV_ABI HttpCreateConnectionWithURL(int tmpl_id, const char* url, int 
 	     "\t enable_keep_alive = %d\n",
 	     tmpl_id, url, enable_keep_alive);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	if (url == nullptr || url[0] == '\0') {
 		return HTTP_ERROR_INVALID_URL;
 	}
 
-	auto id = g_net->HttpCreateConnectionWithURL(Network::Id(tmpl_id), url, enable_keep_alive != 0);
+	auto id = network->HttpCreateConnectionWithURL(Network::Id(tmpl_id), url, enable_keep_alive != 0);
 
 	if (!id.IsValid()) {
 		return HTTP_ERROR_OUT_OF_MEMORY;
@@ -3656,9 +3744,10 @@ int KYTY_SYSV_ABI HttpDeleteConnection(int conn_id) {
 
 	LOGF("\t conn_id = %d\n", conn_id);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpDeleteConnection(Network::Id(conn_id))) {
+	if (!network->HttpDeleteConnection(Network::Id(conn_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3675,7 +3764,8 @@ int KYTY_SYSV_ABI HttpCreateRequest(int conn_id, int method, const char* path,
 	     "\t content_length = %" PRIu64 "\n",
 	     conn_id, method, path, content_length);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	auto method_name = HttpMethodToString(method);
 	if (method_name == nullptr) {
@@ -3686,7 +3776,7 @@ int KYTY_SYSV_ABI HttpCreateRequest(int conn_id, int method, const char* path,
 	}
 
 	auto id =
-	    g_net->HttpCreateRequestWithURL2(Network::Id(conn_id), method_name, path, content_length);
+	    network->HttpCreateRequestWithURL2(Network::Id(conn_id), method_name, path, content_length);
 
 	if (!id.IsValid()) {
 		return HTTP_ERROR_OUT_OF_MEMORY;
@@ -3705,13 +3795,14 @@ int KYTY_SYSV_ABI HttpCreateRequest2(int conn_id, const char* method, const char
 	     "\t content_length = %" PRIu64 "\n",
 	     conn_id, method, path, content_length);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	if (method == nullptr || path == nullptr) {
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	auto id = g_net->HttpCreateRequestWithURL2(Network::Id(conn_id), method, path, content_length);
+	auto id = network->HttpCreateRequestWithURL2(Network::Id(conn_id), method, path, content_length);
 	return id.IsValid() ? id.ToInt() : HTTP_ERROR_OUT_OF_MEMORY;
 }
 
@@ -3725,7 +3816,8 @@ int KYTY_SYSV_ABI HttpCreateRequestWithURL2(int conn_id, const char* method, con
 	     "\t content_length = %" PRIu64 "\n",
 	     conn_id, url, method, content_length);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
 	if (method == nullptr) {
 		return HTTP_ERROR_INVALID_VALUE;
@@ -3734,7 +3826,7 @@ int KYTY_SYSV_ABI HttpCreateRequestWithURL2(int conn_id, const char* method, con
 		return HTTP_ERROR_INVALID_URL;
 	}
 
-	auto id = g_net->HttpCreateRequestWithURL2(Network::Id(conn_id), method, url, content_length);
+	auto id = network->HttpCreateRequestWithURL2(Network::Id(conn_id), method, url, content_length);
 
 	if (!id.IsValid()) {
 		return HTTP_ERROR_OUT_OF_MEMORY;
@@ -3748,9 +3840,10 @@ int KYTY_SYSV_ABI HttpDeleteRequest(int req_id) {
 
 	LOGF("\t req_id = %d\n", req_id);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpDeleteRequest(Network::Id(req_id))) {
+	if (!network->HttpDeleteRequest(Network::Id(req_id))) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
@@ -3764,9 +3857,10 @@ int KYTY_SYSV_ABI HttpSetRequestContentLength(int request_id, uint64_t content_l
 	     "\t content_length = %" PRIu64 "\n",
 	     request_id, content_length);
 
-	EXIT_IF(g_net == nullptr);
+	const auto network = GetNetwork();
+	EXIT_IF(network == nullptr);
 
-	if (!g_net->HttpSetRequestContentLength(Network::Id(request_id), content_length)) {
+	if (!network->HttpSetRequestContentLength(Network::Id(request_id), content_length)) {
 		return HTTP_ERROR_INVALID_ID;
 	}
 
