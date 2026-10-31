@@ -405,10 +405,33 @@ void TestChmod(const std::filesystem::path& temp_dir) {
         *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF,
         "posix_fchmod invalid fd returns -1 with POSIX_EBADF");
 
+  // Boundary check: cannot escape mount with ..
+  Check(sceKernelChmod("/chmod_test/../../outside.txt", 0777) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "chmod outside mount returns ENOENT");
+
+  // Status check: stat reflects permissions
+  FileSystem::FileStat sb {};
+  Check(FileSystem::KernelStat("/chmod_test/sample_chmod.txt", &sb) == OK && (sb.st_mode & 0777) != 0,
+        "stat reflects initial permissions");
+  Check(sceKernelChmod("/chmod_test/sample_chmod.txt", 0444) == OK,
+        "chmod readonly returns OK");
+  Check(FileSystem::KernelStat("/chmod_test/sample_chmod.txt", &sb) == OK && (sb.st_mode & 0222) == 0,
+        "stat reflects read-only mode");
+  Check(sceKernelChmod("/chmod_test/sample_chmod.txt", 0644) == OK,
+        "restore writable mode");
+
   // fchmod open file check
   int fd = FileSystem::KernelOpen("/chmod_test/sample_chmod.txt", 0x0002 /* O_RDWR */, 0644);
   Check(fd >= 0, "open sample_chmod for fchmod");
   Check(sceKernelFchmod(fd, 0600) == OK, "sceKernelFchmod open fd returns OK");
+  FileSystem::FileStat fsb {};
+  Check(FileSystem::KernelFstat(fd, &fsb) == OK, "fstat reflects fchmod");
+
+  // Rename while open: fchmod operates on the open handle
+  Check(FileSystem::KernelRename("/chmod_test/sample_chmod.txt", "/chmod_test/renamed_chmod.txt") == OK,
+        "rename file while descriptor is open");
+  Check(sceKernelFchmod(fd, 0644) == OK, "fchmod operates on open file even after rename");
+  Check(FileSystem::KernelFstat(fd, &fsb) == OK, "fstat on open handle succeeds after rename");
   Check(posix_fchmod(fd, 0644) == 0, "posix_fchmod open fd returns 0");
   Check(FileSystem::KernelClose(fd) == OK, "close sample_chmod");
 

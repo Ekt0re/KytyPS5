@@ -56,6 +56,7 @@ public:
 	void Umount(const std::string& folder_or_point);
 
 	[[nodiscard]] std::filesystem::path ResolvePath(const std::string& mounted_name);
+	bool GetMountFolder(const std::string& mounted_name, std::filesystem::path* out_dir);
 
 private:
 	std::vector<MountPair> m_mount_pairs;
@@ -375,6 +376,28 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 
 	// Unmounted guest paths must not fall through to the host filesystem.
 	return {};
+}
+
+bool MountPoints::GetMountFolder(const std::string& mounted_name, std::filesystem::path* out_dir) {
+	Common::LockGuard lock(m_mutex);
+
+	std::string normalized = Common::FixFilenameSlash(mounted_name);
+	normalized.erase(std::unique(normalized.begin(), normalized.end(),
+	                             [](char a, char b) { return a == '/' && b == '/'; }),
+	                 normalized.end());
+
+	const auto mounted_path = Common::FixDirectorySlash(normalized);
+	const auto it           = std::find_if(
+	    m_mount_pairs.begin(), m_mount_pairs.end(),
+	    [&mounted_path](const MountPair& p) { return mounted_path.starts_with(p.point); });
+	if (it != m_mount_pairs.end()) {
+		if (out_dir != nullptr) {
+			*out_dir = it->dir;
+		}
+		return true;
+	}
+
+	return false;
 }
 
 void Initialize() {
@@ -1138,8 +1161,15 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 
 	const bool is_dir = !info->is_file;
 
+	uint16_t        perms = 0777u;
+	std::error_code ec_status;
+	auto            fs_status = std::filesystem::status(real_file_name, ec_status);
+	if (!ec_status) {
+		perms = static_cast<uint16_t>(fs_status.permissions()) & 07777u;
+	}
+
 	FileStat stat {};
-	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
+	stat.st_mode = perms | (is_dir ? 0040000u : 0100000u);
 
 	auto at = Common::DateTime::FromSystemUTC();
 	auto wt = at;
@@ -1187,8 +1217,23 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	LOGF("\tKernelFstat: %s\n", Common::PathToString(file->real_name).c_str());
 
+	uint16_t perms     = 0777u;
+	bool     got_perms = false;
+	if (!file->directory) {
+		file->mutex.Lock();
+		got_perms = file->f.GetPermissions(&perms);
+		file->mutex.Unlock();
+	}
+	if (!got_perms) {
+		std::error_code ec_status;
+		auto            fs_status = std::filesystem::status(file->real_name, ec_status);
+		if (!ec_status) {
+			perms = static_cast<uint16_t>(fs_status.permissions()) & 07777u;
+		}
+	}
+
 	FileStat stat {};
-	stat.st_mode = 0000777u | (file->directory ? 0040000u : 0100000u);
+	stat.st_mode = perms | (file->directory ? 0040000u : 0100000u);
 
 	auto at = Common::DateTime::FromSystemUTC();
 	auto wt = at;
@@ -1573,6 +1618,15 @@ int KYTY_SYSV_ABI KernelChmod(const char* path, uint32_t mode) {
 
 	LOGF("\t KernelChmod: path = %s, mode = 0%o\n", path, mode & 07777);
 
+	std::filesystem::path mount_dir;
+	if (!g_mount_points->GetMountFolder(path, &mount_dir)) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	if (Common::IsArchivePath(mount_dir)) {
+		return KERNEL_ERROR_EROFS;
+	}
+
 	auto real_name = g_mount_points->ResolvePath(path);
 	if (real_name.empty()) {
 		return KERNEL_ERROR_ENOENT;
@@ -1583,12 +1637,47 @@ int KYTY_SYSV_ABI KernelChmod(const char* path, uint32_t mode) {
 	}
 
 	std::error_code ec;
-	bool            exists = std::filesystem::exists(real_name, ec);
-	if (ec || !exists) {
+	auto            canonical_mount = std::filesystem::weakly_canonical(mount_dir, ec);
+	if (ec) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	std::filesystem::permissions(real_name, static_cast<std::filesystem::perms>(mode & 07777), ec);
+	auto canonical_target = std::filesystem::weakly_canonical(real_name, ec);
+	if (ec) {
+		if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
+			return KERNEL_ERROR_EPERM;
+		}
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	auto rel = canonical_target.lexically_relative(canonical_mount);
+	if (rel.empty() || *rel.begin() == ".." || rel.is_absolute()) {
+		LOGF("\t KernelChmod target escapes mount point: %s -> %s\n", path,
+		     Common::PathToString(canonical_target).c_str());
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	bool exists = std::filesystem::exists(canonical_target, ec);
+	if (ec) {
+		LOGF("\t KernelChmod exists check failed: %s (ec = %d)\n", ec.message().c_str(),
+		     ec.value());
+		if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
+			return KERNEL_ERROR_EPERM;
+		}
+		if (ec == std::errc::no_such_file_or_directory) {
+			return KERNEL_ERROR_ENOENT;
+		}
+		if (ec == std::errc::read_only_file_system) {
+			return KERNEL_ERROR_EROFS;
+		}
+		return KERNEL_ERROR_EIO;
+	}
+	if (!exists) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	std::filesystem::permissions(canonical_target,
+	                             static_cast<std::filesystem::perms>(mode & 07777), ec);
 	if (ec) {
 		LOGF("\t KernelChmod permissions failed: %s (ec = %d)\n", ec.message().c_str(), ec.value());
 		if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
@@ -1632,6 +1721,18 @@ int KYTY_SYSV_ABI KernelFchmod(int fd, uint32_t mode) {
 
 	LOGF("\t KernelFchmod: fd = %d, file = %s, mode = 0%o\n", fd,
 	     Common::PathToString(file->real_name).c_str(), mode & 07777);
+
+	Common::LockGuard lock(file->mutex);
+
+	if (!file->directory) {
+		if (file->f.IsInvalid()) {
+			return KERNEL_ERROR_EBADF;
+		}
+		if (!file->f.Chmod(mode)) {
+			return KERNEL_ERROR_EIO;
+		}
+		return OK;
+	}
 
 	std::error_code ec;
 	std::filesystem::permissions(file->real_name, static_cast<std::filesystem::perms>(mode & 07777),
