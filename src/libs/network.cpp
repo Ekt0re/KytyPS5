@@ -1,4 +1,4 @@
-#if defined(_WIN32)
+﻿#if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -4305,6 +4305,32 @@ int KYTY_SYSV_ABI NpGetAccountIdA(int user_id, uint64_t* account_id) {
 	return np_error_signed_out;
 }
 
+int KYTY_SYSV_ABI NpGetUserIdByAccountId(uint64_t account_id, int* user_id) {
+	PRINT_NAME();
+
+	LOGF("\t account_id = 0x%016" PRIx64 "\n", account_id);
+
+	if (account_id == 0 || user_id == nullptr) {
+		return np_error_invalid_argument;
+	}
+
+	// Without the PSN backend, the only valid account is the primary user's account
+	// configured. If PSN emulation is not enabled, the system is signed out.
+	if (!Config::PsnEmulationEnabled()) {
+		return np_error_signed_out;
+	}
+
+	// Compare with the primary user's fixed account_id (which is equal to the one
+	// returned by NpGetAccountIdA). Guest users do not have an NP account.
+	const int primary_user_id = Config::GetUserId();
+	if (account_id != 0x00000000feedfaceull || Config::IsGuestUserId(primary_user_id)) {
+		return np_error_user_not_found;
+	}
+
+	*user_id = primary_user_id;
+	LOGF("\t user_id = %d\n", *user_id);
+	return OK;
+}
 int KYTY_SYSV_ABI NpGetAccountCountryA(int user_id, void* country_code) {
 	PRINT_NAME();
 
@@ -4335,7 +4361,7 @@ int KYTY_SYSV_ABI NpGetAccountAge(int req_id, int user_id, uint8_t* age) {
 	}
 
 	std::lock_guard lock(g_np_request_mutex);
-	auto* request = np_get_request_locked(req_id);
+	auto*           request = np_get_request_locked(req_id);
 	if (request == nullptr) {
 		return np_error_request_not_found;
 	}
@@ -4468,7 +4494,7 @@ int KYTY_SYSV_ABI NpCheckNpAvailability(int req_id, const char* user, void* resu
 
 	return np_complete_locked(request, std::strcmp(user, "Kyty") == 0
 	                                       ? np_reachability_result(Config::GetUserId())
-	                                       : np_error_signed_out);
+										   : np_error_signed_out);
 }
 
 int KYTY_SYSV_ABI NpCheckNpReachability(int req_id, int user_id) {
