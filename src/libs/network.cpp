@@ -4324,7 +4324,7 @@ int KYTY_SYSV_ABI NpGetUserIdByAccountId(uint64_t account_id, int* user_id) {
 	// returned by NpGetAccountIdA). Guest users do not have an NP account.
 	const int primary_user_id = Config::GetUserId();
 	if (account_id != 0x00000000feedfaceull || Config::IsGuestUserId(primary_user_id)) {
-		return np_error_user_not_found;
+		return np_error_invalid_id;
 	}
 
 	*user_id = primary_user_id;
