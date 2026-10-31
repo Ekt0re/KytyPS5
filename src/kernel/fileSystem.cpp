@@ -100,6 +100,7 @@ private:
 
 static MountPoints*     g_mount_points = nullptr;
 static FileDescriptors* g_files        = nullptr;
+static Common::Mutex     g_fs_operation_mutex;
 
 static bool IsRandomDevice(const std::string& path) {
 	return path == "/dev/random" || path == "/dev/urandom";
@@ -1450,6 +1451,8 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 		return KERNEL_ERROR_EROFS;
 	}
 
+	Common::LockGuard fs_lock(g_fs_operation_mutex);
+
 	if (real_to.empty() || !Common::File::IsFileExisting(real_from)) {
 		return KERNEL_ERROR_ENOENT;
 	}
@@ -1566,6 +1569,8 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 		return KERNEL_ERROR_EROFS;
 	}
 
+	Common::LockGuard fs_lock(g_fs_operation_mutex);
+
 	if (!Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_ENOENT;
 	}
@@ -1661,6 +1666,8 @@ int KYTY_SYSV_ABI KernelChmod(const char* path, uint32_t mode) {
 		return KERNEL_ERROR_EROFS;
 	}
 
+	Common::LockGuard fs_lock(g_fs_operation_mutex);
+
 	std::filesystem::path canonical_target;
 	if (!ConstrainTargetToMount(path, real_name, &canonical_target)) {
 		LOGF("\t KernelChmod target escapes mount point: %s -> %s\n", path,
@@ -1745,6 +1752,8 @@ int KYTY_SYSV_ABI KernelFchmod(int fd, uint32_t mode) {
 		}
 		return OK;
 	}
+
+	Common::LockGuard fs_lock(g_fs_operation_mutex);
 
 	std::filesystem::path canonical_target;
 	if (!ConstrainTargetToMount(file->name, file->real_name, &canonical_target)) {
