@@ -583,6 +583,9 @@ target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
+add_kyty_full_emulator_test(net_resolver_tests
+	"${KYTY_TESTS_DIR}/NetResolverTests.cpp")
+
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"

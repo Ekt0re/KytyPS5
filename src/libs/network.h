@@ -37,6 +37,31 @@ struct NetEpollEvent {
 static_assert(sizeof(NetEpollData) == 8);
 static_assert(sizeof(NetEpollEvent) == 24);
 
+struct NetResolverAddress {
+	uint32_t af;
+	union {
+		struct {
+			uint32_t inaddr_addr;
+		} addr;
+		struct {
+			uint8_t in6addr_addr[16];
+		} addr6;
+		uint8_t reserved[32];
+	} u;
+};
+
+static_assert(sizeof(NetResolverAddress) == 36);
+
+struct NetResolverInfo {
+	uint32_t           records;
+	uint32_t           recordsv4;
+	uint32_t           recordsv6;
+	uint32_t           reserved[3];
+	NetResolverAddress addrs[10];
+};
+
+static_assert(sizeof(NetResolverInfo) == 384);
+
 int KYTY_SYSV_ABI NetInit();
 int KYTY_SYSV_ABI NetTerm();
 int KYTY_SYSV_ABI NetPoolCreate(const char* name, int size, int flags);
@@ -46,6 +71,8 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid);
 int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags);
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags);
+int KYTY_SYSV_ABI NetResolverStartNtoaMultipleRecords(int rid, const char* hostname, void* info,
+                                                      int timeout, int retry, int flags);
 int KYTY_SYSV_ABI NetInetPton(int af, const char* src, void* dst);
 const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32_t size);
 int KYTY_SYSV_ABI         NetEtherNtostr(const NetEtherAddr* n, char* str, size_t len);
