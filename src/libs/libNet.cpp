@@ -286,19 +286,27 @@ static int KYTY_SYSV_ABI SslGetMemoryPoolStats(int ssl_ctx_id, void* stats) {
 
 	LOGF("\t ssl_ctx_id = %d\n", ssl_ctx_id);
 
-	if (stats != nullptr) {
-		struct SslMemoryPoolStats {
-			uint64_t pool_size;
-			uint64_t max_inuse_size;
-			uint64_t current_inuse_size;
-			uint32_t reserved;
-		};
-		auto* s               = static_cast<SslMemoryPoolStats*>(stats);
-		s->pool_size          = 0;
-		s->max_inuse_size     = 0;
-		s->current_inuse_size = 0;
-		s->reserved           = 0;
+	if (stats == nullptr) {
+		return Network::SSL_ERROR_INVALID_ARG;
 	}
+
+	struct SslMemoryPoolStats {
+		uint64_t pool_size;
+		uint64_t max_inuse_size;
+		uint64_t current_inuse_size;
+		uint32_t reserved;
+	};
+	auto* s = static_cast<SslMemoryPoolStats*>(stats);
+
+	uint64_t pool_size = 0;
+	if (!Ssl::SslGetSize(ssl_ctx_id, &pool_size)) {
+		return Network::SSL_ERROR_INVALID_ID;
+	}
+
+	s->pool_size          = pool_size;
+	s->max_inuse_size     = 0;
+	s->current_inuse_size = 0;
+	s->reserved           = 0;
 
 	return OK;
 }
@@ -1529,7 +1537,7 @@ static int KYTY_SYSV_ABI Http2AbortRequest(int req_id) {
 		return 0;
 	}
 
-	return Network::Http::HttpAbortRequest(req_id);
+	return HTTP2_ERROR_INVALID_ID;
 }
 
 static int KYTY_SYSV_ABI Http2GetMemoryPoolStats(int ctx_id, void* stats) {

@@ -123,6 +123,7 @@ public:
 	Id   SslInit(uint64_t pool_size);
 	bool SslTerm(Id ssl_ctx_id);
 	bool SslValid(Id ssl_ctx_id);
+	bool SslGetSize(int ssl_ctx_id, uint64_t* size);
 
 	Id   HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size);
 	bool HttpTerm(Id http_ctx_id);
@@ -371,6 +372,21 @@ bool Network::SslValid(Id ssl_ctx_id) {
 
 	return ssl_ctx_id.GetType() == Id::Type::Ssl && ssl_ctx_id.GetId() >= 0 &&
 	       ssl_ctx_id.GetId() < SSL_MAX && m_ssl[ssl_ctx_id.GetId()].used;
+}
+
+bool Network::SslGetSize(int ssl_ctx_id, uint64_t* size) {
+	Common::LockGuard lock(m_mutex);
+
+	Id id(ssl_ctx_id);
+	if (id.GetType() == Id::Type::Ssl && id.GetId() >= 0 && id.GetId() < SSL_MAX &&
+	    m_ssl[id.GetId()].used) {
+		if (size != nullptr) {
+			*size = m_ssl[id.GetId()].size;
+		}
+		return true;
+	}
+
+	return false;
 }
 
 Network::Id Network::HttpInit(int memid, Id ssl_ctx_id, uint64_t pool_size) {
@@ -2825,6 +2841,12 @@ int KYTY_SYSV_ABI SslFreeCaCerts(int ssl_ctx_id, void* ca_certs) {
 	certs->pool          = nullptr;
 
 	return OK;
+}
+
+bool KYTY_SYSV_ABI SslGetSize(int ssl_ctx_id, uint64_t* size) {
+	EXIT_IF(g_net == nullptr);
+
+	return g_net->SslGetSize(ssl_ctx_id, size);
 }
 
 } // namespace Ssl
