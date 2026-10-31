@@ -435,6 +435,14 @@ void TestChmod(const std::filesystem::path& temp_dir) {
   Check(posix_fchmod(fd, 0644) == 0, "posix_fchmod open fd returns 0");
   Check(FileSystem::KernelClose(fd) == OK, "close sample_chmod");
 
+  // Directory descriptor fchmod check
+  const auto host_sub = temp_dir / "sub_dir";
+  Common::File::CreateDirectory(host_sub);
+  int dir_fd = FileSystem::KernelOpen("/chmod_test/sub_dir", 0x00020000 /* O_DIRECTORY */, 0755);
+  Check(dir_fd >= 0, "open directory descriptor");
+  Check(sceKernelFchmod(dir_fd, 0755) == OK, "fchmod on valid directory descriptor succeeds");
+  Check(FileSystem::KernelClose(dir_fd) == OK, "close directory descriptor");
+
   FileSystem::Umount("/chmod_test");
 }
 

@@ -1605,6 +1605,40 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 	return KERNEL_ERROR_ENOENT;
 }
 
+static bool ConstrainTargetToMount(const std::string&           guest_path,
+                                   const std::filesystem::path& host_path,
+                                   std::filesystem::path*       canonical_target_out) {
+	std::filesystem::path mount_dir;
+	if (!g_mount_points->GetMountFolder(guest_path, &mount_dir)) {
+		return false;
+	}
+
+	if (Common::IsArchivePath(mount_dir)) {
+		return false;
+	}
+
+	std::error_code ec;
+	auto            canonical_mount = std::filesystem::weakly_canonical(mount_dir, ec);
+	if (ec) {
+		return false;
+	}
+
+	auto canonical_target = std::filesystem::weakly_canonical(host_path, ec);
+	if (ec) {
+		return false;
+	}
+
+	auto rel = canonical_target.lexically_relative(canonical_mount);
+	if (rel.empty() || *rel.begin() == ".." || rel.is_absolute()) {
+		return false;
+	}
+
+	if (canonical_target_out != nullptr) {
+		*canonical_target_out = std::move(canonical_target);
+	}
+	return true;
+}
+
 int KYTY_SYSV_ABI KernelChmod(const char* path, uint32_t mode) {
 	PRINT_NAME();
 
@@ -1618,15 +1652,6 @@ int KYTY_SYSV_ABI KernelChmod(const char* path, uint32_t mode) {
 
 	LOGF("\t KernelChmod: path = %s, mode = 0%o\n", path, mode & 07777);
 
-	std::filesystem::path mount_dir;
-	if (!g_mount_points->GetMountFolder(path, &mount_dir)) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	if (Common::IsArchivePath(mount_dir)) {
-		return KERNEL_ERROR_EROFS;
-	}
-
 	auto real_name = g_mount_points->ResolvePath(path);
 	if (real_name.empty()) {
 		return KERNEL_ERROR_ENOENT;
@@ -1636,28 +1661,15 @@ int KYTY_SYSV_ABI KernelChmod(const char* path, uint32_t mode) {
 		return KERNEL_ERROR_EROFS;
 	}
 
-	std::error_code ec;
-	auto            canonical_mount = std::filesystem::weakly_canonical(mount_dir, ec);
-	if (ec) {
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	auto canonical_target = std::filesystem::weakly_canonical(real_name, ec);
-	if (ec) {
-		if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
-			return KERNEL_ERROR_EPERM;
-		}
-		return KERNEL_ERROR_ENOENT;
-	}
-
-	auto rel = canonical_target.lexically_relative(canonical_mount);
-	if (rel.empty() || *rel.begin() == ".." || rel.is_absolute()) {
+	std::filesystem::path canonical_target;
+	if (!ConstrainTargetToMount(path, real_name, &canonical_target)) {
 		LOGF("\t KernelChmod target escapes mount point: %s -> %s\n", path,
-		     Common::PathToString(canonical_target).c_str());
+		     Common::PathToString(real_name).c_str());
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	bool exists = std::filesystem::exists(canonical_target, ec);
+	std::error_code ec;
+	bool            exists = std::filesystem::exists(canonical_target, ec);
 	if (ec) {
 		LOGF("\t KernelChmod exists check failed: %s (ec = %d)\n", ec.message().c_str(),
 		     ec.value());
@@ -1734,9 +1746,35 @@ int KYTY_SYSV_ABI KernelFchmod(int fd, uint32_t mode) {
 		return OK;
 	}
 
+	std::filesystem::path canonical_target;
+	if (!ConstrainTargetToMount(file->name, file->real_name, &canonical_target)) {
+		LOGF("\t KernelFchmod directory target escapes mount point: %s -> %s\n", file->name.c_str(),
+		     Common::PathToString(file->real_name).c_str());
+		return KERNEL_ERROR_ENOENT;
+	}
+
 	std::error_code ec;
-	std::filesystem::permissions(file->real_name, static_cast<std::filesystem::perms>(mode & 07777),
-	                             ec);
+	bool            exists = std::filesystem::exists(canonical_target, ec);
+	if (ec) {
+		LOGF("\t KernelFchmod exists check failed: %s (ec = %d)\n", ec.message().c_str(),
+		     ec.value());
+		if (ec == std::errc::permission_denied || ec == std::errc::operation_not_permitted) {
+			return KERNEL_ERROR_EPERM;
+		}
+		if (ec == std::errc::no_such_file_or_directory) {
+			return KERNEL_ERROR_ENOENT;
+		}
+		if (ec == std::errc::read_only_file_system) {
+			return KERNEL_ERROR_EROFS;
+		}
+		return KERNEL_ERROR_EIO;
+	}
+	if (!exists) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	std::filesystem::permissions(canonical_target,
+	                             static_cast<std::filesystem::perms>(mode & 07777), ec);
 	if (ec) {
 		LOGF("\t KernelFchmod permissions failed: %s (ec = %d)\n", ec.message().c_str(),
 		     ec.value());
