@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -27,6 +28,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -263,6 +265,28 @@ static vk::Format InputFormat(uint8_t raw_format, uint32_t used_components) {
 	return NarrowInputFormat(format, used_components);
 }
 
+// Under RenderDoc (--rd), pipelines carry their guest shader hashes, so a captured draw or
+// dispatch maps back to the guest program.
+static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
+                         std::span<const ShaderModule* const> stages) {
+	if (!Config::RenderDocEnabled() || pipeline == nullptr ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
+		return;
+	}
+	std::string name;
+	for (const auto* stage: stages) {
+		if (stage == nullptr) continue;
+		if (!name.empty()) name += ' ';
+		name += fmt::format("{}_{:016x}", ShaderRecompiler::StageName(stage->info.stage),
+		                    stage->info.shader_hash);
+	}
+	vk::DebugUtilsObjectNameInfoEXT info {};
+	info.objectType   = vk::ObjectType::ePipeline;
+	info.objectHandle = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
+	info.pObjectName  = name.c_str();
+	(void)graphics.device.setDebugUtilsObjectNameEXT(&info);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
                                 const GraphicsPipelineKey&                key,
@@ -485,6 +509,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	if (result != vk::Result::eSuccess) {
 		ExitPipelineFailure("vkCreateGraphicsPipelines", result, stages);
 	}
+	NamePipeline(graphics, pipeline, stages);
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -522,6 +547,8 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		const ShaderModule* modules[] = {&module};
 		ExitPipelineFailure("vkCreateComputePipelines", result, modules);
 	}
+	const auto* stage = &module;
+	NamePipeline(graphics, pipeline, {&stage, 1});
 	return pipeline;
 }
 

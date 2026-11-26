@@ -1,5 +1,6 @@
 #include "graphics/presentation/renderDoc.h"
 
+#include "common/compilePause.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -147,6 +148,9 @@ static void StartCapture() {
 		return;
 	}
 	g_captured_flips = 0;
+	// The capture slows the GPU thread many times over; like a shader compile, it holds long
+	// guest sleeps (KYTY_PAUSE_ON_COMPILE), so the game's watchdog does not fire mid-capture.
+	Common::CompilePause::g_active.fetch_add(1, std::memory_order_relaxed);
 	g_state.store(RenderDocState::Capturing, std::memory_order_release);
 	LOGF("RenderDoc: capture started\n");
 }
@@ -171,6 +175,7 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 		StartCapture();
 	} else {
 		const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
+		Common::CompilePause::g_active.fetch_sub(1, std::memory_order_relaxed);
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
 		LOGF(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
 	}
