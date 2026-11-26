@@ -1443,14 +1443,27 @@ void TestImageAtomicFormats() {
       const SrtRuntime runtime{.user_data = data};
       ResourceSnapshot snapshot;
       ResourceSpecialization specialization;
-      const bool bound = std::ranges::find(accepted, format) != accepted.end();
+      // A direct k8UInt T# keeps its descriptor for the emulated byte atomics.
+      const bool emulated = !atomic64 && format == BufferFormat::k8UInt;
+      const bool bound = emulated || std::ranges::find(accepted, format) != accepted.end();
       Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
                 specialization.images[0].numeric_class == TextureNumericClass::Uint &&
                 specialization.images[0].dimension ==
                     Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
                 (snapshot.images[0].dwords[1] == data[0]) == bound &&
-                (bound || snapshot.images[0] == DescriptorValue{.dword_count = 8u}),
+                (bound || snapshot.images[0] == DescriptorValue{.dword_count = 8u}) &&
+                (specialization.images[0].conversion_format == BufferFormat::k8UInt) == emulated,
             "image atomic format width was not applied");
+      if (!emulated) continue;
+      // The applied image binds as plain UInt storage that the emitter updates under a lock.
+      // The plan owns its values, so the program can take the specialization.
+      ApplyResourceSpecialization(program, specialization);
+      const auto &image = program.info.images[0];
+      Check(!image.atomic && image.read && image.written && EmulatesImageAtomics(image) &&
+                DescriptorBindingForImage(image).has_value() &&
+                ImageBindingResourceClass(*DescriptorBindingForImage(image)) ==
+                    ImageResourceClass::Storage,
+            "emulated 8-bit image atomics did not bind a plain storage view");
     }
   }
 }

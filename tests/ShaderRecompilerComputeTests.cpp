@@ -1558,6 +1558,8 @@ struct TestCase {
   u32 storage_image_dwords_per_pixel = 4;
   std::vector<u32> storage_image_r32ui;
   std::vector<u32> expected_storage_image_r32ui;
+  // Overrides the R32Uint/R32G32Uint format of the uint storage image (data packed tightly).
+  vk::Format storage_image_uint_format = vk::Format::eUndefined;
   std::vector<std::string> required_spirv;
   std::vector<std::string> forbidden_spirv;
   const ShaderProfile *profile = &Maintenance8Profile;
@@ -25938,6 +25940,8 @@ private:
     device_info.pNext = &ray_query;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
+    device_features.shaderStorageImageReadWithoutFormat =
+        available_features.shaderStorageImageReadWithoutFormat;
     device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;
     device_features.shaderResourceMinLod = true;
@@ -26223,7 +26227,7 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, (BufferCache::CACHING_NUMPAGES + ShaderRecompiler::IR::HeapRowBits) / 8,
+        shader_name, BufferCache::FAULT_BUFFER_BYTES,
         usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
@@ -26438,12 +26442,17 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         test.storage_image_format, vk::ImageUsageFlagBits::eStorage,
         test.storage_image_rgba, test.storage_image_dwords_per_pixel,
         vk::ImageLayout::eGeneral);
+    const bool uint_override = test.storage_image_uint_format != vk::Format::eUndefined;
+    const auto uint_format = uint_override ? test.storage_image_uint_format
+                             : atomic64    ? vk::Format::eR32G32Uint
+                                           : vk::Format::eR32Uint;
     storage_image_uint = vulkan->CreateImage2D(
-        test.name, test.image_width, test.image_height,
-        atomic64 ? vk::Format::eR32G32Uint : vk::Format::eR32Uint,
-        vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, atomic64 ? 2 : 1,
-        vk::ImageLayout::eGeneral,
-        atomic64 ? vk::Format::eR64Uint : vk::Format::eR32Uint);
+        test.name, test.image_width, test.image_height, uint_format,
+        vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui,
+        (vk::blockSize(uint_format) + 3u) / 4u, vk::ImageLayout::eGeneral,
+        uint_override ? vk::Format::eUndefined
+        : atomic64    ? vk::Format::eR64Uint
+                      : vk::Format::eR32Uint);
   }
   if (needs_sampler) {
     sampler = vulkan->CreateSampler(
@@ -50073,6 +50082,105 @@ template <bool signed_format = false> TestCase ImageAtomicVariants() {
   return test;
 }
 
+// A 32-bit atomic on a k8UInt T# updates the addressed byte (GTA VI ORs flags into an 8-bit
+// map). It runs as a locked read-modify-write of an R8 UInt storage view: the result keeps the
+// low byte, the return value is the old byte, and neighbouring texels keep their bytes.
+TestCase ImageAtomic8BitTexelOps() {
+  using O = ShaderOpcode;
+  struct Op {
+    u32 encoding;
+    u32 data;
+    u32 compare;
+  };
+  // swap, cmpswap (match), cmpswap (miss), add (wraps), smin, smax (sign-extended old), umin,
+  // and, or, xor.
+  const Op ops[] = {{0x0f, 0x1ffu, 0},  {0x10, 0x44u, 0x133u}, {0x10, 0x55u, 0x99u},
+                    {0x11, 10u, 0},     {0x14, 0xfffffff0u, 0}, {0x16, 1u, 0},
+                    {0x15, 9u, 0},      {0x18, 0x3cu, 0},       {0x19, 0x30u, 0},
+                    {0x1a, 0xffu, 0}};
+  const uint8_t initial[16] = {0x12, 0x33, 0x34, 250, 0x05, 0x80, 200, 0xf0,
+                          0x0f, 0x55, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99};
+  const uint8_t after[16] = {0xff, 0x44, 0x34, 4,    0xf0, 0x01, 9,    0x30,
+                        0x3f, 0xaa, 0x99, 0x99, 0x99, 0x99, 0x99, 0x99};
+  std::vector<u32> code;
+  AppendVMovU32(&code, 22, 0);
+  for (u32 i = 0; i < static_cast<u32>(std::size(ops)); i++) {
+    AppendVMovU32(&code, 20, i & 3u);
+    AppendVMovU32(&code, 21, i >> 2u);
+    AppendVMovLiteral(&code, 0, ops[i].data);
+    AppendVMovLiteral(&code, 1, ops[i].compare);
+    const bool cmpswap = ops[i].encoding == 0x10;
+    code.push_back(EncodeMimg0(ops[i].encoding, cmpswap ? 0x3 : 0x1, 0, true));
+    code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&code, 0, i);
+  }
+  AppendEnd(&code);
+
+  const auto pack = [](const uint8_t (&bytes)[16]) {
+    std::vector<u32> words(4, 0);
+    for (u32 i = 0; i < 16; i++) words[i / 4] |= u32{bytes[i]} << (8u * (i % 4u));
+    return words;
+  };
+  TestCase test;
+  test.name = "ImageAtomic8BitTexelOps";
+  test.code = std::move(code);
+  for (u32 i = 0; i < static_cast<u32>(std::size(ops)); i++) test.expected.push_back(initial[i]);
+  test.opcodes = {O::V_MOV_B32,           O::IMAGE_ATOMIC_SWAP, O::IMAGE_ATOMIC_CMPSWAP,
+                  O::IMAGE_ATOMIC_ADD,    O::IMAGE_ATOMIC_SMIN, O::IMAGE_ATOMIC_SMAX,
+                  O::IMAGE_ATOMIC_UMIN,   O::IMAGE_ATOMIC_AND,  O::IMAGE_ATOMIC_OR,
+                  O::IMAGE_ATOMIC_XOR,    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k8UInt);
+  test.has_user_data = true;
+  test.storage_image_uint_format = vk::Format::eR8Uint;
+  test.storage_image_r32ui = pack(initial);
+  test.expected_storage_image_r32ui = pack(after);
+  test.required_spirv = {"OpCapability StorageImageReadWithoutFormat", "OpImageRead",
+                         "OpAtomicCompareExchange", "OpAtomicStore", "fault_buffer",
+                         StorageUint2DImageBindingName(false)};
+  test.forbidden_spirv = {"OpImageTexelPointer", "R32ui", StorageUint2DImageBindingName(true)};
+  return test;
+}
+
+// Many lanes of many waves update the same bytes at once. Lost updates of a plain
+// read-modify-write would show as missing counts or bits; the lock keeps every one.
+TestCase ImageAtomic8BitTexelContention() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1b, 20, InlineU32(3), 0)); // x = lane & 3
+  AppendVMovU32(&code, 21, 0);
+  AppendVMovU32(&code, 22, 0);
+  AppendVMovU32(&code, 1, 1);
+  code.push_back(EncodeMimg0(0x11, 0x1)); // row 0: add 1
+  code.push_back(EncodeMimg1(1, 20));
+  code.push_back(EncodeVop2(0x16, 2, InlineU32(2), 0));  // lane >> 2
+  code.push_back(EncodeVop2(0x1b, 2, InlineU32(7), 2));  // & 7
+  code.push_back(EncodeVop2(0x1a, 3, Vgpr(2), 1));       // 1 << bit
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x19, 0x1)); // row 1: or one bit
+  code.push_back(EncodeMimg1(3, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageAtomic8BitTexelContention";
+  test.code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::V_AND_B32, O::V_LSHRREV_B32, O::V_LSHLREV_B32,
+                  O::IMAGE_ATOMIC_ADD, O::IMAGE_ATOMIC_OR, O::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k8UInt);
+  test.has_user_data = true;
+  test.storage_image_uint_format = vk::Format::eR8Uint;
+  // Row 3 is a sentinel no lane touches.
+  test.storage_image_r32ui = {0u, 0u, 0u, 0x5a5a5a5au};
+  // 15 groups of 64 lanes: each row-0 texel counts 15 * 16 = 240 adds.
+  test.expected_storage_image_r32ui = {0xf0f0f0f0u, 0xffffffffu, 0u, 0x5a5a5a5au};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.dispatch_x = 15;
+  return test;
+}
+
 // Input and old texel cover high-DWORD ordering, carry/wrap, the unsigned sign
 // boundary, and equal-high-DWORD ordering through the RG32_UINT -> R64_UINT view.
 constexpr uint64_t ImageAtomicInputs[][2] = {
@@ -51839,6 +51947,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants<>);
   AddCase(ImageAtomicVariants<true>);
+  AddCase(ImageAtomic8BitTexelOps);
+  AddCase(ImageAtomic8BitTexelContention);
   for (const auto &atomic : ImageAtomicIntegerCases) {
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, false));
     cases.push_back(ImageAtomicIntegerGlcAndExec(atomic, true));
@@ -59929,6 +60039,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageAtomicVariants<true>());
     RunCase(&vulkan, ImageAtomicSignedMinMax<false, true>());
     RunCase(&vulkan, ImageAtomicSignedMinMax<true, true>());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-atomic8-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageAtomic8BitTexelOps());
+    RunCase(&vulkan, ImageAtomic8BitTexelContention());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-atomic64-only") == 0) {

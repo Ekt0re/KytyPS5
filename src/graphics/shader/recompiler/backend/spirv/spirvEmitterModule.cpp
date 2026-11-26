@@ -256,7 +256,10 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || info.uses_heap_rows;
+	// Emulated image atomics keep their lock words in the fault buffer.
+	const bool emulated_image_atomics = std::ranges::any_of(info.images, IR::EmulatesImageAtomics);
+	counts[static_cast<size_t>(Kind::FaultBuffer)] =
+	    info.uses_dma || info.uses_heap_rows || emulated_image_atomics;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
@@ -364,6 +367,14 @@ void DefineDescriptors(EmitterState& state) {
 				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				// The texels an emulated atomic updates under its lock bypass incoherent caches.
+				if (std::ranges::any_of(info.images, [&](const auto& image) {
+					    return IR::EmulatesImageAtomics(image) && !image.heap &&
+					           IR::DescriptorBindingForImage(image) == kind;
+				    })) {
+					state.builder.AddAnnotation(spv::OpDecorate, definition.variable,
+					                            spv::DecorationCoherent);
+				}
 				break;
 			}
 		}

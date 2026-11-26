@@ -580,6 +580,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	// Emulated 8-bit image atomics read their texel through an unformatted storage view.
+	device_features.shaderStorageImageReadWithoutFormat =
+	    supported2.features.shaderStorageImageReadWithoutFormat;
 	device_features.shaderStorageImageMultisample =
 	    supported2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;

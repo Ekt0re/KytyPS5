@@ -1153,7 +1153,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic && !IsImageAtomicFormat(format, base.atomic64)) {
+		// See EmulatedImageAtomicBits. Only a direct T# qualifies: a table candidate of another
+		// format belongs to a different access.
+		const bool emulated_atomic =
+		    base.atomic && !base.atomic64 && EmulatedImageAtomicBits(format) != 0u &&
+		    image.indirect_root == ImageResource::NoIndirectImage && !image.heap &&
+		    [&] {
+			    const auto* source = Source(program, base.source);
+			    return source != nullptr && !source->indirect_descriptor.has_value();
+		    }();
+		if (base.atomic && !emulated_atomic && !IsImageAtomicFormat(format, base.atomic64)) {
 			// The ISA defines image atomics only on 32- and 64-bit elements; Vulkan has no atomic
 			// view of other sizes. Like a table candidate of another format, which belongs to a
 			// different access, the image binds as null: its atomics return 0 and write nothing.
@@ -1224,6 +1233,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (std::ranges::any_of(program.info.sampled_pairs,
 			                       [&](const auto& pair) { return pair.image == i; }) &&
 			    !ValidatePackedUnormSampling(program, snapshot, i)) return false;
+		}
+		if (emulated_atomic) {
+			image.conversion_format = format;
+			image.shader_swizzle    = ShaderImageIdentitySwizzle;
 		}
 		if (storage) {
 			// Atomics bind a raw R32/R64 UInt view whatever the numeric class.
@@ -2113,6 +2126,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.skip_degamma               = source.skip_degamma;
 		image.heap                       = source.heap;
 		image.indirect_resources.clear();
+		// The emulated atomics read and write the texel through the plain storage view.
+		if (image.atomic && !image.atomic64 && EmulatedImageAtomicBits(image.conversion_format) != 0u) {
+			image.atomic  = false;
+			image.read    = true;
+			image.written = true;
+		}
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {
 		const auto root = images[index].indirect_root;

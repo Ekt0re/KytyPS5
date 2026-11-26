@@ -199,6 +199,22 @@ struct ImageResource {
 	                : format == F::k32UInt || format == F::k32SInt || format == F::k32Float;
 }
 
+// A 32-bit image atomic on a k8UInt T#. The ISA defines image atomics only on 32- and 64-bit
+// elements, but GTA VI ORs small values into a k8UInt map whose allocation holds only 8-bit
+// texels (its DCC metadata starts right after the 8-bit surface), so the operation updates the
+// addressed byte. Vulkan has no 8-bit image atomics, and an atomic on such a view can reset the
+// GPU, so the image binds its plain R8 UInt storage view instead: ResourceMaterialization keeps
+// the format as its conversion_format, ApplyResourceSpecialization clears its atomic flag, and the
+// SPIR-V emitter runs each atomic as a read-modify-write of the texel under a lock word of the
+// fault buffer. Returns the element width, or 0 for formats that are not emulated. (k16UInt is
+// not: as a conversion format it marks depth-code reads.)
+[[nodiscard]] constexpr uint32_t EmulatedImageAtomicBits(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k8UInt ? 8u : 0u;
+}
+
+// Lock words for emulated image atomics follow the fault bitmap; any two texels may share one.
+inline constexpr uint32_t ImageAtomicLockWords = 4096u;
+
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
 	if (image.resource_class != ImageResourceClass::Storage || !image.written)
@@ -214,6 +230,12 @@ RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format
 // R16Uint, so the host binds it as UNorm and the shader converts back.
 [[nodiscard]] constexpr bool ReadsDepthBits(const ImageResource& image) {
 	return image.conversion_format == Prospero::BufferFormat::k16UInt;
+}
+
+// An atomic image bound through its R8 UInt storage view (see EmulatedImageAtomicBits).
+[[nodiscard]] constexpr bool EmulatesImageAtomics(const ImageResource& image) {
+	return image.resource_class == ImageResourceClass::Storage && !image.atomic &&
+	       EmulatedImageAtomicBits(image.conversion_format) != 0u;
 }
 
 struct SamplerResource {

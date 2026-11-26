@@ -34,6 +34,14 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// The fault buffer holds the fault bitmap (pages, then heap rows) and then the lock words of
+	// emulated image atomics (IR::EmulatedImageAtomicBits), which the bitmap scan never touches.
+	static constexpr uint64_t FAULT_BITMAP_BYTES =
+	    (CACHING_NUMPAGES + ShaderRecompiler::IR::HeapRowBits) / 8;
+	static constexpr uint64_t IMAGE_ATOMIC_LOCK_DWORD = FAULT_BITMAP_BYTES / 4;
+	static constexpr uint64_t FAULT_BUFFER_BYTES =
+	    FAULT_BITMAP_BYTES + ShaderRecompiler::IR::ImageAtomicLockWords * 4;
+	static_assert(FAULT_BITMAP_BYTES % 16 == 0 && IMAGE_ATOMIC_LOCK_DWORD < UINT32_MAX);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
