@@ -37,6 +37,23 @@ protected:
 	~ImageHeapSource() = default;
 };
 
+struct HeapRowView {
+	uint32_t              first = UINT32_MAX; // Report bit of row 0.
+	std::vector<uint32_t> rows;               // Rows the GPU reported.
+};
+
+class HeapRowSource {
+public:
+	// The reported rows of a root that selects among count rows. False when the root cannot report.
+	virtual bool Acquire(uint64_t shader, uint32_t source, uint64_t count, HeapRowView& view) = 0;
+	// A reported row that cannot be bound.
+	virtual void Reject(uint64_t shader, uint32_t source, uint32_t row, const DescriptorValue& value,
+	                    std::string_view reason) = 0;
+
+protected:
+	~HeapRowSource() = default;
+};
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -45,6 +62,7 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	HeapRowSource*            heap_rows             = nullptr;
 };
 
 class SrtReadCapture {

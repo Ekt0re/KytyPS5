@@ -256,7 +256,7 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
+	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma || info.uses_heap_rows;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
@@ -834,10 +834,6 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.subgroup_arithmetic) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
-	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
-		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
-	}
 	const bool fragment_barycentric =
 	    state.program.stage == ShaderType::Pixel &&
 	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
@@ -874,6 +870,13 @@ void DefineModule(EmitterState& state) {
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		const bool compute_derivatives =
+		    state.program.stage == ShaderType::Compute && state.program.info.compute_derivatives;
+		if (compute_derivatives && (uint64_t {local_x} * local_y * local_z) % 4u != 0u) {
+			EXIT("compute derivatives require four-lane workgroups (got %ux%ux%u) hash=0x%016" PRIx64
+			     "\n",
+			     local_x, local_y, local_z, state.program.shader_hash);
+		}
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;
@@ -884,6 +887,27 @@ void DefineModule(EmitterState& state) {
 		}
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
 		                               local_y, local_z);
+		// DerivativeGroupQuadsKHR is invalid when local size X or Y is odd
+		// (VUID-StandaloneSpirv-DerivativeGroupQuadsKHR-10151). Based on AnyKyty 688dbf145d
+		// (simnJS/AnyPS5, GPL-2.0).
+		if (compute_derivatives) {
+			const bool quads_layout  = (local_x & 1u) == 0u && (local_y & 1u) == 0u;
+			const bool linear_layout = (uint64_t {local_x} * local_y * local_z) % 4u == 0u;
+			if (quads_layout && state.profile.compute_derivative_quads) {
+				state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
+				state.builder.AddExecutionMode(state.main_func,
+				                               spv::ExecutionModeDerivativeGroupQuadsKHR);
+			} else if (linear_layout && state.profile.compute_derivative_linear) {
+				state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupLinearKHR);
+				state.builder.AddExecutionMode(state.main_func,
+				                               spv::ExecutionModeDerivativeGroupLinearKHR);
+			} else {
+				EXIT("compute derivative group feature unavailable for local size %ux%ux%u "
+				     "hash=0x%016" PRIx64 "\n",
+				     local_x, local_y, local_z, state.program.shader_hash);
+			}
+			state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
+		}
 	}
 	if (state.program.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
@@ -895,9 +919,6 @@ void DefineModule(EmitterState& state) {
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
-	}
-	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}
 	state.builder.AddName(state.main_func, "main");
 	if (state.program.info.function_lds) {

@@ -60,9 +60,12 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	[[nodiscard]] bool IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Scans the fault bitmap once the current work has run.
+	void               RequestFaultScan() { m_fault_process_pending = true; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -83,13 +86,13 @@ private:
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
-	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	ResolveCache              m_resolve_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
+	PipelineCache             m_pipeline_cache;
 	OcclusionQueries          m_occlusion_queries;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;

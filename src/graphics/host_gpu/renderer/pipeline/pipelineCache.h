@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/uniqueFunction.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -14,6 +15,9 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 
+#include <future>
+#include <deque>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -41,6 +45,7 @@ struct TranslateResult;
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
+class HeapRowSource;
 } // namespace ShaderRecompiler::IR
 
 namespace ShaderRecompiler::Spirv {
@@ -176,6 +181,24 @@ private:
 	std::jthread m_thread;
 };
 
+// Runs jobs in the order they were posted.
+class PipelineWorkers {
+public:
+	PipelineWorkers();
+	explicit PipelineWorkers(size_t threads);
+	~PipelineWorkers() { Finish(); }
+	KYTY_CLASS_NO_COPY(PipelineWorkers);
+	void Post(Common::UniqueFunction<void>&& job);
+	// Runs the queued jobs and stops the threads.
+	void Finish() { m_threads.clear(); }
+
+private:
+	std::mutex                               m_mutex;
+	std::condition_variable_any              m_ready;
+	std::queue<Common::UniqueFunction<void>> m_jobs;
+	std::vector<std::jthread>                m_threads;
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -183,6 +206,7 @@ public:
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
 	              const std::filesystem::path& shader_store = {});
 	~PipelineCache();
+	void SetHeapRows(ShaderRecompiler::IR::HeapRowSource* rows) { m_heap_rows = rows; }
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	// Finishes the queued writes and stops the store thread, then writes the driver cache if it
 	// changed.
@@ -190,7 +214,9 @@ public:
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
+		// Null while a worker still compiles it.
 		vk::Pipeline            pipeline              = nullptr;
+		std::shared_future<vk::Pipeline> compiling;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;
@@ -205,8 +231,19 @@ public:
 	                                      ShaderComputeInputInfo&      input_info);
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
-	                              const DrawTargets& targets);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	                              const DrawTargets& targets, bool wait = true);
+	// Takes a finished compile, or with `wait` the running one.
+	static Pipeline& Resolve(Pipeline& pipeline, bool wait);
+	// Without `wait` the pipeline may still be compiling.
+	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info, bool wait = true);
+
+	// Safe on any thread. Starts translating, on a worker, the program of a compute dispatch with
+	// these registers and DISPATCH_INITIATOR, unless that program was asked for before. The
+	// dispatch adopts the translation if its program key is the same. Wrong registers only waste
+	// the work. The code is copied from guest memory on the calling thread, which should be a
+	// guest thread (it handles faults on GPU-written memory).
+	void TranslateComputeAhead(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator,
+	                           bool async_compute);
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -216,7 +253,8 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// Compiling pipelines keep references.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
@@ -246,8 +284,12 @@ private:
 
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
 
+	// A translation started ahead, or a key whose program the command thread looked up first.
+	struct AheadJob;
+
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
+	ShaderRecompiler::IR::HeapRowSource*   m_heap_rows = nullptr;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
@@ -255,15 +297,47 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	std::atomic<bool>             m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
+	// Host values TranslateComputeAhead needs off the command thread.
+	uint32_t m_compute_subgroup_size     = 64;
+	uint32_t m_max_compute_shared_memory = 0;
+	// Translations ahead by program key, and the keys of programs that need none. Unlike the
+	// program cache, any thread may use it.
+	std::mutex                                                     m_ahead_mutex;
+	std::condition_variable                                        m_ahead_done;
+	std::unordered_map<ProgramKey, std::shared_ptr<AheadJob>, ProgramKeyHash> m_ahead;
+	// Queued, running and finished translations not taken yet, oldest first, and their number.
+	std::deque<std::shared_ptr<AheadJob>> m_ahead_pending;
+	std::atomic<bool>                     m_ahead_stop = false;
+	// Translations ahead finished and taken by the command thread.
+	std::atomic<uint32_t>                 m_ahead_finished = 0;
+	uint32_t                              m_ahead_taken    = 0;
+	// Declared last, so its jobs end before anything they use is destroyed.
+	PipelineWorkers m_workers;
+	PipelineWorkers m_translators;
+
+	// Creates the host pipeline of `pipeline`, whose layouts exist, on a worker.
+	void StartCompile(Pipeline& pipeline, Common::UniqueFunction<vk::Pipeline>&& create);
+	// Runs a translation ahead on a translator thread.
+	void TranslateAhead(AheadJob& job);
+	// On the command thread, for a program key looked up for the first time: takes its
+	// translation ahead and the resource plan extracted from it, waiting for a running one, or
+	// returns false. Either way, later requests for the key are ignored.
+	bool TakeTranslation(const ProgramKey& key, ShaderRecompiler::TranslateResult& translated,
+	                     ShaderRecompiler::IR::ResourcePlan& plan);
+	// Marks the keys of the programs in the cache as needing no translation ahead.
+	void MarkProgramsKnown();
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
+	                               ShaderRecompiler::IR::PushData::Window& push_data);
+	template <typename InputInfo>
+	const ShaderModule* GetProgramImpl(const ShaderParams& params, InputInfo& input_info,
 	                               ShaderRecompiler::IR::PushData::Window& push_data);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions       options,
@@ -294,7 +368,18 @@ std::filesystem::path ShaderStorePath();
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 
-// Stages are indexed like GraphicsPipelineKey::stage_ids.
+// Creates the layouts a pipeline of these stages (null where absent) has, which
+// CreateHostPipeline reads.
+void CreatePipelineLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                           std::span<const ShaderModule* const> stages);
+// Safe on any thread. Stages are indexed like GraphicsPipelineKey::stage_ids.
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const GraphicsPipelineKey&                key,
+                                const std::array<const ShaderModule*, 4>& stages,
+                                vk::PipelineCache                         driver_cache);
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const ShaderModule& module, vk::PipelineCache driver_cache);
+// Both of the above.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,

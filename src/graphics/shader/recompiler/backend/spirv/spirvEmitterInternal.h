@@ -321,6 +321,9 @@ uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+// The lane number inside the guest wave, which can differ from the host subgroup lane when the
+// two sizes disagree.
+uint32_t EmitGuestLane(EmitterState& state);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
@@ -398,12 +401,13 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
-uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index, bool non_uniform = false);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
+uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index);
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
 void EmitMemoryBindings(EmitterState& state);

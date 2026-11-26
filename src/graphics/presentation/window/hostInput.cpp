@@ -962,6 +962,25 @@ void HostInputDisconnectGamepadTouchPad(int id) {
 	}
 }
 
+void HostInputResetGamepadTouchPad(int id) {
+	float x = 0;
+	float y = 0;
+	{
+		std::scoped_lock lock(g_touchpad_mutex);
+		if (!g_gamepad_touchpad.enabled || g_gamepad_touchpad.id != id) {
+			return;
+		}
+		// Keep the touchpad mode; drop what the old mapping held (no release events follow).
+		x                          = g_gamepad_touchpad.x;
+		y                          = g_gamepad_touchpad.y;
+		g_gamepad_touchpad.drawing = false;
+		g_gamepad_touchpad.x_axis  = 128;
+		g_gamepad_touchpad.y_axis  = 128;
+		g_mouse_touchpad.revision++;
+	}
+	Controller::SetTouchPad(id, 1, false, x, y);
+}
+
 HostInputTouchPadVisualState GetHostInputTouchPadVisualState() {
 	std::scoped_lock lock(g_touchpad_mutex);
 	auto             state = g_mouse_touchpad;
@@ -992,6 +1011,16 @@ void HostInputToggleMouseToJoystick() {
 }
 
 bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
+	if (std::getenv("KYTY_AUTOPRESS") != nullptr) {
+		static bool auto_down = false;
+		static Uint64 last = 0;
+		const auto now = SDL_GetTicks();
+		if (now - last > (auto_down ? 150u : 2500u)) {
+			last = now; auto_down = !auto_down;
+			HostInputKey(SDLK_J, auto_down);
+		}
+		max_wait_ms = max_wait_ms < 0 || max_wait_ms > 50 ? 50 : max_wait_ms;
+	}
 	int timeout = -1;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;

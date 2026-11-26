@@ -306,15 +306,14 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	    ShaderRecompiler::IR::RawSignedStorageFormat(resource, format) != Prospero::BufferFormat::kInvalid;
 	const auto numeric_class =
 	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
-	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
-	                              resource.atomic && !resource.atomic64;
+	// Atomic images bind an R32 or R64 UInt view of any format with that element size.
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
-	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
-	     numeric_class != Prospero::TextureNumericClass::Sint &&
-	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
-	     (!resource.atomic || format == (resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
-	                                                       : Prospero::BufferFormat::k32UInt)));
+	    resource.atomic
+	        ? uint_resource && ShaderRecompiler::IR::IsImageAtomicFormat(format, resource.atomic64)
+	        : raw_sint_storage ||
+	              (numeric_class != Prospero::TextureNumericClass::Unsupported &&
+	               numeric_class != Prospero::TextureNumericClass::Sint &&
+	               uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
 		return;
 	}
@@ -416,63 +415,6 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 		default: EXIT("unsupported texture view dimension\n");
 	}
 	return view;
-}
-
-static bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
-                                  uint32_t view_levels, uint32_t& base_level) {
-	if (!info.IsTiled()) {
-		return false;
-	}
-	ImageInfo physical = info;
-	// A view entirely past MAX_MIP addresses its own chain starting at its base mip (PPSA02110
-	// compresses mip 1 through a T# that declares one level).
-	if (base_level >= physical_levels) {
-		const auto mip  = info.MipExtent(base_level);
-		physical.extent = {mip.width, mip.height, info.IsVolume() ? mip.depth : 1u};
-		physical_levels = view_levels;
-	}
-	physical.resources.levels = physical_levels;
-	physical.UpdateSize();
-	info.UpdateSize();
-	const auto same_mip = [&](uint32_t target, uint32_t source) {
-		return physical.mip_layout[target] == info.mip_layout[source] &&
-		       physical.MipExtent(target) == info.MipExtent(source);
-	};
-	if (physical.first_tail_level == info.first_tail_level &&
-	    physical.tiled_slice_stride == info.tiled_slice_stride &&
-	    physical.data.size == info.data.size) {
-		bool matches = true;
-		for (uint32_t level = 0; level < physical_levels; ++level) {
-			matches &= same_mip(level, level);
-		}
-		if (matches) {
-			return true;
-		}
-	}
-	if (metadata ||
-	    (info.TransferLayers() > 1 && physical.tiled_slice_stride != info.tiled_slice_stride)) {
-		return false;
-	}
-	// T# addresses the last mip. A view can select the same stored subresources
-	// with different mip indices; inaccessible mips need no host representation.
-	for (uint32_t base = 0; base + view_levels <= physical_levels; ++base) {
-		bool matches = true;
-		for (uint32_t i = 0; i < view_levels; ++i) {
-			const auto source = base_level + i;
-			const auto target = base + i;
-			if (!same_mip(target, source) ||
-			    (target >= physical.first_tail_level) != (source >= info.first_tail_level)) {
-				matches = false;
-				break;
-			}
-		}
-		if (matches) {
-			info       = std::move(physical);
-			base_level = base;
-			return true;
-		}
-	}
-	return false;
 }
 
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
@@ -615,6 +557,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
 	// their layout.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	if (desc.info.data.size != 0 && !m_context.IsAnyMapped(address, desc.info.data.size)) {
 		return {.layout = vk::ImageLayout::eGeneral};
 	}
 	const auto alignment = desc.info.DataAlignment();
@@ -793,6 +738,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				source = {};
 				continue;
 			}
+			// A table can hold rows no access selects, so a candidate may name unmapped memory.
+			if (metadata.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
+			    (descriptor.NumRecords() == UINT32_MAX || size >= (uint64_t {1} << 30u)) &&
+			    Libs::LibKernel::Memory::TryClampRangeSize(address, size, true) == 0) {
+				source = {};
+				continue;
+			}
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
 					// Sentinel write ranges end before tables captured by any bound stage.
@@ -873,6 +825,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
+			if (!images[i].image_id) continue;
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();
@@ -900,13 +853,18 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
                                              DrawTargets&                       targets) {
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
+	bool uses_heap_rows  = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		uses_dma |= stage->runtime->module->info.info.uses_dma;
+		uses_heap_rows |= stage->runtime->module->info.info.uses_heap_rows;
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
+	}
+	if (uses_heap_rows) {
+		m_context.RequestFaultScan();
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

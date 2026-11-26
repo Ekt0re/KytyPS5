@@ -166,7 +166,7 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
-		if (!FillSourcesDisjoint(resources.buffers, destination)) return false;
+		if (!binding.image_id || !FillSourcesDisjoint(resources.buffers, destination)) return false;
 		std::scoped_lock lock {cache.m_lock};
 		const auto&      image = cache.GetImage(binding.image_id);
 		const auto&      view  = binding.desc.view_info;
@@ -284,10 +284,24 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+// Records the dispatch, at submission if its pipeline is still compiling.
+template <typename Record>
+static void RecordDispatch(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
+                           const Record& record) {
+	if (pipeline.pipeline) {
+		record(buffer.Handle(), pipeline.pipeline);
+		return;
+	}
+	buffer.GetContext().GetCommandScheduler().Split(
+	    [record, compiling = pipeline.compiling](vk::CommandBuffer command) {
+		    record(command, compiling.get());
+	    });
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().StartOperation();
 	auto& sh_ctx = buffer.GetShaders();
 
 	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
@@ -370,7 +384,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, false);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
@@ -383,6 +397,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	if (program.info.uses_heap_rows) {
+		m_context.RequestFaultScan();
+	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
@@ -391,7 +408,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	const auto vk_buffer = buffer.Handle();
+	auto vk_buffer = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	if (HasStorageWrites(input_info, bindings)) {
@@ -461,13 +478,18 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	const auto record = [=](vk::CommandBuffer command, vk::Pipeline handle) {
+		command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+		command.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	};
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
 	                                   std::max(input_info.threads_num[1], 1u) *
 	                                   std::max(input_info.threads_num[2], 1u);
 	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
 	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute,
+		                       PipelineCache::Resolve(pipeline, true).pipeline);
 		// A single guest wave per group can run in launch order without a device-wide
 		// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
 		for (uint32_t z = 0; z < thread_group_z; ++z) {
@@ -481,7 +503,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			}
 		}
 	} else {
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		RecordDispatch(buffer, pipeline, record);
+		vk_buffer = buffer.Handle();
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 
@@ -494,7 +517,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
                                       bool async_compute) {
 	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().StartOperation();
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
 	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
@@ -512,7 +535,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, false);
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
@@ -521,6 +544,9 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const auto& program = input_info.stage.module->info;
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
+	}
+	if (program.info.uses_heap_rows) {
+		m_context.RequestFaultScan();
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
@@ -535,12 +561,17 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	const auto vk_buffer = buffer.Handle();
+	auto vk_buffer = buffer.Handle();
 	if (HasStorageWrites(input_info, bindings)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	RecordDispatch(buffer, pipeline,
+	               [args = args_buffer->Handle(), offset = args_offset](vk::CommandBuffer command,
+	                                                                    vk::Pipeline handle) {
+		               command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+		               command.dispatchIndirect(args, offset);
+	               });
+	vk_buffer = buffer.Handle();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

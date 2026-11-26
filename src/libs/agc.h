@@ -195,6 +195,12 @@ uint32_t KYTY_SYSV_ABI  AgcDcbDispatchIndirectGetSize();
 uint32_t* KYTY_SYSV_ABI AgcDcbEventWrite(CommandBuffer* buf, uint8_t event_type,
                                          const volatile void* address);
 uint64_t KYTY_SYSV_ABI AgcDcbEventWriteGetSize(uint8_t event_type);
+uint64_t KYTY_SYSV_ABI AgcAcbEventWriteGetSize(uint8_t event_type);
+uint32_t KYTY_SYSV_ABI  AgcAcbAtomicMemGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbAtomicMemGetSize();
+uint32_t KYTY_SYSV_ABI  AgcAcbRewindGetSize();
+uint32_t KYTY_SYSV_ABI  AgcDcbStallCommandBufferParserGetSize();
+int KYTY_SYSV_ABI       AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine);
 uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uint32_t cb_db_op,
                                          uint32_t gcr_cntl, const volatile void* base,
                                          uint64_t size_bytes, uint32_t poll_cycles);

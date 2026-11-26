@@ -22,6 +22,7 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("HuViW4HnrOw", VideoOut::VideoOutSubmitChangeBufferAttribute2);
 	LIB_FUNC("N5KDtkIjjJ4", VideoOut::VideoOutUnregisterBuffers);
 	LIB_FUNC("CBiu4mCE1DA", VideoOut::VideoOutSetFlipRate);
+	LIB_FUNC("pA8xxaySl7A", VideoOut::VideoOutSetGlobalBlendSpace);
 	LIB_FUNC("HXzjK9yI30k", VideoOut::VideoOutAddFlipEvent);
 	LIB_FUNC("Xru92wHJRmg", VideoOut::VideoOutAddVblankEvent);
 	LIB_FUNC("keipklF0pMY", VideoOut::VideoOutAddPreVblankStartEvent);

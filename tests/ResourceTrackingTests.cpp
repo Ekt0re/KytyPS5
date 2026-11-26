@@ -4406,7 +4406,8 @@ void TestCompactScalarImageTable() {
 }
 
 void TestScalarBufferSelectorDomain() {
-  const auto make_plan = [](bool active = true, bool sparse = false, bool uniformize_first = false) {
+  const auto make_plan = [](bool active = true, bool sparse = false, bool uniformize_first = false,
+                            bool adjusted = false) {
     Fixture fixture;
     const auto material = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
                                           fixture.UserData(2), fixture.UserData(3)});
@@ -4454,6 +4455,7 @@ void TestScalarBufferSelectorDomain() {
     MemoryInfo sample;
     sample.kind = ResourceKind::Image;
     sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    if (adjusted) sample.image_sample_flags = Decoder::ImageSampleFlagAdjust;
     const auto sampler = fixture.Sampler(sampler_words);
     fixture.Emit(ValueOpcode::ImageSampleRaw,
         {fixture.Image(words), sampler, fixture.ImageAddress(), Value(true)},
@@ -4500,7 +4502,6 @@ void TestScalarBufferSelectorDomain() {
   auto plan = make_plan();
   CheckFatal([&] { make_plan(false); }, "not a valid runtime value",
              "scalar selector accepted an empty EXEC lane read");
-  const auto heap_plan = make_plan(false, false, true);
   LinearTestMemory memory;
   memory.words[144u / 4u] = 1u;
   memory.words[160u / 4u] = 99u; // This field is outside the affine offset domain.
@@ -4521,14 +4522,18 @@ void TestScalarBufferSelectorDomain() {
   FakeImageHeap heap;
   auto resident = runtime;
   resident.image_heap = &heap;
-  Check(MaterializeResources(heap_plan, resident, snapshot, specialization) &&
-            heap.requests.size() == 2u && heap.requests[0].base == 0x2000u &&
-            heap.requests[1].base == 0x2200u &&
-            std::ranges::all_of(heap.requests, [](const ImageHeapRequest &request) {
-              return request.size == 3u * 32u && request.step == 32u && request.first == 0u &&
-                     request.count == 3u;
-            }),
-        "address tables at two offsets from one pointer did not request their own heaps");
+  for (const bool adjusted : {false, true}) {
+    const auto heap_plan = make_plan(false, false, true, adjusted);
+    heap.requests.clear();
+    Check(MaterializeResources(heap_plan, resident, snapshot, specialization) &&
+              heap.requests.size() == 2u && heap.requests[0].base == 0x2000u &&
+              heap.requests[1].base == 0x2200u &&
+              std::ranges::all_of(heap.requests, [](const ImageHeapRequest &request) {
+                return request.size == 3u * 32u && request.step == 32u && request.first == 0u &&
+                       request.count == 3u;
+              }),
+          "address tables at two offsets from one pointer did not request their own heaps");
+  }
   memory.watched_address = 0x1000u + 144u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 3u && memory.watched_reads == 1u &&
@@ -6418,13 +6423,28 @@ void TestBoundedFormattedBufferStore() {
   Check(materialize() && specialization == original &&
             snapshot.buffers[0].dwords[0] == memory.words[32],
         "destination address refresh was frozen or caused needless specialization");
-  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 9>{
+  // A one-component store writes X whatever the other selectors say. Other one-component
+  // formats, wider records and an index-only bound with the record inside the stride are exact.
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
             {35u, static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12u | 4u},
-            {35u, memory.words[35] & ~7u}, {35u, memory.words[35] | (4u << 3u)},
-            {32u, memory.words[32] + 1u},
-            {33u, 8u << 16u}, {33u, (4u << 16u) | (1u << 31u)},
-            {35u, memory.words[35] | (1u << 23u)}, {35u, memory.words[35] | (3u << 28u)}}}) {
+            {35u, memory.words[35] | (4u << 3u)}, {33u, 8u << 16u},
+            {35u, memory.words[35] | (1u << 28u)}}}) {
+    const auto saved = memory.words[word];
+    memory.words[word] = replacement;
+    Check(materialize(), "formatted finite store rejected an exactly representable record");
+    memory.words[word] = saved;
+  }
+  // An X store of two DWORDs into four-byte records is out of bounds at every index.
+  memory.words[35] = static_cast<uint32_t>(Prospero::BufferFormat::k32_32UInt) << 12u | 0x2cu;
+  Check(materialize() && snapshot.buffers[0].dwords == DescriptorValue {}.dwords,
+        "a store wider than its records was bound");
+  memory.words[35] = static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u | 4u;
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 8>{
+           {{35u, memory.words[35] & ~7u}, {32u, memory.words[32] + 1u},
+            {33u, (4u << 16u) | (1u << 31u)}, {35u, memory.words[35] | (1u << 23u)},
+            {35u, memory.words[35] | (3u << 28u)}, {35u, memory.words[35] | (2u << 28u)},
+            {33u, 6u << 16u}, {35u, (memory.words[35] & ~7u) | 5u}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
     Check(!materialize(), "formatted finite store accepted an unproved format or bounds mode");
@@ -6657,9 +6677,19 @@ void TestBoundedBufferRecords(uint32_t d32_components) {
   Check(loads == 112u, "empty root incorrectly folded nonempty formatted candidates");
   memory.words[first] = first_address;
   memory.words[first + 2u] = 16u;
+  // Records narrower than the format are out of bounds at every index, and an index-only
+  // bound is exact when the format fits the record.
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 2>{
+           {{first + 1u, 4u << 16u}, {first + 3u, memory.words[first + 3u] | (1u << 28u)}}}) {
+    const auto saved = memory.words[word];
+    memory.words[word] = replacement;
+    Check(materialize(), "formatted record rejected an exactly representable V#");
+    memory.words[word] = saved;
+  }
   for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
-           {{first + 1u, 4u << 16u}, {first + 1u, 9u << 16u},
-            {first, memory.words[first] + 1u}, {first + 3u, memory.words[first + 3u] | (1u << 28u)},
+           {{first + 1u, 9u << 16u}, {first, memory.words[first] + 1u},
+            {first + 3u, memory.words[first + 3u] | (2u << 28u)},
+            {first + 3u, memory.words[first + 3u] | (3u << 28u)},
             {first + 1u, (8u << 16u) | (1u << 31u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
@@ -6961,13 +6991,105 @@ void TestGpuSelectedBufferRecords() {
                   std::pair{memory.base + table_offset + aligned_bias + 416u, uint64_t{12u}}) !=
                   snapshot.specialization_reads.end(),
           "partial descriptor did not zero-fill and capture only in-bounds DWORDs");
-    user_data[2] = aligned_bias + 160u + MaxIndirectDescriptorProbes * 64u + 4u;
+    user_data[2] = aligned_bias + 160u + MaxIndirectScalarTableRows * 64u + 4u;
     memory.reads = 0u;
     Check(!materialize() && memory.reads == 0u,
           "oversized affine table was read before its candidate cap was checked");
   }
   CheckFatal([] { MakeBufferRecordFixture(1u, false, true, 0u, true); },
              "not a valid runtime value", "split dynamic descriptor offsets lost independent U32 wrapping");
+}
+
+struct TestHeapRows final : HeapRowSource {
+  std::vector<uint32_t> rows;
+  uint32_t first = 1000u;
+  uint32_t acquired = 0u;
+  std::vector<std::pair<uint32_t, std::string>> rejected;
+  bool Acquire(uint64_t, uint32_t, uint64_t, HeapRowView& view) override {
+    ++acquired;
+    view.first = first;
+    view.rows = rows;
+    return true;
+  }
+  void Reject(uint64_t, uint32_t, uint32_t row, const DescriptorValue&, std::string_view reason) override {
+    rejected.emplace_back(row, std::string(reason));
+  }
+};
+
+// Rows of a table that no proven key reaches are bound only once the GPU reports selecting them.
+void TestReportedBufferRows() {
+  namespace Prospero = Libs::Graphics::Prospero;
+  auto fixture = MakeBufferRecordFixture(1u, false, true, 0u);
+  const auto plan = ExtractResourcePlan(fixture->program);
+  std::vector<uint32_t> roots;
+  for (uint32_t resource = 0; resource < plan.info.buffers.size(); ++resource)
+    if (plan.descriptor_sources[plan.info.buffers[resource].source].indirect_descriptor)
+      roots.push_back(resource);
+  Check(roots.size() == 2u, "reported rows fixture lost its roots");
+  LinearTestMemory memory;
+  constexpr uint32_t table_offset = 256u;
+  const auto write = [&](uint32_t slot, uint32_t member, std::array<uint32_t, 4> words) {
+    std::ranges::copy(words, memory.words.begin() + (table_offset + 160u + member * 16u + slot * 64u) / 4u);
+  };
+  for (uint32_t slot = 0; slot < 4u; ++slot)
+    for (uint32_t member = 0; member < 2u; ++member)
+      write(slot, member, {0x100000u + member * 0x10000u + slot * 0x1000u,
+                           (member == 0u ? 8u : 3u) << 16u, 16u,
+                           member == 0u ? (uint32_t(Prospero::BufferFormat::k16_16_16_16Float) << 12u) |
+                                              Libs::Graphics::DstSel(4, 5, 6, 1)
+                                        : 0x5204u});
+  // A row between records holds other fields; an unreported one is never interpreted.
+  write(1u, 0u, {0x3f3d0da9u, 0u, 0u, 0x3f7fffffu});
+  std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset, 0u, 384u, 0u,
+      0u, 0u, 0u, 0u};
+  TestHeapRows rows;
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory, .heap_rows = &rows};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materialize = [&] { return MaterializeResources(plan, runtime, snapshot, specialization); };
+  const auto entry = [&](uint32_t root, uint32_t slot) {
+    const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+    return snapshot.flattened_srt[mapping + 1u + slot];
+  };
+  Check(materialize() && rows.rejected.empty(), "an unreported field row was interpreted");
+  for (const auto root : roots) {
+    const auto mapping = specialization.buffers[root].indirect_mapping_offset;
+    Check(specialization.buffers[root].heap_rows && snapshot.flattened_srt[mapping - 2u] == 1000u &&
+              snapshot.flattened_srt[mapping - 1u] == 4u && snapshot.flattened_srt[mapping] == 4u,
+          "a reporting table lost its report header");
+    Check(entry(root, 0u) != UINT32_MAX && entry(root, 3u) != UINT32_MAX &&
+              entry(root, 1u) == UINT32_MAX && entry(root, 2u) == UINT32_MAX,
+          "rows between records were bound before any report, or records were left unbound");
+  }
+  rows.rows = {1u, 2u};
+  Check(materialize() && rows.rejected.size() == 1u && rows.rejected[0].first == 1u,
+        "a reported field row was not rejected by name");
+  Check(entry(roots[0], 1u) == 0u && entry(roots[0], 2u) != UINT32_MAX && entry(roots[0], 2u) != 0u &&
+            entry(roots[1], 1u) != UINT32_MAX && entry(roots[1], 1u) != 0u,
+        "reported rows were not bound or a rejected row did not read as null");
+  // A heap too large to scan binds the reported rows only, searched by row.
+  user_data[2] = 160u + 64u * (MaxIndirectDescriptorProbes + 8u);
+  rows.rows = {3u, 0u};
+  rows.rejected.clear();
+  memory.reads = 0u;
+  Check(materialize() && memory.reads == 4u && rows.rejected.empty(),
+        "a whole heap was scanned instead of its reported rows");
+  for (const auto root : roots) {
+    const auto& buffer = specialization.buffers[root];
+    const auto mapping = buffer.indirect_mapping_offset;
+    Check(buffer.heap_rows && buffer.indirect_search_iterations >= 4u &&
+              snapshot.flattened_srt[mapping - 1u] == MaxIndirectDescriptorProbes + 8u &&
+              snapshot.flattened_srt[mapping] == 2u && snapshot.flattened_srt[mapping + 1u] == 0u &&
+              snapshot.flattened_srt[mapping + 3u] == 3u &&
+              snapshot.flattened_srt[mapping + 2u] != 0u && snapshot.flattened_srt[mapping + 4u] != 0u,
+          "reported heap rows lost their sorted row search");
+  }
+  rows.rows.clear();
+  Check(materialize() && snapshot.buffers.size() == plan.info.buffers.size(),
+        "an unreported heap bound a row");
+  runtime.heap_rows = nullptr;
+  Check(!materialize(), "without reports an oversized heap was not rejected");
 }
 
 void TestWorkgroupSelectedBufferRecords() {
@@ -7260,11 +7382,22 @@ void TestGpuSelectedFormattedRecordStore() {
   memory.words[first] += 1u;
   Check(materialize() && specialization == original,
         "signed byte destination refresh required alignment or needless specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
-      {first + 1u, 2u << 16u}, {first + 1u, (1u << 16u) | (1u << 31u)},
+  // Wider records, another byte format, an index-only bound and the unused Y selector are exact.
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+      {first + 1u, 2u << 16u},
       {first + 3u, (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) | 4u},
       {first + 3u, memory.words[first + 3u] | (1u << 28u)},
       {first + 3u, memory.words[first + 3u] | (4u << 3u)}}}) {
+    const auto saved = memory.words[word];
+    memory.words[word] = value;
+    Check(materialize(), "signed byte candidate rejected an exactly representable V#");
+    memory.words[word] = saved;
+  }
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+      {first + 1u, (1u << 16u) | (1u << 31u)},
+      {first + 3u, memory.words[first + 3u] | (2u << 28u)},
+      {first + 3u, memory.words[first + 3u] | (1u << 23u)},
+      {first + 3u, (memory.words[first + 3u] & ~7u) | 5u}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = value;
     Check(!materialize(), "signed byte candidate accepted an unproved format, stride or bounds");
@@ -7292,6 +7425,37 @@ void TestGpuSelectedFormattedRecordStore() {
        {std::tuple{592u, 0u, false}, std::tuple{65540u, 16u, false}, std::tuple{592u, 16u, true}})
     CheckFatal([&] { make(stride, shift, split); }, "not a valid runtime value",
                "exact record store accepted an unbounded, wrapping or split descriptor offset");
+
+  {
+    constexpr uint32_t rows = 196608u;
+    constexpr uint32_t prefix = 448u;
+    auto packed_fixture = make(16u, 8u);
+    const auto packed_plan = ExtractResourcePlan(packed_fixture->program);
+    LinearTestMemory packed;
+    packed.words.resize(prefix / 4u + rows * 4u);
+    const std::array<uint32_t, 4> entry{0x100000u, 1u << 16u, 20u,
+        (uint32_t(Prospero::BufferFormat::k8SInt) << 12u) | 4u};
+    for (const uint32_t row : {0u, 65536u, rows - 1u})
+      std::ranges::copy(entry, packed.words.begin() + prefix / 4u + row * 4u);
+    packed.words[prefix / 4u + (rows - 1u) * 4u] += 32u;
+    const std::array<uint32_t, 8> packed_data{uint32_t(packed.base), 16u << 16u,
+        rows + prefix / 16u, 0x5204u};
+    const SrtRuntime packed_runtime{.user_data = packed_data, .userdata = &packed,
+        .read_specialization_memory = ReadLinearTestMemory};
+    Check(MaterializeResources(packed_plan, packed_runtime, snapshot, specialization),
+          "large packed buffer table failed to materialize");
+    const auto offset = specialization.buffers[root].indirect_mapping_offset;
+    Check(snapshot.buffers.size() == packed_plan.info.buffers.size() + 2u &&
+              snapshot.flattened_srt.at(offset) == rows &&
+              snapshot.flattened_srt.at(offset + 1u) == 1u &&
+              snapshot.flattened_srt.at(offset + 2u) == 0u &&
+              snapshot.flattened_srt.at(offset + 65537u) == 1u &&
+              snapshot.flattened_srt.at(offset + rows) == 2u && packed.reads < 100u,
+          "packed buffer table lost a late, null or duplicate entry, or read slots individually");
+    packed.fail_address = packed.base + prefix + (rows - 1u) * 16u;
+    Check(!MaterializeResources(packed_plan, packed_runtime, snapshot, specialization),
+          "unreadable final packed buffer batch was accepted");
+  }
 
   auto wide = make(16u, 16u, false, true);
   auto wide_plan = ExtractResourcePlan(wide->program);
@@ -7364,19 +7528,25 @@ void TestGpuSelectedFormattedRecordStore() {
   Check(wide_materialize() && specialization == wide_original &&
             snapshot.buffers[wide_root].dwords[0] == memory.words[table_offset / 4u],
         "RGBA16 destination refresh froze the address or changed format specialization");
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 6>{{
-      {0u, memory.words[table_offset / 4u] | 1u}, {1u, 16u << 16u},
-      {1u, (8u << 16u) | (1u << 31u)}, {3u, rgba | (1u << 28u)},
-      {3u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) | 4u}, {3u, rgba ^ 1u}}}) {
+  // Stores write the format's components, so a one-component format takes X of an XYZW store.
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 3>{{
+      {1u, 16u << 16u}, {3u, rgba | (1u << 28u)},
+      {3u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) | 4u}}}) {
+    auto& field = memory.words[table_offset / 4u + word];
+    const auto saved = field;
+    field = value;
+    Check(wide_materialize(), "RGBA16 store rejected an exactly representable V#");
+    field = saved;
+  }
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+      {0u, memory.words[table_offset / 4u] | 1u}, {1u, 10u << 16u},
+      {1u, (8u << 16u) | (1u << 31u)}, {3u, rgba ^ 1u}}}) {
     auto& field = memory.words[table_offset / 4u + word];
     const auto saved = field;
     field = value;
     Check(!wide_materialize(), "RGBA16 store accepted unproved format, alignment, stride, bounds or swizzle");
     field = saved;
   }
-  wide_plan.info.buffers[wide_root].max_byte_extent = 4u;
-  Check(!wide_materialize(), "scalar formatted store incorrectly admitted an RGBA16 candidate");
-  wide_plan.info.buffers[wide_root].max_byte_extent = 16u;
   auto& wide_indirect = *wide_plan.descriptor_sources[
       wide_plan.info.buffers[wide_root].source].indirect_descriptor;
   for (const bool overflow : {false, true}) {
@@ -7848,6 +8018,91 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
   return ExtractResourcePlan(fixture.program);
 }
 
+enum class CorrelatedUse { SameFlag, Inverted, Complement, Reloaded, Unguarded };
+
+ResourcePlan CorrelatedBufferPlan(CorrelatedUse kind) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *alternate = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  auto *use = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  const auto branch = [](Block *from, Block *on_true, Block *on_false) {
+    from->AddBranch(on_true);
+    from->AddBranch(on_false);
+    from->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = on_true, .false_block = on_false};
+  };
+  branch(entry, alternate, merge);
+  alternate->AddBranch(merge);
+  alternate->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+  if (kind == CorrelatedUse::Inverted || kind == CorrelatedUse::Complement)
+    branch(merge, exit, use);
+  else branch(merge, use, exit);
+  use->AddBranch(exit);
+  use->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = exit};
+  exit->terminator.kind = CFG::TerminatorKind::Return;
+
+  // CS 1b40c4c36dea3c5d: the flag lies in memory the shader may also write.
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto flag = [&](Block *block, uint32_t pc) {
+    const auto handle = fixture.Emit(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)}, 0, block);
+    return fixture.Emit(ValueOpcode::LoadAddressU32,
+                        {handle, Value(0u), Value(0u), Value(true)},
+                        fixture.AddMemory(scalar, pc), block);
+  };
+  const auto condition = [&](Block *block, Value word) {
+    const auto bit = fixture.Emit(ValueOpcode::BitwiseAnd32, {word, Value(16u)}, 0, block);
+    return fixture.Emit(ValueOpcode::INotEqual32, {Value(0u), bit}, 0, block);
+  };
+  const auto first = flag(entry, 0x1c);
+  entry->condition = condition(entry, first);
+  auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  phi.AddPhiOperand(entry, Value(0u));
+  phi.AddPhiOperand(alternate, Value(0x4000u));
+  const auto second = kind == CorrelatedUse::Reloaded ? flag(merge, 0x70) : first;
+  merge->condition = kind == CorrelatedUse::Unguarded
+      ? Value(true) : kind == CorrelatedUse::Complement
+      ? fixture.Emit(ValueOpcode::IEqual32,
+                     {fixture.Emit(ValueOpcode::BitwiseAnd32, {Value(16u), second}, 0, merge),
+                      Value(0u)}, 0, merge)
+      : condition(merge, second);
+  fixture.block = use;
+  const auto word1 = fixture.Emit(ValueOpcode::BitwiseOr32, {Value(0u), Value(4u << 16u)});
+  const auto handle = fixture.Buffer({Value(&phi), word1, Value(16u), Value(0x16204u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(memory, 0x2944));
+  fixture.PlanAndTrack();
+  Check(handle.ResolveInstruction()->Arg(0).Resolve() == Value(&phi),
+        "correlated host descriptor changed the GPU Phi");
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program);
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestCorrelatedBufferPhi() {
+  for (const auto kind : {CorrelatedUse::SameFlag, CorrelatedUse::Inverted,
+                          CorrelatedUse::Complement}) {
+    const auto plan = CorrelatedBufferPlan(kind);
+    Check(plan.info.buffers.size() == 1u && plan.info.buffers[0].written,
+          "correlated store lost its buffer");
+    const auto &words = plan.descriptor_sources[plan.info.buffers[0].source].dwords;
+    Check(words[0].Resolve() ==
+              Value(kind == CorrelatedUse::Inverted ? 0u : 0x4000u),
+          "correlated branch selected the wrong Phi operand");
+  }
+  CheckFatal([] { CorrelatedBufferPlan(CorrelatedUse::Reloaded); },
+             "not a valid runtime value", "separately loaded flags were treated as one value");
+  CheckFatal([] { CorrelatedBufferPlan(CorrelatedUse::Unguarded); },
+             "not a valid runtime value", "uncorrelated shader-written predicate was accepted");
+}
+
 void TestConditionalSamplerPhi() {
   for (const bool diamond : {false, true}) {
     for (const bool reverse : {false, true}) {
@@ -7984,11 +8239,6 @@ void TestPackedDescriptorWaterfall() {
         {image, sampler, f.ImageAddress(), variant == 1u ? Value(true) : selected_active},
         f.AddMemory({.kind = ResourceKind::Image,
                      .image_dimension = Decoder::ImageDimension::Dim2D}, 0x6cu));
-    if (variant != 0u) {
-      CheckFatal([&] { f.PlanAndTrack(); }, "not a valid runtime value",
-                 "packed waterfall accepted widened EXEC or an unbounded sampler key");
-      continue;
-    }
     f.PlanAndTrack();
     const auto plan = ExtractResourcePlan(f.program);
     for (const auto source : {plan.info.images[0].source, plan.info.samplers[0].source}) {
@@ -7996,8 +8246,10 @@ void TestPackedDescriptorWaterfall() {
       const auto& table = value.indirect_descriptor;
       Check(table && !table->selector && table->table_scalar &&
                 table->table_stride == value.dword_count * 4u &&
-                (value.dword_count != 4u || table->table_maximum == 65535u),
-            "packed waterfall lost its static sampler bit bound or captured the varying key");
+                (value.dword_count != 4u ||
+                 (variant == 0u ? table->table_maximum == 65535u : !table->table_maximum)),
+            "packed waterfall lost its static sampler bit bound, captured the varying key, or "
+            "bounded a key by an unproved EXEC or domain");
     }
     LinearTestMemory memory;
     const std::array<uint32_t, 8> user_data{
@@ -8026,6 +8278,116 @@ void TestPackedDescriptorWaterfall() {
       return (span.first >= memory.base + 256u && span.first + span.second <= memory.base + 320u) ||
           (span.first >= memory.base + 512u && span.first + span.second <= memory.base + 512u + 59u * 16u);
     }), "packed waterfall materialization read outside the descriptor heaps");
+  }
+}
+
+// GTA VI layers: a readlane waterfall selects a 16-byte layer of a material block at a runtime
+// offset, and that layer's sampler index selects a row of a sampler heap. No bound is known.
+void TestUnboundedSamplerHeap() {
+  enum class Variant { Valid, Adjusted, Offset, Split, AddressTable };
+  for (const auto variant : {Variant::Valid, Variant::Adjusted, Variant::Offset, Variant::Split,
+                             Variant::AddressTable}) {
+    Fixture f(ShaderType::Pixel);
+    const auto layer = f.Emit(ValueOpcode::GetInterpolationParameter,
+                              {Value(1u), Value(1u), Value(2u)});
+    const auto lane = f.Emit(ValueOpcode::ReadLane, {layer, Value(3u)});
+    const auto active = f.Emit(ValueOpcode::IEqual32, {lane, layer});
+    const auto scalar = [&](Value buffer, Value offset, uint32_t immediate) {
+      return f.Emit(ValueOpcode::ReadConstBuffer, {buffer, offset},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = immediate}, 0x550u));
+    };
+    const auto material = f.Buffer({f.UserData(0), f.UserData(1), f.UserData(2), f.UserData(3)});
+    const auto key = scalar(material, f.Emit(ValueOpcode::IAdd32,
+        {f.Emit(ValueOpcode::ShiftLeftLogical32, {lane, Value(4u)}), f.UserData(8)}), 0x890u);
+    auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+    if (variant == Variant::Offset) offset = f.Emit(ValueOpcode::IAdd32, {offset, Value(0x23u)});
+    const auto heap = f.Buffer({f.UserData(4), f.UserData(5), f.UserData(6), f.UserData(7)});
+    const auto address = f.Address(f.UserData(4), f.UserData(5));
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      const auto at = variant == Variant::Split && word == 2u
+          ? f.Emit(ValueOpcode::IAdd32, {offset, Value(8u)}) : offset;
+      const auto immediate = variant == Variant::Split && word == 2u ? 0u : word * 4u;
+      words[word] = variant == Variant::AddressTable
+          ? f.Emit(ValueOpcode::LoadAddressU32, {address, at, Value(0u), Value(true)},
+                f.AddMemory({.kind = ResourceKind::ScalarAddress, .offset = immediate}, 0x56cu))
+          : scalar(heap, at, immediate);
+    }
+    MemoryInfo sample{.kind = ResourceKind::Image,
+                      .image_dimension = Decoder::ImageDimension::Dim2D};
+    if (variant == Variant::Adjusted) {
+      sample.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+      const auto quads = f.Emit(ValueOpcode::SelectU32, {active, Value(1u), Value(0u)});
+      words[3] = f.Emit(ValueOpcode::BitwiseOr32,
+          {words[3], f.Emit(ValueOpcode::ShiftLeftLogical32, {quads, Value(12u)})});
+    }
+    const auto image = f.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                Value(0u), Value(0u), Value(0u), Value(0u)});
+    const auto sampler = f.Sampler(words);
+    f.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, f.ImageAddress(), active},
+           f.AddMemory(sample, 0x588u));
+    if (variant == Variant::Split || variant == Variant::AddressTable) {
+      CheckFatal([&] { f.PlanAndTrack(); }, "not a valid runtime value",
+                 "unbounded sampler table accepted split offsets or a table without a size");
+      continue;
+    }
+    f.PlanAndTrack();
+    const auto plan = ExtractResourcePlan(f.program);
+    const auto &table = plan.descriptor_sources[plan.info.samplers[0].source].indirect_descriptor;
+    Check(table && !table->selector && !table->table_maximum && table->table_scalar &&
+              table->table_stride == 16u && table->key_count.IsEmpty(),
+          "unbounded sampler key lost the sampler heap's own bound");
+    // The GPU key is the row of the byte offset the shader itself computes.
+    const auto *handle = sampler.Instruction();
+    const auto *select = handle->Arg(0).ResolveInstruction();
+    const auto *scaled = select->Arg(1).ResolveInstruction();
+    const auto *row = scaled->Arg(0).ResolveInstruction();
+    Check(select->GetOpcode() == ValueOpcode::SelectU32 && select->Arg(0) == Value(true) &&
+              scaled->GetOpcode() == ValueOpcode::ShiftLeftLogical32 && scaled->Arg(1) == Value(2u) &&
+              row->GetOpcode() == ValueOpcode::ShiftRightLogical32 && row->Arg(1) == Value(4u) &&
+              row->Arg(0).Resolve() == offset.Resolve(),
+          "unbounded sampler heap key is not the row of its native offset");
+    LinearTestMemory memory;
+    std::array<uint32_t, 9> user_data{
+        uint32_t(memory.base) + 0x2000u, 16u << 16u, 64u, 0x5204u,
+        uint32_t(memory.base) + 512u, 16u << 16u, 20u, 0x5204u, 0u};
+    memory.fail_address = memory.base + 0x2000u; // No selector bytes are read.
+    for (uint32_t row_index = 0; row_index < 20u; ++row_index) {
+      memory.words[(512u + row_index * 16u) / 4u] = 1u + row_index % 5u;
+      memory.words[(512u + row_index * 16u) / 4u + 3u] = variant == Variant::Adjusted ? 7u : 0u;
+    }
+    const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+        .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto check = [&](uint32_t rows) {
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                specialization.samplers.size() == 1u + std::min(rows, 5u),
+            "sampler heap did not deduplicate the rows its V# covers");
+      const auto &root = specialization.samplers[0];
+      const auto mapping = root.indirect_mapping_offset;
+      // Byte offset 0x23 reads at 0x20, so residue zero still names every row.
+      Check(root.indirect_search_iterations == 0u && snapshot.flattened_srt[mapping] == rows,
+            "sampler heap mapping is not one word per row");
+      for (uint32_t row_index = 0; row_index < rows; ++row_index) {
+        const auto ordinal = snapshot.flattened_srt[mapping + 1u + row_index];
+        Check(ordinal == 1u + row_index % 5u &&
+                  snapshot.samplers[ordinal].dwords[0] == 1u + row_index % 5u &&
+                  snapshot.samplers[ordinal].dwords[3] == (variant == Variant::Adjusted ? 7u : 0u),
+              "sampler heap mapped a row to another descriptor");
+      }
+      Check(snapshot.specialization_reads ==
+                std::vector{std::pair{memory.base + 512u, uint64_t{rows} * 16u}},
+            "sampler heap escaped writable-alias capture or read outside its V#");
+    };
+    check(20u);
+    user_data[6] = 3u;
+    check(3u);
+    user_data[6] = 0u;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization.samplers.size() == 1u &&
+              snapshot.samplers[0] == DescriptorValue{.dword_count = 4u},
+          "empty sampler heap kept stale candidates");
   }
 }
 
@@ -9531,14 +9893,17 @@ int main() {
       TestGuardedWaterfallBufferRecords();
     });
     Run("GPU-selected buffer records", TestGpuSelectedBufferRecords);
+    Run("reported buffer rows", TestReportedBufferRows);
     Run("workgroup-selected buffer records", TestWorkgroupSelectedBufferRecords);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("guarded carried buffer key", TestGuardedCarriedBufferKey);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
+    Run("correlated buffer phi", TestCorrelatedBufferPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
     Run("packed descriptor waterfall", TestPackedDescriptorWaterfall);
+    Run("unbounded sampler heap", TestUnboundedSamplerHeap);
     Run("finite image waterfall", TestFiniteImageWaterfall);
     Run("finite inline sampler", TestFiniteInlineSampler);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);

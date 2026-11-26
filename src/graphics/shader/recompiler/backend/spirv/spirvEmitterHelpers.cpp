@@ -112,6 +112,21 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
 }
 
+uint32_t EmitGuestLane(EmitterState& state) {
+	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
+	const auto host_size = workgroup != nullptr && workgroup->host_subgroup_size != 0u
+	                           ? workgroup->host_subgroup_size
+	                           : state.program.wave_size;
+	if (host_size <= state.program.wave_size) {
+		// A wider guest wave is emitted as host-sized halves, already numbered past the first.
+		return EmitSubgroupLocalInvocationId(state);
+	}
+	// A wider host subgroup carries several guest waves; number lanes inside the guest wave.
+	return Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	              EmitSubgroupLocalInvocationId(state),
+	              ConstantU32(state, state.program.wave_size - 1u));
+}
+
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
 	for (const auto& input: state.inputs) {
 		if (input.kind == kind) {

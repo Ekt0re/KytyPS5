@@ -500,16 +500,17 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
 	    vk::PhysicalDeviceRobustness2PropertiesEXT, vk::PhysicalDeviceVulkan11Properties,
 	    vk::PhysicalDeviceSubgroupSizeControlProperties, vk::PhysicalDevicePushDescriptorProperties,
-	    vk::PhysicalDeviceMeshShaderPropertiesEXT>
+	    vk::PhysicalDeviceMeshShaderPropertiesEXT, vk::PhysicalDeviceDriverProperties>
 	    properties;
 	auto& [properties2, float_controls, robustness2_props, properties11, subgroup_control,
-	       push_descriptor, mesh_properties] = properties;
+	       push_descriptor, mesh_properties, driver_properties] = properties;
 	if (!graphics.mesh_shader_enabled) {
 		properties.unlink<vk::PhysicalDeviceMeshShaderPropertiesEXT>();
 	}
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 	graphics.physical_device_properties = properties2.properties;
+	graphics.driver_id                  = driver_properties.driverID;
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
@@ -522,6 +523,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    supported13.subgroupSizeControl == VK_TRUE &&
 	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_control.minSubgroupSize <= 64 && subgroup_control.maxSubgroupSize >= 64;
+	graphics.fragment_subgroup_size_control_enabled =
+	    graphics.compute_subgroup_size_control_enabled &&
+	    (subgroup_stages & vk::ShaderStageFlagBits::eFragment);
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
@@ -550,6 +554,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
+	graphics.compute_derivative_quads_enabled  = compute_derivatives.computeDerivativeGroupQuads == VK_TRUE;
+	graphics.compute_derivative_linear_enabled = compute_derivatives.computeDerivativeGroupLinear == VK_TRUE;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -687,7 +693,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!graphics.conditional_rendering_enabled) {
 		create.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
 	}
-	if (!compute_derivatives.computeDerivativeGroupQuads) {
+	if (!graphics.compute_derivative_quads_enabled && !graphics.compute_derivative_linear_enabled) {
 		create.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
 	}
 	if (!extended_dynamic_state) {

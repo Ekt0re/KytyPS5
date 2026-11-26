@@ -1271,6 +1271,15 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	return OK;
 }
 
+KYTY_SYSV_ABI int VideoOutSetGlobalBlendSpace(int handle, uint32_t space, uint32_t option) {
+	PRINT_NAME();
+
+	LOGF("\tspace = %u, option = %u\n", space, option);
+
+	// The host composes no system overlay, so the blend space has no effect.
+	return DriverState().Get(handle) == nullptr ? VIDEO_OUT_ERROR_INVALID_HANDLE : OK;
+}
+
 KYTY_SYSV_ABI int VideoOutDeleteFlipEvent(EventQueue::KernelEqueue eq, int handle) {
 	PRINT_NAME();
 	return DeleteVideoOutEvent(handle, eq, VideoOutEventKind::Flip);

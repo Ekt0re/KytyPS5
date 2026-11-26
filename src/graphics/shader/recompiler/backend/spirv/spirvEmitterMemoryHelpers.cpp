@@ -2,23 +2,36 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
-uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index) {
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index, bool non_uniform) {
 	const auto pointer = state.builder.AllocateId();
 	const auto value   = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
 	                          pointer, state.push_constant_variable, ConstantU32(state, 0), index);
+	if (non_uniform) {
+		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+	}
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 	return value;
 }
 
-static uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index) {
-	if (state.program.bindings.UsesPushData()) return EmitPushDataLoad(state, dword_index);
+static uint32_t EmitShaderDataDwordLoadAt(EmitterState& state, uint32_t dword_index,
+                                         bool non_uniform = false) {
+	if (state.program.bindings.UsesPushData()) {
+		return EmitPushDataLoad(state, dword_index, non_uniform);
+	}
 	if (state.shader_data_storage_variable != 0) {
 		const auto pointer = state.builder.AllocateId();
 		const auto value   = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
 		                          pointer, state.shader_data_storage_variable,
 		                          ConstantU32(state, 0), dword_index);
+		if (non_uniform) {
+			state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+			state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+			state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+		}
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	}
@@ -38,7 +51,7 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 	return ret;
 }
 
-static uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index) {
+uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index) {
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
 	                          state.flattened_srt_variable, ConstantU32(state, 0), index);
@@ -264,14 +277,44 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 		const auto  data_start = bindings.UsesPushData() ? bindings.push_data_start_dword : 0u;
 		const auto word = EmitShaderDataDwordLoadAt(state, EmitAddU32(
 		    state, ConstantU32(state, bindings.memory_offset_dword + data_start),
-		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))));
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), array_index, ConstantU32(state, 2))), true);
 		const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), array_index, ConstantU32(state, 3)),
 		    ConstantU32(state, 3));
 		access.byte_offset = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
 		    state, word, shift, ConstantU32(state, 8));
-		access.length = EmitShaderDataDwordLoadAt(state, EmitAddU32(
-		    state, ConstantU32(state, bindings.MemorySizeDword() + data_start), array_index));
+		// A non-uniform index into push constants is not reliable: some drivers treat the
+		// load as uniform and use another lane's descriptor size. Load each candidate's size
+		// with a constant index and select the lane's slot.
+		uint32_t length = 0;
+		bool     have_candidate = false;
+		const auto root_index = state.program.info.buffers[mem.resource].indirect_root;
+		if (root_index < state.program.info.buffers.size() &&
+		    state.program.info.buffers[root_index].indirect_root == root_index) {
+			for (const auto candidate :
+			     state.program.info.buffers[root_index].indirect_resources) {
+				const auto slot = state.program.info.buffers[candidate].descriptor_index;
+				if (slot == UINT32_MAX) continue;
+				const auto value = EmitShaderDataDwordLoadAt(
+				    state, ConstantU32(state, bindings.MemorySizeDword() + data_start + slot));
+				if (!have_candidate) {
+					length         = value;
+					have_candidate = true;
+				} else {
+					const auto is_slot =
+					    Binary(state, spv::OpIEqual, TypeBool(state), array_index,
+					           ConstantU32(state, slot));
+					length = Select(state, TypeU32(state), is_slot, value, length);
+				}
+			}
+		}
+		if (!have_candidate) {
+			length = EmitShaderDataDwordLoadAt(
+			    state, EmitAddU32(state,
+			                      ConstantU32(state, bindings.MemorySizeDword() + data_start),
+			                      array_index));
+		}
+		access.length = length;
 	} else {
 		access.byte_offset = state.memory_byte_offsets[static_index];
 		access.length      = state.memory_byte_sizes[static_index];

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -36,8 +37,64 @@ public:
 		bool queued = false;
 	};
 
+	// Instruction -> Location, the first Location registered for an address winning as with
+	// std::unordered_map::emplace. Open addressing on the pointer keeps the lookups of every
+	// visit cache-friendly; locations live in a deque so pending pointers stay valid.
+	class LocationMap {
+	public:
+		void Reserve(size_t count) {
+			size_t capacity = 64;
+			while (capacity < count * 2u) capacity *= 2u;
+			if (capacity > m_slots.size()) Rehash(capacity);
+		}
+		Location& Emplace(Inst* key, Block::iterator instruction) {
+			if ((m_storage.size() + 1u) * 2u > m_slots.size()) Rehash(std::max<size_t>(64, m_slots.size() * 2u));
+			auto& slot = Probe(key);
+			if (slot.key == nullptr) {
+				slot.key   = key;
+				slot.index = static_cast<uint32_t>(m_storage.size());
+				m_storage.push_back(Location {instruction});
+			}
+			return m_storage[slot.index];
+		}
+		Location* Find(const Inst* key) {
+			if (m_slots.empty()) return nullptr;
+			const auto& slot = Probe(key);
+			return slot.key == nullptr ? nullptr : &m_storage[slot.index];
+		}
+		Location& At(const Inst* key) {
+			auto* found = Find(key);
+			if (found == nullptr) std::abort(); // As std::unordered_map::at without exceptions.
+			return *found;
+		}
+		[[nodiscard]] size_t size() const { return m_storage.size(); }
+
+	private:
+		struct Slot {
+			const Inst* key   = nullptr;
+			uint32_t    index = 0;
+		};
+		[[nodiscard]] size_t Hash(const Inst* key) const {
+			// Nodes allocated together stay together, so walks in program order stay local.
+			return static_cast<size_t>(reinterpret_cast<uintptr_t>(key) >> 4u);
+		}
+		Slot& Probe(const Inst* key) {
+			const size_t mask = m_slots.size() - 1u;
+			for (size_t at = Hash(key) & mask;; at = (at + 1u) & mask)
+				if (m_slots[at].key == key || m_slots[at].key == nullptr) return m_slots[at];
+		}
+		void Rehash(size_t capacity) {
+			std::vector<Slot> old(capacity);
+			old.swap(m_slots);
+			for (const auto& slot: old)
+				if (slot.key != nullptr) Probe(slot.key) = slot;
+		}
+		std::vector<Slot>    m_slots;
+		std::deque<Location> m_storage;
+	};
+
 	void Register(Block::iterator instruction) {
-		Queue(locations.emplace(&*instruction, Location {instruction}).first->second);
+		Queue(locations.Emplace(&*instruction, instruction));
 	}
 
 	void Queue(Location& location) {
@@ -57,9 +114,9 @@ public:
 		// the drain left nothing queued, so a queued instruction was visited here.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
-			const auto found = locations.find(inst);
-			if (found == locations.end() || found->second.queued) continue;
-			Queue(found->second);
+			auto* found = locations.Find(inst);
+			if (found == nullptr || found->queued) continue;
+			Queue(*found);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
 		affected.clear();
@@ -72,7 +129,7 @@ public:
 		return result;
 	}
 
-	std::unordered_map<Inst*, Location> locations;
+	LocationMap locations;
 	std::vector<Location*>              pending; // Map nodes keep their addresses across rehashes.
 	std::unordered_set<Inst*> lowered_ancillary;
 
@@ -904,7 +961,7 @@ private:
 		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
 		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
 		auto* block = source->Parent();
-		const auto where = m_worklist.locations.at(source).instruction;
+		const auto where = m_worklist.locations.At(source).instruction;
 		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32 ? ValueOpcode::LogicalAnd
 		              : source->GetOpcode() == ValueOpcode::BitwiseOr32 ? ValueOpcode::LogicalOr
 		              : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
@@ -938,6 +995,9 @@ private:
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	FoldWorklist worklist;
 	LaneMaskProjection mask_projection(worklist);
+	size_t instructions = 0;
+	for (auto* block: blocks) instructions += block->Instructions().size();
+	worklist.locations.Reserve(instructions);
 	for (auto* block: blocks)
 		for (auto inst = block->begin(); inst != block->end(); ++inst) worklist.Register(inst);
 	std::vector<Use> users;

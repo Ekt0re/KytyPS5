@@ -25,6 +25,8 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
+#include <xxhash.h>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -657,6 +659,27 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	*dst = h;
 
 	dbg_dump_shader(h);
+
+	// Diagnostic only: input for tools/shaderCheck.
+	if (static const char* dir = std::getenv("KYTY_SHADER_REGISTRY"); dir != nullptr) {
+		const auto path = fmt::format("{}/{}_{:016x}.reg", dir, static_cast<uint32_t>(h->type),
+		                              XXH3_64bits(const_cast<const void*>(code), h->shader_size));
+		if (auto* file = std::fopen(path.c_str(), "wbx"); file != nullptr) {
+			const uint32_t header[] {0x4745524bu, static_cast<uint32_t>(h->type),
+			                         static_cast<uint32_t>(h->shader_size),
+			                         static_cast<uint32_t>(h->num_sh_registers)};
+			std::fwrite(header, sizeof(header), 1, file);
+			for (uint32_t i = 0; i < h->num_sh_registers; i++) {
+				const uint32_t reg[] {static_cast<uint32_t>(h->sh_registers[i].offset),
+				                      static_cast<uint32_t>(h->sh_registers[i].value)};
+				std::fwrite(reg, sizeof(reg), 1, file);
+			}
+			std::fwrite(const_cast<const void*>(code), 1, h->shader_size, file);
+			const uint32_t scratch_size = h->scratch_size_dw_per_thread;
+			std::fwrite(&scratch_size, sizeof(scratch_size), 1, file);
+			std::fclose(file);
+		}
+	}
 
 	return OK;
 }
@@ -3516,12 +3539,54 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
 	return OK;
 }
 
+uint64_t KYTY_SYSV_ABI AgcAcbEventWriteGetSize(uint8_t /*event_type*/) {
+	PRINT_NAME();
+
+	return 8;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbAtomicMemGetSize() {
+	PRINT_NAME();
+
+	return 36;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbAtomicMemGetSize() {
+	PRINT_NAME();
+
+	return 36;
+}
+
+uint32_t KYTY_SYSV_ABI AgcAcbRewindGetSize() {
+	PRINT_NAME();
+
+	return 8;
+}
+
+uint32_t KYTY_SYSV_ABI AgcDcbStallCommandBufferParserGetSize() {
+	PRINT_NAME();
+
+	return 8;
+}
+
+int KYTY_SYSV_ABI AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine) {
+	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_ACQUIRE_MEM) {
+		return AGC_ERROR_INVALID_PACKET;
+	}
+
+	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(engine) << 31u);
+	return OK;
+}
+
 int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 	if (((cmd[0] >> 8u) & 0xffu) != Pm4::IT_REWIND) {
 		return AGC_ERROR_INVALID_PACKET;
 	}
 
 	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(state) << 31u);
+	if (state != 0 && g_renderer != nullptr) {
+		g_renderer->GetGpu().ReleaseRewind(cmd);
+	}
 	return OK;
 }
 

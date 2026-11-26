@@ -608,6 +608,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	                           std::ranges::any_of(info.images, uses_mapping) ||
 	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
+	info.uses_heap_rows  = std::ranges::any_of(info.buffers, &BufferResource::heap_rows);
 	switch (program.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local: CollectVertexInputs(input_info.vertex, info, inputs.components); break;

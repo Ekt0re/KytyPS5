@@ -552,6 +552,7 @@ constexpr uint64_t AMM_MAP_DIRECT_RECORD_SIZE    = 0x30;
 constexpr uint64_t AMM_UNMAP_RECORD_SIZE         = 0x20;
 constexpr uint64_t AMM_MAP_AS_PRT_RECORD_SIZE    = 0x0c;
 constexpr uint64_t AMM_REMAP_RECORD_SIZE         = 0x10;
+constexpr uint64_t AMM_ALLOCATE_PA_RECORD_SIZE   = 0x10;
 constexpr uint64_t AMM_PAGE_SIZE                 = 0x4000;
 constexpr int      AMM_MAP_FIXED                 = 0x10;
 constexpr int      AMM_USAGE_DIRECT              = 0;
@@ -778,6 +779,19 @@ static uint64_t AprReadFileRecordSize(uint64_t file_offset) {
 
 static uint64_t WriteAddressRecordSize(uint64_t value) {
 	return value <= 3 ? 8 : value < (uint64_t {1} << 34) ? 12 : 16;
+}
+
+// Titles size command buffers with the console's record sizes, so records must not exceed them.
+static uint64_t WaitAddressRecordSize(uint64_t value) {
+	return value == 0 ? 8 : value < (uint64_t {1} << 32) ? 12 : 16;
+}
+
+static uint64_t WaitCounterRecordSize(uint64_t value) {
+	return value <= 0xff ? 4 : 8;
+}
+
+static uint64_t WriteCounterRecordSize(uint64_t value) {
+	return value <= 0xfff ? 4 : 8;
 }
 
 static uint64_t AprReadGatherRecordSize(uint64_t file_offset) {
@@ -1833,7 +1847,7 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_b
 	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer),
 	                           CommandBufferState::WaitCommand {
 	                               reinterpret_cast<uint64_t>(address), value, compare, false},
-	                           0x20)
+	                           WaitAddressRecordSize(value))
 	           ? OK
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
@@ -1849,7 +1863,7 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnCounter(void* command_buffer, uint8_
 	EXIT_NOT_IMPLEMENTED(access != 1 || mask_op != 0 || flush != 0 || value > UINT32_MAX);
 	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer),
 	                           CommandBufferState::WaitCommand {index, value, compare, true},
-	                           0x20)
+	                           WaitCounterRecordSize(value))
 	           ? OK
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
@@ -1895,7 +1909,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t
 	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer),
 	                           CommandBufferState::WriteCounterCommand {
 	                               index, static_cast<uint32_t>(value)},
-	                           0x20)
+	                           WriteCounterRecordSize(value))
 	           ? OK
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
@@ -2223,6 +2237,28 @@ static int KYTY_SYSV_ABI AmmCommandBufferMapAsPrt(void* command_buffer, uint64_t
 	           : LibKernel::KERNEL_ERROR_EBUSY;
 }
 
+static int KYTY_SYSV_ABI AmmCommandBufferAllocatePaForPrt(void* command_buffer, uint64_t va,
+                                                          uint64_t size, int32_t type,
+                                                          int32_t prot) {
+	PRINT_NAME();
+
+	if (command_buffer == nullptr || !ValidateAmmMapArgs(va, size) || (prot & PROT_CPU_EXEC) != 0) {
+		return LibKernel::KERNEL_ERROR_EINVAL;
+	}
+
+	CommandBufferState::AmmMapCommand command {};
+	command.kind = AmmCommandKind::MapAuto;
+	command.va   = va;
+	command.size = size;
+	command.type = type;
+	command.prot = prot;
+
+	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer), command,
+	                           AMM_ALLOCATE_PA_RECORD_SIZE)
+	           ? OK
+	           : LibKernel::KERNEL_ERROR_EBUSY;
+}
+
 static int KYTY_SYSV_ABI AmmCommandBufferRemapIntoPrt(void* command_buffer, uint64_t va,
                                                       uint64_t old_va, uint64_t size, int32_t prot,
                                                       int32_t prot_mask) {
@@ -2474,6 +2510,7 @@ LIB_DEFINE(InitAmpr_1) {
 	LIB_FUNC("8TBE+9XCZbI", Ampr::AmmCommandBufferMapDirect);
 	LIB_FUNC("kOfZlhbVAkc", Ampr::AmmCommandBufferMapDirectWithGpuMaskId);
 	LIB_FUNC("ZJCgt+aPHAU", Ampr::AmmCommandBufferMapAsPrt);
+	LIB_FUNC("d3lKWPM6odc", Ampr::AmmCommandBufferAllocatePaForPrt);
 	LIB_FUNC("0Xo9g4goDXU", Ampr::AmmCommandBufferRemapIntoPrt);
 	LIB_FUNC("3A2X6OCHtnA", Ampr::AmmCommandBufferUnmapToPrt);
 	LIB_FUNC("M-VFI2DJWQA", Ampr::AmmCommandBufferUnmap);

@@ -17,6 +17,7 @@ struct ResourceSpecialization {
 		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
 		uint32_t               indirect_mapping_offset         = 0;
 		uint32_t               indirect_search_iterations      = 0;
+		bool                   heap_rows                       = false;
 		bool                   operator==(const Buffer&) const = default;
 	};
 

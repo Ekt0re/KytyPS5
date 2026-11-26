@@ -42,6 +42,10 @@ ShaderParams PrepareProgram(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               input_info);
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
+// Like PrepareProgram, but false, instead of an error, when the shader is not mapped. Safe on any
+// thread.
+bool TryPrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info,
+                       ShaderParams& params);
 
 } // namespace Libs::Graphics
 

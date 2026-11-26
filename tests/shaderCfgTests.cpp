@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
@@ -1402,6 +1403,68 @@ void TestRebasedTextureMipViews() {
   sparse.data.address -= 0x100;
   Check(sparse.SubresourceOf(sparse_chain).mip == -1,
         "sparse view accepted a different mip-tail origin");
+}
+
+void TestMipViewPastMaxMip() {
+  const auto make = [](Prospero::BufferFormat format, Prospero::TileMode tile, uint32_t width,
+                       uint32_t height, uint32_t levels) {
+    ImageInfo info {};
+    info.data.address  = 0x100000000ull;
+    info.guest_format  = format;
+    info.type          = Prospero::ImageType::kColor2D;
+    info.extent        = {width, height, 1};
+    info.resources     = {levels, 1};
+    info.tile_mode     = tile;
+    info.samples       = 1;
+    return info;
+  };
+
+  {
+    // No Man's Sky compresses mip 1 through a T# that declares one level (256x256 -> 128x128).
+    auto     info = make(Prospero::BufferFormat::k32_32UInt, Prospero::TileMode::kStandard4KB, 256,
+                         256, 2);
+    uint32_t base = 1;
+    const bool ok = ResolveTextureMipView(info, 1, false, 1, base);
+    Check(ok && info.extent.width == 128 && info.extent.height == 128 &&
+              info.resources.levels == 1 && info.data.size == 0x20000 && base == 0,
+          "a view past MAX_MIP did not rebase to its own 128x128 chain");
+  }
+  {
+    // The same chain's mip 4 sits in the tail and is not an independent 16x16 image.
+    auto     info = make(Prospero::BufferFormat::k32_32UInt, Prospero::TileMode::kStandard4KB, 256,
+                         256, 5);
+    uint32_t base = 4;
+    Check(!ResolveTextureMipView(info, 1, false, 1, base),
+          "a tail mip past MAX_MIP was accepted as its own chain");
+  }
+
+  const Prospero::BufferFormat formats[] = {
+      Prospero::BufferFormat::k8_8_8_8UNorm,
+      Prospero::BufferFormat::k10_10_10_2UNorm,
+      Prospero::BufferFormat::k16_16_16_16Float,
+  };
+  for (const auto format : formats) {
+    for (const bool metadata : {false, true}) {
+      auto chain = make(format, Prospero::TileMode::kRenderTarget, 1920, 1080, 6);
+      chain.UpdateSize();
+      auto     info = make(format, Prospero::TileMode::kRenderTarget, 1920, 1080, 7);
+      uint32_t base = 6;
+      const bool ok = ResolveTextureMipView(info, 6, metadata, 1, base);
+      char       msg[320];
+      std::snprintf(msg, sizeof(msg),
+                    "1920x1080 render target mip 6 past MAX_MIP format=%u meta=%d ok=%d "
+                    "extent=%ux%u levels=%u base=%u size=%llu chain=%llu",
+                    static_cast<unsigned>(format), metadata ? 1 : 0, ok ? 1 : 0, info.extent.width,
+                    info.extent.height, info.resources.levels, base,
+                    static_cast<unsigned long long>(info.data.size),
+                    static_cast<unsigned long long>(chain.data.size));
+      // The standalone mip is not this chain's mip 6, so the view stays on the 1920x1080
+      // image and must not grow past the six stored levels (Astro Bot's PS logo).
+      Check(ok && info.extent.width == 1920 && info.extent.height == 1080 &&
+                info.data.size == chain.data.size,
+            msg);
+    }
+  }
 }
 
 void TestShaderFeatureCollection() {
@@ -4480,6 +4543,98 @@ void TestNewShaderRecompilerUnbasedFlatUsesBda() {
             result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer)] != 0,
         "unbased FLAT did not compile through BDA");
   CheckSpirvBinaryValidates(result.spirv);
+
+  // A guest page past the BDA table is a missing page: get_bda_pointer compares the 64-bit page
+  // with the table size before it indexes the table or records a fault.
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto begin  = source.find("%get_bda_pointer = OpFunction");
+  const auto end    = source.find("OpFunctionEnd", begin);
+  const auto body   = begin == std::string::npos ? std::string {} : source.substr(begin, end - begin);
+  const auto pages  = std::to_string(Libs::Graphics::BufferCache::CACHING_NUMPAGES);
+  std::string pages_id;
+  std::string page_type;
+  for (size_t line = 0; line < source.size();) {
+    const auto next = std::min(source.find('\n', line), source.size());
+    const auto text = source.substr(line, next - line);
+    if (text.find("OpConstant %ulong " + pages) != std::string::npos ||
+        text.find("OpConstant %uint64 " + pages) != std::string::npos) {
+      pages_id = text.substr(text.find('%'), text.find(' ', text.find('%')) - text.find('%'));
+      page_type = text.find("OpConstant %ulong ") != std::string::npos ? "%ulong" : "%uint64";
+    }
+    line = next + 1;
+  }
+  Check(!pages_id.empty(), "BDA page lookup has no page table size constant");
+
+  // Follow the comparison: it must pick the table index and guard the fault record.
+  std::vector<std::vector<std::string>> instructions;
+  {
+    std::istringstream lines(body);
+    for (std::string line; std::getline(lines, line);) {
+      std::istringstream words(line);
+      std::vector<std::string> tokens;
+      for (std::string word; words >> word;) {
+        tokens.push_back(word);
+      }
+      instructions.push_back(std::move(tokens));
+    }
+  }
+  // Empty pattern entries match any operand.
+  const auto find_line = [&](std::initializer_list<std::string> pattern) -> std::vector<std::string> {
+    for (const auto &tokens: instructions) {
+      if (tokens.size() == pattern.size() &&
+          std::equal(pattern.begin(), pattern.end(), tokens.begin(),
+                     [](const std::string &p, const std::string &t) { return p.empty() || p == t; })) {
+        return tokens;
+      }
+    }
+    return {};
+  };
+  const auto find = [&](std::initializer_list<std::string> pattern) -> std::string {
+    const auto tokens = find_line(pattern);
+    return tokens.empty() ? std::string {} : tokens[0];
+  };
+  // The comparison reads the original 64-bit page, the right shift of the packed address, and the
+  // table index narrows that same result. Narrowing before the comparison would alias page 2^32
+  // onto page zero.
+  const auto compare  = find_line({"", "=", "OpULessThan", "%bool", "", pages_id});
+  const auto in_range = compare.empty() ? std::string {} : compare[0];
+  const auto page64   = compare.empty() ? std::string {} : compare[4];
+  const auto shifted  = find_line({page64, "=", "OpShiftRightLogical", page_type, "", ""});
+  const auto narrowed = find({"", "=", "OpUConvert", "%uint", page64});
+  const auto index    = find({"", "=", "OpSelect", "%uint", in_range, narrowed, "%uint_0"});
+  const auto missing  = find({"", "=", "OpLogicalNot", "%bool", in_range});
+  auto       unbacked = find({"", "=", "OpLogicalOr", "%bool", "", missing});
+  if (unbacked.empty()) {
+    unbacked = find({"", "=", "OpLogicalOr", "%bool", missing, ""});
+  }
+  Check(!in_range.empty() && shifted.size() == 6 && !narrowed.empty() && !index.empty() &&
+            !missing.empty() && !unbacked.empty() &&
+            !find({"", "=", "OpAccessChain", "", "%bda_pagetable", "%uint_0", index}).empty() &&
+            !find({"OpBranchConditional", unbacked, "", ""}).empty(),
+        "BDA page lookup did not select the table index with the bounds check");
+
+  // The fault bitmap is only touched in the block the bounds check branches into.
+  std::string record_label;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 4 && tokens[0] == "OpBranchConditional" && tokens[1] == in_range) {
+      record_label = tokens[2];
+    }
+  }
+  bool     in_record    = false;
+  bool     record_index = false;
+  uint32_t record_uses  = 0;
+  uint32_t total_uses   = 0;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 3 && tokens[1] == "=" && tokens[2] == "OpLabel") {
+      in_record = !record_label.empty() && tokens[0] == record_label;
+    }
+    const auto uses = static_cast<uint32_t>(std::count(tokens.begin(), tokens.end(), "%fault_buffer"));
+    total_uses += uses;
+    record_uses += in_record ? uses : 0;
+    record_index |= in_record && std::find(tokens.begin(), tokens.end(), index) != tokens.end();
+  }
+  Check(!record_label.empty() && record_uses != 0 && record_uses == total_uses && record_index,
+        "BDA fault record is not guarded by the page bounds check");
 }
 
 void TestNewShaderRecompilerDsReadWrite2Translation() {
@@ -5933,6 +6088,76 @@ void TestNativeGuardedSamplerSource(bool inline_constants) {
   }
 }
 
+// A loop spills its constant sampler to VGPR lanes, reuses the SGPRs for data and restores them
+// on every native path before the sample and the backedge. The structurizer's dispatch of the
+// two forward gotos merges the clobbered words into the backedge Phi; the native lane spill
+// still proves the constant words. Variant 1 leaves s16 clobbered on the P3 path to the backedge
+// and variant 2 overwrites the spill VGPR; both must stay unproven.
+void TestNativeSpilledSamplerLanes(uint32_t variant) {
+  constexpr uint32_t loop = 5, p2 = 22, p3 = 28, join = 33;
+  const auto readlane = [](uint32_t sgpr, uint32_t lane) {
+    return std::array<uint32_t, 2>{EncodeVop3Word0(0x360, sgpr), EncodeVop3Word1(256 + 1, 128 + lane, 0)};
+  };
+  std::vector<uint32_t> code = {
+      EncodeSopk(0x00, 16, 146), EncodeSop2(0x24, 17, 140, 140),
+      EncodeSMovB32(18, 255), 0x05000000u, EncodeSMovB32(19, 128),
+      // loop: v_writelane_b32 v1, s16, 0; v_writelane_b32 v1, s17, 1
+      EncodeVop3Word0(0x361, 1), EncodeVop3Word1(16, 128, 0),
+      EncodeVop3Word0(0x361, 1), EncodeVop3Word1(17, 129, 0),
+      EncodeVop1(0x02, 16, 256), EncodeVop1(0x02, 17, 256), // v_readfirstlane_b32 s16/s17, v0
+      EncodeSopc(0x07, 20, 130), EncodeSopp(0x04, p3 - 12 - 1),
+      EncodeSopc(0x07, 20, 129), EncodeSopp(0x04, p2 - 14 - 1),
+  };
+  const auto append = [&](std::initializer_list<uint32_t> words) {
+    code.insert(code.end(), words.begin(), words.end());
+  };
+  const auto restore = [&] {
+    for (uint32_t word = 0; word < 2; ++word) {
+      const auto read = readlane(16 + word, word);
+      append({read[0], read[1]});
+    }
+  };
+  restore();                                                // 15
+  append({EncodeMimg0(0x20, 0x1), EncodeMimg1(4, 2, 4, 2)}); // 19: sample s[16:19]
+  append({EncodeSopp(0x02, join - 21 - 1)});
+  Check(code.size() == p2, "spilled sampler test layout");
+  append({EncodeVop1(0x01, 4, 242)});
+  restore();
+  append({EncodeSopp(0x02, join - 27 - 1)});
+  Check(code.size() == p3, "spilled sampler test layout");
+  append({EncodeVop1(0x01, 5, 16)}); // The clobbered SGPR is data here.
+  restore();
+  Check(code.size() == join, "spilled sampler test layout");
+  if (variant == 1u) code[p3 + 1u] = code[p3 + 2u] = EncodeSopp(0x00);
+  if (variant == 2u) code[10] = EncodeVop1(0x01, 1, 256); // v_mov_b32 v1, v0
+  append({EncodeSop2(0x02, 21, 21, 193), EncodeSopc(0x07, 21, 128),
+          EncodeSopp(0x05, static_cast<uint16_t>(static_cast<int32_t>(loop) - 35 - 1)),
+          EncodeExp0(0x00, 0x1), EncodeExp1(4, 0, 0, 0), EncodeSopp(0x01)});
+  auto user_data = ImageTestUserData();
+  user_data[13] = 2u;
+  const std::array<uint32_t, 4> sampler{0x92u, 0x00fff000u, 0x05000000u, 0u};
+  for (uint32_t mode = 0; mode != 3; ++mode) {
+    user_data[12] = mode;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data_base = 8;
+    options.user_data = user_data;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    if (variant != 0u) {
+      ExpectFatal([&] { (void)RecompileForTest(code, options); },
+                  "a clobbered lane spill proved a constant sampler");
+      return;
+    }
+#endif
+    const auto result = RecompileForTest(code, options);
+    // Only mode 0 reaches the sample; the others materialize a null sampler.
+    const auto expected = mode == 0u ? sampler : std::array<uint32_t, 4>{};
+    Check(!result.program.dispatcher_fallback && result.resources.samplers.size() == 1u &&
+              std::equal(expected.begin(), expected.end(), result.resources.samplers[0].dwords.begin()),
+          "a sampler restored from its lane spill lost its constant words");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestNativeConstantSamplerSelection() {
   const uint32_t shader[] = {
       EncodeSopk(0x00, 16, 146), EncodeSop2(0x24, 17, 140, 140),
@@ -6118,12 +6343,19 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   Check(materialize(), "restored material batch failed to materialize");
   auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
   CheckSpirvBinaryValidates(result.spirv);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // Wraparound leaves no key bound, so the bounded table V# supplies every row instead.
   auto unbounded = code;
   unbounded[0x3cu / 4u] = EncodeSopc(0x0bu, 14u, 13u); // s_cmp_le_u32 admits wraparound.
-  ExpectFatal([&] { ShaderRecompiler::TranslateProgram(unbounded, options); },
-              "material selection accepted an inclusive induction bound");
-#endif
+  const auto scanned = ShaderRecompiler::TranslateProgram(unbounded, options);
+  uint32_t whole_tables = 0;
+  for (const auto& source: scanned.program.descriptor_sources) {
+    if (!source.indirect_descriptor) continue;
+    Check(source.indirect_descriptor->table_scalar && !source.indirect_descriptor->selector &&
+              source.indirect_descriptor->key_count.IsEmpty(),
+          "material selection accepted an inclusive induction bound");
+    ++whole_tables;
+  }
+  Check(whole_tables == 1u, "unbounded material selection lost its table scan");
 }
 
 void TestNativeDescriptorProvenanceKeepsGpuSelection() {
@@ -13559,6 +13791,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestMipViewPastMaxMip();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
@@ -13651,6 +13884,11 @@ int main() {
   TestNativeGuardedSamplerSource(false);
   TestNativeGuardedSamplerSource(true);
   TestNativeConstantSamplerSelection();
+  TestNativeSpilledSamplerLanes(0);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  TestNativeSpilledSamplerLanes(1);
+  TestNativeSpilledSamplerLanes(2);
+#endif
   TestNullImageTakesDeclaredCube();
   TestPackedZeroHighSamplerTableKey();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
@@ -13769,3 +14007,4 @@ int main() {
 
   return 0;
 }
+

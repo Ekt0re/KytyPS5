@@ -24,17 +24,22 @@ struct GraphicContext {
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
 	vk::PhysicalDevice                 physical_device                       = nullptr;
 	vk::PhysicalDeviceProperties       physical_device_properties            = {};
+	vk::DriverId                       driver_id                             = vk::DriverId::eAmdProprietary;
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// Fragment shaders can run at the guest wave size (VK_EXT_subgroup_size_control).
+	bool                               fragment_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               ray_query_enabled                     = false;
+	bool                               compute_derivative_quads_enabled      = false;
+	bool                               compute_derivative_linear_enabled     = false;
 	bool                               r8_srgb_views                         = false;
 	bool                               r8g8_srgb_views                       = false;
 	bool                               r4g4b4a4_render_targets               = false;

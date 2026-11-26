@@ -7,10 +7,12 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/computePrescan.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -24,6 +26,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -118,6 +121,7 @@ void GuestGpu::Submit(std::span<const uint32_t> commands) {
 	submission.queue_id = 0;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
+	Prescan(0, commands);
 }
 
 void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands) {
@@ -131,6 +135,31 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
+	Prescan(1 + compute_queue, commands);
+}
+
+void GuestGpu::ReleaseRewind(const uint32_t* rewind) {
+	// The REWIND packet is two dwords; a chaining INDIRECT_BUFFER packet, four, follows it.
+	// Rewinds patched by queue are not told apart: the compute registers of queue 0 are used.
+	Prescan(0, {rewind + 2, 4});
+}
+
+void GuestGpu::Prescan(uint32_t queue_id, std::span<const uint32_t> commands) {
+	// Diagnostic switch for comparisons.
+	static const bool disabled = std::getenv("KYTY_NO_TRANSLATE_AHEAD") != nullptr;
+	if (disabled) {
+		return;
+	}
+	struct Sink final: ComputePrescanSink {
+		PipelineCache& cache;
+		bool           async_compute;
+		Sink(PipelineCache& c, bool async): cache(c), async_compute(async) {}
+		void Found(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator) override {
+			cache.TranslateComputeAhead(regs, dispatch_initiator, async_compute);
+		}
+	} sink(m_renderer.GetPipelineCache(), queue_id != 0);
+	std::scoped_lock lock(m_prescan_mutex);
+	PrescanComputeDispatches(commands, m_prescan_regs[queue_id], sink);
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
@@ -820,6 +849,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
+	// A GPU-written count is brought back before the CPU reads it, like the records below.
+	if (count_addr != nullptr) {
+		m_renderer.GetBufferCache().ReadMemory(reinterpret_cast<uint64_t>(count_addr),
+		                                       sizeof(uint32_t));
+	}
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
 	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
@@ -849,6 +883,12 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// The records may have been written by the GPU: bring them back before the CPU reads them,
+	// as DispatchIndirect does (ported from KytyPS5 PR #2302, de49ee9186).
+	m_renderer.GetBufferCache().ReadMemory(
+	    args_addr,
+	    static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
+	        (indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand)));
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;

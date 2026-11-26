@@ -718,6 +718,27 @@ ShaderParams PrepareProgram(
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
+bool TryPrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info,
+                       ShaderParams& params) {
+	ShaderMapEntry entry;
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		if (g_shader_map == nullptr) {
+			return false;
+		}
+		const auto iter = g_shader_map->find(regs.cs_regs.data_addr);
+		if (iter == g_shader_map->end()) {
+			return false;
+		}
+		entry = iter->second;
+	}
+	ShaderGetStaticInputInfoCS(regs, entry.data, info);
+	params = GetShaderParams(
+	    regs.cs_regs.data_addr, entry.hash,
+	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), entry.data);
+	return true;
+}
+
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, data, info);

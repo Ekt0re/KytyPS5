@@ -36,6 +36,9 @@ public:
 	void Submit(std::span<const uint32_t> commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
+	// The guest released the REWIND packet at `rewind`: the commands it held back, usually a
+	// chained buffer, are written now and are scanned for compute dispatches (Prescan).
+	void ReleaseRewind(const uint32_t* rewind);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
 	void SuspendPoint();
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
@@ -63,6 +66,8 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	// Has the compute programs that `commands` dispatches translated ahead.
+	void              Prescan(uint32_t queue_id, std::span<const uint32_t> commands);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -83,6 +88,9 @@ private:
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
 	std::binary_semaphore                          m_suspend_point_ready {1};
+	// The compute registers each queue's submitted commands leave, as Prescan sees them.
+	std::mutex                                     m_prescan_mutex;
+	std::array<HW::CsStageRegisters, QueueCount>   m_prescan_regs {};
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

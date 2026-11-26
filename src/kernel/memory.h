@@ -143,8 +143,24 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 // Stops at the first hole, or with span_holes at the end of the last committed range.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
+// 0 when nothing is committed there.
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Part of the range is guest memory that is reserved or mapped without CPU or GPU write access,
+// so a host store into it faults and nothing recovers the fault. Memory the guest map does not
+// describe is not known to fail, nor is a program image that SetProgramMemoryProtection left
+// host-writable whatever its guest protection.
+[[nodiscard]] bool     IsKnownUnwritable(uint64_t vaddr, uint64_t size);
+// The guest has the whole range committed with CPU or GPU write access. A host store into it
+// faults only on pages the GPU resource tracker protects, which HandleGpuFault recovers.
+[[nodiscard]] bool     IsGuestWritable(uint64_t vaddr, uint64_t size);
+// For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
+// over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
+// and returns the range's id. 0 for any other fault.
+[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
+// Whether such a fault can be retried (false once the same page keeps faulting).
+[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 

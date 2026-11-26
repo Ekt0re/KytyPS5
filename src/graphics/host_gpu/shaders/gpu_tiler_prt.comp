@@ -9,12 +9,25 @@ uvec3 block_extent() {
 	return uvec3(width, BLOCK_BYTES / (width * ELEMENT_BYTES), 1u);
 }
 uint block_offset(uvec3 p) {
-	uvec4 s = ELEMENT_BYTES == 1 ? uvec4(7, 7, 6, 6) :
-	          ELEMENT_BYTES == 2 ? uvec4(7, 6, 6, 5) :
-	          ELEMENT_BYTES == 4 ? uvec4(6, 6, 5, 5) :
-	          ELEMENT_BYTES == 8 ? uvec4(6, 5, 5, 4) : uvec4(5, 5, 4, 4);
-	uint delta = (((p.x >> s.x) & 1u) << 8) ^ (((p.y >> s.y) & 1u) << 9) ^
-	             (((p.x >> s.z) & 1u) << 10) ^ (((p.y >> s.w) & 1u) << 11);
+	// RADV miscompiles the variable shift amounts from this specialization; constant bit
+	// selects are equivalent.
+	uint delta;
+	if (ELEMENT_BYTES == 1) {
+		delta = ((p.x & 128u) << 1) ^ ((p.y & 128u) << 2) ^ ((p.x & 64u) << 4) ^
+		        ((p.y & 64u) << 5);
+	} else if (ELEMENT_BYTES == 2) {
+		delta = ((p.x & 128u) << 1) ^ ((p.y & 64u) << 3) ^ ((p.x & 64u) << 4) ^
+		        ((p.y & 32u) << 6);
+	} else if (ELEMENT_BYTES == 4) {
+		delta = ((p.x & 64u) << 2) ^ ((p.y & 64u) << 3) ^ ((p.x & 32u) << 5) ^
+		        ((p.y & 32u) << 6);
+	} else if (ELEMENT_BYTES == 8) {
+		delta = ((p.x & 64u) << 2) ^ ((p.y & 32u) << 4) ^ ((p.x & 32u) << 5) ^
+		        ((p.y & 16u) << 7);
+	} else {
+		delta = ((p.x & 32u) << 3) ^ ((p.y & 32u) << 4) ^ ((p.x & 16u) << 6) ^
+		        ((p.y & 16u) << 7);
+	}
 	return standard64_offset(p.xy) ^ delta;
 }
 #include "gpu_tiler_common.inc"

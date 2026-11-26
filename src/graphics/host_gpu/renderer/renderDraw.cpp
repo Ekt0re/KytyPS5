@@ -864,12 +864,31 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	    })) {
 		const auto raster =
 		    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
+		// Resolving marked every target; a dropped one is no attachment of this pass, so it must
+		// not stay marked, or a stage sampling it expects an attachment layout that is never set.
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX + 1> unmarked {};
+		size_t                                                unmarked_count = 0;
+		for (const auto& color: colors) {
+			if (color.desc.info.samples != raster) unmarked[unmarked_count++] = color.image_id;
+		}
 		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
 			return color.desc.info.samples != raster;
 		});
 		targets.color_count -= static_cast<uint32_t>(dropped.size());
 		if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
-			targets.depth = {};
+			unmarked[unmarked_count++] = targets.depth.image_id;
+			targets.depth              = {};
+		}
+		auto&      cache = m_context.GetTextureCache();
+		const auto kept  = std::span {targets.colors, targets.color_count};
+		for (size_t i = 0; i < unmarked_count; i++) {
+			const auto id = unmarked[i];
+			if (targets.depth.image_id == id ||
+			    std::ranges::any_of(kept,
+			                        [&](const RenderColorInfo& c) { return c.image_id == id; })) {
+				continue;
+			}
+			cache.GetImage(id).binding.is_target = false;
 		}
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -945,9 +964,9 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(Prospero::PrimitiveType primitive, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
-	switch (ucfg.GetPrimType()) {
+	switch (primitive) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
@@ -979,7 +998,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				}
 			}
 			break;
-		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
+		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(primitive));
 	}
 }
 
@@ -1124,7 +1143,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets, false);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
@@ -1206,23 +1225,37 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
 	buffer.BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_task) {
-		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
-	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else if (args_buffer.first == nullptr) {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
-	} else if (draw.indexed) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
+	const auto record = [=, &occlusion_queries, primitive = ucfg.GetPrimType(),
+	                     args   = args_buffer.first != nullptr ? args_buffer.first->Handle()
+	                                                           : vk::Buffer {},
+	                     offset = args_buffer.second](vk::CommandBuffer command,
+	                                                  vk::Pipeline      handle) {
+		command.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+		if (mesh_task) {
+			command.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+		} else if (mesh_active) {
+			command.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else if (!args) {
+			EmitDrawPrimitives(primitive, command, draw, emit);
+		} else if (draw.indexed) {
+			command.drawIndexedIndirect(args, offset, emit.indirect.count, emit.indirect.stride);
+		} else {
+			command.drawIndirect(args, offset, emit.indirect.count, emit.indirect.stride);
+		}
+		occlusion_queries.End(command, occlusion_query);
+	};
+	if (pipeline.pipeline) {
+		record(vk_buffer, pipeline.pipeline);
 	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
+		m_context.GetCommandScheduler().Split(
+		    [record, compiling = pipeline.compiling](vk::CommandBuffer command) {
+			    record(command, compiling.get());
+			    command.endRendering();
+		    });
+		vk_buffer = buffer.Handle();
 	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
@@ -1270,7 +1303,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().StartOperation();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1361,7 +1394,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().StartOperation();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 

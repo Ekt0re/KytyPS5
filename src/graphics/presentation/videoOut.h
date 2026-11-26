@@ -63,6 +63,7 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
                                                uint32_t dcc_control,
                                                uint64_t dcc_cb_register_clear_color);
 KYTY_SYSV_ABI int  VideoOutSetFlipRate(int handle, int rate);
+KYTY_SYSV_ABI int  VideoOutSetGlobalBlendSpace(int handle, uint32_t space, uint32_t option);
 KYTY_SYSV_ABI int  VideoOutAddFlipEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,
                                         void* udata);
 KYTY_SYSV_ABI int  VideoOutAddVblankEvent(LibKernel::EventQueue::KernelEqueue eq, int handle,

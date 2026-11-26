@@ -101,6 +101,7 @@ void CommandScheduler::Shutdown() {
 			    lock, [this] { return m_operation_state == OperationState::Closed; });
 			return;
 		}
+		SealReleasesLocked();
 		m_operation_state = OperationState::Draining;
 	}
 	if (!m_command.IsInvalid()) {
@@ -117,7 +118,7 @@ void CommandScheduler::Shutdown() {
 	{
 		std::lock_guard lock(m_operation_mutex);
 		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
-		        m_priority_active_tick != 0);
+		        !m_unsealed_releases.empty() || m_priority_active_tick != 0);
 		m_operation_state = OperationState::Closed;
 	}
 	m_operation_available.notify_all();
@@ -148,6 +149,10 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 
 void CommandScheduler::Finish() {
 	CheckActive();
+	{
+		std::lock_guard lock(m_operation_mutex);
+		SealReleasesLocked();
+	}
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
@@ -188,8 +193,37 @@ void CommandScheduler::PopPendingOperations() {
 	}
 }
 
+void CommandScheduler::StartOperation() {
+	{
+		std::lock_guard lock(m_operation_mutex);
+		SealReleasesLocked();
+	}
+	PopPendingOperations();
+}
+
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
 	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
+	CheckActive();
+	EXIT_IF(!operation);
+	{
+		std::lock_guard lock(m_operation_mutex);
+		if (m_operation_state == OperationState::Open) {
+			m_unsealed_releases.push_back(std::move(operation));
+			return;
+		}
+	}
+	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::SealReleasesLocked() {
+	const auto last_recorded_tick = m_command.IsInvalid() ? CurrentTick() - 1 : CurrentTick();
+	for (auto& release: m_unsealed_releases) {
+		m_pending_operations.push({std::move(release), last_recorded_tick});
+	}
+	m_unsealed_releases.clear();
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
@@ -300,12 +334,28 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 	return m_command;
 }
 
+void CommandScheduler::Split(Common::UniqueFunction<void, vk::CommandBuffer>&& tail) {
+	EXIT_IF(m_command.IsInvalid());
+	m_segments.push_back({m_command.m_buffer, std::move(tail)});
+	m_command.m_rendering = false;
+	m_command.m_buffer    = nullptr;
+	BeginCommand();
+}
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
 	m_command.End();
-	const auto buffer   = m_command.m_buffer;
-	auto&      graphics = m_graphics;
+	std::vector<vk::CommandBuffer> buffers;
+	buffers.reserve(m_segments.size() + 1);
+	for (const auto& segment: m_segments) {
+		segment.tail(segment.buffer);
+		EXIT_IF(segment.buffer.end() != vk::Result::eSuccess);
+		buffers.push_back(segment.buffer);
+	}
+	m_segments.clear();
+	buffers.push_back(m_command.m_buffer);
+	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
 	vk::Result result;
@@ -326,8 +376,8 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
 		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
 		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = 1;
-		submit_info.pCommandBuffers      = &buffer;
+		submit_info.commandBufferCount   = static_cast<uint32_t>(buffers.size());
+		submit_info.pCommandBuffers      = buffers.data();
 		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 

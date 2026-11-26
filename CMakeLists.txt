@@ -450,6 +450,7 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(shader_check "${KYTY_TESTS_DIR}/shaderCheck.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -691,6 +692,11 @@ target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 add_kyty_full_emulator_test(kernel_module_info_tests "${KYTY_TESTS_DIR}/KernelModuleInfoTests.cpp")
 target_link_libraries(kernel_module_info_tests kyty_test_gtest)
 
+add_executable(win_read_efault_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WinReadEfaultTests.cpp")
+target_link_libraries(win_read_efault_tests common)
+target_include_directories(win_read_efault_tests PRIVATE ${inc_headers})
+
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
@@ -819,6 +825,7 @@ if(BUILD_TESTING)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME win_read_efault COMMAND $<TARGET_FILE:win_read_efault_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
@@ -862,6 +869,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME graphics_small_formatted_image_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --small-formatted-image-sync-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME trinity_mode
@@ -886,6 +895,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME srgb_texture
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
+	add_test(NAME unmapped_texture
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --unmapped-texture-only)
 	add_test(NAME device_creation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --device-creation-only)
 	add_test(NAME msaa_storage
@@ -941,6 +952,7 @@ if(BUILD_TESTING)
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		win_read_efault_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests

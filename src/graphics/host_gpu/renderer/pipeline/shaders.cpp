@@ -1,3 +1,4 @@
+#include "common/compilePause.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
@@ -139,6 +140,24 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	                     vk::Result::eSuccess);
 }
 
+void CreatePipelineLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                           std::span<const ShaderModule* const> stages) {
+	std::vector<vk::DescriptorSetLayoutBinding> bindings;
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			const auto native_stage = NativeShaderStage(stage->info.stage);
+			AddLayoutBindings(bindings, stage->info, native_stage);
+			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+			pipeline.push_stages |= native_stage;
+			if (stage->mesh_task) pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+		}
+	}
+	if (!(pipeline.push_stages & vk::ShaderStageFlagBits::eCompute)) {
+		pipeline.push_stages |= vk::ShaderStageFlagBits::eFragment;
+	}
+	CreateLayouts(graphics, pipeline, bindings);
+}
+
 // Formats with a narrower host variant drop the components the shader does not read.
 static vk::Format NarrowInputFormat(vk::Format format, uint32_t used_components) {
 	switch (format) {
@@ -197,10 +216,10 @@ static vk::Format InputFormat(uint8_t raw_format, uint32_t used_components) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
-                            const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache) {
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const GraphicsPipelineKey&                key,
+                                const std::array<const ShaderModule*, 4>& stages,
+                                vk::PipelineCache                         driver_cache) {
 	const auto& rendering     = key.rendering;
 	const auto& vertex_input  = key.vertex_input;
 	const auto& static_params = key.static_params;
@@ -227,11 +246,24 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
+	// The recompiled code treats the host subgroup as the guest wave. RADV runs fragment shaders
+	// in 64-lane waves by default, so a wave32 pixel shader's upper 32 lanes tested the EXEC and
+	// ballot bits of lanes 0-31; GTA VI's clustered-light shader (PS 0x02defa99cc8f3d1e) then took
+	// an empty cell's 0xffffffff into its slice range and looped until the GPU reset.
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo pixel_subgroup_size {};
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
-			                                       .module = stage->module,
-			                                       .pName  = "main"};
+			auto& info = shader_stages[shader_stage_count++];
+			info       = {.stage  = NativeShaderStage(stage->info.stage),
+			              .module = stage->module,
+			              .pName  = "main"};
+			const auto wave_size = stage->info.wave_size;
+			if (info.stage == vk::ShaderStageFlagBits::eFragment &&
+			    graphics.fragment_subgroup_size_control_enabled &&
+			    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+				pixel_subgroup_size.requiredSubgroupSize = wave_size;
+				info.pNext                               = &pixel_subgroup_size;
+			}
 		}
 	}
 	if (task_module) {
@@ -342,21 +374,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
-	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	pipeline.push_stages = vk::ShaderStageFlagBits::eFragment;
-	if (task_module) {
-		pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
-	}
-	for (const auto* stage: stages) {
-		if (stage != nullptr) {
-			const auto native_stage = NativeShaderStage(stage->info.stage);
-			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
-			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
-			pipeline.push_stages |= native_stage;
-		}
-	}
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
-
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
 	std::vector<vk::DynamicState> dynamic_states {
@@ -410,19 +427,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDepthStencilState  = (with_depth ? &depth_stencil_info : nullptr);
 	pipeline_info.pColorBlendState    = &color_blending;
 	pipeline_info.pDynamicState       = &dynamic_state;
-	pipeline_info.layout              = pipeline.pipeline_layout;
+	pipeline_info.layout              = layout;
 
-	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline.pipeline);
+	vk::Pipeline pipeline;
+	Common::CompilePause::Scope compile_pause;
+	const auto   result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
+	                                                            nullptr, &pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	graphics.device.destroyShaderModule(task_module, nullptr);
+	return pipeline;
 }
 
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const ShaderModule& module, vk::PipelineCache driver_cache) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -435,22 +455,36 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 
-	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
-	pipeline.uses_image_heap = module.info.info.uses_image_heap;
-	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
-
 	vk::ComputePipelineCreateInfo info {};
 	if (module.info.info.uses_gds) {
 		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
 	}
 	info.stage  = comp_shader_stage_info;
-	info.layout = pipeline.pipeline_layout;
+	info.layout = layout;
 
-	const auto result =
-	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+	vk::Pipeline pipeline;
+	Common::CompilePause::Scope compile_pause;
+	const auto   result =
+	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	return pipeline;
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const GraphicsPipelineKey&                 key,
+                            const std::array<const ShaderModule*, 4>& stages,
+                            vk::PipelineCache                          driver_cache) {
+	CreatePipelineLayouts(graphics, pipeline, stages);
+	pipeline.pipeline =
+	    CreateHostPipeline(graphics, pipeline.pipeline_layout, key, stages, driver_cache);
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+	const auto* stage = &module;
+	CreatePipelineLayouts(graphics, pipeline, {&stage, 1});
+	pipeline.pipeline =
+	    CreateHostPipeline(graphics, pipeline.pipeline_layout, module, driver_cache);
 }
 
 } // namespace Libs::Graphics

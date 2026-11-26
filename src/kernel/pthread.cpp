@@ -1,3 +1,4 @@
+#include "common/compilePause.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
@@ -516,6 +517,7 @@ static void SleepNanoInSlices(uint64_t nanoseconds) {
 	for (uint64_t slept = 0; slept < nanoseconds; slept = Common::SteadyNs() - start) {
 		Common::Thread::SleepNano(std::min(nanoseconds - slept, slice_nanos));
 	}
+	if (nanoseconds >= 500000000ull) Common::CompilePause::HoldWhileCompiling();
 }
 
 struct PthreadStaticObject {

@@ -45,7 +45,9 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
 	                           : desc.view_info.format;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
-	if (cmask ? code == 0 : code == 0x20) {
+	// PS5 DCC fast clears to the CB_COLOR_CLEAR_WORD value fill the keys with 0x10, not only the
+	// GFX10 0x20.
+	if (cmask ? code == 0 : (code == 0x20 || code == 0x10)) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
@@ -205,9 +207,63 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	while (info.pixel_format != vk::Format::eUndefined &&
+	       m_slot_images[id].backing.image == nullptr) {
+		m_slot_images.erase(id);
+		if (!ReleaseIdleImages(info.data)) {
+			EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
+			     info.extent.width, info.extent.height, info.extent.depth,
+			     static_cast<int>(info.pixel_format), info.IsVolume() ? 1u : info.resources.layers,
+			     info.resources.levels);
+		}
+		id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	}
 	RegisterImage(id);
 	return id;
+}
+
+bool TextureCache::ReleaseIdleImages(GuestRange requested) {
+	if (!m_scheduler.Active() || m_gc_tick == 0) {
+		return false;
+	}
+	std::vector<ImageId> candidates;
+	m_lru_cache.ForEachItemBelow(m_gc_tick - 1, [&](ImageId id) { candidates.push_back(id); });
+	std::vector<ImageId> released;
+	uint64_t             released_size = 0;
+	for (const auto id: candidates) {
+		if (released_size >= requested.size) {
+			break;
+		}
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->backing.image == nullptr || image->tick_accessed_last == m_gc_tick ||
+		    image->heap_refs.load(std::memory_order_relaxed) != 0u || image->binding.is_bound ||
+		    image->binding.is_target || image->usage.video_out ||
+		    image->Overlaps(requested.address, requested.size)) {
+			continue;
+		}
+		if (image->IsGpuModified() && image->IsMaybeCpuDirty()) {
+			TrackImage(id);
+			image->ResolveMaybeCpuHash(image->HashGuestEdges());
+		}
+		if (image->SafeToDownload() && (image->info.HasStencil() || !DownloadImageMemory(id))) {
+			continue;
+		}
+		released_size += image->AccountedSize();
+		released.push_back(id);
+		FreeImage(id);
+	}
+	if (released.empty()) {
+		return false;
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto id: released) {
+		m_slot_images[id].ReleaseBacking();
+	}
+	return true;
 }
 
 void TextureCache::RegisterImage(ImageId id) {
@@ -275,7 +331,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -650,7 +706,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    binding == BindingType::Texture && cached.info.IsDepth() && !cached.info.HasStencil() &&
 	    !requested.IsVolume() && requested.samples == cached.info.samples &&
 	    IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = !cached.info.resources.Contains(requested.resources) ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -690,6 +746,16 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
+	if (grow_depth) {
+		// The grown image keeps the pending HTile clears of every slice.
+		const auto metadata = m_surface_metas.find(info.metadata.range.address);
+		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
+			metadata->second.owner = replacement_id;
+		}
+	}
+	if (RetireThroughGuestMemory(replacement_id, cached_id)) {
+		return replacement_id;
+	}
 	// The copy below covers only the cached layers and levels; the rest start from guest memory.
 	if (info.resources.levels > cached.info.resources.levels ||
 	    info.resources.layers > cached.info.resources.layers) {
@@ -718,13 +784,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
-	}
-	if (grow_depth) {
-		// The grown image keeps the pending HTile clears of every slice.
-		const auto metadata = m_surface_metas.find(info.metadata.range.address);
-		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
-			metadata->second.owner = replacement_id;
-		}
 	}
 	FreeImage(cached_id);
 	return replacement_id;
@@ -861,7 +920,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                              requested.resources.levels == cached.info.resources.levels;
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
 		if ((requested.pixel_format == cached.info.pixel_format || compatible_array) &&
-		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    requested.type == cached.info.type &&
+		    !cached.info.resources.Contains(requested.resources) &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
 		      requested.extent == cached.info.extent &&
@@ -919,6 +979,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
+	if (RetireThroughGuestMemory(expanded_id, source_id)) {
+		return expanded_id;
+	}
 	InitializeImage(expanded_id);
 	if (const auto view = source.info.SubresourceOf(info); view.mip >= 0) {
 		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(view.mip),
@@ -928,6 +991,21 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	}
 	FreeImage(source_id);
 	return expanded_id;
+}
+
+bool TextureCache::RetireThroughGuestMemory(ImageId replacement_id, ImageId retired_id) {
+	const auto& replacement = m_slot_images[replacement_id].info;
+	auto&       retired     = m_slot_images[retired_id];
+	if (replacement.type != retired.info.type ||
+	    replacement.resources.Contains(retired.info.resources) || replacement.samples != 1 ||
+	    replacement.metadata.compression != VideoOutCompression::Uncompressed ||
+	    (retired.IsGpuModified() &&
+	     (!retired.SafeToDownload() || !BcAlias::Publish(*this, retired)))) {
+		return false;
+	}
+	InitializeImage(replacement_id);
+	FreeImage(retired_id);
+	return true;
 }
 
 bool TextureCache::CanDownload(const Image& image) const {
@@ -1297,6 +1375,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		// A resident image heap may sample the adopted image, for example an R8 texture at
+		// the stencil range. Its references still belong to that image, so queue the change.
+		record.HeapChanged();
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1392,7 +1473,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                             desc.info.guest_format;
 			if (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format)) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (!resolved.info.resources.Contains(desc.info.resources)) {
+				if (CanDownload(resolved)) {
+					RefreshImage(result);
+					if (resolved.SafeToDownload()) {
+						(void)BcAlias::Publish(*this, resolved);
+					}
+				}
 				FreeImage(result);
 				result = {};
 			}
@@ -1841,14 +1928,9 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
-	if (!selected) {
-		return false;
-	}
-
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, ImageId id) {
 	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
+	auto&            image = m_texture_cache.m_slot_images[id];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!image.SafeToDownload()) {
 		return false;

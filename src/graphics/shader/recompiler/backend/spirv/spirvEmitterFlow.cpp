@@ -736,7 +736,7 @@ void EmitBarrier(EmitterState& state) {
 uint32_t EmitLaneId(EmitterState& state) {
 	return state.program.stage == ShaderType::TessellationControl
 	           ? EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0)
-	           : EmitSubgroupLocalInvocationId(state);
+	           : EmitGuestLane(state);
 }
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
