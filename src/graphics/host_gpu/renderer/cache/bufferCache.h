@@ -39,9 +39,15 @@ public:
 	static constexpr uint64_t FAULT_BITMAP_BYTES =
 	    (CACHING_NUMPAGES + ShaderRecompiler::IR::HeapRowBits) / 8;
 	static constexpr uint64_t IMAGE_ATOMIC_LOCK_DWORD = FAULT_BITMAP_BYTES / 4;
-	static constexpr uint64_t FAULT_BUFFER_BYTES =
-	    FAULT_BITMAP_BYTES + ShaderRecompiler::IR::ImageAtomicLockWords * 4;
+	// After them, at a storage-offset-aligned position, the write bitmap: one bit per caching
+	// page that a device-address store (indirect buffer store or atomic) wrote. (Port of TheCruZ's
+	// write bitmap, KytyPS5 PR #2469 line 427a75fc.)
+	static constexpr uint64_t WRITE_BITMAP_OFFSET =
+	    (FAULT_BITMAP_BYTES + ShaderRecompiler::IR::ImageAtomicLockWords * 4 + 255) & ~uint64_t {255};
+	static constexpr uint64_t WRITE_BITMAP_BYTES = ((CACHING_NUMPAGES + 127) / 128) * 16;
+	static constexpr uint64_t FAULT_BUFFER_BYTES  = WRITE_BITMAP_OFFSET + WRITE_BITMAP_BYTES;
 	static_assert(FAULT_BITMAP_BYTES % 16 == 0 && IMAGE_ATOMIC_LOCK_DWORD < UINT32_MAX);
+	static_assert(WRITE_BITMAP_OFFSET / 4 + WRITE_BITMAP_BYTES / 4 < UINT32_MAX);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -99,6 +105,10 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
+	// Records stores a shader made through device addresses, known once it completed: the bytes
+	// of [vaddr, vaddr + size) a cached buffer holds become GPU modified, except on pages the CPU
+	// dirtied since, whose upload replaces them.
+	void               NoteGpuWrites(uint64_t vaddr, uint64_t size);
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.

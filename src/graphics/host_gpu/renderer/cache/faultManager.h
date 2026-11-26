@@ -31,6 +31,7 @@ private:
 	HeapRows                                   m_heap_rows;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
+	Buffer                                     m_write_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;

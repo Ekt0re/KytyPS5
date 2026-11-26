@@ -1121,6 +1121,43 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
+// Sets the caching page's bit in the write bitmap (BufferCache::WRITE_BITMAP_OFFSET), so the host
+// learns which pages device-address stores wrote. Most stores find the bit set already; only the
+// first store to a page pays for the atomic. The address has a BDA page table entry, so its page
+// is in range. (Port of TheCruZ's RecordBdaWrite, KytyPS5 PR #2469 line 427a75fc.)
+void RecordBdaWrite(EmitterState& state, uint32_t address) {
+	const auto type     = TypeU64(state);
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed   = Select(state, type, extended,
+	                             Binary(state, spv::OpISub, type, address,
+	                                    ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase -
+	                                                           LOWER_ADDRESS_SIZE)),
+	                             address);
+	const auto page     = Unary(state, spv::OpUConvert, TypeU32(state),
+	                            Binary(state, spv::OpShiftRightLogical, type, packed,
+	                                   ConstantU32(state, BufferCache::CACHING_PAGEBITS)));
+	const auto word = Binary(
+	    state, spv::OpIAdd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5)),
+	    ConstantU32(state, static_cast<uint32_t>(BufferCache::WRITE_BITMAP_OFFSET / sizeof(uint32_t))));
+	const auto bit =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	const auto pointer = FaultElementPointer(state, word);
+	const auto scope   = ConstantU32(state, spv::ScopeDevice);
+	const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	const auto value   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), value, pointer, scope, relaxed);
+	const auto missing =
+	    Binary(state, spv::OpIEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), value, bit), ConstantU32(state, 0));
+	EmitIfCondition(state, missing, [&]() {
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+		                          pointer, scope, relaxed, bit);
+	});
+}
+
 // A DWORD store by device address; memory without a cached buffer is not written, as indirect
 // loads read it as zero.
 void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
@@ -1139,14 +1176,14 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uin
 			constexpr uint32_t alignment = sizeof(uint32_t);
 			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
 			                          alignment);
+			RecordBdaWrite(state, aligned);
 		});
 	});
 }
 
 // A raw DWORD store through a V# the GPU computes (IR::MemoryInfo::SupportsIndirectBufferStore):
 // each lane resolves the V# with the address and bounds rules of indirect loads and writes by
-// device address. (Port of TheCruZ's StoreIndirectBuffer, KytyPS5 PR #2469 line 427a75fc,
-// without its write bitmap.)
+// device address. (Port of TheCruZ's StoreIndirectBuffer, KytyPS5 PR #2469 line 427a75fc.)
 void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
@@ -1721,6 +1758,7 @@ uint32_t AtomicIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                          bda);
 				const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
 				EmitAtomicMemoryBarrier(state, IR::ResourceKind::IndirectBuffer);
+				RecordBdaWrite(state, aligned);
 				return old;
 			});
 		});

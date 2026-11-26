@@ -57,6 +57,21 @@ public:
 	void ValidateGpuDirtyOwnership(const RangeSet&, uint64_t, uint64_t, const char*) {}
 #endif
 
+	// Marks the pages of the range GPU dirty unless they are CPU dirty and calls func(address,
+	// size) for the runs it marked.
+	template <typename Func>
+	void MarkRegionAsGpuModifiedUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->MarkGpuDirtyUnlessCpuDirty(
+			    offset, bytes, [&](uint64_t address, uint64_t length) { runs.emplace_back(address, length); });
+		});
+		for (const auto& [address, length]: runs) {
+			func(address, length);
+		}
+	}
+
 	template <bool clear, typename Func>
 	void ForEachDownloadRange(uint64_t vaddr, uint64_t size, Func&& func) {
 		static_assert(std::is_nothrow_invocable_v<Func&, uint64_t, uint64_t>);
