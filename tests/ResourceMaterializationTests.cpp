@@ -1226,6 +1226,53 @@ void TestIndirectStorageSwizzles() {
         "indirect storage candidates sharing one swizzle were incompatible");
 }
 
+// GPU-selected indexed V#s with ADD_TID: compute stages keep the bit for the emitter, which adds the
+// lane to the index and to its bound; other stages and byte-offset roots reject it.
+void TestIndexedAddTidIndirectBuffers() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const auto stage : {Libs::Graphics::ShaderType::Compute, Libs::Graphics::ShaderType::Pixel}) {
+    for (const bool indexed : {true, false}) {
+      Program program;
+      program.stage = stage;
+      program.srt_plan_complete = program.resource_tracking_complete = true;
+      for (const uint32_t base : {0x10000u, 0x20000u}) {
+        DescriptorSource source;
+        source.dword_count = 4u;
+        source.dwords.fill(Value(0u));
+        source.dwords[0] = Value(base);
+        source.dwords[1] = Value(16u << 16u); // stride 16
+        source.dwords[2] = Value(8u);         // 8 records
+        // 32UInt, identity, ADD_TID, OOB mode 0 (indexed) or 3 (raw bytes)
+        source.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) | (20u << 12u) | (1u << 23u) |
+                                 ((indexed ? 0u : 3u) << 28u));
+        program.descriptor_sources.push_back(source);
+      }
+      DescriptorSource root;
+      root.dword_count = 4u;
+      root.dwords.fill(Value(0u));
+      auto& indirect = root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
+      indirect.sources = {0, 1};
+      indirect.indexed = indexed;
+      program.descriptor_sources.push_back(root);
+      program.info.buffers.push_back(
+          {.source = 2u, .max_byte_extent = 4u, .read = true, .raw = true});
+      auto plan = Extract(program);
+      const SrtRuntime runtime{};
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+      const bool expected = indexed && stage == Libs::Graphics::ShaderType::Compute;
+      Check(materialized == expected,
+            "an ADD_TID candidate was accepted outside an indexed compute access, or rejected in one");
+      if (!expected) continue;
+      bool lane = specialization.buffers.size() > 1u;
+      for (size_t i = 1; i < specialization.buffers.size(); ++i)
+        lane &= (specialization.buffers[i].packed_stride & (1u << 20u)) != 0u;
+      Check(lane, "an indexed ADD_TID candidate lost the lane bit of its packed stride");
+    }
+  }
+}
+
 // A storage swizzle that fills only the channels an unconverted format lacks becomes the identity.
 void TestStorageFillSwizzle() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -1599,6 +1646,7 @@ int main() {
   TestEmptyScalarBufferSpecialization();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestIndirectStorageSwizzles();
+  TestIndexedAddTidIndirectBuffers();
   TestStorageFillSwizzle();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);

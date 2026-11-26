@@ -28,6 +28,9 @@ struct Profile {
 	// Quads for even 2D local sizes, Linear for other groups whose size is a multiple of four.
 	bool compute_derivative_quads  = true;
 	bool compute_derivative_linear = true;
+	// A wave64 compute program run as two halves on a 32-lane host subgroup orders its LDS
+	// accesses with a subgroup barrier (KYTY_LDS_SYNC=0 turns it off).
+	bool lds_lane_sync = true;
 };
 
 inline constexpr Profile DefaultProfile {};

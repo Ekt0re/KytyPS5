@@ -350,7 +350,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
 					collect_element(child);
-				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+				// An indirect root's selected children carry their own ADD_TID.
+				const auto& children = info.buffers[memory.resource].indirect_resources;
+				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u ||
+				    std::ranges::any_of(children, [&](uint32_t child) {
+					    return (info.buffers[child].packed_stride & (1u << 20u)) != 0u;
+				    })) {
 					if (program.stage != ShaderType::Compute) {
 						return Fail("buffer ADD_TID is only valid for compute shaders");
 					}

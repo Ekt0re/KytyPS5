@@ -173,6 +173,15 @@ void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
 
 } // namespace
 
+// KYTY_LDS_SYNC=0 drops the LDS ordering of wave64 programs run as halves (Profile::lds_lane_sync).
+static bool LdsLaneSyncEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LDS_SYNC");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	// AMD's own drivers run NMin/NMax as v_min/v_max, which give the guest's NaN and signed-zero
 	// results; Mesa's RADV implements the GLSL.std.450 semantics instead, so it keeps the ordered
@@ -187,7 +196,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .relaxed_float          = Config::RelaxedShaderFloatEnabled(),
 	        .ray_query              = graphics.ray_query_enabled,
 	        .compute_derivative_quads  = graphics.compute_derivative_quads_enabled,
-	        .compute_derivative_linear = graphics.compute_derivative_linear_enabled};
+	        .compute_derivative_linear = graphics.compute_derivative_linear_enabled,
+	        .lds_lane_sync             = LdsLaneSyncEnabled()};
 }
 
 std::filesystem::path ShaderStorePath() {
@@ -275,6 +285,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	    .specialization = program.specialization,
 	    .function_code  = {function_code.begin(), function_code.end()},
 	});
+	RetainModuleSpirv(module, result.spirv);
 	m_compiled[static_cast<size_t>(key.stage)]++;
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",

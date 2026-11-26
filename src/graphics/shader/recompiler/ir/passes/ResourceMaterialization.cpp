@@ -224,7 +224,9 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t offset,
 
 // Rewrites a GPU-selected V# as null, as index bounds (indexed) or as byte bounds (not indexed),
 // so every access of the root sees the bounds the V# gives it. Returns why it cannot, or null.
-const char* NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource) {
+// lane_index: the stage adds the guest lane to an indexed ADD_TID V#'s index (compute only).
+const char* NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferResource& resource,
+                                    bool lane_index) {
 	ShaderBufferResource descriptor;
 	if (!DecodeBufferDescriptor(value, descriptor)) return "V# width";
 	const bool formatted_read = resource.formatted && resource.read && !resource.written;
@@ -233,8 +235,12 @@ const char* NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const 
 		value.dwords.fill(0u);
 		return nullptr;
 	}
-	// Swizzled ranges end past stride * records and the lane index is not part of the bounds test.
-	if (descriptor.SwizzleEnabled() || descriptor.AddTid()) return "swizzle or thread ID";
+	// Swizzled ranges end past stride * records.
+	if (descriptor.SwizzleEnabled()) return "swizzle";
+	// ADD_TID adds the lane to the index, which the bounds then test (BufferByteAddress and
+	// BufferIndexInBounds read packed_stride bit 20). Byte offsets alone have no index to add it to
+	// once the stride becomes 1 below. Indexed ADD_TID after Axellito/VIKyng bcee3021.
+	if (descriptor.AddTid() && (!indexed || !lane_index)) return "thread ID";
 	const auto oob = descriptor.OutOfBounds();
 	if (!indexed) {
 		if (resource.formatted) return "formatted byte offsets";
@@ -1907,7 +1913,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        specialization.buffers,
 					        [&](DescriptorValue& value) {
 						        reject_reason = NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
+						            value, source->indirect_descriptor->indexed, base,
+						            program.stage == ShaderType::Compute);
 						        return reject_reason == nullptr;
 					        },
 					        true, &reject_reason))

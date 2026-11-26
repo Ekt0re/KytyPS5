@@ -405,10 +405,14 @@ uint32_t BufferIndexInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 	const auto last_record = Binary(state, spv::OpUDiv, TypeU32(state),
 	    Binary(state, spv::OpISub, TypeU32(state), available, ConstantU32(state, 1u)),
 	    ConstantU32(state, stride));
+	// An ADD_TID V# tests the index plus the lane, as BufferByteAddress addresses it.
+	auto index = ctx.Arg(inst, 1);
+	if ((buffer.packed_stride & (1u << 20u)) != 0u)
+		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	return AndCondition(state, payload_in_bounds,
 	    AndCondition(state,
 	        Binary(state, spv::OpUGreaterThan, TypeBool(state), bytes, first_byte),
-	        Binary(state, spv::OpULessThanEqual, TypeBool(state), ctx.Arg(inst, 1), last_record)));
+	        Binary(state, spv::OpULessThanEqual, TypeBool(state), index, last_record)));
 }
 
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -678,9 +682,36 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 	});
 }
 
+// A guest wave64 run as two halves on a 32-lane host subgroup passes values between its lanes
+// through LDS with no barrier, which the guest's lockstep wave orders. Host invocations of the
+// subgroup are not in lockstep (NVIDIA's independent thread scheduling), so a store of one
+// instruction can race a load of the next. A subgroup barrier with LDS acquire/release before each
+// LDS access of the first half orders every access of the previous instruction, as __syncwarp()
+// does. Guest control flow is scalar, so the guest wave, which is the host subgroup here, reaches
+// it together. (Port of gtafork 4c4eaac7 via Axellito/VIKyng bcee3021; KYTY_LDS_SYNC=0: off.)
+void EmitLdsLaneSync(EmitterState& state, const IR::MemoryInfo& mem) {
+	if (!state.profile.lds_lane_sync || mem.kind != IR::ResourceKind::Lds ||
+	    state.lane_count != 2 || state.lane_half != 0 ||
+	    state.program.stage != ShaderType::Compute || state.program.info.bvh_stack) {
+		return;
+	}
+	uint32_t memory = 0;
+	if (state.lds_storage_class == spv::StorageClassWorkgroup) {
+		memory = spv::MemorySemanticsWorkgroupMemoryMask;
+	} else if (state.lds_storage_class == spv::StorageClassStorageBuffer) {
+		memory = spv::MemorySemanticsUniformMemoryMask;
+	} else {
+		return;
+	}
+	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup),
+	                          ConstantU32(state, spv::ScopeWorkgroup),
+	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+}
+
 template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
+	EmitLdsLaneSync(ctx.state, mem);
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		auto index = DwordIndex(ctx, inst, mem);
 		if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
@@ -1564,6 +1595,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
+	EmitLdsLaneSync(state, mem);
 	EnsureLdsStorage(state);
 	const auto address = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
 	                            ByteAddress(ctx, inst, mem), ConstantU32(state, 0xfff8u));
@@ -1789,6 +1821,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
 	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) return;
+	EmitLdsLaneSync(ctx.state, mem);
 	const auto buffer_components = IR::BufferComponentCount(op);
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);
@@ -1822,6 +1855,7 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
+	EmitLdsLaneSync(ctx.state, mem);
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
 	else if (buffer_components > 1u)

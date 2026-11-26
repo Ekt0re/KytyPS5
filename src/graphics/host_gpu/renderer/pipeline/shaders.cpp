@@ -1,6 +1,7 @@
 #include "common/compilePause.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -20,10 +21,56 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics {
+
+bool RetainModuleSpirv() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAILED_SPIRV_DUMP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void RetainModuleSpirv(ShaderModule& module, const std::vector<uint32_t>& spirv) {
+	module.spirv_words = spirv.size();
+	if (RetainModuleSpirv()) {
+		module.spirv = spirv;
+	}
+}
+
+// The driver's result and the modules of a pipeline it fails to create: a driver given an invalid
+// or oversized module may only answer ErrorUnknown (Axellito/VIKyng bcee3021 found a 1 GB module).
+[[noreturn]] static void ExitPipelineFailure(const char* kind, vk::Result result,
+                                             std::span<const ShaderModule* const> modules) {
+	for (const auto* module: modules) {
+		if (module == nullptr) {
+			continue;
+		}
+		std::printf("%s: module id=0x%016" PRIx64 " stage=%u spirv=%zu words\n", kind, module->id,
+		            static_cast<unsigned>(module->info.stage), module->spirv_words);
+		if (module->spirv.empty()) {
+			continue;
+		}
+		std::error_code error;
+		const auto      folder = Config::GetShaderLogFolder() / "failed";
+		std::filesystem::create_directories(folder, error);
+		const auto path = folder / fmt::format("{:016x}.spv", module->id);
+		if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+			std::fwrite(module->spirv.data(), sizeof(uint32_t), module->spirv.size(), file);
+			std::fclose(file);
+			std::printf("%s: wrote %s\n", kind, path.string().c_str());
+		}
+	}
+	EXIT("%s failed: %s%s\n", kind, vk::to_string(result).c_str(),
+	     RetainModuleSpirv() ? "" : " (KYTY_FAILED_SPIRV_DUMP=1 writes the modules' SPIR-V)");
+}
 
 static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -433,7 +480,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	Common::CompilePause::Scope compile_pause;
 	const auto   result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		ExitPipelineFailure("vkCreateGraphicsPipelines", result, stages);
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -466,7 +515,10 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	Common::CompilePause::Scope compile_pause;
 	const auto   result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		const ShaderModule* modules[] = {&module};
+		ExitPipelineFailure("vkCreateComputePipelines", result, modules);
+	}
 	return pipeline;
 }
 

@@ -540,12 +540,20 @@ uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32
 void DefineTrinityFunctions(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
+// One OpSwitch, and the OpPhi of its results, take two words per case under SPIR-V's 16-bit
+// instruction word count, and the validator's universal limit is 16383 switch cases, so a switch
+// holds at most this many cases; EmitIndexSwitch nests larger ones. (A GPU-selected heap can give thousands of distinct candidates: Axellito/VIKyng bcee3021
+// found a one-switch-per-access module past 1 GB and a corrupt OpSwitch, which they cap.)
+inline constexpr uint32_t MaxSwitchCases     = 8192u;
+inline constexpr uint32_t MaxSwitchCasesBits = 13u;
+static_assert(MaxSwitchCases == 1u << MaxSwitchCasesBits);
+
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
-auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
-                        uint32_t result_type, Fn&& emit) {
+auto EmitFlatIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
+                         uint32_t result_type, Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
-	EXIT_IF(count == 0u);
+	EXIT_IF(count == 0u || count > MaxSwitchCases);
 	const auto merge_label = state.builder.AllocateId();
 	std::vector<uint32_t> labels(count);
 	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
@@ -578,6 +586,36 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 		state.builder.AddFunction(phi);
 		return phi[2];
 	}
+}
+
+// Calls emit(item) in the case of index for items [0, count); an index past them takes item 0 when
+// there is a result, and no case otherwise.
+template <typename Fn>
+auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
+                        uint32_t result_type, Fn&& emit) {
+	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
+	if (count <= MaxSwitchCases) {
+		return EmitFlatIndexSwitch(state, index, count, result_type, emit);
+	}
+	const auto groups = (uint64_t {count} + MaxSwitchCases - 1u) >> MaxSwitchCasesBits;
+	EXIT_IF(groups > MaxSwitchCases);
+	if constexpr (has_result) {
+		// The flat switch's default: case 0.
+		index = Select(state, TypeU32(state),
+		               Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, count)),
+		               index, ConstantU32(state, 0u));
+	}
+	const auto low  = Binary(state, spv::OpBitwiseAnd, TypeU32(state), index,
+	                         ConstantU32(state, MaxSwitchCases - 1u));
+	const auto high = Binary(state, spv::OpShiftRightLogical, TypeU32(state), index,
+	                         ConstantU32(state, MaxSwitchCasesBits));
+	return EmitFlatIndexSwitch(state, high, static_cast<uint32_t>(groups), result_type,
+	                           [&](uint32_t group) {
+		                           const auto first = group << MaxSwitchCasesBits;
+		                           return EmitFlatIndexSwitch(
+		                               state, low, std::min(MaxSwitchCases, count - first),
+		                               result_type, [&](uint32_t item) { return emit(first + item); });
+	                           });
 }
 
 template <typename Fn>

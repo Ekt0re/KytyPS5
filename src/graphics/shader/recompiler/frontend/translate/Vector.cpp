@@ -285,8 +285,20 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, true);
 			return;
 		case O::V_CMP_LG_F16:
+		case O::V_CMPX_LG_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdNotEqual32, true);
 			return;
+		case O::V_CMP_NLG_F16:
+		case O::V_CMPX_NLG_F16:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordEqual32, true);
+			return;
+		case O::V_CMP_F_F16:
+		case O::V_CMPX_F_F16: EmitCompareConstant(inst, false, false); return;
+		case O::V_CMP_TRU_F16:
+		case O::V_CMPX_TRU_F16: EmitCompareConstant(inst, true, false); return;
+		case O::V_CMP_O_F16:
+		case O::V_CMPX_O_F16: EmitFloatOrderedCompare(inst, true, IR::Type::F16); return;
+		case O::V_CMPX_U_F16: EmitFloatOrderedCompare(inst, false, IR::Type::F16); return;
 		case O::V_CMP_GT_F16:
 		case O::V_CMPX_GT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThan32, true);

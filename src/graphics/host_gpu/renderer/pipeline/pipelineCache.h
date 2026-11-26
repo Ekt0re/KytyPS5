@@ -129,7 +129,16 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	// The SPIR-V's size, and the SPIR-V itself with KYTY_FAILED_SPIRV_DUMP=1, for the report of a
+	// pipeline the driver fails to create (after Axellito/VIKyng bcee3021).
+	size_t                                       spirv_words = 0;
+	std::vector<uint32_t>                        spirv;
 };
+
+// KYTY_FAILED_SPIRV_DUMP=1: modules keep their SPIR-V, written to the shader log folder's failed/
+// when a pipeline that uses them cannot be created.
+bool RetainModuleSpirv();
+void RetainModuleSpirv(ShaderModule& module, const std::vector<uint32_t>& spirv);
 
 // A draw's depth target and its first color_count color targets.
 struct DrawTargets {

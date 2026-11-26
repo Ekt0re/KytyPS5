@@ -6424,12 +6424,13 @@ void TestBoundedFormattedBufferStore() {
             snapshot.buffers[0].dwords[0] == memory.words[32],
         "destination address refresh was frozen or caused needless specialization");
   // A one-component store writes X whatever the other selectors say. Other one-component
-  // formats, wider records and an index-only bound with the record inside the stride are exact.
-  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 5>{
+  // formats, wider records, an index-only bound with the record inside the stride and ADD_TID
+  // (the emitter adds the lane to the index and to its bound) are exact.
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 6>{
            {{35u, static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u | 4u},
             {35u, static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12u | 4u},
             {35u, memory.words[35] | (4u << 3u)}, {33u, 8u << 16u},
-            {35u, memory.words[35] | (1u << 28u)}}}) {
+            {35u, memory.words[35] | (1u << 28u)}, {35u, memory.words[35] | (1u << 23u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = replacement;
     Check(materialize(), "formatted finite store rejected an exactly representable record");
@@ -6440,9 +6441,9 @@ void TestBoundedFormattedBufferStore() {
   Check(materialize() && snapshot.buffers[0].dwords == DescriptorValue {}.dwords,
         "a store wider than its records was bound");
   memory.words[35] = static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 12u | 4u;
-  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 8>{
+  for (const auto [word, replacement] : std::array<std::pair<uint32_t, uint32_t>, 7>{
            {{35u, memory.words[35] & ~7u}, {32u, memory.words[32] + 1u},
-            {33u, (4u << 16u) | (1u << 31u)}, {35u, memory.words[35] | (1u << 23u)},
+            {33u, (4u << 16u) | (1u << 31u)},
             {35u, memory.words[35] | (3u << 28u)}, {35u, memory.words[35] | (2u << 28u)},
             {33u, 6u << 16u}, {35u, (memory.words[35] & ~7u) | 5u}}}) {
     const auto saved = memory.words[word];
@@ -7382,21 +7383,22 @@ void TestGpuSelectedFormattedRecordStore() {
   memory.words[first] += 1u;
   Check(materialize() && specialization == original,
         "signed byte destination refresh required alignment or needless specialization");
-  // Wider records, another byte format, an index-only bound and the unused Y selector are exact.
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+  // Wider records, another byte format, an index-only bound, the unused Y selector and ADD_TID
+  // (the lane joins the index and its bound) are exact.
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 5>{{
       {first + 1u, 2u << 16u},
       {first + 3u, (uint32_t(Prospero::BufferFormat::k8UInt) << 12u) | 4u},
       {first + 3u, memory.words[first + 3u] | (1u << 28u)},
-      {first + 3u, memory.words[first + 3u] | (4u << 3u)}}}) {
+      {first + 3u, memory.words[first + 3u] | (4u << 3u)},
+      {first + 3u, memory.words[first + 3u] | (1u << 23u)}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = value;
     Check(materialize(), "signed byte candidate rejected an exactly representable V#");
     memory.words[word] = saved;
   }
-  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 4>{{
+  for (const auto [word, value] : std::array<std::pair<uint32_t, uint32_t>, 3>{{
       {first + 1u, (1u << 16u) | (1u << 31u)},
       {first + 3u, memory.words[first + 3u] | (2u << 28u)},
-      {first + 3u, memory.words[first + 3u] | (1u << 23u)},
       {first + 3u, (memory.words[first + 3u] & ~7u) | 5u}}}) {
     const auto saved = memory.words[word];
     memory.words[word] = value;

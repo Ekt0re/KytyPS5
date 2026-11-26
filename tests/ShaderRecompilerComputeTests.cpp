@@ -26681,6 +26681,16 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMPX_GE_F16:
   case Opcode::V_CMPX_NEQ_F16:
   case Opcode::V_CMPX_NLT_F16:
+  case Opcode::V_CMP_F_F16:
+  case Opcode::V_CMP_O_F16:
+  case Opcode::V_CMP_NLG_F16:
+  case Opcode::V_CMP_TRU_F16:
+  case Opcode::V_CMPX_F_F16:
+  case Opcode::V_CMPX_U_F16:
+  case Opcode::V_CMPX_LG_F16:
+  case Opcode::V_CMPX_O_F16:
+  case Opcode::V_CMPX_NLG_F16:
+  case Opcode::V_CMPX_TRU_F16:
     return CoverageClass::NeedsFloatCase;
 
   case Opcode::S_LOAD_DWORD:

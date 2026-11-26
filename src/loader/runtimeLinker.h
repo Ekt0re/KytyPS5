@@ -167,6 +167,10 @@ public:
 	static void     PatchGuestCode(uint64_t address, uint64_t size);
 
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
+	// Fault context, lock-free (the faulting thread may hold m_mutex): appends the loaded modules,
+	// `*` marking the one that holds `pc`, and returns whether one does. Best effort while modules
+	// load. After Axellito/VIKyng bcee3021 (WriteCrashReport).
+	bool DescribeModules(uint64_t pc, std::string& out) const;
 
 private:
 	static void LoadProgramToMemory(Program* program);

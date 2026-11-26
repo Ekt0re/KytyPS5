@@ -19,6 +19,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "kytyGitVersion.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -27,13 +28,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -622,6 +627,134 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+bool RuntimeLinker::DescribeModules(uint64_t pc, std::string& out) const {
+	bool found = false;
+	for (const auto* program: m_programs) {
+		if (program == nullptr) {
+			continue;
+		}
+		const bool here = pc >= program->base_vaddr && pc - program->base_vaddr < program->base_size;
+		found |= here;
+		out += fmt::format("  {}0x{:016x} 0x{:08x} {}\n", here ? "* " : "  ", program->base_vaddr,
+		                   program->base_size, program->file_name.filename().string());
+	}
+	return found;
+}
+
+// KYTY_RAGE_ASSERT_BYPASS=1, a diagnostic that is off by default: skips the deliberate crashes of
+// GTA's RAGE engine, `mov dword [0], imm32` (c7 04 25 00000000 imm32: the imm32 names the failed
+// check) and the `int imm8` (cd xx, typically int 0x41) of its abort paths, so a run continues
+// past them. A console has no handler for either: the game dies there, so a hit means an earlier
+// emulation error, and execution past it is not what the console does. After Axellito/VIKyng
+// bcee3021 ("RAGE assert/int bypass"), limited to guest module code and opt-in.
+static bool RageAssertBypassEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RAGE_ASSERT_BYPASS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static bool TryBypassGuestTrap(const Common::HostException::ExceptionInfo& info) {
+	if (!RageAssertBypassEnabled() ||
+	    info.type != Common::HostException::ExceptionType::AccessViolation) {
+		return false;
+	}
+	const auto pc = info.exception_address;
+	if (!IsReadableRange(pc, 11)) {
+		return false;
+	}
+	std::string modules;
+	if (!Common::Singleton<RuntimeLinker>::Instance()->DescribeModules(pc, modules)) {
+		return false;
+	}
+	const auto* code = reinterpret_cast<const uint8_t*>(pc);
+	uint32_t    disp = 0;
+	uint32_t    sentinel = 0;
+	std::memcpy(&disp, code + 3, sizeof(disp));
+	std::memcpy(&sentinel, code + 7, sizeof(sentinel));
+	size_t length = 0;
+	if (code[0] == 0xC7 && code[1] == 0x04 && code[2] == 0x25 && disp == 0 &&
+	    info.access_violation_vaddr < 0x1000) {
+		length = 11;
+		std::printf("!!! KYTY_RAGE_ASSERT_BYPASS: skipped the store to [0] at pc=0x%016" PRIx64
+		            " sentinel=0x%08x\n", pc, sentinel);
+	} else if (code[0] == 0xCD) {
+		// Linux reports the #GP of a user INT as a fault on address 0, Windows on UINT64_MAX.
+		length = 2;
+		std::printf("!!! KYTY_RAGE_ASSERT_BYPASS: skipped int 0x%02x at pc=0x%016" PRIx64 "\n",
+		            code[1], pc);
+	} else {
+		return false;
+	}
+	std::fflush(stdout);
+	Loader::X64InstructionEmulator::SkipInstruction(info.native_context, length);
+	return true;
+}
+
+// The fault context, also kept in _Logs/crash_<time>.txt (after Axellito/VIKyng bcee3021).
+static void WriteCrashReport(const Common::HostException::ExceptionInfo& exception_info) {
+	const auto* info = &exception_info;
+	char thread_name[64] = "(host thread)";
+	if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
+		if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+		}
+	}
+	std::string r = "--- Guest fault context ---\n";
+	r += fmt::format("version: {}\n", KYTY_GIT_VERSION);
+	r += fmt::format("thread: {}\n", thread_name);
+	r += fmt::format("type={} code={} pc=0x{:016x} access={} address=0x{:016x}\n",
+	                 static_cast<unsigned>(info->type), info->native_code, info->exception_address,
+	                 static_cast<unsigned>(info->access_violation_type),
+	                 info->access_violation_vaddr);
+	r += fmt::format("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
+	                 "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
+	                 "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
+	                 "r12={:016x} r13={:016x} r14={:016x} r15={:016x}\n",
+	                 info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+	                 info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
+	                 info->r14, info->r15);
+	if (IsReadableRange(info->exception_address - 48, 96)) {
+		const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
+		r += "code (pc-48 .. pc+48, fault at byte 48):";
+		for (int i = 0; i < 96; i++) {
+			r += fmt::format("{}{:02x}", (i % 16 == 0) ? "\n " : " ", code[i]);
+		}
+		r += "\n";
+	}
+	if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+		const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+		r += "stack:";
+		for (int i = 0; i < 32; i++) {
+			r += fmt::format("{}{:016x}", (i % 4 == 0) ? "\n " : " ", stack[i]);
+		}
+		r += "\n";
+	}
+	r += "modules (base / size / name; * holds pc):\n";
+	Common::Singleton<RuntimeLinker>::Instance()->DescribeModules(info->exception_address, r);
+	std::fwrite(r.data(), 1, r.size(), stdout);
+	std::fflush(stdout);
+
+	const auto time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+	std::tm    tm {};
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	localtime_s(&tm, &time);
+#else
+	localtime_r(&time, &tm);
+#endif
+	char stamp[32] = {};
+	std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
+	const auto      path = std::filesystem::path("_Logs") / fmt::format("crash_{}.txt", stamp);
+	std::error_code error;
+	std::filesystem::create_directories(path.parent_path(), error);
+	if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+		std::fwrite(r.data(), 1, r.size(), file);
+		std::fclose(file);
+		std::printf("crash report: %s\n", path.string().c_str());
+	}
+}
+
 bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -669,42 +802,12 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			return true;
 		}
 	}
-	// Report whatever guest context can be read safely before terminating: which guest thread
-	// faulted, the register file, the faulting code bytes and the top of its stack.
-	{
-		char thread_name[64] = "(host thread)";
-		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
-			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
-				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
-			}
-		}
-		std::printf("--- Guest fault context ---\n");
-		std::printf("thread: %s\n", thread_name);
-		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
-		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
-		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
-		            "r12=%016" PRIx64 " r13=%016" PRIx64 " r14=%016" PRIx64 " r15=%016" PRIx64 "\n",
-		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
-		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
-		            info->r14, info->r15);
-		if (IsReadableRange(info->exception_address - 48, 96)) {
-			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
-			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
-			for (int i = 0; i < 96; i++) {
-				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
-			}
-			std::printf("\n");
-		}
-		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
-			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
-			std::printf("stack:");
-			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
-			}
-			std::printf("\n");
-		}
-		std::fflush(stdout);
+	if (TryBypassGuestTrap(exception_info)) {
+		return true;
 	}
+	// Report whatever guest context can be read safely before terminating: which guest thread
+	// faulted, the register file, the faulting code bytes, the top of its stack and the modules.
+	WriteCrashReport(exception_info);
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,

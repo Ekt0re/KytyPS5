@@ -1554,6 +1554,30 @@ void TestShaderFeatureCollection() {
             !add_tid_requirements.subgroup_ballot &&
             !add_tid_requirements.subgroup_shuffle,
         "buffer ADD_TID requested the wrong subgroup contract");
+  {
+    // A GPU-selected child V# with ADD_TID needs the lane too, though its root has none.
+    Program child;
+    child.resource_tracking_complete = true;
+    child.stage = ShaderType::Compute;
+    child.info.buffers.resize(2);
+    child.info.buffers[0].indirect_root = 0;
+    child.info.buffers[0].indirect_resources = {0, 1};
+    child.info.buffers[1].indirect_root = 0;
+    child.info.buffers[1].packed_stride = 1u << 20u;
+    child.block_storage.push_back(std::make_unique<Block>());
+    auto *child_block = child.block_storage.back().get();
+    child.blocks.push_back(child_block);
+    child.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+    auto &child_buffer = child_block->AppendNewInst(
+        ValueOpcode::GetBufferResource, {Value(0u), Value(0u), Value(0u), Value(0u)});
+    auto &child_load = child_block->AppendNewInst(
+        ValueOpcode::LoadBufferU32,
+        {Value(&child_buffer), Value(0u), Value(0u), Value(0u), Value(true)});
+    child_load.SetFlags(MemoryFlags{.index = 0});
+    CollectShaderInfo(child, {.compute = &compute_info});
+    Check(child.info.subgroup_local_invocation_id,
+          "a selected ADD_TID buffer did not request the subgroup lane");
+  }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal(
@@ -3284,6 +3308,33 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   Check((result.decoded_dump.find("V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo") != std::string::npos),
         "captured SDWA V_CMPX_CLASS_F32 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+// The F16 compares RDNA2 has besides the common ones (F, O, NLG, TRU and their CMPX forms, CMPX
+// U and LG) decode in compact and VOP3 encodings and translate into valid SPIR-V.
+void TestVopcRemainingF16Compares() {
+  using namespace ShaderRecompiler::Decoder;
+  const std::pair<uint32_t, Opcode> compares[] = {
+      {0xc8u, Opcode::V_CMP_F_F16},    {0xcfu, Opcode::V_CMP_O_F16},
+      {0xeau, Opcode::V_CMP_NLG_F16},  {0xefu, Opcode::V_CMP_TRU_F16},
+      {0xd8u, Opcode::V_CMPX_F_F16},   {0xddu, Opcode::V_CMPX_LG_F16},
+      {0xdfu, Opcode::V_CMPX_O_F16},   {0xf8u, Opcode::V_CMPX_U_F16},
+      {0xfau, Opcode::V_CMPX_NLG_F16}, {0xffu, Opcode::V_CMPX_TRU_F16}};
+  for (const auto& [id, opcode] : compares) {
+    const bool exec = (id >= 0xd8u && id <= 0xdfu) || id >= 0xf8u;
+    const uint32_t compact[] = {EncodeVopc(id, 256, 1), EncodeSopp(0x01)};
+    const uint32_t vop3[] = {EncodeVop3Word0(id, exec ? 126u : 106u), EncodeVop3Word1(256, 257, 0),
+                             EncodeSopp(0x01)};
+    for (auto words : {std::span<const uint32_t>(compact), std::span<const uint32_t>(vop3)}) {
+      Instruction decoded;
+      DecodeInstruction(words, 0, decoded);
+      Check(decoded.opcode == opcode &&
+                (decoded.dst.kind == OperandKind::ExecLo) == exec,
+            "a remaining F16 compare did not decode");
+      auto result = RecompileForTest(words, MakeCompileOptions(ShaderType::Pixel));
+      CheckSpirvBinaryValidates(result.spirv);
+    }
+  }
 }
 
 void TestVopcCmpxClassF16Decoder() {
@@ -12800,6 +12851,39 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   CompilePixelRuntime(vcc_params, vcc_input);
 }
 
+// A wave64 program run as two halves on a 32-lane host orders each LDS access of its first half
+// with a subgroup barrier (Profile::lds_lane_sync); a native wave64 host or the profile switch
+// emits none.
+void TestLdsLaneSync() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeDs0(0x0d), EncodeDs1(0, 1, 0), // ds_write_b32 v0, v1
+      EncodeDs0(0x0d), EncodeDs1(0, 2, 3), // ds_write_b32 v3, v2
+      EncodeSopp(0x01),
+  };
+  for (const uint32_t host : {32u, 64u}) {
+    for (const bool sync : {true, false}) {
+      ShaderComputeInputInfo compute{};
+      compute.threads_num[0] = 64;
+      compute.threads_num[1] = compute.threads_num[2] = 1;
+      compute.lds_size_dwords = 64;
+      compute.host_subgroup_size = host;
+      auto options = MakeCompileOptions(ShaderType::Compute);
+      options.wave_size = 64;
+      options.input_info.compute = &compute;
+      Spirv::Profile profile{};
+      profile.lds_lane_sync = sync;
+      options.profile = &profile;
+      const auto result = RecompileForTest(shader, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      const auto barriers =
+          CountSourceOccurrences(DisassembleSpirvBinary(result.spirv), "OpControlBarrier");
+      Check(barriers == (sync && host == 32u ? 2u : 0u),
+            "LDS accesses of a split wave64 were not ordered once per guest instruction");
+    }
+  }
+}
+
 void TestComputeLdsAllocationIdentity() {
   const uint32_t shader[] = {
       EncodeDs0(0x0d, 4288u), // ds_write_b32 v0, v1 offset:4288
@@ -13504,6 +13588,63 @@ void TestSpirvRepeatedEmission() {
         "split-wave re-emission retained native-wave definitions");
 }
 
+// A switch past one OpSwitch's 16-bit word count nests on the index's high bits; the module stays
+// valid, results keep the flat switch's default (case 0) and void switches skip out-of-range indices.
+void TestNestedIndexSwitch() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::Spirv;
+  using namespace ShaderRecompiler::Spirv::Emitter;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{.compute = &compute};
+  const Profile profile{};
+  for (const uint32_t count : {MaxSwitchCases, MaxSwitchCases + 1u, 2u * MaxSwitchCases + 7u}) {
+    for (const bool result : {true, false}) {
+      IR::Program program;
+      program.stage = ShaderType::Compute;
+      EmitterState state(program, input, profile);
+      state.builder.RequireCapability(spv::CapabilityShader);
+      state.builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+      const auto main = state.builder.AllocateId();
+      state.builder.AddFunction(spv::OpFunction, TypeVoid(state), main,
+                                spv::FunctionControlMaskNone, TypeFunction(state));
+      EmitLabel(state, state.builder.AllocateId());
+      // A runtime index: the function's variable, stored and loaded.
+      const auto pointer = TypePointer(state, spv::StorageClassFunction, TypeU32(state));
+      const auto variable = state.builder.AllocateId();
+      state.builder.AddFunction(spv::OpVariable, pointer, variable, spv::StorageClassFunction);
+      state.builder.AddFunction(spv::OpStore, variable, ConstantU32(state, count - 1u));
+      const auto index = state.builder.AllocateId();
+      state.builder.AddFunction(spv::OpLoad, TypeU32(state), index, variable);
+      uint32_t emitted = 0;
+      if (result) {
+        EmitIndexSwitch(state, index, count, TypeU32(state), [&](uint32_t item) {
+          emitted++;
+          return Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, item));
+        });
+      } else {
+        EmitIndexSwitch(state, index, count, 0u, [&](uint32_t item) {
+          emitted++;
+          state.builder.AddFunction(spv::OpStore, variable, ConstantU32(state, item));
+        });
+      }
+      state.builder.AddFunction(spv::OpReturn);
+      state.builder.AddFunction(spv::OpFunctionEnd);
+      state.builder.AddEntryPoint(spv::ExecutionModelGLCompute, main, "main", {});
+      state.builder.AddExecutionMode(main, spv::ExecutionModeLocalSize, 64u, 1u, 1u);
+      const auto binary = state.builder.Build();
+      CheckSpirvBinaryValidates(binary);
+      const auto source = DisassembleSpirvBinary(binary);
+      const auto switches = CountSourceOccurrences(source, "OpSwitch");
+      Check(emitted == count && switches == (count <= MaxSwitchCases
+                                                 ? 1u
+                                                 : 1u + (count + MaxSwitchCases - 1u) / MaxSwitchCases),
+            "a large index switch did not nest into valid groups of cases");
+    }
+  }
+}
+
 void TestSpirvConditionVotes() {
   using namespace ShaderRecompiler;
   using K = CFG::BranchCondition;
@@ -13906,6 +14047,7 @@ int main() {
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
+  TestNestedIndexSwitch();
   TestSpirvConditionVotes();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
@@ -13948,6 +14090,7 @@ int main() {
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestVopcCmpxClassF16Decoder();
+  TestVopcRemainingF16Compares();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerInteger64CompareEncodings();
@@ -14099,6 +14242,7 @@ int main() {
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();
+  TestLdsLaneSync();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestCapturedBufferLoadUbyteD16Decode();

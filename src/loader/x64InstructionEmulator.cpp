@@ -878,4 +878,9 @@ void CompleteLoad(void* native_context, size_t length, uint32_t value) {
 	context.Advance(length);
 }
 
+void SkipInstruction(void* native_context, size_t length) {
+	Context context {static_cast<decltype(Context::native)>(native_context)};
+	context.Advance(length);
+}
+
 } // namespace Loader::X64InstructionEmulator
