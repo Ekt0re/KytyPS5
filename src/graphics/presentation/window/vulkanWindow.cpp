@@ -417,6 +417,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       acceleration_structure, ray_query, cooperative_matrix, float8, maintenance5,
 	       pipeline_binary] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+	graphics.external_memory_host_enabled = add(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {

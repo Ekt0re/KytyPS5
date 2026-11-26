@@ -167,6 +167,10 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	if (buffer.IsZeroCopy()) {
+		// The bytes are in guest memory already; only the write has to finish.
+		return ResolveZeroCopy(buffer, !async);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -390,7 +394,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		const auto buffer_id = FindBuffer(vaddr, size);
+		auto&      buffer    = m_slot_buffers[buffer_id];
+		bool       migrate   = false;
 		if (IsRegionGpuModified(vaddr, size)) {
 			const auto start =
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
@@ -398,6 +404,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			                          buffer.CpuAddress() + buffer.Size());
 			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				// Buffers the CPU keeps faulting on may move to guest memory (zero-copy).
+				buffer.readback_faults++;
+				migrate = ZeroCopyEnabled() && !buffer.IsZeroCopy();
 			}
 		}
 		if (is_write) {
@@ -406,6 +415,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (m_cpu_write_listener) {
 				m_cpu_write_listener(vaddr, size);
 			}
+		}
+		if (migrate) {
+			MaybeMigrateToZeroCopy(buffer_id);
 		}
 	});
 }
@@ -492,22 +504,197 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	DeleteBuffer(overlap_id);
 }
 
+bool BufferCache::ZeroCopyEnabled() const {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_ZERO_COPY");
+		return text != nullptr && text[0] == '1';
+	}();
+	return enabled && m_graphics.external_memory_host_enabled;
+}
+
+bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
+	const auto vaddr = buffer.CpuAddress();
+	const auto size  = buffer.Size();
+	bool       any   = false;
+	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size,
+	                                             [&](uint64_t address, uint64_t bytes) noexcept {
+		                                             any = true;
+		                                             m_gpu_modified_ranges.Subtract(address, bytes);
+		                                             ForgetColorMetadataChecks(address, bytes);
+	                                             });
+	if (!any || !wait) {
+		return any;
+	}
+	if (buffer.last_write_tick != 0 && !m_scheduler.IsFree(buffer.last_write_tick)) {
+		KYTY_PROFILER_BLOCK("BufferCache::ZeroCopyWait");
+		m_scheduler.Wait(std::min(buffer.last_write_tick, m_scheduler.CurrentTick()));
+	}
+	// Every write to this buffer has finished: its pages go back to the CPU, writable without a
+	// further fault (zero-copy pages never need CPU-dirty tracking, there is nothing to upload).
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	return true;
+}
+
+void BufferCache::JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
+	auto& new_buffer = m_slot_buffers[new_id];
+	auto& overlap    = m_slot_buffers[overlap_id];
+	if (accumulate_stream_score) {
+		new_buffer.IncreaseStreamScore(overlap.StreamScore() + 1);
+	}
+	if (overlap.IsZeroCopy()) {
+		// Same guest memory: nothing to move, only its pending writes.
+		new_buffer.last_write_tick = std::max(new_buffer.last_write_tick, overlap.last_write_tick);
+	} else {
+		// Only bytes the GPU wrote are newer in the old buffer; guest memory holds the rest and
+		// may hold CPU writes the old buffer never received, so a whole copy would undo them.
+		bool copied = false;
+		m_gpu_modified_ranges.ForEachInRange(
+		    overlap.CpuAddress(), overlap.Size(), [&](uint64_t start, uint64_t end) {
+			    new_buffer.CopyFrom(m_scheduler.Current(), overlap, start - overlap.CpuAddress(),
+			                        start - new_buffer.CpuAddress(), end - start);
+			    copied = true;
+		    });
+		if (copied) {
+			new_buffer.last_write_tick = m_scheduler.CurrentTick();
+		}
+	}
+	DeleteBuffer(overlap_id);
+}
+
+void BufferCache::MaybeMigrateToZeroCopy(BufferId id) {
+	constexpr uint32_t Threshold = 16;
+	constexpr uint64_t MaxSize   = 512ull * 1024 * 1024;
+	auto&              buffer    = m_slot_buffers[id];
+	if (buffer.IsZeroCopy() || buffer.readback_faults < Threshold ||
+	    buffer.zero_copy_judgment == 2) {
+		return;
+	}
+	const auto vaddr = buffer.CpuAddress();
+	const auto size  = buffer.Size();
+	bool       images = false;
+	{
+		// The texture cache never holds its lock across ReadMemory (textureCache.cpp).
+		std::scoped_lock lock {m_texture_cache.m_lock};
+		m_texture_cache.ForEachImageInRegion(vaddr, size, [&](ImageId, Image&) {
+			images = true;
+			return true;
+		});
+	}
+	if (images || size > MaxSize || LibKernel::Memory::ContiguousBackingAlias(vaddr, size) == 0) {
+		buffer.zero_copy_judgment = 2;
+		return;
+	}
+	m_zero_copy.Add(vaddr, size);
+	// CreateBuffer joins the old buffer into one over guest memory.
+	(void)CreateBuffer(vaddr, size);
+}
+
+bool BufferCache::ZeroCopyBackingValid(BufferId id) {
+	auto&      buffer     = m_slot_buffers[id];
+	const auto generation = LibKernel::Memory::BackingGeneration();
+	if (buffer.backing_generation == generation) {
+		return true;
+	}
+	if (LibKernel::Memory::ContiguousBackingAlias(buffer.CpuAddress(), buffer.Size()) ==
+	    buffer.HostPointer()) {
+		buffer.backing_generation = generation;
+		return true;
+	}
+	std::printf("Zero-copy: buffer 0x%011llx+0x%llx lost its backing; back to VRAM\n",
+	            static_cast<unsigned long long>(buffer.CpuAddress()),
+	            static_cast<unsigned long long>(buffer.Size()));
+	std::fflush(stdout);
+	DropZeroCopyBuffer(id);
+	return false;
+}
+
+void BufferCache::DropZeroCopyBuffer(BufferId id) {
+	auto&      buffer = m_slot_buffers[id];
+	const auto vaddr  = buffer.CpuAddress();
+	const auto size   = buffer.Size();
+	(void)ResolveZeroCopy(buffer, true);
+	m_zero_copy.Subtract(vaddr, size);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	DeleteBuffer(id);
+}
+
+void BufferCache::UnmapZeroCopy(uint64_t vaddr, uint64_t size) {
+	if (m_zero_copy.Empty() || !m_zero_copy.Intersects(vaddr, size)) {
+		return;
+	}
+	std::vector<BufferId> drop;
+	auto                  it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
+		const auto& buffer = m_slot_buffers[it->second];
+		if (buffer.IsZeroCopy() && buffer.CpuAddress() + buffer.Size() > vaddr) {
+			drop.push_back(it->second);
+		}
+	}
+	for (const auto id: drop) {
+		DropZeroCopyBuffer(id);
+	}
+	m_zero_copy.Subtract(vaddr, size);
+}
+
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
-	const auto overlap = ResolveOverlaps(vaddr, size);
+	const auto     overlap = ResolveOverlaps(vaddr, size);
+	const auto     length  = overlap.end - overlap.begin;
+	constexpr auto flags   = AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress;
 
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
+	BufferId id {};
+	bool     zero_copy = false;
+	if (!m_zero_copy.Empty() && m_zero_copy.Intersects(overlap.begin, length)) {
+		constexpr uint64_t MaxZeroCopy = 512ull * 1024 * 1024;
+		const auto         generation  = LibKernel::Memory::BackingGeneration();
+		const auto         alias =
+		    length <= MaxZeroCopy ? LibKernel::Memory::ContiguousBackingAlias(overlap.begin, length) : 0;
+		if (alias != 0 && (alias & 0xfffu) == 0) {
+			id        = m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
+			                                  reinterpret_cast<void*>(alias), flags, length);
+			zero_copy = m_slot_buffers[id].IsZeroCopy();
+			if (zero_copy) {
+				m_slot_buffers[id].backing_generation = generation;
+			} else {
+				m_slot_buffers.erase(id);
+			}
+		}
+		if (zero_copy) {
+			m_zero_copy.Add(overlap.begin, length);
+		} else {
+			m_zero_copy.Subtract(overlap.begin, length);
+		}
+		if (++m_zero_copy_created <= 64 || !zero_copy) {
+			std::printf("Zero-copy: buffer 0x%011llx+0x%llx %s\n",
+			            static_cast<unsigned long long>(overlap.begin),
+			            static_cast<unsigned long long>(length),
+			            zero_copy    ? "imports guest memory"
+			            : alias == 0 ? "stays in VRAM (backing not contiguous or too large)"
+			                         : "stays in VRAM (import refused)");
+			std::fflush(stdout);
+		}
+	}
+	if (!zero_copy) {
+		id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
+		                           flags, length);
+	}
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
-	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
-	                     overlap.end - overlap.begin);
+	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}{}]", overlap.begin, length,
+	                     zero_copy ? " zero-copy" : "");
 	for (auto it = overlap.first; it != overlap.last;) {
 		const auto old_id = (it++)->second;
-		JoinOverlap(id, old_id, !overlap.has_stream_leap);
+		if (zero_copy) {
+			JoinZeroCopy(id, old_id, !overlap.has_stream_leap);
+		} else {
+			JoinOverlap(id, old_id, !overlap.has_stream_leap);
+		}
 	}
 	Register(id);
 	return id;
@@ -515,6 +702,17 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     ImageId image) {
+	if (buffer.IsZeroCopy()) {
+		// Guest memory is the buffer: nothing to upload. A write still marks the range GPU-owned
+		// until it finishes, which clears its CPU-dirty state first (the tracker keeps them apart).
+		const bool from_image = image && SynchronizeBufferFromImage(buffer, image);
+		if (is_written || from_image) {
+			m_memory_tracker.ForEachUploadRange(
+			    vaddr, size, true, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+			buffer.last_write_tick = m_scheduler.CurrentTick();
+		}
+		return from_image;
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	m_memory_tracker.ForEachUploadRange(
@@ -627,6 +825,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	if (!is_written && size <= CACHING_PAGESIZE &&
+	    (m_zero_copy.Empty() || !m_zero_copy.Intersects(vaddr, size)) &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size) && (!image || written_past_read)) {
 		// Within one draw window the guest has no signal to rewrite the range. A copy made in this
@@ -654,6 +853,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
+		id = FindBuffer(vaddr, end - vaddr);
+	}
+	if (m_slot_buffers[id].IsZeroCopy() && !ZeroCopyBackingValid(id)) {
 		id = FindBuffer(vaddr, end - vaddr);
 	}
 	auto& buffer = m_slot_buffers[id];
@@ -921,8 +1123,11 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 				--it;
 			}
 			for (; it != m_buffers.end() && it->first < finish; ++it) {
-				auto&      buffer = m_slot_buffers[it->second];
-				const auto first  = std::max(buffer.CpuAddress(), start);
+				auto& buffer = m_slot_buffers[it->second];
+				if (buffer.IsZeroCopy()) {
+					continue; // the GPU reads guest memory itself
+				}
+				const auto first = std::max(buffer.CpuAddress(), start);
 				const auto last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
 				if (first < last) {
 					// Reads follow every range's protection; a write in between re-queues its page.

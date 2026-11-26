@@ -140,6 +140,11 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 // TryReadBacking for large reads of memory that may never have been written: does not commit it.
 bool                   TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size);
+// Host address of the backing alias for a guest range that one contiguous run of direct memory
+// holds (no gaps, no private mappings), 0 otherwise. The alias stays mapped for the whole run.
+uint64_t               ContiguousBackingAlias(uint64_t vaddr, uint64_t size);
+// Changes whenever guest pages are bound to or unbound from the backing.
+uint64_t               BackingGeneration();
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.

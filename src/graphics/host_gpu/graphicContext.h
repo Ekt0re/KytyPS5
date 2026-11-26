@@ -29,6 +29,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_external_memory_host: guest direct memory can back buffers without a copy.
+	bool                               external_memory_host_enabled          = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// Fragment shaders can run at the guest wave size (VK_EXT_subgroup_size_control).
 	bool                               fragment_subgroup_size_control_enabled = false;

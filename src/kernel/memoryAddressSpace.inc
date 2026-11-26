@@ -306,6 +306,30 @@ public:
 		return true;
 	}
 
+	// Changes whenever a guest page is bound to or unbound from the backing, so holders of a
+	// backing address (zero-copy GPU buffers) know to check it again.
+	[[nodiscard]] uint64_t Generation() const noexcept {
+		return m_generation.load(std::memory_order_acquire);
+	}
+
+	// The alias address of [vaddr, vaddr + size) when one contiguous backing run holds all of it,
+	// 0 otherwise. Callers hold the state lock.
+	[[nodiscard]] uint64_t ContiguousAlias(uint64_t vaddr, uint64_t size) const {
+		uint64_t alias  = 0;
+		uint64_t runs   = 0;
+		bool     gapped = false;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
+			    runs++;
+			    if (start == vaddr && bytes == size) {
+				    alias = reinterpret_cast<uint64_t>(m_backing_base) + offset;
+			    }
+		    },
+		    [&](uint64_t, uint64_t) { gapped = true; });
+		return runs == 1 && !gapped ? alias : 0;
+	}
+
 	// Needs no lock either, as the alias stays mapped. A read racing an unmap copies the backing's
 	// current bytes, or zeros for a page unmapped between the check and the copy.
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) const {
@@ -453,6 +477,7 @@ private:
 	}
 
 	void StorePages(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		const auto end = vaddr + size;
 		EXIT_IF(((vaddr | size | backing_offset) & PageMask) != 0 ||
 		        (end >> PageBits) > BucketCount * BucketPages || backing_offset + size > m_size);
@@ -469,6 +494,7 @@ private:
 	}
 
 	void ClearPages(uint64_t vaddr, uint64_t size) {
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 		for (auto page = vaddr >> PageBits; page < (vaddr + size) >> PageBits; ++page) {
 			m_pages[page / BucketPages].load(std::memory_order_relaxed)[page % BucketPages].store(
 			    0, std::memory_order_relaxed);
@@ -646,6 +672,7 @@ private:
 	uint8_t*                                                     m_backing_base = nullptr;
 	uint64_t                                                     m_size         = 0;
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_pages {};
+	std::atomic<uint64_t>                                        m_generation {1};
 };
 
 // Callers change it with the state lock held exclusively and query it under the operation lock or
@@ -728,6 +755,20 @@ public:
 #endif
 
 	// Writes the backed bytes of a range that holds no private mappings.
+	[[nodiscard]] uint64_t BackingGeneration() const { return m_backing->Generation(); }
+
+	// See GuestBackingStore::ContiguousAlias; 0 also when a private mapping overlaps the range.
+	[[nodiscard]] uint64_t ContiguousBackingAlias(uint64_t vaddr, uint64_t size) {
+		if (!Owns(vaddr, size)) {
+			return 0;
+		}
+		std::shared_lock state(g_memory_state_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			return 0;
+		}
+		return m_backing->ContiguousAlias(vaddr, size);
+	}
+
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		if (!Owns(vaddr, size)) {
 			return false;

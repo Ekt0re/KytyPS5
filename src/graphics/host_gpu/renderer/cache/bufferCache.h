@@ -136,6 +136,8 @@ public:
 	void               NoteGpuWrites(uint64_t vaddr, uint64_t size);
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
+	// Zero-copy buffers over an unmapped range are dropped before their backing is reused.
+	void               UnmapZeroCopy(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -210,6 +212,21 @@ private:
 	                                       std::span<const vk::BufferCopy> copies);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
+	// Zero-copy guest memory (KYTY_ZERO_COPY=1, VK_EXT_external_memory_host). A buffer the CPU
+	// keeps faulting on is rebuilt over guest memory itself, so GPU writes land there. Its pages
+	// still count as GPU-modified while a write is pending (labels reach the guest before the
+	// host GPU finishes), but a fault on them only waits for the buffer's last write instead of
+	// flushing all recorded work and copying bytes back.
+	[[nodiscard]] bool ZeroCopyEnabled() const;
+	// Settles the pending GPU writes of a zero-copy buffer: false when none are tracked. With
+	// `wait`, waits for its last write and returns its pages to the CPU.
+	[[nodiscard]] bool ResolveZeroCopy(Buffer& buffer, bool wait);
+	void               JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
+	void               MaybeMigrateToZeroCopy(BufferId id);
+	// False (and the buffer dropped) when the guest range moved to other backing.
+	[[nodiscard]] bool ZeroCopyBackingValid(BufferId id);
+	void               DropZeroCopyBuffer(BufferId id);
+
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
@@ -242,6 +259,9 @@ private:
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	// Guest ranges whose buffers are zero-copy; a buffer created over them imports guest memory.
+	RangeSet                                          m_zero_copy;
+	uint64_t                                          m_zero_copy_created = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

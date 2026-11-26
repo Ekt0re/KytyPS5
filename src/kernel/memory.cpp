@@ -834,6 +834,14 @@ bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBackingUncommitted(vaddr, data, size);
 }
 
+uint64_t ContiguousBackingAlias(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space->ContiguousBackingAlias(vaddr, size);
+}
+
+uint64_t BackingGeneration() {
+	return g_guest_address_space->BackingGeneration();
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
