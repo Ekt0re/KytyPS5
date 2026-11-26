@@ -55778,10 +55778,16 @@ void CheckShaderRecompilerFatalContracts() {
     auto plan = ShaderRecompiler::IR::ExtractResourcePlan(program);
     ShaderRecompiler::IR::ResourceSnapshot snapshot;
     ShaderRecompiler::IR::ResourceSpecialization specialization;
+    // Vulkan has no atomic view of packed formats, so the image binds as null (its atomics
+    // return 0 and write nothing) instead of failing the specialization; only direct 8-bit
+    // T#s are emulated (EmulatedImageAtomicBits).
     Require("PackedAtomicImageRejection", "resource materialization",
-            !ShaderRecompiler::IR::MaterializeResources(
-                plan, {}, snapshot, specialization),
-            "packed atomic image descriptor was accepted");
+            ShaderRecompiler::IR::MaterializeResources(plan, {}, snapshot,
+                                                       specialization) &&
+                snapshot.images.size() == 1u &&
+                std::ranges::all_of(snapshot.images[0].dwords,
+                                    [](uint32_t word) { return word == 0u; }),
+            "packed atomic image descriptor was not bound as null");
   }
 }
 #endif

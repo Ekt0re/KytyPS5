@@ -849,10 +849,17 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
-	// A GPU-written count is brought back before the CPU reads it, like the records below.
+	// A GPU-written count is brought back before the CPU reads it, like the records below. Bytes
+	// the GPU did not write need no readback (and no GPU-thread round trip, which a CP without a
+	// guest GPU, such as the test harness's, cannot make).
+	auto&      buffer_cache  = m_renderer.GetBufferCache();
+	const auto read_gpu_data = [&](uint64_t address, uint64_t size) {
+		if (GuestRange {address, size}.Valid() && buffer_cache.IsRegionGpuModified(address, size)) {
+			buffer_cache.ReadMemory(address, size);
+		}
+	};
 	if (count_addr != nullptr) {
-		m_renderer.GetBufferCache().ReadMemory(reinterpret_cast<uint64_t>(count_addr),
-		                                       sizeof(uint32_t));
+		read_gpu_data(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
 	}
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
@@ -885,10 +892,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	// The records may have been written by the GPU: bring them back before the CPU reads them,
 	// as DispatchIndirect does (ported from KytyPS5 PR #2302, de49ee9186).
-	m_renderer.GetBufferCache().ReadMemory(
-	    args_addr,
-	    static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
-	        (indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand)));
+	read_gpu_data(args_addr, static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
+	                             (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+	                                      : sizeof(vk::DrawIndirectCommand)));
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
