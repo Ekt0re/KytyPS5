@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -133,20 +134,25 @@ void FaultManager::ProcessFaultBuffer() {
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, write_scan);
 	command.dispatch(static_cast<uint32_t>((BufferCache::WRITE_BITMAP_BYTES / 16 + 63) / 64), 1, 1);
-	dependency.pBufferMemoryBarriers = &post_barrier;
-	command.pipelineBarrier2(dependency);
-	// The scans wrote the download areas the host reads after the tick; waiting on the tick alone
-	// does not make shader writes visible to host reads (Senaxx/KytyPS5 1e7597c01, via Jetsku's
-	// 3fd14ddb).
-	vk::MemoryBarrier2 host_barrier {};
+	// The host reads both page lists after the tick (the deferred operation below): only a
+	// device-to-host dependency makes the parser's writes visible to host reads (Vulkan spec, host
+	// access); waiting for the tick alone does not. After Jetsku/KytyPS5 3fd14ddb (Senaxx 1e7597c01).
+	vk::BufferMemoryBarrier2 host_barrier {};
 	host_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	host_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	host_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
 	host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
-	vk::DependencyInfo host_dependency {};
-	host_dependency.memoryBarrierCount = 1;
-	host_dependency.pMemoryBarriers    = &host_barrier;
-	command.pipelineBarrier2(host_dependency);
+	host_barrier.buffer        = m_download_buffer.Handle();
+	host_barrier.offset        = offset;
+	host_barrier.size          = PageFaultAreaSize;
+	auto write_host_barrier    = host_barrier;
+	write_host_barrier.buffer  = m_write_download_buffer.Handle();
+	write_host_barrier.offset  = write_offset;
+	write_host_barrier.size    = PageWriteAreaSize;
+	const std::array post_barriers {post_barrier, host_barrier, write_host_barrier};
+	dependency.bufferMemoryBarrierCount = static_cast<uint32_t>(post_barriers.size());
+	dependency.pBufferMemoryBarriers    = post_barriers.data();
+	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, write_mapped, write_offset, area] {
