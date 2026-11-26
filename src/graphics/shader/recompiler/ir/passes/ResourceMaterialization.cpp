@@ -21,7 +21,33 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+bool BufferRuntimeOutOfBounds(const BufferResource& resource, const ShaderBufferResource& descriptor) {
+	return (resource.packed_stride & BufferResource::RuntimeStride) != 0u &&
+	       resource.indirect_root == BufferResource::NoIndirectBuffer && !resource.scalar &&
+	       !resource.written && descriptor.Stride() == 0u && descriptor.OutOfBounds() == 0u;
+}
+
+void PackBufferRuntimeStrides(std::span<const BufferResource> buffers, const Bindings& bindings,
+                              const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data) {
+	for (uint32_t resource = 0; resource < buffers.size() && resource < snapshot.buffers.size();
+	     ++resource) {
+		const auto& buffer = buffers[resource];
+		const auto  index  = buffer.descriptor_index;
+		if (index == UINT32_MAX || (buffer.packed_stride & BufferResource::RuntimeStride) == 0u)
+			continue;
+		const auto dword = bindings.BufferStrideDword() + index / 2u;
+		if (dword >= shader_data.size()) continue;
+		const auto& value = snapshot.buffers[resource];
+		if (value.dword_count != 4u) continue;
+		const auto stride = (value.dwords[1] >> 16u) & 0x3fffu;
+		const auto shift  = (index % 2u) * 16u;
+		shader_data[dword] = (shader_data[dword] & ~(0xffffu << shift)) | (stride << shift);
+	}
+}
+
 uint64_t BufferBindingSize(const BufferResource& resource, const ShaderBufferResource& descriptor) {
+	// Every vector access is out of bounds; the module reads them as zero through an empty binding.
+	if (BufferRuntimeOutOfBounds(resource, descriptor)) return 0u;
 	const auto size = descriptor.GetSize();
 	// OOB_SELECT=2 tests only NumRecords != 0. A zero-stride vector access still spans its payload.
 	if (!resource.scalar && size != 0u && descriptor.Stride() == 0u && descriptor.OutOfBounds() == 2u)
@@ -1975,12 +2001,21 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		// A direct V# gives its stride at run time; only the swizzle, index stride and ADD_TID
+		// bits shape the module. Draws that unbind a buffer or bind another stride share it.
+		const bool direct = i < program.info.buffers.size() &&
+		                    !Source(program, base.source)->indirect_descriptor.has_value();
 		auto& buffer         = specialization.buffers[i];
-		buffer.packed_stride = packed_stride;
+		buffer.packed_stride =
+		    direct ? (packed_stride & ~0x3fffu) | BufferResource::RuntimeStride : packed_stride;
 		buffer.descriptor_format =
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
-		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		// Bounds mode 0 with stride 0 puts every vector access out of bounds. The host binds
+		// such a direct read-only buffer empty (BufferBindingSize), so its reads return zero at
+		// run time; scalar reads (which ignore the stride) and stores keep the folded reads.
+		buffer.zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u &&
+		                         !(direct && !base.scalar && !base.written);
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
 	if (validate_buffer_keys) {

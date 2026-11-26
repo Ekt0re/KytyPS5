@@ -135,6 +135,17 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 	return state.program.info.buffers[mem.resource].packed_stride;
 }
 
+uint32_t StorageBufferRuntimeStride(EmitterState& state, const IR::MemoryInfo& mem) {
+	const auto slot = state.program.info.buffers.at(mem.resource).descriptor_index;
+	if (slot == UINT32_MAX) return ConstantU32(state, 0u);
+	if (slot < state.memory_strides.size() && state.memory_strides[slot] != 0u)
+		return state.memory_strides[slot];
+	const auto word =
+	    EmitShaderDataDwordLoad(state, state.program.bindings.BufferStrideDword() + slot / 2u);
+	return EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+	    state, word, ConstantU32(state, (slot % 2u) * 16u), ConstantU32(state, 16u));
+}
+
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -171,6 +182,35 @@ void EmitMemoryBindings(EmitterState& state) {
 	const auto count = state.program.bindings.descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)];
 	state.memory_byte_offsets.resize(count);
 	state.memory_byte_sizes.resize(count);
+	// Run-time strides of direct V#s, loaded once at entry like the binding offsets, for the
+	// bindings some access addresses with an index (others never multiply by the stride).
+	state.memory_strides.assign(count, 0u);
+	std::vector<bool> indexed(count);
+	for (const auto* block: state.program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::None ||
+			    inst.NumArgs() < 2) continue;
+			const auto& mem = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+			if (mem.kind != IR::ResourceKind::Buffer || mem.resource >= state.program.info.buffers.size())
+				continue;
+			const auto& buffer = state.program.info.buffers[mem.resource];
+			if (buffer.descriptor_index >= count) continue;
+			const auto index = inst.Arg(1).Resolve();
+			if ((buffer.packed_stride & ((1u << 14u) | (1u << 20u))) != 0u || !index.IsImmediate() ||
+			    index.GetType() != IR::Type::U32 ||
+			    index.U32() != 0u)
+				indexed[buffer.descriptor_index] = true;
+		}
+	}
+	for (const auto& buffer: state.program.info.buffers) {
+		const auto slot = buffer.descriptor_index;
+		if (slot >= count || (buffer.packed_stride & IR::BufferResource::RuntimeStride) == 0u ||
+		    !indexed[slot] || state.memory_strides[slot] != 0u) continue;
+		const auto word =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferStrideDword() + slot / 2u);
+		state.memory_strides[slot] = EmitNative<spv::OpBitFieldUExtract, IR::Type::U32>(
+		    state, word, ConstantU32(state, (slot % 2u) * 16u), ConstantU32(state, 16u));
+	}
 	std::vector<bool> dynamic_offsets(count);
 	for (uint32_t resource = 0; resource < state.program.info.buffers.size(); ++resource) {
 		if (SharedIndirectBufferResource(state, resource) == UINT32_MAX) continue;

@@ -156,6 +156,10 @@ struct ExportInfo {
 
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
+	// packed_stride flag of a direct V#: its stride is not part of the module and the shader reads
+	// it from shader data (Bindings::BufferStrideDword), so binding an empty buffer (stride 0) or
+	// another stride does not need another translation. The static stride bits are then 0.
+	static constexpr uint32_t RuntimeStride = 1u << 31u;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
@@ -612,9 +616,14 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Then each binding's run-time V# stride, two 16-bit halves per dword.
+	[[nodiscard]] uint32_t BufferStrideDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return BufferStrideDword() +
+		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 1u) / 2u;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

@@ -21606,8 +21606,22 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+        // As the renderer: a zero-stride bounds-mode-0 V# is bound empty (BufferBindingSize).
+        if (resource < compiled.resources.buffers.size() &&
+            compiled.resources.buffers[resource].dword_count == 4u) {
+          ShaderBufferResource descriptor;
+          std::copy_n(compiled.resources.buffers[resource].dwords.begin(), 4, descriptor.fields);
+          if (ShaderRecompiler::IR::BufferRuntimeOutOfBounds(compiled.program.info.buffers[resource],
+                                                             descriptor)) {
+            info = vk::DescriptorBufferInfo{nullptr, 0, vk::WholeSize};
+            shader_data[layout.MemorySizeDword() + index] = 0u;
+            continue;
+          }
+        }
         shader_data[layout.MemorySizeDword() + index] = static_cast<u32>(info.range);
       }
+      ShaderRecompiler::IR::PackBufferRuntimeStrides(compiled.program.info.buffers, layout,
+                                                     compiled.resources, shader_data);
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
       write.dstSet = descriptor_set;
@@ -40507,9 +40521,9 @@ TestCase TBufferCapturedZeroStrideOob(bool raw_bounds = false, bool scalar = fal
   test.user_data[35] = 0x0004d000u | (raw_bounds ? 3u << 28u : 0u);
   test.has_user_data = true;
   test.storage_buffer_offsets = {0, 0, 16};
-  test.expected_buffer_resources = raw_bounds || scalar
-                                       ? std::vector<u32>{0, 1, 2}
-                                       : std::vector<u32>{0, 2};
+  // A read-only zero-stride V# reads zero through an empty binding (scalar reads ignore the
+  // stride, so that variant folds its vector read in the module instead).
+  test.expected_buffer_resources = std::vector<u32>{0, 1, 2};
   auto &code = test.code;
   AppendVMovLiteral(&code, 0, test.initial[0]);
   AppendStoreVgpr(&code, 0, 0); // Keep resource zero before the removed middle slot.
@@ -40531,8 +40545,49 @@ TestCase TBufferCapturedZeroStrideOob(bool raw_bounds = false, bool scalar = fal
   test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW,
                   O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   if (scalar) test.opcodes.push_back(O::S_BUFFER_LOAD_DWORD);
-  test.ir_counts = {{"LoadBufferU32x4", raw_bounds ? 1u : 0u}};
+  test.ir_counts = {{"LoadBufferU32x4", scalar ? 0u : 1u}};
   return test;
+}
+
+// A direct V# gives its stride at run time: strides 8 and 4 and an unbound buffer (stride 0,
+// bounds mode 0) share one module, and the unbound one reads zero through an empty binding.
+TestCase RuntimeStrideBufferRead(u32 stride, u32 records) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = stride == 8u ? "RuntimeStrideBufferReadStride8"
+              : stride == 4u ? "RuntimeStrideBufferReadStride4"
+                             : "RuntimeStrideBufferReadEmpty";
+  for (u32 i = 0; i < 16u; ++i) test.initial.push_back(0x1000u + i);
+  test.initial.push_back(0xdeadbeefu);
+  test.expected = test.initial;
+  test.expected[16] = stride == 0u ? 0u : test.initial[3u * stride / 4u];
+  test.user_data = MakeStructuredStorageBufferData(4, 17);
+  test.user_data[4] = 0x2000u;
+  test.user_data[5] = stride << 16u;
+  test.user_data[6] = records;
+  test.user_data[7] = DstSel(4, 5, 6, 7) | (1u << 24u); // Bounds mode 0.
+  test.has_user_data = true;
+  test.expected_buffer_resources = std::vector<u32>{0, 1};
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 3);
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false)); // buffer_load_dword idxen, s[4:7].
+  code.push_back(EncodeMubuf1(10, 1, 20));
+  AppendStoreVgpr(&code, 10, 16);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+void CheckRuntimeStrideSharesModule(VulkanHarness *vulkan) {
+  const std::array cases{RuntimeStrideBufferRead(8u, 4u), RuntimeStrideBufferRead(4u, 8u),
+                         RuntimeStrideBufferRead(0u, 64u)};
+  const auto subgroup = vulkan != nullptr ? vulkan->SubgroupSize() : 64u;
+  const auto first = CompileCase(cases[0], subgroup).spirv;
+  for (const auto &test : cases) {
+    Require(test.name, "shared module", CompileCase(test, subgroup).spirv == first,
+            "a buffer stride change produced another SPIR-V module");
+    RunCase(vulkan, test);
+  }
 }
 
 TestCase BufferZeroStrideOobFormatsAndWidths() {
@@ -40555,7 +40610,8 @@ TestCase BufferZeroStrideOobFormatsAndWidths() {
     test.user_data[base + 3] = (format << 12u) | DstSel(1, 4, 1, 0);
   }
   test.has_user_data = true;
-  test.expected_buffer_resources = std::vector<u32>{0};
+  // The zero-stride V#s stay bound, empty, and read zero (and their format constants) at run time.
+  test.expected_buffer_resources = std::vector<u32>{0, 1, 2};
   auto &code = test.code;
   AppendVMovU32(&code, 0, 0);
   AppendStoreVgpr(&code, 0, 0);
@@ -40586,7 +40642,6 @@ TestCase BufferZeroStrideOobFormatsAndWidths() {
                   O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX3,
                   O::BUFFER_LOAD_FORMAT_X, O::BUFFER_LOAD_FORMAT_XYZW,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.ir_counts = {{"LoadBuffer", 0}};
   return test;
 }
 
@@ -51960,6 +52015,9 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return TBufferCapturedZeroStrideOob(true); });
   AddCase([] { return TBufferCapturedZeroStrideOob(false, true); });
   AddCase(BufferZeroStrideOobFormatsAndWidths);
+  AddCase([] { return RuntimeStrideBufferRead(8u, 4u); });
+  AddCase([] { return RuntimeStrideBufferRead(4u, 8u); });
+  AddCase([] { return RuntimeStrideBufferRead(0u, 64u); });
   AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatX8UintZeroExtendsByte);
@@ -52370,9 +52428,10 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
         {.type = Prospero::ShaderBinaryType::kCs,
          .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
-  // The first two share code and differ only in the buffer stride specialization.
-  struct Case { u32 code, stride; };
-  constexpr std::array<Case, 3> cases{{{0, 4}, {0, 8}, {1, 4}}};
+  // The first two share code and differ only in the buffer's ADD_TID specialization. The V#
+  // stride is read at run time, so another stride reuses the module.
+  struct Case { u32 code, stride; bool add_tid; };
+  constexpr std::array<Case, 3> cases{{{0, 4, false}, {0, 4, true}, {1, 4, false}}};
   const auto compile = [&](PipelineCache &cache, const Case &test) {
     HW::ComputeShaderInfo regs{};
     regs.cs_regs.data_addr = reinterpret_cast<uint64_t>(codes[test.code].data());
@@ -52382,7 +52441,8 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     regs.cs_regs.wave_size = 32;
     regs.cs_regs.user_sgpr = 4;
     const ShaderBufferResource buffer{{0x10000u, test.stride << 16u, 64,
-        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u)}};
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) |
+            (test.add_tid ? 1u << 23u : 0u)}};
     std::copy_n(buffer.fields, 4, regs.cs_user_sgpr.value);
     ShaderComputeInputInfo input{};
     return cache.GetComputeProgram(regs, input)->id;
@@ -52397,6 +52457,10 @@ void CheckStableProgramIds(VulkanHarness &vulkan) {
     expected[static_cast<size_t>(ShaderType::Compute)] = static_cast<uint32_t>(cases.size());
     Require(name, "compiled modules", PipelineCacheTestAccess::Compiled(cache) == expected,
             "the per-stage compile counts missed or added a module");
+    Require(name, "runtime stride",
+            compile(cache, {0, 8, false}) == forward[0] &&
+                PipelineCacheTestAccess::Compiled(cache) == expected,
+            "a different buffer stride compiled another module");
   }
   {
     PipelineCache cache(vulkan.RuntimeContext(), nullptr);
@@ -60499,6 +60563,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, TBufferCapturedZeroStrideOob(false, true));
     RunCase(&vulkan, BufferZeroStrideOobFormatsAndWidths());
     RunCase(&vulkan, TBufferLoadFormatXIdxenUsesDescriptorStride());
+    CheckRuntimeStrideSharesModule(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {

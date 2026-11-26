@@ -86,14 +86,18 @@ uint32_t BufferLane(EmitterState& state) {
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	auto&      state  = ctx.state;
 	const auto packed = StorageBufferPackedStride(state, mem);
-	const auto stride = packed & 0x3fffu;
 	auto       index  = ctx.Arg(inst, 1);
 	if ((packed & (1u << 20u)) != 0u) {
 		index = Binary(state, spv::OpIAdd, TypeU32(state), index, BufferLane(state));
 	}
-	const bool swizzle = stride != 0u && (packed & (1u << 14u)) != 0u;
+	// A run-time stride keeps the swizzle bit only when the V# that specialized it had a stride.
+	const bool runtime = (packed & IR::BufferResource::RuntimeStride) != 0u;
+	const bool swizzle = (runtime || (packed & 0x3fffu) != 0u) && (packed & (1u << 14u)) != 0u;
 	return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3), mem.offset,
-	                              ConstantU32(state, stride),
+	                              !runtime ? ConstantU32(state, packed & 0x3fffu)
+	                              : index == ConstantU32(state, 0u) && !swizzle
+	                                  ? index // Record 0 starts at byte 0 whatever the stride.
+	                                  : StorageBufferRuntimeStride(state, mem),
 	                              swizzle ? ConstantBool(state, true) : 0u,
 	                              ConstantU32(state, (packed >> 16u) & 3u))
 	    .byte;

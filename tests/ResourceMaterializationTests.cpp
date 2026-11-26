@@ -916,8 +916,14 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
     const bool inactive = !independent_mask && (!reads.readable || reads.count == 0u);
     Check(snapshot.buffers[0].dwords[0] == (inactive ? 0u : 0x8000u),
           "empty traversal kept its descriptor or an uncertain traversal lost it");
-    Check(specialization.buffers[0].zero_stride_oob == inactive,
-          "inactive traversal did not expose dead vector reads to specialization");
+    // The dead vector reads read zero through an empty binding instead of a module variant.
+    Libs::Graphics::ShaderBufferResource bound_descriptor;
+    std::copy_n(snapshot.buffers[0].dwords.begin(), 4, bound_descriptor.fields);
+    auto bound = program.info.buffers[0];
+    bound.packed_stride = specialization.buffers[0].packed_stride;
+    Check(!specialization.buffers[0].zero_stride_oob &&
+              (BufferBindingSize(bound, bound_descriptor) == 0u) == inactive,
+          "inactive traversal did not bind its dead vector reads empty");
     Check(reads.descriptors == (inactive ? 0u : 4u),
           "inactive traversal read its descriptor or an uncertain traversal skipped it");
     if (inactive) {
@@ -1047,6 +1053,86 @@ void TestBackEdgeReachesPhiPredecessor() {
     Check(ReachedBlocks(plan, {.user_data = user_data}) ==
               (selected == 0u ? std::vector<uint8_t>{1, 1, 1, 1} : std::vector<uint8_t>{1, 1, 0, 1}),
           "Phi restart followed a rejected edge or missed a reachable one");
+  }
+}
+
+// A direct V# reads its stride from shader data, so unbinding a buffer (stride 0, bounds mode 0)
+// or binding another stride keeps one module. The empty one binds zero bytes and reads zero.
+void TestRuntimeStrideSharesEmptyBufferModule() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto make_program = [](bool written) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.user_data_count = 4u;
+    auto &block = AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 4u;
+    for (uint32_t word = 0; word < 4u; ++word)
+      source.dwords[word] = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+          {Value(static_cast<ScalarReg>(word))}));
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0u, .read = true, .written = written});
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0u, .data_dwords = 1u,
+                                   .data_bits = 32u});
+    const auto handle = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+        {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
+    auto &read = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0u});
+    block.AppendNewInst(ValueOpcode::Identity, {Value(&read)});
+    return program;
+  };
+  const auto loads = [](const Program &program) {
+    uint32_t count = 0u;
+    for (const auto *block : program.blocks)
+      for (const auto &inst : *block) count += inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+    return count;
+  };
+  std::array<uint32_t, 4> descriptor{};
+  uint32_t reads = 0u;
+  const SrtRuntime runtime{.user_data = descriptor, .userdata = &reads,
+                           .read_specialization_memory = RejectSpecializationRead};
+  FakeGuestMemory fake(RejectSpecializationRead, &reads);
+  for (const bool written : {false, true}) {
+    auto plan = Extract(make_program(written));
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization, first;
+    // Bound with stride 4, unbound (stride 0, mode 0), bound with stride 12, all-zero V#.
+    for (const auto [stride, records] : {std::pair{4u, 16u}, {0u, 64u}, {12u, 16u}, {0u, 0u}}) {
+      descriptor = {stride == 0u && records == 0u ? 0u : 0x8000u, stride << 16u, records,
+                    stride == 0u && records == 0u ? 0u : 0x4dfacu};
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 0u,
+            "direct V# materialization failed or read guest memory");
+      const auto &buffer = specialization.buffers[0];
+      Check((buffer.packed_stride & BufferResource::RuntimeStride) != 0u &&
+                (buffer.packed_stride & 0x3fffu) == 0u,
+            "direct V# kept its numeric stride in the module key");
+      // Stores (and scalar reads) still fold the out-of-bounds reads in the module.
+      Check(buffer.zero_stride_oob == (written && stride == 0u),
+            "zero-stride specialization did not follow the buffer's access kinds");
+      if (!written) {
+        if (first.buffers.empty()) first = specialization;
+        Check(specialization == first, "an empty or restrided buffer created a shader variant");
+      }
+      auto program = make_program(written);
+      ApplyResourceSpecialization(program, specialization);
+      Check(loads(program) == (written && stride == 0u ? 0u : 1u),
+            "runtime-stride buffer lost or kept its load against its specialization");
+      program.info.buffers[0].descriptor_index = 1u;
+      Bindings bindings;
+      bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] = 2u;
+      std::vector<uint32_t> shader_data(bindings.ShaderDataDwords(), 0xffffffffu);
+      PackBufferRuntimeStrides(program.info.buffers, bindings, snapshot, shader_data);
+      Check(shader_data[bindings.BufferStrideDword()] == (0xffffu | (stride << 16u)),
+            "runtime stride was not packed into its binding's half of shader data");
+      Libs::Graphics::ShaderBufferResource bound;
+      std::copy_n(snapshot.buffers[0].dwords.begin(), 4, bound.fields);
+      const auto size = BufferBindingSize(program.info.buffers[0], bound);
+      const auto expected = stride == 0u ? (written ? uint64_t{records} : 0u)
+                                         : uint64_t{stride} * records;
+      Check(size == expected, "empty zero-stride buffer was not bound with zero bytes");
+    }
   }
 }
 
@@ -1644,6 +1730,7 @@ int main() {
   TestCyclicControlPredicatesRemainUnknown();
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
+  TestRuntimeStrideSharesEmptyBufferModule();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestIndirectStorageSwizzles();
   TestIndexedAddTidIndirectBuffers();

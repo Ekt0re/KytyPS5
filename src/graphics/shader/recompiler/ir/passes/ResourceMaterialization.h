@@ -54,6 +54,12 @@ struct ResourceSpecialization {
 };
 
 uint64_t BufferBindingSize(const BufferResource& resource, const ShaderBufferResource& descriptor);
+// Whether resource (after ApplyResourceSpecialization) is a direct read-only V# whose bounds mode 0
+// and zero stride put every access out of bounds; BufferBindingSize binds it empty.
+bool BufferRuntimeOutOfBounds(const BufferResource& resource, const ShaderBufferResource& descriptor);
+// Writes the V# stride of each BufferResource::RuntimeStride binding into shader data.
+void PackBufferRuntimeStrides(std::span<const BufferResource> buffers, const Bindings& bindings,
+                              const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.
