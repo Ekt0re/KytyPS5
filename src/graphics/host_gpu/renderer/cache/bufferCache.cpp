@@ -16,10 +16,12 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -48,6 +50,13 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	auto* buffer = temporary.get();
 	scheduler.DeferRelease([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
+}
+
+// KYTY_SYNC_STATS also counts re-uploads of downloaded bytes and of unchanged pages, which hashes
+// every uploaded page.
+bool DetailedSyncStats() noexcept {
+	static const bool enabled = std::getenv("KYTY_SYNC_STATS") != nullptr;
+	return enabled && Common::DebugCounters::Enabled();
 }
 
 } // namespace
@@ -172,39 +181,55 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	if (DetailedSyncStats()) {
+		for (const auto& copy: copies) {
+			m_stats_downloaded.Add(buffer_address + copy.srcOffset, copy.size);
+		}
+	}
 
 	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& copy: copies) {
 		copy.dstOffset += download.offset;
 	}
 
-	auto& command = m_scheduler.Current();
-	command.EndRendering();
-	const auto              native = command.Handle();
-	vk::BufferMemoryBarrier before {};
-	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
-	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	before.buffer              = buffer.Handle();
-	before.offset              = 0;
-	before.size                = buffer.Size();
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-	                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-	                       nullptr);
-	native.copyBuffer(buffer.Handle(), download.buffer->Handle(),
-	                  static_cast<uint32_t>(copies.size()), copies.data());
+	const auto record = [&](vk::CommandBuffer native) {
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+		                       nullptr);
+		native.copyBuffer(buffer.Handle(), download.buffer->Handle(),
+		                  static_cast<uint32_t>(copies.size()), copies.data());
 
-	auto after          = before;
-	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-	after.buffer        = download.buffer->Handle();
-	after.offset        = download.offset;
-	after.size          = total_size;
-	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                       vk::PipelineStageFlagBits::eAllCommands |
-	                           vk::PipelineStageFlagBits::eHost,
-	                       {}, 0, nullptr, 1, &after, 0, nullptr);
+		auto after          = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		after.buffer        = download.buffer->Handle();
+		after.offset        = download.offset;
+		after.size          = total_size;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands |
+		                           vk::PipelineStageFlagBits::eHost,
+		                       {}, 0, nullptr, 1, &after, 0, nullptr);
+	};
+	// Decided after MapDownload, which may submit the current command buffer while it waits.
+	const bool detached = !async && CanDownloadDetached(buffer_address, copies);
+	if (detached) {
+		// The barrier orders the copy after every submitted command, and no unsubmitted command
+		// writes these ranges: the copy reads what a flush and wait would have read.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncDetachedReadbacks);
+		m_scheduler.SubmitDetached(record);
+	} else {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		record(command.Handle());
+	}
 	auto publish = [total_size, buffer_address, copies = std::move(copies),
 	                download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
@@ -220,11 +245,63 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::SyncReadbacks,
 		                                         Common::DebugCounters::Counter::SyncReadbackNs);
 		const auto tick = m_scheduler.CurrentTick();
-		m_scheduler.Wait(tick);
-		m_scheduler.WaitPriorityOperations(tick);
+		if (detached) {
+			// Nothing is deferred at the current tick: older publications land first, as in a
+			// flush and wait.
+			m_scheduler.WaitPriorityOperations(tick - 1);
+			// The open command buffer is still submitted, without waiting for it, as a flush and
+			// wait would have: completions the guest waits for (flips, interrupts, image
+			// write-backs) keep the latency they had. Without this, GTA VI fell into a black
+			// 30 fps loop in 2 of 3 runs although every detached download read the same bytes
+			// as a flushed one (KYTY_DETACHED_READBACK=2 skips the submission, for comparison).
+			if (m_detached_readback == DetachedReadback::Submit) {
+				m_scheduler.Flush();
+			}
+		} else {
+			m_scheduler.Wait(tick);
+			m_scheduler.WaitPriorityOperations(tick);
+		}
 		publish();
 	}
 	return true;
+}
+
+bool BufferCache::CanDownloadDetached(uint64_t                        buffer_address,
+                                      std::span<const vk::BufferCopy> copies) {
+	const auto tick = m_scheduler.CurrentTick();
+	// Address writes may reach these ranges; publications deferred at this tick go first.
+	if (m_detached_readback == DetachedReadback::Off || m_address_writes_pending || m_address_write_tick == tick ||
+	    m_scheduler.HasPriorityOperationsSince(tick)) {
+		return false;
+	}
+	return std::none_of(copies.begin(), copies.end(), [&](const vk::BufferCopy& copy) {
+		return HasUnsubmittedWrite(buffer_address + copy.srcOffset, copy.size);
+	});
+}
+
+void BufferCache::MarkUnsubmittedWrite(uint64_t vaddr, uint64_t size) {
+	const auto tick = m_scheduler.CurrentTick();
+	if (m_unsubmitted_tick != tick) {
+		m_unsubmitted_writes.Clear();
+		m_unsubmitted_tick = tick;
+	}
+	m_unsubmitted_writes.Add(vaddr, size);
+}
+
+void BufferCache::RecordPendingWrites() {
+	m_pending_writes.ForEach(
+	    [this](uint64_t begin, uint64_t end) { MarkUnsubmittedWrite(begin, end - begin); });
+	m_pending_writes.Clear();
+	if (m_address_writes_pending) {
+		m_address_writes_pending = false;
+		m_address_write_tick     = m_scheduler.CurrentTick();
+	}
+}
+
+bool BufferCache::HasUnsubmittedWrite(uint64_t vaddr, uint64_t size) const {
+	return m_pending_writes.Intersects(vaddr, size) ||
+	       (m_unsubmitted_tick == m_scheduler.CurrentTick() &&
+	        m_unsubmitted_writes.Intersects(vaddr, size));
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -239,6 +316,13 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	// KYTY_DETACHED_READBACK=0 flushes and waits for every synchronous download, as before; 2
+	// reads detached without submitting the open command buffer afterwards.
+	if (const char* value = std::getenv("KYTY_DETACHED_READBACK"); value != nullptr) {
+		m_detached_readback = value[0] == '0'   ? DetachedReadback::Off
+		                      : value[0] == '2' ? DetachedReadback::NoSubmit
+		                                        : DetachedReadback::Submit;
+	}
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -395,6 +479,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	MarkUnsubmittedWrite(overlap.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
 }
 
@@ -439,6 +524,27 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+void BufferCache::RecordUploadStats(uint64_t address, const uint8_t* data, uint64_t size) {
+	m_stats_downloaded.ForEachInRange(address, size, [](uint64_t start, uint64_t end) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncReuploadBytes, end - start);
+	});
+	m_stats_downloaded.Subtract(address, size);
+	// Whole 4 KiB pages only, keyed by guest page.
+	const auto end = address + size;
+	for (auto page = Common::AlignUp(address, TRACKER_PAGE_SIZE); page + TRACKER_PAGE_SIZE <= end;
+	     page += TRACKER_PAGE_SIZE) {
+		const auto hash          = XXH3_64bits(data + (page - address), TRACKER_PAGE_SIZE);
+		auto [entry, inserted]   = m_stats_upload_hashes.try_emplace(page, hash);
+		if (!inserted) {
+			if (entry->second == hash) {
+				Common::DebugCounters::Add(
+				    Common::DebugCounters::Counter::SyncUnchangedUploadBytes, TRACKER_PAGE_SIZE);
+			}
+			entry->second = hash;
+		}
+	}
+}
+
 void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
                                std::span<vk::BufferCopy> copies, uint64_t total_size) {
 	if (copies.empty()) {
@@ -456,6 +562,9 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 				    if (!LibKernel::Memory::CopySparseMemory(address, mapped + copy.srcOffset,
 					                                         copy.size)) {
 					    EXIT("BufferCache: failed to read sparse guest buffer memory\n");
+				    }
+				    if (DetailedSyncStats()) {
+					    RecordUploadStats(address, mapped + copy.srcOffset, copy.size);
 				    }
 				    copy.srcOffset += base_offset;
 			    }
@@ -524,6 +633,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncStreamBytes, size);
 			if (!LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 				EXIT("BufferCache: failed to read sparse guest buffer memory\n");
 			}
@@ -541,6 +651,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		m_pending_writes.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -595,6 +706,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size, true);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	RecordPendingWrites();
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -634,6 +746,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	auto [dst, dst_offset] = dst_memory ? ObtainBuffer(dst_vaddr, size, true, true, dst_id)
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	RecordPendingWrites();
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
@@ -816,6 +929,7 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			}
 		});
 	});
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncBdaUploadBytes, total_size);
 	UploadCopies(uploads, copies, total_size);
 }
 

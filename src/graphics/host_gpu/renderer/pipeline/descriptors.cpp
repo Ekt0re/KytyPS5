@@ -871,6 +871,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_heap_rows  = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
+		if (stage->runtime->module->info.has_address_writes) {
+			m_context.GetBufferCache().NoteAddressWrites();
+		}
 		uses_dma |= stage->runtime->module->info.info.uses_dma;
 		uses_heap_rows |= stage->runtime->module->info.info.uses_heap_rows;
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;

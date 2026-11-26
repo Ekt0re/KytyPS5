@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/recorder.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
 #include <optional>
@@ -84,6 +85,69 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_detached_pool != nullptr) {
+		m_graphics.device.destroyFence(m_detached_fence, nullptr);
+		m_graphics.device.destroyCommandPool(m_detached_pool, nullptr);
+	}
+}
+
+// Detached submissions follow KytyPS5 PR #1254 by NeySlim ("gpu: read back submitted buffer
+// data without a flush").
+vk::CommandBuffer CommandScheduler::BeginDetached() {
+	CheckActive();
+	auto& device = m_graphics.device;
+	if (m_detached_pool == nullptr) {
+		vk::CommandPoolCreateInfo create {};
+		create.queueFamilyIndex = m_graphics.queue_family;
+		create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		RequireVulkanSuccess(device.createCommandPool(&create, nullptr, &m_detached_pool),
+		                     "create detached command pool");
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_detached_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		RequireVulkanSuccess(device.allocateCommandBuffers(&allocate, &m_detached_command),
+		                     "allocate detached command buffer");
+		const vk::FenceCreateInfo fence {};
+		RequireVulkanSuccess(device.createFence(&fence, nullptr, &m_detached_fence),
+		                     "create detached fence");
+	}
+	// With the command recorder, earlier ticks may still wait on its thread for their submission:
+	// the copy must follow them on the queue.
+	if (Recorder::Enabled() && m_master.SubmittedTick() + 1 < m_master.CurrentTick()) {
+		Recorder::SyncAll();
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(m_detached_command.begin(&begin), "begin detached command buffer");
+	return m_detached_command;
+}
+
+void CommandScheduler::EndDetached() {
+	// Commands the recorder queued for this buffer reach it before it ends.
+	if (Recorder::IsDeferred(static_cast<VkCommandBuffer>(m_detached_command))) {
+		Recorder::Sync(m_detached_command);
+	}
+	RequireVulkanSuccess(m_detached_command.end(), "end detached command buffer");
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		vk::SubmitInfo    submit_info {};
+		submit_info.commandBufferCount = 1;
+		submit_info.pCommandBuffers    = &m_detached_command;
+		result = m_graphics.queue.submit(1, &submit_info, m_detached_fence);
+	}
+	RequireVulkanSuccess(result, "submit detached command buffer");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	// The signal of a queue-submission fence also covers every batch submitted earlier on this
+	// queue.
+	RequireVulkanSuccess(
+	    m_graphics.device.waitForFences(1, &m_detached_fence, VK_TRUE, UINT64_MAX),
+	    "wait for detached fence");
+	RequireVulkanSuccess(m_graphics.device.resetFences(1, &m_detached_fence),
+	                     "reset detached fence");
+	RequireVulkanSuccess(m_detached_command.reset({}), "reset detached command buffer");
 }
 
 void CommandScheduler::Shutdown() {
@@ -252,6 +316,13 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	}
 	lock.unlock();
 	operation();
+}
+
+bool CommandScheduler::HasPriorityOperationsSince(uint64_t tick) {
+	std::lock_guard lock(m_operation_mutex);
+	// Operations are queued in tick order, so the newest one is at the back.
+	return (!m_priority_operations.empty() && m_priority_operations.back().tick >= tick) ||
+	       (m_priority_active_tick != 0 && m_priority_active_tick >= tick);
 }
 
 bool CommandScheduler::HasPendingPriorityOperations() {

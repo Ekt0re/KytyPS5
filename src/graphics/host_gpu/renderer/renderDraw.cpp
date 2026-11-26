@@ -1288,6 +1288,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer = buffer.Handle();
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	m_context.GetBufferCache().RecordPendingWrites();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (shader_write_stages) {

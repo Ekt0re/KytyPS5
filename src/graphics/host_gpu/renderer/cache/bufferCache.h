@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -117,6 +118,11 @@ public:
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// After a draw, dispatch, fill or copy is recorded: the ranges bound for writing since the last
+	// call, and address writes noted since, belong to the current command buffer.
+	void RecordPendingWrites();
+	// A program with address writes is bound; its writes can reach any range.
+	void NoteAddressWrites() noexcept { m_address_writes_pending = true; }
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -165,10 +171,18 @@ private:
 	                                     bool is_written, Common::SlotId image);
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
 	                  uint64_t total_size);
+	void RecordUploadStats(uint64_t address, const uint8_t* data, uint64_t size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, Common::SlotId id);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// GPU writes recorded in the current command buffer, or bound and not recorded yet. A
+	// synchronous download of ranges without such writes reads them in a detached submission
+	// behind the submitted work, without flushing the current command buffer.
+	void               MarkUnsubmittedWrite(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasUnsubmittedWrite(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool CanDownloadDetached(uint64_t                        buffer_address,
+	                                       std::span<const vk::BufferCopy> copies);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
@@ -181,6 +195,16 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                          m_pending_writes;
+	RangeSet                                          m_unsubmitted_writes;
+	uint64_t                                          m_unsubmitted_tick       = 0;
+	uint64_t                                          m_address_write_tick     = 0;
+	bool                                              m_address_writes_pending = false;
+	enum class DetachedReadback { Off, Submit, NoSubmit };
+	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;
+	// Statistics only (KYTY_SYNC_STATS): bytes last downloaded, and hashes of uploaded pages.
+	RangeSet                                          m_stats_downloaded;
+	std::unordered_map<uint64_t, uint64_t>            m_stats_upload_hashes;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;

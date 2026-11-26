@@ -440,6 +440,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	PreparedBindings* descriptor_stage = &bindings;
 	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
+	if (program.has_address_writes) {
+		m_context.GetBufferCache().NoteAddressWrites();
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -560,6 +563,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		vk_buffer = buffer.Handle();
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	m_context.GetBufferCache().RecordPendingWrites();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -595,6 +599,9 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	CacheDmaBases(m_context, input_info.stage);
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = input_info.stage.module->info;
+	if (program.has_address_writes) {
+		m_context.GetBufferCache().NoteAddressWrites();
+	}
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -630,6 +637,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	               });
 	vk_buffer = buffer.Handle();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	m_context.GetBufferCache().RecordPendingWrites();
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

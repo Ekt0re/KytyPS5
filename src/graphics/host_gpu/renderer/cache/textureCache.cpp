@@ -2016,6 +2016,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, ImageId id) {
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	MarkUnsubmittedWrite(image.info.data.address, copy_size);
 	return true;
 }
 

@@ -2872,6 +2872,82 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Adapted from KytyPS5 PR #1254 by NeySlim.
+  void CheckSchedulerDetachedSubmission() {
+    constexpr const char *name = "SchedulerDetachedSubmission";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo timeline_create{};
+    timeline_create.pNext = &timeline_type;
+    vk::Semaphore gate = nullptr;
+    Require(name, "gate create",
+            m_runtime_context.device.createSemaphore(&timeline_create, nullptr, &gate) ==
+                    vk::Result::eSuccess &&
+                gate != nullptr,
+            "failed to create the gate timeline semaphore");
+
+    // A submitted write that cannot run before the gate opens.
+    constexpr u32 value = 0x5aa5c33cu;
+    auto source = CreateHostBuffer(
+        name, sizeof(u32),
+        vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst, {0});
+    auto destination =
+        CreateHostBuffer(name, sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {0});
+    scheduler.Current().Handle().fillBuffer(source.buffer, 0, sizeof(u32), value);
+    SubmitInfo gated;
+    gated.AddWait(gate, 1);
+    scheduler.Flush(gated);
+    const auto open_tick = scheduler.CurrentTick();
+    const auto open_handle = scheduler.Current().Handle();
+
+    std::atomic<bool> opened{false};
+    std::jthread opener([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      opened = true;
+      vk::SemaphoreSignalInfo signal_info{};
+      signal_info.semaphore = gate;
+      signal_info.value = 1;
+      (void)m_runtime_context.device.signalSemaphore(&signal_info);
+    });
+    scheduler.SubmitDetached([&](vk::CommandBuffer command) {
+      vk::MemoryBarrier before{};
+      before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+      before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                              vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr,
+                              0, nullptr);
+      const vk::BufferCopy copy{0, 0, sizeof(u32)};
+      command.copyBuffer(source.buffer, destination.buffer, 1, &copy);
+      vk::MemoryBarrier after{};
+      after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                              vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0, nullptr, 0,
+                              nullptr);
+    });
+    const bool waited_for_gate = opened.load();
+    opener.join();
+    Require(name, "runs behind submitted work",
+            waited_for_gate && ReadBuffer(name, destination, 1)[0] == value,
+            "the detached copy completed before earlier submitted work");
+    Require(name, "open command buffer",
+            scheduler.CurrentTick() == open_tick && scheduler.Current().Handle() == open_handle,
+            "the detached submission flushed or replaced the recording");
+    scheduler.Finish();
+    m_runtime_context.device.destroySemaphore(gate, nullptr);
+    DestroyBuffer(&source);
+    DestroyBuffer(&destination);
+    scheduler.Shutdown();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -5557,6 +5633,310 @@ public:
                 static_cast<bool>(volume.backing.flags &
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Adapted from KytyPS5 PR #1254 by NeySlim. A synchronous readback of data that only submitted
+  // work wrote runs in a detached submission; data an unsubmitted or unrecorded command can still
+  // write is read after a flush and wait, as before.
+  void CheckBufferCacheDetachedDownload() {
+    constexpr const char *name = "BufferCacheDetachedDownload";
+    constexpr uintptr_t base = 0x0000000208400000ull;
+    constexpr uint64_t allocation_size = 0x800000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = TRACKER_PAGE_SIZE;
+    constexpr uint64_t owner_size = 0x100000;
+    // ReadMemory downloads the GPU-written bytes of the 512 KiB window around a read.
+    constexpr uint64_t old_offset = 0x10000;
+    constexpr uint64_t old_neighbour_offset = old_offset + 2 * page;
+    constexpr uint64_t new_offset = 0xc0000;
+    constexpr uint64_t pending_offset = 0x180000;
+    constexpr uint64_t join_offset = 0x200000;
+    constexpr uint64_t join_second_offset = join_offset + 0x10000;
+    constexpr uint64_t order_offset = 0x280000;
+    constexpr uint64_t address_offset = 0x300000;
+    constexpr uint64_t address_recorded_offset = 0x380000;
+    constexpr uint64_t image_offset = 0x400000;
+    constexpr uint64_t window_offset = 0x480000;
+    constexpr uint32_t stale = 0x0badf00du;
+
+    // Mode 2 keeps the open command buffer after a detached download, so the tick shows which
+    // downloads flushed; the default mode's submission is checked at the end.
+    setenv("KYTY_DETACHED_READBACK", "2", 1);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    unsetenv("KYTY_DETACHED_READBACK");
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    for (uint64_t offset = 0; offset < allocation_size; offset += page) {
+      std::memcpy(memory + offset, &stale, sizeof(stale));
+    }
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto GpuWrite = [&](uint64_t offset, uint32_t value) {
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      const auto MarkWritten = [&](uint64_t offset) {
+        (void)cache.ObtainBuffer(base + offset, sizeof(uint32_t), true, false);
+      };
+      const auto Backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        (void)Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value));
+        return value;
+      };
+      const auto Owned = [&](uint64_t offset) {
+        return cache.IsRegionGpuModified(base + offset, sizeof(uint32_t)) &&
+               cache.HasGpuDirtyBytes(base + offset, sizeof(uint32_t));
+      };
+
+      // Data written by submitted work downloads behind it, without a flush.
+      (void)cache.FindBuffer(base, owner_size);
+      MarkWritten(old_offset);
+      GpuWrite(old_offset, 0x11111111u);
+      MarkWritten(old_neighbour_offset);
+      GpuWrite(old_neighbour_offset, 0x22222222u);
+      scheduler.Flush();
+      MarkWritten(new_offset);
+      GpuWrite(new_offset, 0x55555555u);
+      const auto open_tick = scheduler.CurrentTick();
+      const auto open_handle = scheduler.Current().Handle();
+      cache.ReadMemory(base + old_offset, sizeof(uint32_t));
+      Require(name, "detached download",
+              Backing(old_offset) == 0x11111111u && !Owned(old_offset) &&
+                  Backing(old_neighbour_offset) == 0x22222222u &&
+                  !Owned(old_neighbour_offset) && scheduler.CurrentTick() == open_tick &&
+                  scheduler.Current().Handle() == open_handle,
+              "submitted GPU data was not published without flushing the open command buffer");
+      Require(name, "outside the window", Backing(new_offset) == stale && Owned(new_offset),
+              "a page outside the download window was published");
+
+      // Data written by the open command buffer still flushes it.
+      cache.ReadMemory(base + new_offset, sizeof(uint32_t));
+      Require(name, "unsubmitted write",
+              Backing(new_offset) == 0x55555555u && !Owned(new_offset) &&
+                  scheduler.CurrentTick() == open_tick + 1,
+              "data written by the open command buffer was read without a flush");
+
+      // A window holding one range the open command buffer writes flushes as a whole.
+      MarkWritten(window_offset);
+      GpuWrite(window_offset, 0x12121212u);
+      scheduler.Flush();
+      MarkWritten(window_offset + page);
+      GpuWrite(window_offset + page, 0x34343434u);
+      const auto window_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + window_offset, sizeof(uint32_t));
+      Require(name, "window with an unsubmitted write",
+              Backing(window_offset) == 0x12121212u &&
+                  Backing(window_offset + page) == 0x34343434u &&
+                  scheduler.CurrentTick() == window_tick + 1,
+              "a download window with an unsubmitted write was read without a flush");
+
+      // A range bound for writing whose command is not recorded yet.
+      MarkWritten(pending_offset);
+      GpuWrite(pending_offset, 0x66666666u);
+      scheduler.Flush();
+      MarkWritten(pending_offset);
+      const auto pending_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + pending_offset, sizeof(uint32_t));
+      Require(name, "pending write",
+              Backing(pending_offset) == 0x66666666u &&
+                  scheduler.CurrentTick() == pending_tick + 1,
+              "a range bound for writing was read without a flush");
+      // Recorded only after that flush: it belongs to the command buffer open now.
+      cache.RecordPendingWrites();
+      MarkWritten(pending_offset);
+      cache.RecordPendingWrites();
+      const auto recorded_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + pending_offset, sizeof(uint32_t));
+      Require(name, "recorded write", scheduler.CurrentTick() == recorded_tick + 1,
+              "a range written by a recorded command was read without a flush");
+
+      // Joining owners copies their contents in the open command buffer.
+      (void)cache.FindBuffer(base + join_offset, BufferCache::CACHING_PAGESIZE);
+      (void)cache.FindBuffer(base + join_second_offset, BufferCache::CACHING_PAGESIZE);
+      MarkWritten(join_offset);
+      GpuWrite(join_offset, 0x88888888u);
+      MarkWritten(join_second_offset);
+      GpuWrite(join_second_offset, 0x99999999u);
+      scheduler.Flush();
+      const auto joined = cache.FindBuffer(
+          base + join_offset, join_second_offset - join_offset + BufferCache::CACHING_PAGESIZE);
+      const auto join_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + join_second_offset, sizeof(uint32_t));
+      Require(name, "joined owner",
+              cache.GetBuffer(joined).IsInBounds(base + join_offset,
+                                                 join_second_offset - join_offset + 4) &&
+                  Backing(join_second_offset) == 0x99999999u &&
+                  Backing(join_offset) == 0x88888888u &&
+                  scheduler.CurrentTick() == join_tick + 1,
+              "a download read a joined owner before its copy ran");
+
+      // A publication deferred at the open tick keeps running first.
+      MarkWritten(order_offset);
+      GpuWrite(order_offset, 0xaaaaaaaau);
+      scheduler.Flush();
+      scheduler.DeferPriorityOperation([] {});
+      const auto order_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + order_offset, sizeof(uint32_t));
+      Require(name, "deferred publication",
+              Backing(order_offset) == 0xaaaaaaaau && scheduler.CurrentTick() == order_tick + 1,
+              "a download skipped a publication deferred at the open tick");
+
+      // Address writes can reach any range: noted ones not recorded yet, then recorded ones.
+      MarkWritten(address_offset);
+      GpuWrite(address_offset, 0xbbbbbbbbu);
+      MarkWritten(address_recorded_offset);
+      GpuWrite(address_recorded_offset, 0xb0b0b0b0u);
+      scheduler.Flush();
+      cache.NoteAddressWrites();
+      const auto address_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + address_offset, sizeof(uint32_t));
+      Require(name, "pending address writes",
+              Backing(address_offset) == 0xbbbbbbbbu &&
+                  scheduler.CurrentTick() == address_tick + 1,
+              "a download ignored address writes of a command not recorded yet");
+      cache.RecordPendingWrites();
+      const auto address_recorded_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + address_recorded_offset, sizeof(uint32_t));
+      Require(name, "recorded address writes",
+              Backing(address_recorded_offset) == 0xb0b0b0b0u &&
+                  scheduler.CurrentTick() == address_recorded_tick + 1,
+              "a download ignored address writes of the open command buffer");
+
+      // A texel read copies a newer image into the owner in the open command buffer; a
+      // download of that range waits for the copy.
+      (void)cache.FindBuffer(base + image_offset, BufferCache::CACHING_PAGESIZE);
+      MarkWritten(image_offset);
+      GpuWrite(image_offset, 0xccccccccu);
+      scheduler.Flush();
+      auto &texture_cache = context.GetTextureCache();
+      auto image_desc = MakeLinearDesc(base + image_offset, sizeof(uint32_t),
+                                       vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+                                       Prospero::ImageType::kColor2D, {1, 1, 1}, 1, 4, 1);
+      const auto image = texture_cache.FindImage(image_desc);
+      Require(name, "image clear",
+              image &&
+                  texture_cache.ClearImageFromBuffer(scheduler.Current(), base + image_offset,
+                                                     sizeof(uint32_t), 0xddddddddu) &&
+                  texture_cache.GetImage(image).IsGpuModified(),
+              "the image over the owner was not cleared on the GPU");
+      scheduler.Flush();
+      (void)cache.ObtainBuffer(base + image_offset, sizeof(uint32_t), false, true);
+      const auto image_tick = scheduler.CurrentTick();
+      cache.ReadMemory(base + image_offset, sizeof(uint32_t));
+      Require(name, "image copy",
+              Backing(image_offset) == 0xddddddddu && scheduler.CurrentTick() == image_tick + 1,
+              "a download read an owner before its copy from an image ran");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // After a detached download the open command buffer is submitted without waiting for it, as
+  // a flush and wait would have submitted it (KYTY_DETACHED_READBACK default).
+  void CheckBufferCacheDetachedSubmit() {
+    constexpr const char *name = "BufferCacheDetachedSubmit";
+    constexpr uintptr_t base = 0x0000000208c00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t old_offset = 0x10000;
+    constexpr uint64_t new_offset = 0x100000;
+    using Common::DebugCounters::Counter;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    const bool counters = Common::DebugCounters::Enabled();
+    Common::DebugCounters::SetEnabled(true);
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto GpuWrite = [&](uint64_t offset, uint32_t value) {
+        (void)cache.ObtainBuffer(base + offset, sizeof(value), true, false);
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      const auto Backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        (void)Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value));
+        return value;
+      };
+      (void)cache.FindBuffer(base, allocation_size);
+      GpuWrite(old_offset, 0x13579bdfu);
+      scheduler.Flush();
+      GpuWrite(new_offset, 0x2468ace0u);
+      const auto open_tick = scheduler.CurrentTick();
+      const auto detached = Common::DebugCounters::Get(Counter::SyncDetachedReadbacks);
+      cache.ReadMemory(base + old_offset, sizeof(uint32_t));
+      Require(name, "detached and submitted",
+              Backing(old_offset) == 0x13579bdfu &&
+                  Common::DebugCounters::Get(Counter::SyncDetachedReadbacks) == detached + 1 &&
+                  scheduler.CurrentTick() == open_tick + 1,
+              "a detached download did not submit the open command buffer");
+      // The write of the command buffer it submitted reads detached in turn.
+      cache.ReadMemory(base + new_offset, sizeof(uint32_t));
+      Require(name, "submitted write",
+              Backing(new_offset) == 0x2468ace0u &&
+                  Common::DebugCounters::Get(Counter::SyncDetachedReadbacks) == detached + 2,
+              "a write submitted by a detached download was not read back detached");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Common::DebugCounters::SetEnabled(counters);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -60269,6 +60649,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
+    vulkan.CheckSchedulerDetachedSubmission();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--host-image-allocation-only") == 0) {
@@ -60811,6 +61192,13 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-detached-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSchedulerDetachedSubmission();
+    vulkan.CheckBufferCacheDetachedDownload();
+    vulkan.CheckBufferCacheDetachedSubmit();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -61055,6 +61443,7 @@ int main(int argc, char **argv) {
   CheckWave64WholeWaveResults();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
+  vulkan.CheckSchedulerDetachedSubmission();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckVideoOutHdr10ToSdr();
   vulkan.CheckDescriptorHeapLargeSet();
@@ -61109,6 +61498,8 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheDetachedDownload();
+    vulkan.CheckBufferCacheDetachedSubmit();
   } else {
     skipped_device_checks = true;
   }
