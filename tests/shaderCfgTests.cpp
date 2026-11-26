@@ -12191,6 +12191,55 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   auto result = RecompileForTest(inline_sampler_shader, options);
 }
 
+// GTA VI ORs a quad mask (reserved sampler bits) into sampler dword 3 before image_sample_*_a.
+// The two crossing branches make structurization merge that SGPR with its earlier user-data
+// value, although only the quad mask reaches the sample on native paths.
+void TestSampleAdjustNativeQuadMaskSampler() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x02, 24, 1), 125u << 25u,  // s_load_dwordx4 s[24:27], s[2:3], 0
+      EncodeSMovB32(36, 12),                  // s_mov_b32 s36, s12
+      EncodeSopc(0x06, 13, 128),              // s_cmp_eq_u32 s13, 0
+      EncodeSopp(0x05, 12),                   // s_cbranch_scc1 F
+      EncodeVopc(0xc2, 129, 0),               // v_cmp_eq_u32 vcc, 1, v0
+      EncodeSop1(0x2d, 106, 106),             // s_quadmask_b64 vcc, vcc
+      EncodeSop2(0x1e, 36, 106, 128 + 12),    // s_lshl_b32 s36, vcc_lo, 12
+      EncodeSopc(0x06, 14, 128),              // s_cmp_eq_u32 s14, 0
+      EncodeSopp(0x05, 10),                   // s_cbranch_scc1 E
+      EncodeSmem0(0x0a, 20, 12), (125u << 25u) | 0x10u, // s_buffer_load_dwordx4 s[20:23], s[24:27], 0x10
+      EncodeSop2(0x10, 23, 23, 36),           // s_or_b32 s23, s23, s36
+      EncodeMimg0(0xa0, 0x1),
+      EncodeMimg1(1, 1, 5, 2),                // image_sample_a v1, v[2:3], s[4:11], s[20:23]
+      EncodeMubuf0(0x1c), EncodeMubuf1(1, 1, 0),
+      EncodeVop1(0x01, 3, 36),                // F: v_mov_b32 v3, s36
+      EncodeMubuf0(0x1c), EncodeMubuf1(3, 1, 0),
+      EncodeSopp(0x01),                       // E: s_endpgm
+  };
+  const auto user_data = ImageTestUserData();
+  const auto translate = [&](bool reserved_mask) {
+    auto code = std::vector<uint32_t>(std::begin(shader), std::end(shader));
+    // A shift by 4 leaves the quad mask's bits 4..19 partly outside the reserved bits 12..29.
+    if (!reserved_mask) code[7] = EncodeSop2(0x1e, 36, 106, 128 + 4);
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data = user_data;
+    return ShaderRecompiler::TranslateProgram(code, options);
+  };
+  const auto result = translate(true);
+  const auto &program = result.program;
+  Check(program.info.samplers.size() == 1u,
+        "quad-mask sampler was not tracked as one sampler");
+  const auto *source =
+      TypedDescriptorSource(program, program.info.samplers[0].source);
+  const auto *dword3 =
+      source == nullptr ? nullptr : source->dwords[3].ResolveInstruction();
+  Check(dword3 != nullptr &&
+            dword3->GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ReadConst,
+        "adjusted sample kept the quad mask in sampler dword 3");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal([&] { (void)translate(false); },
+              "a quad mask reaching non-reserved sampler bits was dropped");
+#endif
+}
+
 void TestSrtWalkerRealSmemTranslation() {
   const uint32_t shader[] = {
       EncodeSMovB32(124, 130), // m0 = 2
@@ -13971,6 +14020,7 @@ int main() {
   TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();
   TestTypedDescriptorRealCarryAndScalarLoads();
+  TestSampleAdjustNativeQuadMaskSampler();
   TestSrtWalkerRealSmemTranslation();
   TestSrtWalkerVccBaseTranslation();
   TestSrtWalkerRealSBufferTranslation();

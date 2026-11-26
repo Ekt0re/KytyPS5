@@ -14,6 +14,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -141,6 +142,38 @@ bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	}
 	// Leave one high DWORD on each side for the signed instruction offset/carry.
 	return lower > 0x00008000u && upper < 0xffff7fffu;
+}
+
+// CFG::ScalarOperandCode and CFG::MayWriteScalarRegister, kept here because the tracking
+// unit tests do not link the CFG builder.
+bool NativeScalarCode(const Decoder::Operand& operand, uint32_t& code) {
+	switch (operand.kind) {
+		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
+		case Decoder::OperandKind::VccLo: code = 106u; return true;
+		case Decoder::OperandKind::VccHi: code = 107u; return true;
+		case Decoder::OperandKind::M0: code = 124u; return true;
+		case Decoder::OperandKind::ExecLo: code = 126u; return true;
+		case Decoder::OperandKind::ExecHi: code = 127u; return true;
+		default: return false;
+	}
+}
+
+bool NativeMayWriteScalar(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {
+	// A vector lane mask (comparison or carry) spans wave_size / 32 SGPRs; a lane read writes one.
+	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
+	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
+	    inst.family == Decoder::Family::VOP3P) {
+		const bool lane_read = inst.opcode == Decoder::Opcode::V_READLANE_B32 ||
+		                       inst.opcode == Decoder::Opcode::V_READFIRSTLANE_B32;
+		const uint32_t size = lane_read ? 1u : wave_size / 32u;
+		uint32_t destination = 0;
+		for (const auto* operand: {&inst.dst, &inst.dst2})
+			if (NativeScalarCode(*operand, destination) && code >= destination && code < destination + size)
+				return true;
+	}
+	uint32_t destination = 0;
+	return NativeScalarCode(inst.dst, destination) && code >= destination &&
+	       code < destination + std::max<uint32_t>(1u, inst.data_dwords);
 }
 
 Value CanonicalizeSampleAdjustDword3(Value value) {
@@ -781,6 +814,140 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	// The native instructions (indices into m_decoded) whose write of scalar code reaches
+	// instruction `before` on some native path, with UINT32_MAX for the entry value; nullopt
+	// when a call or an unknown block lies on the way.
+	std::optional<std::vector<uint32_t>> NativeDefinitions(uint32_t code, uint32_t before) const {
+		const auto& blocks = m_native_cfg.blocks;
+		const auto found = std::ranges::find_if(blocks, [&](const auto& block) {
+			return block.inst_begin <= before && before < block.inst_end;
+		});
+		if (found == blocks.end()) return std::nullopt;
+		std::vector<uint32_t> result;
+		std::vector<std::pair<uint32_t, uint32_t>> pending {{found->id, before}};
+		std::set<std::pair<uint32_t, uint32_t>> visited;
+		while (!pending.empty()) {
+			const auto point = pending.back();
+			pending.pop_back();
+			if (!visited.insert(point).second) continue;
+			if (point.first >= blocks.size()) return std::nullopt;
+			const auto& block = blocks[point.first];
+			uint32_t index = UINT32_MAX;
+			for (uint32_t i = point.second; i > block.inst_begin;) {
+				const auto& inst = m_decoded.instructions[--i];
+				if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64) return std::nullopt;
+				if (NativeMayWriteScalar(inst, code, m_program.wave_size)) { index = i; break; }
+			}
+			if (index == UINT32_MAX && block.id != m_native_cfg.entry_block) {
+				if (block.predecessors.empty()) return std::nullopt;
+				for (const auto predecessor: block.predecessors)
+					pending.emplace_back(predecessor, blocks[predecessor].inst_end);
+				continue;
+			}
+			if (std::ranges::find(result, index) == result.end()) result.push_back(index);
+		}
+		return result;
+	}
+
+	// Bits scalar code may hold before instruction `before`, from the native instructions
+	// defining it: moves, shifts by constants, AND/OR and quad masks; all bits otherwise.
+	uint32_t NativePossibleBits(uint32_t code, uint32_t before, uint32_t depth = 0) const {
+		if (depth > 8u) return UINT32_MAX;
+		const auto definitions = NativeDefinitions(code, before);
+		if (!definitions || definitions->empty()) return UINT32_MAX;
+		uint32_t bits = 0;
+		for (const auto index: *definitions) {
+			if (index == UINT32_MAX) return UINT32_MAX;
+			const auto& inst = m_decoded.instructions[index];
+			const auto source = [&](const Decoder::Operand& operand) -> uint32_t {
+				if (operand.kind == Decoder::OperandKind::LiteralConstant ||
+				    operand.kind == Decoder::OperandKind::IntegerInlineConstant)
+					return operand.value;
+				uint32_t source_code = 0;
+				return NativeScalarCode(operand, source_code)
+				    ? NativePossibleBits(source_code, index, depth + 1u) : UINT32_MAX;
+			};
+			const auto constant = [](const Decoder::Operand& operand, uint32_t& value) {
+				value = operand.value;
+				return operand.kind == Decoder::OperandKind::LiteralConstant ||
+				       operand.kind == Decoder::OperandKind::IntegerInlineConstant;
+			};
+			uint32_t dst = 0;
+			if (!NativeScalarCode(inst.dst, dst)) return UINT32_MAX;
+			uint32_t shift = 0;
+			switch (inst.opcode) {
+				case Decoder::Opcode::S_QUADMASK_B64:
+					if (dst == code) { bits |= 0xffffu; continue; }
+					if (dst + 1u == code) continue;
+					return UINT32_MAX;
+				default: break;
+			}
+			if (dst != code || std::max(1u, inst.data_dwords) != 1u) return UINT32_MAX;
+			switch (inst.opcode) {
+				case Decoder::Opcode::S_MOV_B32: bits |= source(inst.src0); break;
+				case Decoder::Opcode::S_QUADMASK_B32: bits |= 0xffu; break;
+				case Decoder::Opcode::S_AND_B32: bits |= source(inst.src0) & source(inst.src1); break;
+				case Decoder::Opcode::S_OR_B32: bits |= source(inst.src0) | source(inst.src1); break;
+				case Decoder::Opcode::S_LSHL_B32:
+					if (!constant(inst.src1, shift)) return UINT32_MAX;
+					bits |= source(inst.src0) << (shift & 31u);
+					break;
+				case Decoder::Opcode::S_LSHR_B32:
+					if (!constant(inst.src1, shift)) return UINT32_MAX;
+					bits |= source(inst.src0) >> (shift & 31u);
+					break;
+				default: return UINT32_MAX;
+			}
+		}
+		return bits;
+	}
+
+	// The value an adjusted sample (image_sample_*_a) sees in sampler dword 3 once the reserved
+	// bits it discards are dropped, or empty. Handles dword 3 defined natively by one S_OR_B32
+	// of a scalar sampler-word load and an SGPR that, on every native path, only holds reserved
+	// bits (GTA VI ORs in a quad mask). Structurization can merge that SGPR with values from
+	// paths that never reach the sample, so the IR Phi alone does not show this. The IR OR
+	// equals the native one, so it differs from the load operand only in reserved bits.
+	Value NativeSampleAdjustDword3(Value dword3, uint32_t reg, uint32_t use_pc) const {
+		const auto* inst = dword3.Resolve().TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseOr32 ||
+		    m_native_cfg.blocks.empty()) return {};
+		const auto use = std::ranges::lower_bound(m_decoded.instructions, use_pc, {},
+		                                         &Decoder::Instruction::pc);
+		if (use == m_decoded.instructions.end() || use->pc != use_pc) return {};
+		const auto unique = [&](uint32_t code, uint32_t before) -> const Decoder::Instruction* {
+			const auto definitions = NativeDefinitions(code, before);
+			if (!definitions || definitions->size() != 1u || definitions->front() == UINT32_MAX)
+				return nullptr;
+			return &m_decoded.instructions[definitions->front()];
+		};
+		const auto* write = unique(reg, static_cast<uint32_t>(use - m_decoded.instructions.begin()));
+		if (write == nullptr || write->opcode != Decoder::Opcode::S_OR_B32 ||
+		    write->dst.kind != Decoder::OperandKind::Sgpr || write->dst.reg != reg ||
+		    write->src0.kind != Decoder::OperandKind::Sgpr ||
+		    write->src1.kind != Decoder::OperandKind::Sgpr) return {};
+		const auto at = static_cast<uint32_t>(write - m_decoded.instructions.data());
+		for (const auto& [kept, masked]: {std::pair {write->src0.reg, write->src1.reg},
+		                                  std::pair {write->src1.reg, write->src0.reg}}) {
+			if (kept == masked || (NativePossibleBits(masked, at) & ~SamplerDword3ReservedMask) != 0u)
+				continue;
+			const auto* load = unique(kept, at);
+			if (load == nullptr || load->dst.kind != Decoder::OperandKind::Sgpr) continue;
+			for (uint32_t arg = 0; arg < 2u; ++arg) {
+				const auto operand = inst->Arg(arg).Resolve();
+				const auto* read = operand.TryInstruction();
+				if (read == nullptr || (read->GetOpcode() != ValueOpcode::ReadConst &&
+				                        read->GetOpcode() != ValueOpcode::ReadConstBuffer &&
+				                        read->GetOpcode() != ValueOpcode::LoadAddressU32)) continue;
+				const auto flags = read->Flags<MemoryFlags>();
+				if (flags.pc != load->pc || flags.index >= m_program.memory_info.size() ||
+				    load->dst.reg + m_program.memory_info[flags.index].component_index != kept) continue;
+				return operand;
+			}
+		}
+		return {};
+	}
+
 	// The SGPR and the pc before which it holds the value a V_READLANE_B32 writing reg at pc
 	// restores: the source of the one V_WRITELANE_B32 of the same constant lane reaching the read
 	// on every native path with no other write of the VGPR between. Adapted from
@@ -1131,6 +1298,11 @@ private:
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
+			if (base_reg != UINT32_MAX && descriptor.dwords[3].Resolve().GetType() == Type::U32 &&
+			    !ValidateRuntimeValue(m_program, descriptor.dwords[3])) {
+				const auto native = NativeSampleAdjustDword3(handle.Arg(3), base_reg + 3u, pc);
+				if (!native.IsEmpty()) descriptor.dwords[3] = native;
+			}
 		}
 		const auto dword0 = descriptor.dwords[0].Resolve();
 		if (sampler && dword0.IsImmediate() && dword0.GetType() == Type::U32 &&
