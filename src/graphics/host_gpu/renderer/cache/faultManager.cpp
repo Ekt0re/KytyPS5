@@ -135,6 +135,18 @@ void FaultManager::ProcessFaultBuffer() {
 	command.dispatch(static_cast<uint32_t>((BufferCache::WRITE_BITMAP_BYTES / 16 + 63) / 64), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
+	// The scans wrote the download areas the host reads after the tick; waiting on the tick alone
+	// does not make shader writes visible to host reads (Senaxx/KytyPS5 1e7597c01, via Jetsku's
+	// 3fd14ddb).
+	vk::MemoryBarrier2 host_barrier {};
+	host_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	host_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	host_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eHost;
+	host_barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+	vk::DependencyInfo host_dependency {};
+	host_dependency.memoryBarrierCount = 1;
+	host_dependency.pMemoryBarriers    = &host_barrier;
+	command.pipelineBarrier2(host_dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, write_mapped, write_offset, area] {
