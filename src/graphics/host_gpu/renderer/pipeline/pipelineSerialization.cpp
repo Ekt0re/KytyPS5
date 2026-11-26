@@ -378,6 +378,11 @@ void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& 
 				return;
 			}
 			g_decode_plan_ns += NanosecondsSince(part);
+			// KYTY_RT_OFF: stored BVH modules walk the scene; InsertRecord drops them, and their
+			// programs translate again with the miss.
+			if (loaded.module.info.info.bvh && ShaderRecompiler::Spirv::BvhIntersectAlwaysMisses()) {
+				break;
+			}
 			part = std::chrono::steady_clock::now();
 			loaded.module.module = CompileSPV(spirv, m_graphics.device);
 			g_decode_spirv_ns += NanosecondsSince(part);
@@ -410,6 +415,9 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 			if (inserted) {
 				program->second.resource_plan = std::move(loaded.plan);
 			}
+			if (loaded.module.info.info.bvh && ShaderRecompiler::Spirv::BvhIntersectAlwaysMisses()) {
+				break;
+			}
 			program->second.modules.push_back(std::move(loaded.module));
 			break;
 		}
@@ -424,7 +432,8 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 // Records are encoded here, since programs and modules change later.
 void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
                                 const ShaderModule& module, const std::vector<uint32_t>& spirv) {
-	if (!m_store) {
+	// KYTY_RT_OFF modules never enter the store, so runs without it keep the real ones.
+	if (!m_store || (module.info.info.bvh && ShaderRecompiler::Spirv::BvhIntersectAlwaysMisses())) {
 		return;
 	}
 	Writer record;

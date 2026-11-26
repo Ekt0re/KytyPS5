@@ -37,6 +37,10 @@ struct Profile {
 
 inline constexpr Profile DefaultProfile {};
 
+// KYTY_RT_OFF=1: BVH node tests always miss (an empty scene). Not part of Profile, so the shader
+// store header stays; the pipeline cache neither loads nor stores BVH modules while it is set.
+bool BvhIntersectAlwaysMisses();
+
 // Resets and writes backend IDs and descriptor indices; do not emit the same program concurrently.
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   IR::PushData::Window push_data       = {},
