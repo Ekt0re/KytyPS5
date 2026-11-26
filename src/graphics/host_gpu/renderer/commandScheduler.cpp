@@ -4,9 +4,11 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/recorder.h"
 
 #include <algorithm>
 #include <optional>
+#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -343,15 +345,67 @@ void CommandScheduler::Split(Common::UniqueFunction<void, vk::CommandBuffer>&& t
 	BeginCommand();
 }
 
+namespace {
+
+// What a deferred submission needs on the recorder thread (copied into its record).
+struct DeferredSubmit {
+	SubmitInfo       submit;
+	vk::Queue        queue;
+	Common::Mutex*   queue_mutex;
+	MasterSemaphore* master;
+	uint64_t         tick;
+};
+static_assert(std::is_trivially_copyable_v<DeferredSubmit>);
+
+vk::Result QueueSubmit(vk::Queue queue, const SubmitInfo& submit, const vk::CommandBuffer* buffers,
+                       uint32_t count) {
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+	timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+	timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+	submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+	submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+	submit_info.commandBufferCount   = count;
+	submit_info.pCommandBuffers      = buffers;
+	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+
+	return queue.submit(1, &submit_info, nullptr);
+}
+
+// Runs on the command recorder's thread once it ended the buffers.
+void RunDeferredSubmit(const void* data, const VkCommandBuffer* buffers, uint32_t count) {
+	const auto& deferred = *static_cast<const DeferredSubmit*>(data);
+	static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
+	vk::Result result;
+	{
+		Common::LockGuard lock(*deferred.queue_mutex);
+		result = QueueSubmit(deferred.queue, deferred.submit,
+		                     reinterpret_cast<const vk::CommandBuffer*>(buffers), count);
+		deferred.master->MarkSubmitted(deferred.tick);
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(),
+		     deferred.tick);
+	}
+}
+
+} // namespace
+
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
 
-	m_command.End();
+	m_command.EndRendering();
 	std::vector<vk::CommandBuffer> buffers;
 	buffers.reserve(m_segments.size() + 1);
 	for (const auto& segment: m_segments) {
 		segment.tail(segment.buffer);
-		EXIT_IF(segment.buffer.end() != vk::Result::eSuccess);
 		buffers.push_back(segment.buffer);
 	}
 	m_segments.clear();
@@ -359,30 +413,51 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 
+	// Buffers the GPU thread recorded through the command recorder are ended and submitted on the
+	// recorder's thread, after the commands queued into them. Ticks are still handed out here, in
+	// the order of the submissions, which the recorder keeps.
+	const bool deferred =
+	    Recorder::Enabled() && std::all_of(buffers.begin(), buffers.end(), [](vk::CommandBuffer b) {
+		    return Recorder::IsDeferred(static_cast<VkCommandBuffer>(b));
+	    });
+	if (deferred) {
+		DeferredSubmit run {};
+		run.submit      = submit;
+		run.queue       = graphics.queue;
+		run.queue_mutex = &graphics.queue_mutex;
+		run.master      = &m_master;
+		run.tick        = m_master.NextTick();
+		run.submit.AddSignal(m_master.Handle(), run.tick);
+		static_assert(sizeof(vk::CommandBuffer) == sizeof(VkCommandBuffer));
+		Recorder::EndAndRun(reinterpret_cast<const VkCommandBuffer*>(buffers.data()),
+		                    static_cast<uint32_t>(buffers.size()), &RunDeferredSubmit, &run,
+		                    sizeof(run));
+		m_command.m_buffer = nullptr;
+		return run.tick;
+	}
+
+	// Submissions still queued on the recorder thread signal earlier ticks: they go first.
+	// So do the commands queued for buffers of this batch, and the recorder must not use the
+	// command pool while this thread ends them.
+	if (m_master.SubmittedTick() + 1 < m_master.CurrentTick() ||
+	    std::any_of(buffers.begin(), buffers.end(), [](vk::CommandBuffer b) {
+		    return Recorder::IsDeferred(static_cast<VkCommandBuffer>(b));
+	    })) {
+		Recorder::SyncAll();
+	}
+	for (const auto buffer: buffers) {
+		EXIT_IF(buffer.end() != vk::Result::eSuccess);
+	}
+
 	vk::Result result;
 	uint64_t   tick;
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
-
-		vk::TimelineSemaphoreSubmitInfo timeline_info {};
-		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
-		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
-		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
-		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
-
-		vk::SubmitInfo submit_info {};
-		submit_info.pNext                = &timeline_info;
-		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
-		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
-		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
-		submit_info.commandBufferCount   = static_cast<uint32_t>(buffers.size());
-		submit_info.pCommandBuffers      = buffers.data();
-		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
-		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
-
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		result = QueueSubmit(graphics.queue, submit, buffers.data(),
+		                     static_cast<uint32_t>(buffers.size()));
+		m_master.MarkSubmitted(tick);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 

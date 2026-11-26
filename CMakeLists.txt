@@ -531,6 +531,13 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(recorder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RecorderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/recorder.cpp"
+)
+target_link_libraries(recorder_tests fmt::fmt common)
+target_include_directories(recorder_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexMetadata.cpp"

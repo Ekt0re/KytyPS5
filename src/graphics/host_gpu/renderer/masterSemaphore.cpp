@@ -38,6 +38,11 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
+void MasterSemaphore::MarkSubmitted(uint64_t tick) noexcept {
+	m_submitted_tick.store(tick, std::memory_order_release);
+	m_submitted_tick.notify_all();
+}
+
 void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
@@ -45,6 +50,10 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Refresh();
 	if (IsFree(tick)) {
 		return;
+	}
+	for (auto submitted = m_submitted_tick.load(std::memory_order_acquire); submitted < tick;
+	     submitted      = m_submitted_tick.load(std::memory_order_acquire)) {
+		m_submitted_tick.wait(submitted, std::memory_order_acquire);
 	}
 
 	vk::SemaphoreWaitInfo wait_info {};

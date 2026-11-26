@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/recorder.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
@@ -1032,6 +1033,9 @@ void WindowContext::CreateVulkan() {
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	// After the upscalers took the real device functions, before the allocator takes the
+	// recorder's waiting destroy and free functions.
+	Recorder::Install();
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
