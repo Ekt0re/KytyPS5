@@ -1,0 +1,60 @@
+#version 450
+
+// Copies a GPU-written VkDispatchIndirectCommand into a guard slot the dispatch reads instead.
+// A count of 0 in any dimension dispatches nothing (as on the console, where the other counts do
+// not matter); counts past the device limits or an implausible total are garbage left by a
+// mis-emulated or dropped writer and are also turned into an empty dispatch, instead of an
+// out-of-spec indirect dispatch that can keep the GPU busy for minutes. The original counts and
+// a verdict stay in the slot for the host to report.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer source_buf {
+    uint source[];
+};
+
+// Slot layout (8 words): 0..2 counts to dispatch, 3 verdict, 4..6 original counts, 7 sequence.
+layout(std430, binding = 1) buffer slot_buf {
+    uint slot[];
+};
+
+layout(push_constant) uniform Params {
+    uint source_word; // first word of the arguments in the bound source range
+    uint max_x;
+    uint max_y;
+    uint max_z;
+    uint max_total;   // most workgroups one dispatch may plausibly have
+    uint sequence;
+} params;
+
+const uint VERDICT_OK      = 0u;
+const uint VERDICT_EMPTY   = 1u;
+const uint VERDICT_LIMIT   = 2u;
+const uint VERDICT_TOTAL   = 3u;
+
+void main() {
+    const uint x = source[params.source_word + 0u];
+    const uint y = source[params.source_word + 1u];
+    const uint z = source[params.source_word + 2u];
+    uint verdict = VERDICT_OK;
+    if (x == 0u || y == 0u || z == 0u) {
+        verdict = VERDICT_EMPTY;
+    } else if (x > params.max_x || y > params.max_y || z > params.max_z) {
+        verdict = VERDICT_LIMIT;
+    } else {
+        // x * y * z without overflow: each factor is at most max_total once checked in turn.
+        const uint xy = (y > params.max_total / x) ? 0xffffffffu : x * y;
+        if (xy > params.max_total || z > params.max_total / xy) {
+            verdict = VERDICT_TOTAL;
+        }
+    }
+    const bool keep = verdict == VERDICT_OK;
+    slot[0] = keep ? x : 0u;
+    slot[1] = keep ? y : 0u;
+    slot[2] = keep ? z : 0u;
+    slot[3] = verdict;
+    slot[4] = x;
+    slot[5] = y;
+    slot[6] = z;
+    slot[7] = params.sequence;
+}

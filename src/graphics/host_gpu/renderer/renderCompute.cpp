@@ -6,6 +6,8 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/runtimeToggles.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "gpu_tiler_shaders/dispatch_args_guard_spv.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -41,6 +43,8 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <chrono>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -294,6 +298,189 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 		       return image.written &&
 			          image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
 	       });
+}
+
+// Dispatch-argument guard (KYTY_DISPATCH_GUARD, on unless set to 0). Indirect dispatch counts a
+// guest compute pass produced are copied by a one-invocation pass into a slot of a host-visible
+// ring, which the dispatch reads instead: a count of 0 dispatches nothing (as on the console), and
+// counts past the device limits or more than 2^24 workgroups in total, which only garbage from a
+// mis-emulated writer gives, become an empty dispatch instead of an out-of-spec one that can keep
+// the GPU busy until the device is lost (GTA VI, shader 0xe119767e79e995c9). The ring keeps the
+// original counts, and refused dispatches are logged every 10 s.
+class DispatchArgsGuard {
+public:
+	static constexpr uint32_t Slots     = 65536;
+	static constexpr uint64_t SlotBytes = 32;
+	static constexpr uint32_t MaxTotal  = 1u << 24u;
+
+	struct Result {
+		vk::Buffer buffer;
+		uint64_t   offset;
+		uint32_t   slot;
+	};
+
+	DispatchArgsGuard(GraphicContext& graphics, CommandScheduler& scheduler)
+	    : m_graphics(graphics),
+	      m_ring(graphics, scheduler, MemoryUsage::Download, 0, AllFlags, Slots * SlotBytes) {
+		EXIT_IF(m_ring.Mapped().empty());
+		std::memset(m_ring.Mapped().data(), 0xff, m_ring.Mapped().size());
+		const vk::DescriptorSetLayoutBinding bindings[] {
+		    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		};
+		vk::DescriptorSetLayoutCreateInfo layout_info {};
+		layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		layout_info.bindingCount = std::size(bindings);
+		layout_info.pBindings    = bindings;
+		RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&layout_info, nullptr,
+		                                                               &m_set_layout),
+		                     "create dispatch guard descriptor layout");
+		const vk::PushConstantRange range {vk::ShaderStageFlagBits::eCompute, 0,
+		                                   sizeof(PushConstants)};
+		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+		pipeline_layout_info.setLayoutCount         = 1;
+		pipeline_layout_info.pSetLayouts            = &m_set_layout;
+		pipeline_layout_info.pushConstantRangeCount = 1;
+		pipeline_layout_info.pPushConstantRanges    = &range;
+		RequireVulkanSuccess(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+		                                                          &m_layout),
+		                     "create dispatch guard pipeline layout");
+		m_pipeline = CreateComputePipeline(graphics.device, DISPATCH_ARGS_GUARD_SPV, m_layout,
+		                                   "create dispatch guard pipeline");
+		SetVulkanObjectNameF(graphics.device, m_pipeline, "Kyty.DispatchArgsGuard");
+		const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+		m_max[0]           = limits.maxComputeWorkGroupCount[0];
+		m_max[1]           = limits.maxComputeWorkGroupCount[1];
+		m_max[2]           = limits.maxComputeWorkGroupCount[2];
+		m_alignment = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	}
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const char* text = std::getenv("KYTY_DISPATCH_GUARD");
+			return text == nullptr || text[0] != '0';
+		}();
+		return enabled;
+	}
+
+	// Records the guard pass for the arguments at `source` + `offset`; the dispatch reads the
+	// returned slot.
+	Result Record(vk::CommandBuffer command, vk::Buffer source, uint64_t offset,
+	              uint64_t source_size, uint64_t shader) {
+		Report();
+		const uint32_t slot   = static_cast<uint32_t>(m_sequence % Slots);
+		const uint64_t bound  = offset - offset % m_alignment;
+		const uint64_t length = std::min<uint64_t>(source_size - bound, (offset - bound) + 12u);
+		m_shaders[slot]       = shader;
+		const PushConstants constants {.source_word = static_cast<uint32_t>((offset - bound) / 4u),
+		                               .max_x       = m_max[0],
+		                               .max_y       = m_max[1],
+		                               .max_z       = m_max[2],
+		                               .max_total   = MaxTotal,
+		                               .sequence    = static_cast<uint32_t>(m_sequence)};
+		m_sequence++;
+
+		const vk::MemoryBarrier before {.srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+		                                .dstAccessMask = vk::AccessFlagBits::eShaderRead};
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                        vk::PipelineStageFlagBits::eComputeShader, {}, 1, &before, 0,
+		                        nullptr, 0, nullptr);
+		const vk::DescriptorBufferInfo infos[] {
+		    {source, bound, length},
+		    {m_ring.Handle(), slot * SlotBytes, SlotBytes},
+		};
+		std::array<vk::WriteDescriptorSet, 2> writes {};
+		for (uint32_t index = 0; index < writes.size(); ++index) {
+			writes[index].dstBinding      = index;
+			writes[index].descriptorCount = 1;
+			writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+			writes[index].pBufferInfo     = &infos[index];
+		}
+		command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pipeline);
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_layout, 0, writes);
+		command.pushConstants(m_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(constants),
+		                      &constants);
+		command.dispatch(1, 1, 1);
+		const vk::MemoryBarrier after {.srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+		                               .dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead |
+		                                                vk::AccessFlagBits::eHostRead};
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+		                        vk::PipelineStageFlagBits::eDrawIndirect |
+		                            vk::PipelineStageFlagBits::eHost,
+		                        {}, 1, &after, 0, nullptr, 0, nullptr);
+		return {m_ring.Handle(), slot * SlotBytes, slot};
+	}
+
+private:
+	struct PushConstants {
+		uint32_t source_word;
+		uint32_t max_x;
+		uint32_t max_y;
+		uint32_t max_z;
+		uint32_t max_total;
+		uint32_t sequence;
+	};
+
+	[[nodiscard]] const uint32_t* SlotWords(uint32_t slot) const {
+		return reinterpret_cast<const uint32_t*>(m_ring.Mapped().data() + slot * SlotBytes);
+	}
+
+	// Every 10 s: the dispatches the guard refused since the last report (from completed slots).
+	void Report() {
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_last_report < std::chrono::seconds {10}) {
+			return;
+		}
+		m_last_report = now;
+		m_ring.Invalidate(0, m_ring.Size());
+		uint64_t refused = 0;
+		uint64_t empty   = 0;
+		for (uint64_t sequence = m_reported; sequence < m_sequence; sequence++) {
+			const auto  slot  = static_cast<uint32_t>(sequence % Slots);
+			const auto* words = SlotWords(slot);
+			if (words[7] != static_cast<uint32_t>(sequence)) {
+				break; // not completed yet; report it next time
+			}
+			m_reported = sequence + 1;
+			if (words[3] == 1u) {
+				empty++;
+			} else if (words[3] >= 2u) {
+				if (refused++ < 8) {
+					std::printf("Dispatch guard: refused indirect dispatch of shader 0x%016llx with "
+					            "GPU-written counts %ux%ux%u%s\n",
+					            static_cast<unsigned long long>(m_shaders[slot]), words[4], words[5],
+					            words[6], words[3] == 2u ? " (past device limits)"
+					                                     : " (implausible total)");
+				}
+			}
+		}
+		if (refused != 0 || empty != 0) {
+			std::printf("Dispatch guard: %llu GPU-written indirect dispatches were empty, %llu refused "
+			            "in the last 10 s\n",
+			            static_cast<unsigned long long>(empty),
+			            static_cast<unsigned long long>(refused));
+			std::fflush(stdout);
+		}
+	}
+
+	GraphicContext&                       m_graphics;
+	Buffer                                m_ring;
+	vk::DescriptorSetLayout               m_set_layout = nullptr;
+	vk::PipelineLayout                    m_layout     = nullptr;
+	vk::Pipeline                          m_pipeline   = nullptr;
+	uint32_t                              m_max[3] {};
+	uint64_t                              m_alignment = 4;
+	uint64_t                              m_sequence  = 0;
+	uint64_t                              m_reported  = 0;
+	std::array<uint64_t, Slots>           m_shaders {};
+	std::chrono::steady_clock::time_point m_last_report = std::chrono::steady_clock::now();
+};
+
+// One per process (one device); never destroyed, as it would outlive the device at exit.
+static DispatchArgsGuard& GetDispatchArgsGuard(RenderContext& context) {
+	static auto* guard =
+	    new DispatchArgsGuard(context.GetGraphics(), context.GetCommandScheduler());
+	return *guard;
 }
 
 // Records the dispatch, at submission if its pipeline is still compiling.
@@ -577,9 +764,11 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetCommandScheduler().StartOperation();
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
-	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
-	    (args.x == 0 || args.y == 0 || args.z == 0)) {
+	// Known only when the CPU wrote the arguments; a compute pass can produce them instead.
+	const bool args_known =
+	    !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args));
+	if (args_known && (args.x == 0 || args.y == 0 || args.z == 0)) {
 		return;
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
@@ -618,6 +807,13 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF((args_offset & 3u) != 0);
+	DispatchArgsGuard::Result dispatch_args {args_buffer->Handle(), args_offset, UINT32_MAX};
+	if (!args_known && DispatchArgsGuard::Enabled()) {
+		buffer.EndRendering();
+		dispatch_args = GetDispatchArgsGuard(m_context).Record(
+		    buffer.Handle(), args_buffer->Handle(), args_offset, args_buffer->Size(),
+		    program.shader_hash);
+	}
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -627,7 +823,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	}
 	LogAddressWrites(input_info.stage, 0, 0, 0);
 	RecordDispatch(buffer, pipeline,
-	               [args = args_buffer->Handle(), offset = args_offset,
+	               [args = dispatch_args.buffer, offset = dispatch_args.offset,
 	                graphics = &m_context.GetGraphics(),
 	                cs_hash  = program.shader_hash](vk::CommandBuffer command, vk::Pipeline handle) {
 		               command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
