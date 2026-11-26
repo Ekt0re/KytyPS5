@@ -1144,7 +1144,32 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets, false);
+	vk::PipelineStageFlags shader_write_stages = {};
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferWrites(stage.stage)) {
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+		}
+	}
+	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	// KYTY_ASYNC_PIPELINES (after bloodborne_pc, deadinside28 / Supermedo, GPL-2.0: geometry
+	// may go without its pipeline for a frame; full-screen passes wait, since skipping them
+	// left whole frames grey). Draws whose output later work reads in ways a missing frame
+	// would break wait too: depth or stencil writers (shadow maps, depth pre-passes) and
+	// draws whose shaders write memory. Dispatches always wait (renderCompute.cpp).
+	const int  async_mode = PipelineCache::AsyncPipelineMode();
+	const bool full_screen =
+	    Prospero::IsRectList(ucfg.GetPrimType()) ||
+	    (emit.indirect.address == 0 && draw.instance_count <= 1 && draw.index_count <= 6);
+	const bool depth_writes =
+	    static_cast<bool>(m_targets.depth.image_id) &&
+	    static_cast<bool>(m_targets.depth.AttachmentWriteAspects());
+	const bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
+	                       (async_mode >= 2 || !depth_writes);
+	// A draw that waits may start with an unoptimized pipeline (KYTY_FAST_PIPELINES).
+	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
+	                                                                  false, !skippable);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
@@ -1211,15 +1236,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
-	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
-		}
-	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
-	}
 	if (shader_write_stages) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory.
 		buffer.EndRendering();
@@ -1259,8 +1275,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		record(vk_buffer, pipeline.pipeline);
 	} else {
 		m_context.GetCommandScheduler().Split(
-		    [record, compiling = pipeline.compiling](vk::CommandBuffer command) {
-			    record(command, PipelineCache::WaitForPipeline(compiling));
+		    [record, skippable, &occlusion_queries, occlusion_query,
+		     pending = pipeline.Pending()](vk::CommandBuffer command) {
+			    if (skippable && !pending.Ready()) {
+				    occlusion_queries.End(command, occlusion_query);
+				    PipelineCache::NoteSkippedDraw();
+			    } else {
+				    record(command, pending.Get());
+			    }
 			    command.endRendering();
 		    });
 		vk_buffer = buffer.Handle();

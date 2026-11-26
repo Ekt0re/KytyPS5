@@ -290,7 +290,7 @@ static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
 vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
                                 const GraphicsPipelineKey&                key,
                                 const std::array<const ShaderModule*, 4>& stages,
-                                vk::PipelineCache                         driver_cache) {
+                                vk::PipelineCache driver_cache, bool optimize) {
 	const auto& rendering     = key.rendering;
 	const auto& vertex_input  = key.vertex_input;
 	const auto& static_params = key.static_params;
@@ -499,6 +499,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	pipeline_info.pColorBlendState    = &color_blending;
 	pipeline_info.pDynamicState       = &dynamic_state;
 	pipeline_info.layout              = layout;
+	if (!optimize) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
@@ -516,7 +519,8 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 }
 
 vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
-                                const ShaderModule& module, vk::PipelineCache driver_cache) {
+                                const ShaderModule& module, vk::PipelineCache driver_cache,
+                                bool optimize) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
@@ -532,6 +536,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	vk::ComputePipelineCreateInfo info {};
 	if (module.info.info.uses_gds) {
 		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
+	}
+	if (!optimize) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
 	info.stage  = comp_shader_stage_info;
 	info.layout = layout;

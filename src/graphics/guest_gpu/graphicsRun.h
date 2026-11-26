@@ -100,6 +100,8 @@ private:
 	// The compute registers each queue's submitted commands leave, as Prescan sees them.
 	std::mutex                                     m_prescan_mutex;
 	std::array<HW::CsStageRegisters, QueueCount>   m_prescan_regs {};
+	// The graphics queue's registers as Prescan sees them, for graphics translate-ahead.
+	std::unique_ptr<CommandProcessor>              m_prescan_shadow;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

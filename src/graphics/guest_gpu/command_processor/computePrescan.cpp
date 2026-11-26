@@ -1,5 +1,7 @@
 #include "graphics/guest_gpu/command_processor/computePrescan.h"
 
+#include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "kernel/memory.h"
 
@@ -16,7 +18,8 @@ constexpr uint64_t CopyBudgetDw = uint64_t {1} << 22u;
 
 class Prescan {
 public:
-	Prescan(HW::CsStageRegisters& regs, ComputePrescanSink& sink): m_regs(regs), m_sink(sink) {}
+	Prescan(HW::CsStageRegisters& regs, ComputePrescanSink& sink, CommandProcessor* shadow)
+	    : m_regs(regs), m_sink(sink), m_shadow(shadow) {}
 
 	void Walk(std::span<const uint32_t> commands, uint32_t depth) {
 		// A chained buffer replaces the current one, like in the command processor.
@@ -82,8 +85,49 @@ private:
 		return LibKernel::Memory::CopySparseMemory(address, data.data(), uint64_t {dwords} * 4u);
 	}
 
+	// Graphics state for translate-ahead: register packets go through the command processor's
+	// own handlers on the shadow, which only change its registers. Packets that would reach the
+	// host or guest memory (flips, user-data tags) are left out.
+	void Shadow(uint32_t header, std::span<const uint32_t> body) {
+		const uint32_t opcode = (header >> 8u) & 0xffu;
+		const auto     call   = [&](cp_op_parser_func_t handler) {
+            const auto size = static_cast<uint32_t>(body.size() + 1);
+            handler(*m_shadow, header & ~1u, body.data(), size, size);
+		};
+		switch (opcode) {
+			case Pm4::IT_SET_CONTEXT_REG:
+			case Pm4::IT_SET_SH_REG:
+			case Pm4::IT_SET_CONTEXT_REG_INDIRECT:
+			case Pm4::IT_SET_SH_REG_INDIRECT:
+			case Pm4::IT_SET_UCONFIG_REG_INDIRECT:
+			case Pm4::IT_CLEAR_STATE: call(g_cp_op_func[opcode]); break;
+			case Pm4::IT_SET_UCONFIG_REG:
+			case Pm4::IT_SET_UCONFIG_REG_INDEX:
+				if (KYTY_PM4_R(header) == 0u && !body.empty() &&
+				    body[0] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+					call(g_cp_op_func[opcode]);
+				}
+				break;
+			case Pm4::IT_NOP:
+				if (KYTY_PM4_R(header) == Pm4::R_CONTEXT_STATE) call(g_cp_op_custom_func[Pm4::R_CONTEXT_STATE]);
+				break;
+			case Pm4::IT_DRAW_INDEX_2:
+			case Pm4::IT_DRAW_INDEX_OFFSET_2:
+			case Pm4::IT_DRAW_INDEX_MULTI_INST:
+			case Pm4::IT_DRAW_INDEX_AUTO: m_sink.FoundDraw(*m_shadow, false); break;
+			case Pm4::IT_DRAW_INDIRECT:
+			case Pm4::IT_DRAW_INDEX_INDIRECT:
+			case Pm4::IT_DRAW_INDIRECT_MULTI:
+			case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: m_sink.FoundDraw(*m_shadow, true); break;
+			default: break;
+		}
+	}
+
 	void Packet(uint32_t header, std::span<const uint32_t> body, uint32_t depth) {
 		const uint32_t opcode = (header >> 8u) & 0xffu;
+		if (m_shadow != nullptr && !body.empty()) {
+			Shadow(header, body);
+		}
 		switch (opcode) {
 			case Pm4::IT_SET_SH_REG:
 				for (size_t i = 1; i < body.size(); i++) {
@@ -126,14 +170,15 @@ private:
 
 	HW::CsStageRegisters& m_regs;
 	ComputePrescanSink&   m_sink;
+	CommandProcessor*     m_shadow;
 	uint64_t              m_budget = CopyBudgetDw;
 };
 
 } // namespace
 
 void PrescanComputeDispatches(std::span<const uint32_t> commands, HW::CsStageRegisters& regs,
-                              ComputePrescanSink& sink) {
-	Prescan(regs, sink).Walk(commands, 0);
+                              ComputePrescanSink& sink, CommandProcessor* shadow) {
+	Prescan(regs, sink, shadow).Walk(commands, 0);
 }
 
 } // namespace Libs::Graphics

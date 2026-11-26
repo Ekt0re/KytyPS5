@@ -23,6 +23,7 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
+#include <csetjmp>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -38,6 +39,10 @@
 #include <vector>
 
 #include <fmt/format.h>
+
+namespace Common {
+extern thread_local std::jmp_buf* g_dbg_recover;
+}
 
 namespace Libs::Graphics {
 
@@ -162,9 +167,34 @@ void GuestGpu::Prescan(uint32_t queue_id, std::span<const uint32_t> commands) {
 		void Found(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator) override {
 			cache.TranslateComputeAhead(regs, dispatch_initiator, async_compute);
 		}
+		void FoundDraw(CommandProcessor& shadow, bool indirect) override {
+			cache.TranslateGraphicsAhead(shadow.GetCtx(), shadow.GetUcfg(), shadow.GetShCtx(),
+			                             indirect);
+		}
 	} sink(m_renderer.GetPipelineCache(), queue_id != 0);
 	std::scoped_lock lock(m_prescan_mutex);
-	PrescanComputeDispatches(commands, m_prescan_regs[queue_id], sink);
+	// KYTY_NO_GRAPHICS_AHEAD=1: dispatches only. A register packet the shadow cannot apply
+	// stops this scan's graphics part only (and leaks what it held).
+	static const bool graphics = std::getenv("KYTY_NO_GRAPHICS_AHEAD") == nullptr;
+	CommandProcessor* shadow   = nullptr;
+	if (graphics && queue_id == 0) {
+		if (m_prescan_shadow == nullptr) {
+			m_prescan_shadow = std::make_unique<CommandProcessor>(m_renderer, 0);
+		}
+		shadow = m_prescan_shadow.get();
+	}
+	std::jmp_buf recover;
+	auto* const  previous = Common::g_dbg_recover;
+	if (shadow != nullptr && setjmp(recover) != 0) {
+		// Ran into an error: the compute scan is redone without the shadow.
+		Common::g_dbg_recover = previous;
+		m_prescan_shadow->Reset();
+		PrescanComputeDispatches(commands, m_prescan_regs[queue_id], sink);
+		return;
+	}
+	if (shadow != nullptr) Common::g_dbg_recover = &recover;
+	PrescanComputeDispatches(commands, m_prescan_regs[queue_id], sink, shadow);
+	Common::g_dbg_recover = previous;
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {

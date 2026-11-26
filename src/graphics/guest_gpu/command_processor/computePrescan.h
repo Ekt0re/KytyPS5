@@ -18,13 +18,19 @@ bool DecodeCsRegister(HW::CsStageRegisters& cs_regs, uint32_t cmd_offset, uint32
 // change registers from GPU memory) are stepped over, so it may miss or misjudge a dispatch. It
 // starts from and leaves the registers in `regs`, and tells `sink` each dispatch's registers and
 // initiator.
+class CommandProcessor;
+
 class ComputePrescanSink {
 public:
 	virtual ~ComputePrescanSink()                                                   = default;
 	virtual void Found(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator) = 0;
+	// With a `shadow` processor: a draw, with the graphics registers the shadow holds there.
+	virtual void FoundDraw(CommandProcessor& /*shadow*/, bool /*indirect*/) {}
 };
+// `shadow`, if given, is a command processor that never runs commands: register packets are
+// applied to its registers with the command processor's own handlers (graphics translate-ahead).
 void PrescanComputeDispatches(std::span<const uint32_t> commands, HW::CsStageRegisters& regs,
-                              ComputePrescanSink& sink);
+                              ComputePrescanSink& sink, CommandProcessor* shadow = nullptr);
 
 } // namespace Libs::Graphics
 

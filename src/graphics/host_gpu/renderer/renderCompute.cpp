@@ -305,8 +305,8 @@ static void RecordDispatch(CommandBuffer& buffer, const PipelineCache::Pipeline&
 		return;
 	}
 	buffer.GetContext().GetCommandScheduler().Split(
-	    [record, compiling = pipeline.compiling](vk::CommandBuffer command) {
-		    record(command, PipelineCache::WaitForPipeline(compiling));
+	    [record, pending = pipeline.Pending()](vk::CommandBuffer command) {
+		    record(command, pending.Get());
 	    });
 }
 

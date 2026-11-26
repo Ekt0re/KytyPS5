@@ -7,6 +7,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/shaderCompiler.h"
+
+#include <csetjmp>
 
 #include <cstdlib>
 #include <algorithm>
@@ -26,6 +29,10 @@
 
 // The shader store: a header, then zstd-compressed records of everything a run created first.
 // Records are only appended, so a store cut short by a crash keeps every complete record.
+namespace Common {
+extern thread_local std::jmp_buf* g_dbg_recover;
+}
+
 namespace Libs::Graphics {
 
 namespace {
@@ -150,6 +157,48 @@ void ShaderStoreWriter::Post(Common::UniqueFunction<void>&& job) {
 	m_ready.notify_one();
 }
 
+namespace {
+
+// KYTY_SYNC_WARMUP=1: the warm-up creates every pipeline before the game starts (as before),
+// instead of in the background.
+bool SyncWarmUp() {
+	static const bool sync = [] {
+		const char* env = std::getenv("KYTY_SYNC_WARMUP");
+		return env != nullptr && env[0] == '1';
+	}();
+	return sync;
+}
+
+// Decode time by part, summed over the warm-up's threads.
+std::atomic<uint64_t> g_decode_zstd_ns {0};
+std::atomic<uint64_t> g_decode_plan_ns {0};
+std::atomic<uint64_t> g_decode_spirv_ns {0};
+
+uint64_t NanosecondsSince(std::chrono::steady_clock::time_point start) {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now() - start)
+	                                 .count());
+}
+
+double MillisecondsSince(std::chrono::steady_clock::time_point start) {
+	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+	    .count();
+}
+
+} // namespace
+
+// A record decoded on any thread, inserted on the warm-up's.
+struct PipelineCache::LoadedRecord {
+	uint8_t                            type = 0; // Record
+	ProgramKey                         key;
+	ShaderRecompiler::IR::ResourcePlan plan;
+	ShaderModule                       module;
+	GraphicsPipelineKey                pipeline_key;
+	uint64_t                           layout_key = 0;
+	ShaderTessellationInputInfo        layout;
+	bool                               ok = false;
+};
+
 void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (path.empty()) {
 		return;
@@ -167,6 +216,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
 		bytes.resize(read);
 	}
+	const auto read_ms = MillisecondsSince(start);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
@@ -176,118 +226,199 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (reusable) {
 		records = records.subspan(header.size());
-		while (LoadRecord(records)) {
+		// The frames' bounds first, then their contents on several threads, inserted in order.
+		std::vector<std::span<const uint8_t>> frames;
+		for (auto rest = records;;) {
+			Frame frame;
+			if (rest.size() < sizeof(frame)) break;
+			std::memcpy(&frame, rest.data(), sizeof(frame));
+			if (rest.size() - sizeof(frame) < frame.compressed_size) break;
+			frames.push_back(rest.first(sizeof(frame) + frame.compressed_size));
+			rest = rest.subspan(sizeof(frame) + frame.compressed_size);
 		}
+		std::vector<LoadedRecord> loaded(frames.size());
+		Common::ParallelFor(frames.size(), [&](size_t i) { DecodeRecord(frames[i], loaded[i]); });
+		size_t kept = 0;
+		for (; kept < loaded.size() && loaded[kept].ok; kept++) {
+			InsertRecord(std::move(loaded[kept]));
+			records = records.subspan(frames[kept].size());
+		}
+		// Modules of the records after a damaged one were created too.
+		for (auto i = kept; i < loaded.size(); i++) {
+			if (loaded[i].ok && static_cast<Record>(loaded[i].type) == Record::Module) {
+				m_graphics.device.destroyShaderModule(loaded[i].module.module, nullptr);
+			}
+		}
+	}
+	const auto parse_ms = MillisecondsSince(start) - read_ms;
+	if (reusable) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader cache: record time over all threads: zstd {:.0f} ms, resource plans {:.0f} ms, "
+		    "shader modules {:.0f} ms\n",
+		    static_cast<double>(g_decode_zstd_ns) / 1e6, static_cast<double>(g_decode_plan_ns) / 1e6,
+		    static_cast<double>(g_decode_spirv_ns) / 1e6));
 	}
 	// A damaged record ends the store; the records before it stay.
 	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
 
 	const auto modules = MapModules();
-	std::vector<Common::UniqueFunction<void>> jobs;
-	jobs.reserve(m_graphics_pipelines.size() + modules.size());
-	for (auto& node: m_graphics_pipelines) {
-		jobs.emplace_back([this, &modules, &node] {
-			CreateGraphicsPipeline(node.second, node.first, modules);
-		});
-	}
-	// A compute pipeline depends only on its module.
+	// A key with a stage missing from the store keeps no pipeline.
+	std::vector<std::pair<const GraphicsPipelineKey*, std::array<const ShaderModule*, 4>>> graphics;
+	graphics.reserve(m_graphics_pipelines.size());
+	std::erase_if(m_graphics_pipelines, [&](const auto& entry) {
+		std::array<const ShaderModule*, 4> stages {};
+		for (size_t i = 0; i < stages.size(); i++) {
+			const auto found = modules.find(entry.first.stage_ids[i]);
+			if (found == modules.end()) return true;
+			stages[i] = found->second;
+		}
+		graphics.emplace_back(&entry.first, stages);
+		return false;
+	});
+	std::vector<const ShaderModule*> compute;
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
+			compute.push_back(module);
+		}
+	}
+	const bool sync = SyncWarmUp();
+	if (sync) {
+		std::vector<Common::UniqueFunction<void>> jobs;
+		jobs.reserve(graphics.size() + compute.size());
+		for (const auto& [key, stages]: graphics) {
+			jobs.emplace_back([this, key, stages] {
+				CreatePipelineInternal(m_graphics, m_graphics_pipelines.at(*key), *key, stages,
+				                       m_driver_cache);
+			});
+		}
+		// A compute pipeline depends only on its module.
+		for (const auto* module: compute) {
 			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
 				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
 			});
 		}
+		Common::ShaderCompileStatus::AddQueued(static_cast<int64_t>(jobs.size()));
+		Common::ParallelFor(jobs.size(), [&](size_t i) {
+			Common::ShaderCompileStatus::RemoveQueued();
+			jobs[i]();
+		});
+		if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
+			CheckpointDriverCache();
+		}
+	} else {
+		// The layouts here, the pipelines on the workers while the game starts: a draw that
+		// needs one not created yet has it created at once (Expedite, PendingPipeline::Get).
+		// Compute pipelines go first, since dispatches cannot be skipped.
+		auto remaining = std::make_shared<std::atomic<size_t>>(graphics.size() + compute.size());
+		const auto counted = [remaining, start](vk::Pipeline pipeline) {
+			if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Shader cache: background pipeline creation finished {:.0f} ms after the "
+				    "warm-up started\n",
+				    MillisecondsSince(start)));
+			}
+			return pipeline;
+		};
+		for (const auto* module: compute) {
+			auto& pipeline = m_compute_pipelines[module->id];
+			CreatePipelineLayouts(m_graphics, pipeline, {&module, 1});
+			StartDeferredCompile(pipeline, [this, counted, layout = pipeline.pipeline_layout, module] {
+				return counted(CreateHostPipeline(m_graphics, layout, *module, m_driver_cache));
+			});
+		}
+		for (const auto& [key, stages]: graphics) {
+			auto& pipeline = m_graphics_pipelines.at(*key);
+			CreatePipelineLayouts(m_graphics, pipeline, stages);
+			StartDeferredCompile(pipeline,
+			                     [this, counted, layout = pipeline.pipeline_layout, key, stages] {
+				                     return counted(CreateHostPipeline(m_graphics, layout, *key,
+				                                                       stages, m_driver_cache));
+			                     });
+		}
 	}
-	Common::ShaderCompileStatus::AddQueued(static_cast<int64_t>(jobs.size()));
-	Common::ParallelFor(jobs.size(), [&](size_t i) {
-		Common::ShaderCompileStatus::RemoveQueued();
-		jobs[i]();
-	});
-	// A key with a stage missing from the store keeps no pipeline.
-	std::erase_if(m_graphics_pipelines,
-	              [](const auto& entry) { return entry.second.pipeline == nullptr; });
-	if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
-		CheckpointDriverCache();
-	}
+	OpenRecipes(path);
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {} ms\n",
+	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {:.0f} ms (read {:.0f} ms, "
+	    "records {:.0f} ms, pipelines {:.0f} ms{})\n",
 	    m_program_cache.size(), modules.size() - 1,
-	    m_graphics_pipelines.size() + m_compute_pipelines.size(),
-	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-	                                                          start)
-	        .count()));
+	    m_graphics_pipelines.size() + m_compute_pipelines.size(), MillisecondsSince(start),
+	    read_ms, parse_ms, MillisecondsSince(start) - read_ms - parse_ms,
+	    sync ? "" : ", creation continues in the background"));
 }
 
-bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
+void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& loaded) {
 	Frame frame;
-	if (records.size() < sizeof(frame)) {
-		return false;
-	}
-	std::memcpy(&frame, records.data(), sizeof(frame));
-	if (records.size() - sizeof(frame) < frame.compressed_size) {
-		return false;
-	}
-	const auto compressed = records.subspan(sizeof(frame), frame.compressed_size);
+	std::memcpy(&frame, record.data(), sizeof(frame));
+	const auto compressed = record.subspan(sizeof(frame));
 	if (XXH3_64bits(compressed.data(), compressed.size()) != frame.checksum ||
 	    ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != frame.raw_size) {
-		return false;
+		return;
 	}
+	auto                 part = std::chrono::steady_clock::now();
 	std::vector<uint8_t> raw(frame.raw_size);
 	if (ZSTD_decompress(raw.data(), raw.size(), compressed.data(), compressed.size()) != raw.size()) {
-		return false;
+		return;
 	}
+	g_decode_zstd_ns += NanosecondsSince(part);
 	Reader     reader {raw};
-	auto       type     = Record::Module;
 	const auto complete = [&] { return reader.ok && reader.bytes.empty(); };
+	auto type = Record::Module;
 	IoAll(reader, type);
+	loaded.type = static_cast<uint8_t>(type);
 	switch (type) {
 		case Record::Module: {
-			ProgramKey            key;
 			std::vector<uint8_t>  plan;
-			ShaderModule          module;
 			std::vector<uint32_t> spirv;
-			IoKey(reader, key);
+			IoKey(reader, loaded.key);
 			IoAll(reader, plan);
-			IoModule(reader, module);
+			IoModule(reader, loaded.module);
 			IoAll(reader, spirv);
-			if (!complete()) {
-				return false;
+			part = std::chrono::steady_clock::now();
+			if (!complete() || !ShaderRecompiler::IR::LoadResourcePlan(plan, loaded.plan)) {
+				return;
 			}
-			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
-			if (inserted &&
-			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
-				m_program_cache.erase(program);
-				return false;
-			}
-			module.module = CompileSPV(spirv, m_graphics.device);
-			RetainModuleSpirv(module, spirv);
-			program->second.modules.push_back(std::move(module));
+			g_decode_plan_ns += NanosecondsSince(part);
+			part = std::chrono::steady_clock::now();
+			loaded.module.module = CompileSPV(spirv, m_graphics.device);
+			g_decode_spirv_ns += NanosecondsSince(part);
+			RetainModuleSpirv(loaded.module, spirv);
 			break;
 		}
 		case Record::GraphicsPipeline: {
-			GraphicsPipelineKey key;
-			reader.Raw(&key, sizeof(key));
+			reader.Raw(&loaded.pipeline_key, sizeof(loaded.pipeline_key));
 			if (!complete()) {
-				return false;
+				return;
 			}
-			// WarmUp creates the pipeline once every record is loaded.
-			m_graphics_pipelines.try_emplace(key);
 			break;
 		}
 		case Record::TessellationLayout: {
-			uint64_t                    key = 0;
-			ShaderTessellationInputInfo layout;
-			IoAll(reader, key, layout);
+			IoAll(reader, loaded.layout_key, loaded.layout);
 			if (!complete()) {
-				return false;
+				return;
 			}
-			m_tess_layouts.try_emplace(key, layout);
 			break;
 		}
-		default: return false;
+		default: return;
 	}
-	records = records.subspan(sizeof(frame) + compressed.size());
-	return true;
+	loaded.ok = true;
+}
+
+void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
+	switch (static_cast<Record>(loaded.type)) {
+		case Record::Module: {
+			const auto [program, inserted] = m_program_cache.try_emplace(std::move(loaded.key));
+			if (inserted) {
+				program->second.resource_plan = std::move(loaded.plan);
+			}
+			program->second.modules.push_back(std::move(loaded.module));
+			break;
+		}
+		// WarmUp creates the pipeline once every record is loaded.
+		case Record::GraphicsPipeline: m_graphics_pipelines.try_emplace(loaded.pipeline_key); break;
+		case Record::TessellationLayout:
+			m_tess_layouts.try_emplace(loaded.layout_key, loaded.layout);
+			break;
+	}
 }
 
 // Records are encoded here, since programs and modules change later.
@@ -306,6 +437,7 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 }
 
 void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
+	RecordRecipePipeline(key);
 	if (!m_store) {
 		return;
 	}
@@ -346,6 +478,365 @@ bool PipelineCache::CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPip
 	}
 	CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	return true;
+}
+
+
+// Shader recipes, after the shader recipe pack of bloodborne_pc (deadinside28 / Supermedo,
+// GPL-2.0) and the pipeline manifest of AnyPS5 (simnJS, GPL-2.0): `<title>.recipes` beside the
+// store holds, for each module the store got, what its translation read (the guest code, the user
+// data, the stage input and the specialization) and the graphics pipeline keys. Unlike the store,
+// nothing in it depends on the translator, so it is kept when a new stamp discards the store. At
+// start, modules the store lacks are translated again on background threads (KYTY_RECIPE_THREADS,
+// default a sixteenth of the hardware threads, at least one), keep their ids, and so let the
+// recipes' pipeline keys be created in the background as well. KYTY_SHADER_RECIPES=0 turns it off.
+// The guest code makes the file private to the dump it came from.
+namespace {
+
+enum class RecipeRecord : uint8_t { Code, Variant, Pipeline };
+
+constexpr uint64_t RecipeMagic = 0x3150435259544b59ull; // "YKTYRCP1"
+
+bool RecipesEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_SHADER_RECIPES");
+		return env == nullptr || env[0] != '0';
+	}();
+	return enabled;
+}
+
+uint64_t RecipeCodeKey(ShaderType stage, uint64_t hash) {
+	return hash ^ (uint64_t {static_cast<uint8_t>(stage)} * 0x9e3779b97f4a7c15ull);
+}
+
+template <class Info> std::vector<uint8_t> InputBytes(const Info* info) {
+	auto copy  = *info;
+	copy.stage = {};
+	std::vector<uint8_t> bytes(sizeof(copy));
+	std::memcpy(bytes.data(), &copy, sizeof(copy));
+	return bytes;
+}
+
+} // namespace
+
+struct PipelineCache::RecipeJob {
+	ProgramKey                                   key;
+	std::shared_ptr<const std::vector<uint32_t>> code;
+	std::shared_ptr<const std::vector<uint32_t>> back_code;
+	std::vector<uint32_t>                        user_data;
+	uint32_t                                     wave_size      = 64;
+	uint32_t                                     user_data_base = 0;
+	ShaderRecompiler::IR::PushData::Window       window;
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	uint64_t                                     id = 0;
+	ShaderVertexInputInfo                        vertex {};
+	ShaderPixelInputInfo                         pixel {};
+	ShaderComputeInputInfo                       compute {};
+};
+
+
+void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
+	if (store_path.empty() || !RecipesEnabled()) {
+		return;
+	}
+	auto path = store_path;
+	path.replace_extension(".recipes");
+	const auto start = std::chrono::steady_clock::now();
+	Writer     header;
+	IoAll(header, RecipeMagic);
+	std::vector<uint8_t> bytes;
+	if (Common::File file;
+	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
+		bytes.resize(file.Size());
+		uint32_t read = 0;
+		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
+		bytes.resize(read);
+	}
+	auto       records  = std::span<const uint8_t>(bytes);
+	const bool reusable = records.size() >= header.bytes.size() &&
+	                      std::ranges::equal(records.first(header.bytes.size()), header.bytes);
+	std::unordered_map<uint64_t, std::pair<std::shared_ptr<const std::vector<uint32_t>>,
+	                                       std::shared_ptr<const std::vector<uint32_t>>>>
+	                                        codes;
+	std::vector<std::unique_ptr<RecipeJob>> jobs;
+	const auto                              known = MapModules();
+	if (reusable) {
+		records = records.subspan(header.bytes.size());
+		while (records.size() >= sizeof(Frame)) {
+			Frame frame;
+			std::memcpy(&frame, records.data(), sizeof(frame));
+			if (records.size() - sizeof(frame) < frame.compressed_size) break;
+			const auto compressed = records.subspan(sizeof(frame), frame.compressed_size);
+			if (XXH3_64bits(compressed.data(), compressed.size()) != frame.checksum ||
+			    ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != frame.raw_size) {
+				break;
+			}
+			std::vector<uint8_t> raw(frame.raw_size);
+			if (ZSTD_decompress(raw.data(), raw.size(), compressed.data(), compressed.size()) !=
+			    raw.size()) {
+				break;
+			}
+			Reader reader {raw};
+			auto   type = RecipeRecord::Code;
+			IoAll(reader, type);
+			bool ok = false;
+			switch (type) {
+				case RecipeRecord::Code: {
+					auto                  stage = ShaderType::Unknown;
+					uint64_t              hash  = 0;
+					std::vector<uint32_t> code;
+					std::vector<uint32_t> back_code;
+					IoAll(reader, stage, hash, code, back_code);
+					if ((ok = reader.ok && reader.bytes.empty())) {
+						m_recipe_codes.insert(RecipeCodeKey(stage, hash));
+						codes[RecipeCodeKey(stage, hash)] = {
+						    std::make_shared<const std::vector<uint32_t>>(std::move(code)),
+						    std::make_shared<const std::vector<uint32_t>>(std::move(back_code))};
+					}
+					break;
+				}
+				case RecipeRecord::Variant: {
+					auto                 job = std::make_unique<RecipeJob>();
+					std::vector<uint8_t> input;
+					IoKey(reader, job->key);
+					IoAll(reader, job->wave_size, job->user_data_base, job->user_data,
+					      job->window.begin, job->window.end, job->specialization, job->id, input);
+					const auto stage = job->key.stage;
+					const auto size  = stage == ShaderType::Pixel     ? sizeof(job->pixel)
+					                   : stage == ShaderType::Compute ? sizeof(job->compute)
+					                                                  : sizeof(job->vertex);
+					if ((ok = reader.ok && reader.bytes.empty())) {
+						// A build with other stage inputs keeps the record but cannot use it.
+						m_recipe_modules.insert(job->id);
+						const auto code = codes.find(RecipeCodeKey(stage, job->key.hash));
+						if (input.size() == size && code != codes.end() && !known.contains(job->id)) {
+							std::memcpy(stage == ShaderType::Pixel     ? static_cast<void*>(&job->pixel)
+							            : stage == ShaderType::Compute ? static_cast<void*>(&job->compute)
+							                                           : static_cast<void*>(&job->vertex),
+							            input.data(), size);
+							job->code      = code->second.first;
+							job->back_code = code->second.second;
+							jobs.push_back(std::move(job));
+						}
+					}
+					break;
+				}
+				case RecipeRecord::Pipeline: {
+					GraphicsPipelineKey key;
+					reader.Raw(&key, sizeof(key));
+					if ((ok = reader.ok && reader.bytes.empty())) {
+						m_recipe_pipeline_keys.insert(key);
+						if (!m_graphics_pipelines.contains(key)) m_recipe_pipelines.push_back(key);
+					}
+					break;
+				}
+				default: break;
+			}
+			if (!ok) break;
+			records = records.subspan(sizeof(frame) + compressed.size());
+		}
+	}
+	m_recipes.Open(path, header.bytes, reusable ? bytes.size() - records.size() : 0);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader recipes: {} programs, {} modules, {} pipelines in {} ({:.1f} MB, {:.0f} ms); "
+	    "{} modules to translate again\n",
+	    m_recipe_codes.size(), m_recipe_modules.size(), m_recipe_pipeline_keys.size(),
+	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
+	    MillisecondsSince(start), jobs.size()));
+	if (jobs.empty()) {
+		m_recipe_pipelines.clear();
+		return;
+	}
+	const auto threads = [] {
+		const char* env = std::getenv("KYTY_RECIPE_THREADS");
+		const auto  value = env != nullptr ? std::strtoul(env, nullptr, 10) : 0ul;
+		return value != 0 ? size_t {value}
+		                  : std::max<size_t>(1, std::thread::hardware_concurrency() / 16);
+	}();
+	m_replay_start = std::chrono::steady_clock::now();
+	m_replay_left  = jobs.size();
+	m_replayers    = std::make_unique<PipelineWorkers>(threads);
+	for (auto& job: jobs) {
+		m_replayers->Post([this, job = std::shared_ptr<RecipeJob>(std::move(job))] {
+			ReplayRecipe(*job);
+		});
+	}
+}
+
+void PipelineCache::ReplayRecipe(RecipeJob& job) {
+	if (m_ahead_stop) {
+		return;
+	}
+	const Common::ShaderCompileStatus::Work work;
+	const auto                              profile = SpirvProfile(m_graphics);
+	ShaderRecompiler::CompileOptions        options {.wave_size = job.wave_size};
+	options.stage          = job.key.stage;
+	options.user_data_base = job.user_data_base;
+	options.shader_hash    = job.key.hash;
+	options.dump_ir        = false;
+	options.profile        = &profile;
+	options.user_data      = job.user_data;
+	options.back_code      = *job.back_code;
+	if (job.key.stage == ShaderType::Pixel) {
+		options.input_info.pixel = &job.pixel;
+	} else if (job.key.stage == ShaderType::Compute) {
+		options.input_info.compute = &job.compute;
+	} else {
+		options.input_info.vertex = &job.vertex;
+	}
+	ReplayedModule replayed {.key = job.key};
+	volatile bool  usable = false;
+	std::jmp_buf   recover;
+	// Like a translation ahead, a failure ends this job only (and leaks what it held).
+	if (setjmp(recover) == 0) {
+		Common::g_dbg_recover = &recover;
+		auto translated = ShaderRecompiler::TranslateProgram(*job.code, options);
+		replayed.plan   = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		auto result     = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                                   job.specialization, job.window);
+		auto info       = std::move(result.program).TakeCompiledInfo();
+		// The id CompileModule gives these inputs; another one names no stored pipeline.
+		Writer inputs;
+		IoAll(inputs, job.key.stage, job.key.hash, job.key.user_data_count, job.key.static_state,
+		      info.bindings.push_data_start_dword, job.specialization);
+		if (XXH3_64bits(inputs.bytes.data(), inputs.bytes.size()) == job.id) {
+			replayed.module = ShaderModule {.id             = job.id,
+			                                .info           = std::move(info),
+			                                .specialization = job.specialization};
+			if (job.key.stage == ShaderType::Pixel &&
+			    job.pixel.parameter_mode == ShaderPixelParameterMode::Rectangle) {
+				replayed.module.rect_parameters =
+				    RectListParameters(job.pixel, replayed.module.info);
+			} else if (job.key.stage == ShaderType::Mesh) {
+				replayed.module.mesh_task = job.vertex.indirect_draw;
+			}
+			replayed.spirv = std::move(result.spirv);
+			usable         = true;
+		}
+		Common::g_dbg_recover = nullptr;
+	}
+	{
+		std::scoped_lock lock(m_replay_mutex);
+		if (usable) {
+			m_replayed.push_back(std::move(replayed));
+		} else {
+			m_replay_dropped++;
+		}
+	}
+	m_replay_left--;
+	m_replay_ready = true;
+}
+
+void PipelineCache::MergeReplayed() {
+	if (!m_replay_ready.exchange(false)) {
+		return;
+	}
+	// Read first: when it is zero, every result is in m_replayed already.
+	const bool                  finished = m_replay_left == 0;
+	std::vector<ReplayedModule> replayed;
+	size_t                      dropped = 0;
+	{
+		std::scoped_lock lock(m_replay_mutex);
+		replayed.swap(m_replayed);
+		dropped = m_replay_dropped;
+	}
+	for (auto& done: replayed) {
+		auto [entry, inserted] = m_program_cache.try_emplace(done.key);
+		auto& program          = entry->second;
+		if (inserted) {
+			program.resource_plan = std::move(done.plan);
+		} else if (program.call_source != nullptr || program.skip_dispatch ||
+		           std::ranges::any_of(program.modules, [&](const ShaderModule& module) {
+			           return module.id == done.module.id;
+		           })) {
+			continue;
+		}
+		done.module.module = CompileSPV(done.spirv, m_graphics.device);
+		RetainModuleSpirv(done.module, done.spirv);
+		const auto& module = program.modules.emplace_back(std::move(done.module));
+		StoreModule(entry->first, program, module, done.spirv);
+		m_replay_merged++;
+		if (module.info.stage == ShaderType::Compute && !m_compute_pipelines.contains(module.id)) {
+			auto&       pipeline = m_compute_pipelines[module.id];
+			const auto* stage    = &module;
+			CreatePipelineLayouts(m_graphics, pipeline, {&stage, 1});
+			StartDeferredCompile(pipeline, [this, layout = pipeline.pipeline_layout, stage] {
+				return CreateHostPipeline(m_graphics, layout, *stage, m_driver_cache);
+			});
+		}
+	}
+	// The pipelines whose stages now all exist.
+	const auto modules = MapModules();
+	std::erase_if(m_recipe_pipelines, [&](const GraphicsPipelineKey& key) {
+		std::array<const ShaderModule*, 4> stages {};
+		for (size_t i = 0; i < stages.size(); i++) {
+			const auto found = modules.find(key.stage_ids[i]);
+			if (found == modules.end()) return false;
+			stages[i] = found->second;
+		}
+		auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
+		if (inserted) {
+			auto& pipeline = iter->second;
+			CreatePipelineLayouts(m_graphics, pipeline, stages);
+			StartDeferredCompile(pipeline,
+			                     [this, layout = pipeline.pipeline_layout, &key = iter->first,
+			                      stages] {
+				                     return CreateHostPipeline(m_graphics, layout, key, stages,
+				                                               m_driver_cache);
+			                     });
+			StorePipeline(iter->first);
+		}
+		return true;
+	});
+	if (finished && m_replayers != nullptr) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader recipes: translated {} modules again in {:.1f} s ({} unusable); {} pipelines "
+		    "wait for stages the recipes lacked\n",
+		    m_replay_merged, MillisecondsSince(m_replay_start) / 1000.0, dropped,
+		    m_recipe_pipelines.size()));
+		m_recipe_pipelines.clear();
+		m_replayers->Finish();
+	}
+}
+
+void PipelineCache::RecordRecipe(const ProgramKey& key, const ShaderParams& params,
+                                 const ShaderRecompiler::CompileOptions& options,
+                                 ShaderRecompiler::IR::PushData::Window  push_data,
+                                 const ShaderModule&                     module) {
+	if (!m_recipes || !m_recipe_modules.insert(module.id).second) {
+		return;
+	}
+	if (m_recipe_codes.insert(RecipeCodeKey(key.stage, key.hash)).second) {
+		Writer record;
+		IoAll(record, RecipeRecord::Code, key.stage, key.hash,
+		      std::vector<uint32_t>(params.code.begin(), params.code.end()),
+		      std::vector<uint32_t>(params.back_code.begin(), params.back_code.end()));
+		m_recipes.Append(std::move(record.bytes));
+	}
+	std::vector<uint8_t> input;
+	if (key.stage == ShaderType::Pixel) {
+		input = InputBytes(options.input_info.pixel);
+	} else if (key.stage == ShaderType::Compute) {
+		input = InputBytes(options.input_info.compute);
+	} else {
+		input = InputBytes(options.input_info.vertex);
+	}
+	Writer record;
+	IoAll(record, RecipeRecord::Variant);
+	IoKey(record, key);
+	IoAll(record, options.wave_size, options.user_data_base,
+	      std::vector<uint32_t>(options.user_data.begin(), options.user_data.end()), push_data.begin,
+	      push_data.end, module.specialization, module.id, input);
+	m_recipes.Append(std::move(record.bytes));
+}
+
+void PipelineCache::RecordRecipePipeline(const GraphicsPipelineKey& key) {
+	if (!m_recipes || !m_recipe_pipeline_keys.insert(key).second) {
+		return;
+	}
+	Writer record;
+	IoAll(record, RecipeRecord::Pipeline);
+	record.Raw(&key, sizeof(key));
+	m_recipes.Append(std::move(record.bytes));
 }
 
 } // namespace Libs::Graphics
