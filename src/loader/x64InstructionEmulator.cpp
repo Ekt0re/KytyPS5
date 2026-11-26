@@ -729,6 +729,38 @@ static bool TryEmulateCpuExtensions(Context& context) {
 	return true;
 }
 
+static bool TryEmulateClzero(Context& context) {
+	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
+	bool        address_size_32 = false;
+	size_t      offset          = 0;
+	constexpr size_t opcode_size = 3;
+	// Decode only the bytes needed for CLZERO. Its final byte may end a code page.
+	for (; offset <= ZYDIS_MAX_INSTRUCTION_LENGTH - opcode_size; ++offset) {
+		const uint8_t prefix = rip[offset];
+		if (prefix == 0x67) {
+			address_size_32 = true;
+		} else if ((prefix & 0xf0) != 0x40 && prefix != 0x26 && prefix != 0x2e &&
+		           prefix != 0x36 && prefix != 0x3e) {
+			break;
+		}
+	}
+	if (offset > ZYDIS_MAX_INSTRUCTION_LENGTH - opcode_size || rip[offset] != 0x0f ||
+	    rip[offset + 1] != 0x01 || rip[offset + 2] != 0xfc) {
+		return false;
+	}
+
+	constexpr uint64_t cache_line_size = 64;
+	uint64_t           address         = context.Gpr(0);
+	if (address_size_32) {
+		address = static_cast<uint32_t>(address);
+	}
+	address &= ~(cache_line_size - 1);
+	std::memset(reinterpret_cast<void*>(address), 0, cache_line_size);
+	LogFirstTrap(context, ZYDIS_MNEMONIC_CLZERO);
+	context.Advance(offset + opcode_size);
+	return true;
+}
+
 static bool TryEmulateMonitorxMwaitx(Context& context) {
 	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
 	if (rip[0] != 0x0f || rip[1] != 0x01 || (rip[2] != 0xfa && rip[2] != 0xfb)) {
@@ -831,7 +863,8 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
-	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
+	return TryEmulateClzero(context) || TryEmulateReciprocalSquareRoot(context) ||
+	       TryEmulateMonitorxMwaitx(context) ||
 	       TryEmulateSse4a(context) ||
 #if !defined(__APPLE__)
 	       TryEmulateShaNi(context) ||
