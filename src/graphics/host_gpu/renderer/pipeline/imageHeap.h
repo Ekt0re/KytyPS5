@@ -132,6 +132,7 @@ private:
 
 	RenderContext&                       m_context;
 	PageManager&                         m_page_manager;
+	uint32_t                             m_capacity = 0; // Resident images the array binds.
 	std::mutex                           m_mutex; // Fault-visible Memory state and m_memories.
 	std::vector<std::unique_ptr<Memory>> m_memories;
 	std::vector<View*>                   m_active; // Acquired since the last commit.

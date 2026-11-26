@@ -197,7 +197,8 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .ray_query              = graphics.ray_query_enabled,
 	        .compute_derivative_quads  = graphics.compute_derivative_quads_enabled,
 	        .compute_derivative_linear = graphics.compute_derivative_linear_enabled,
-	        .lds_lane_sync             = LdsLaneSyncEnabled()};
+	        .lds_lane_sync             = LdsLaneSyncEnabled(),
+	        .image_heap_capacity       = graphics.image_heap_capacity};
 }
 
 std::filesystem::path ShaderStorePath() {

@@ -81,14 +81,9 @@ size_t ImageHeap::KeyHash::operator()(const Key& key) const noexcept {
 ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
     : m_context(context), m_page_manager(page_manager) {
 	auto& graphics = context.GetGraphics();
-	vk::PhysicalDeviceVulkan12Properties limits {};
-	vk::PhysicalDeviceProperties2        properties {};
-	properties.pNext = &limits;
-	graphics.physical_device.getProperties2(&properties);
-	EXIT_NOT_IMPLEMENTED(std::min({limits.maxDescriptorSetUpdateAfterBindSampledImages,
-	                               limits.maxPerStageDescriptorUpdateAfterBindSampledImages,
-	                               limits.maxPerStageUpdateAfterBindResources}) <
-	                     IR::ImageHeapCapacity);
+	// Set from the device limits at device creation; shaders declare the same array length.
+	m_capacity = graphics.image_heap_capacity;
+	EXIT_NOT_IMPLEMENTED(m_capacity == 0u);
 
 	const vk::DescriptorBindingFlags binding_flags =
 	    vk::DescriptorBindingFlagBits::ePartiallyBound |
@@ -98,7 +93,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	flags_info.bindingCount  = 1;
 	flags_info.pBindingFlags = &binding_flags;
 	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eSampledImage,
-	                                              IR::ImageHeapCapacity,
+	                                              m_capacity,
 	                                              vk::ShaderStageFlagBits::eAll, nullptr};
 	vk::DescriptorSetLayoutCreateInfo layout_info {};
 	layout_info.pNext        = &flags_info;
@@ -108,7 +103,7 @@ ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout) !=
 	        vk::Result::eSuccess);
 	const vk::DescriptorPoolSize pool_size {vk::DescriptorType::eSampledImage,
-	                                        IR::ImageHeapCapacity};
+	                                        m_capacity};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
 	pool_info.maxSets       = 1;
@@ -501,8 +496,8 @@ uint32_t ImageHeap::Allocate() {
 		m_retired.pop_front();
 	}
 	if (m_free.empty()) {
-		if (m_elements.size() == IR::ImageHeapCapacity) {
-			EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
+		if (m_elements.size() == m_capacity) {
+			EXIT("image heaps exceed %u resident images\n", m_capacity);
 		}
 		m_elements.emplace_back();
 		return static_cast<uint32_t>(m_elements.size() - 1u);

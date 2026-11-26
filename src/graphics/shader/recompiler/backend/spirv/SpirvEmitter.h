@@ -31,6 +31,8 @@ struct Profile {
 	// A wave64 compute program run as two halves on a 32-lane host subgroup orders its LDS
 	// accesses with a subgroup barrier (KYTY_LDS_SYNC=0 turns it off).
 	bool lds_lane_sync = true;
+	// Length of the resident image heap array; the host binds that many sampled images.
+	uint32_t image_heap_capacity = IR::ImageHeapCapacity;
 };
 
 inline constexpr Profile DefaultProfile {};
