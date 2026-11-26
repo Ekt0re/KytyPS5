@@ -312,6 +312,24 @@ public:
 		return m_generation.load(std::memory_order_acquire);
 	}
 
+	// Whether a page change after `generation` touched [vaddr, vaddr + size). True when the
+	// history no longer reaches back that far.
+	[[nodiscard]] bool ChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) const {
+		std::lock_guard lock(m_changes_mutex);
+		const auto      now = m_generation.load(std::memory_order_acquire);
+		if (now - generation >= m_changes.size()) {
+			return true;
+		}
+		for (auto g = generation + 1; g <= now; ++g) {
+			const auto& change = m_changes[g % m_changes.size()];
+			if (change.generation != g ||
+			    (change.start < vaddr + size && vaddr < change.end)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// The alias address of [vaddr, vaddr + size) when one contiguous backing run holds all of it,
 	// 0 otherwise. Callers hold the state lock.
 	[[nodiscard]] uint64_t ContiguousAlias(uint64_t vaddr, uint64_t size) const {
@@ -476,8 +494,14 @@ private:
 		}
 	}
 
+	void NoteChange(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_changes_mutex);
+		const auto      generation = m_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+		m_changes[generation % m_changes.size()] = {generation, vaddr, vaddr + size};
+	}
+
 	void StorePages(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
-		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		NoteChange(vaddr, size);
 		const auto end = vaddr + size;
 		EXIT_IF(((vaddr | size | backing_offset) & PageMask) != 0 ||
 		        (end >> PageBits) > BucketCount * BucketPages || backing_offset + size > m_size);
@@ -494,7 +518,7 @@ private:
 	}
 
 	void ClearPages(uint64_t vaddr, uint64_t size) {
-		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		NoteChange(vaddr, size);
 		for (auto page = vaddr >> PageBits; page < (vaddr + size) >> PageBits; ++page) {
 			m_pages[page / BucketPages].load(std::memory_order_relaxed)[page % BucketPages].store(
 			    0, std::memory_order_relaxed);
@@ -673,6 +697,13 @@ private:
 	uint64_t                                                     m_size         = 0;
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_pages {};
 	std::atomic<uint64_t>                                        m_generation {1};
+	struct PageChange {
+		uint64_t generation = 0;
+		uint64_t start      = 0;
+		uint64_t end        = 0;
+	};
+	mutable std::mutex                                           m_changes_mutex;
+	std::array<PageChange, 1024>                                 m_changes {};
 };
 
 // Callers change it with the state lock held exclusively and query it under the operation lock or
@@ -756,6 +787,10 @@ public:
 
 	// Writes the backed bytes of a range that holds no private mappings.
 	[[nodiscard]] uint64_t BackingGeneration() const { return m_backing->Generation(); }
+	[[nodiscard]] bool     BackingChangedSince(uint64_t generation, uint64_t vaddr,
+	                                           uint64_t size) const {
+		return m_backing->ChangedSince(generation, vaddr, size);
+	}
 
 	// See GuestBackingStore::ContiguousAlias; 0 also when a private mapping overlaps the range.
 	[[nodiscard]] uint64_t ContiguousBackingAlias(uint64_t vaddr, uint64_t size) {

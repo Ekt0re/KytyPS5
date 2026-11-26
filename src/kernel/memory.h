@@ -145,6 +145,9 @@ bool                   TryReadBackingUncommitted(uint64_t vaddr, void* data, uin
 uint64_t               ContiguousBackingAlias(uint64_t vaddr, uint64_t size);
 // Changes whenever guest pages are bound to or unbound from the backing.
 uint64_t               BackingGeneration();
+// Whether pages of [vaddr, vaddr + size) were bound or unbound after `generation` (true when
+// that is too long ago to tell).
+bool                   BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.

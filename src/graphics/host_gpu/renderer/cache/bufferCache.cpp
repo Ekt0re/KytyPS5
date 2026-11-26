@@ -596,8 +596,11 @@ bool BufferCache::ZeroCopyBackingValid(BufferId id) {
 	if (buffer.backing_generation == generation) {
 		return true;
 	}
-	if (LibKernel::Memory::ContiguousBackingAlias(buffer.CpuAddress(), buffer.Size()) ==
-	    buffer.HostPointer()) {
+	// Guest mappings change all the time; walk this buffer's pages only when a change touched it.
+	if (!LibKernel::Memory::BackingChangedSince(buffer.backing_generation, buffer.CpuAddress(),
+	                                            buffer.Size()) ||
+	    LibKernel::Memory::ContiguousBackingAlias(buffer.CpuAddress(), buffer.Size()) ==
+	        buffer.HostPointer()) {
 		buffer.backing_generation = generation;
 		return true;
 	}
