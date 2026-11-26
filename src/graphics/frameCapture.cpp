@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/shader.h"
+#include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
 
@@ -34,10 +35,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <fmt/format.h>
 #include <xxhash.h>
 #include <zstd.h>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include <sys/prctl.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -233,6 +236,11 @@ private:
 			return Fail("the capture directory already holds a capture");
 		}
 		FlushGpuWrites();
+		// The replay sets up the same memory layout from the game's parameters.
+		std::error_code copy_error;
+		std::filesystem::copy_file(LibKernel::FileSystem::GetRealFilename("/app0/sce_sys/param.json"),
+		                           m_directory / "param.json",
+		                           std::filesystem::copy_options::overwrite_existing, copy_error);
 		const auto ranges   = Memory::CaptureRanges();
 		const auto physical = Memory::CapturePhysicalBlocks();
 		{
@@ -616,6 +624,94 @@ std::vector<uint8_t> Blob(const Call& call) {
 	return raw;
 }
 
+std::atomic<const char*>& Phase() {
+	static std::atomic<const char*> phase {"start"};
+	return phase;
+}
+
+std::filesystem::path& GuardOutput() {
+	static std::filesystem::path path;
+	return path;
+}
+
+// Resident and shared-memory use every 250 ms, so a cap kill still shows where memory grew. Once
+// the calls run, guest shared memory growing more than KYTY_REPLAY_SHMEM_GUARD_MB (default 2048)
+// over its level after loading dumps every thread's stack (eu-stack) and ends the replay with exit
+// code 3, before the memory cap kills it.
+void StartMemorySampler() {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
+	// The cgroup files are read without the process's memory map lock, which a growing mapping
+	// may hold for a long time.
+	std::string cgroup_path;
+	{
+		std::ifstream cgroup("/proc/self/cgroup");
+		for (std::string line; std::getline(cgroup, line);) {
+			if (line.rfind("0::", 0) == 0) cgroup_path = "/sys/fs/cgroup" + line.substr(3);
+		}
+	}
+	std::thread([cgroup_path] {
+		const auto start     = NowNs();
+		const auto guard     = EnvNumber("KYTY_REPLAY_SHMEM_GUARD_MB", 2048) << 20u;
+		uint64_t   baseline  = 0;
+		uint64_t   tick      = 0;
+		const auto read_file = [](const std::string& path) {
+			std::ifstream file(path);
+			uint64_t      value = 0;
+			file >> value;
+			return value;
+		};
+		const auto limit = read_file(cgroup_path + "/memory.max");
+		for (;; tick++) {
+			const auto current = read_file(cgroup_path + "/memory.current");
+			const bool calls   = std::strcmp(Phase().load(), "calls") == 0;
+			if (calls && baseline == 0) baseline = current;
+			if (calls && (current > baseline + guard || (limit != 0 && current + (1ull << 30u) > limit))) {
+				std::fprintf(stderr,
+				             "[replay] memory guard: cgroup %" PRIu64 " MiB, %" PRIu64
+				             " MiB after loading; thread stacks in %s\n",
+				             current >> 20u, baseline >> 20u,
+				             (GuardOutput() / "stacks.txt").string().c_str());
+				std::fflush(stderr);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+				const auto command =
+				    fmt::format("timeout -s KILL 10 eu-stack -p {} > '{}' 2>&1", getpid(),
+				                (GuardOutput() / "stacks.txt").string());
+				[[maybe_unused]] const int result = std::system(command.c_str());
+#endif
+				std::fflush(stdout);
+				std::quick_exit(3);
+			}
+			if (tick % 5 == 0) {
+				std::string stat;
+				std::ifstream memory_stat(cgroup_path + "/memory.stat");
+				for (std::string entry; std::getline(memory_stat, entry);) {
+					for (const char* key: {"anon ", "file ", "shmem ", "kernel "}) {
+						if (entry.rfind(key, 0) == 0) {
+							stat += " " + entry.substr(0, entry.find(' ')) + "=" +
+							        std::to_string(std::strtoull(entry.c_str() + entry.find(' '), nullptr, 10) >> 20u) + "M";
+						}
+					}
+				}
+				std::fprintf(stderr, "[replay-mem] t=%.2f s cgroup=%" PRIu64 "M%s phase=%s\n",
+				             static_cast<double>(NowNs() - start) / 1e9, current >> 20u, stat.c_str(),
+				             Phase().load());
+				std::fflush(stderr);
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+	}).detach();
+}
+
+double ShmemGiB() {
+	std::ifstream status("/proc/self/status");
+	for (std::string line; std::getline(status, line);) {
+		if (line.rfind("RssShmem:", 0) == 0) return std::strtod(line.c_str() + 9, nullptr) / (1u << 20u);
+	}
+	return 0.0;
+}
+
 double RssGiB() {
 	std::ifstream status("/proc/self/status");
 	for (std::string line; std::getline(status, line);) {
@@ -803,6 +899,10 @@ void VideoOutCall(VideoOutCallKind kind, std::span<const int64_t> args, std::spa
 void RunReplay(const ReplayOptions& options) {
 	int exit_code = 0;
 	{
+		GuardOutput() = options.output;
+		std::filesystem::create_directories(options.output);
+		StartMemorySampler();
+		Phase() = "map";
 		const auto& dir = options.capture;
 		if (!std::filesystem::exists(dir / "header.json")) {
 			Fatal("no finished capture in " + dir.string());
@@ -821,6 +921,7 @@ void RunReplay(const ReplayOptions& options) {
 		for (const auto& range: ranges) {
 			if (!Memory::ReplayMapRange(range)) skipped++;
 		}
+		Phase()               = "load";
 		const auto load_start = NowNs();
 		const auto chunks     = LoadSnapshot(dir / "snapshot.bin", false);
 		const auto calls      = ReadCalls(dir / "calls.bin");
@@ -854,8 +955,15 @@ void RunReplay(const ReplayOptions& options) {
 			uint64_t   timeouts    = 0;
 			uint64_t   submissions = 0;
 			const auto pass_start  = NowNs();
+			Phase()                = "calls";
+			uint64_t call_index    = 0;
 			for (const auto& call: calls) {
+				if (++call_index % 25 == 0) {
+					std::fprintf(stderr, "[replay] call %" PRIu64 "/%zu, %" PRIu64 " submissions\n",
+					             call_index, calls.size(), submissions);
+				}
 				if (!call.waits.empty() && !WaitFor(call.waits, base)) timeouts++;
+				const double shmem_before = call_index <= 80 ? ShmemGiB() : 0.0;
 				switch (call.kind) {
 					case CallKind::Memory: ApplyPages(Blob(call)); break;
 					case CallKind::Submit: {
@@ -940,6 +1048,18 @@ void RunReplay(const ReplayOptions& options) {
 					}
 					case CallKind::FrameEnd:
 					case CallKind::End: break;
+				}
+				if (call_index <= 80) {
+					// Which call makes the guest memory resident (diagnostic for the memory cap).
+					const double shmem_after = ShmemGiB();
+					std::fprintf(stderr,
+					             "[replay-call] %" PRIu64 " kind=%u a0=0x%" PRIx64 " a1=0x%" PRIx64
+					             " a2=0x%" PRIx64 " shmem %.2f -> %.2f GiB\n",
+					             call_index, static_cast<unsigned>(call.kind),
+					             call.args.size() > 0 ? static_cast<uint64_t>(call.args[0]) : 0,
+					             call.args.size() > 1 ? static_cast<uint64_t>(call.args[1]) : 0,
+					             call.args.size() > 2 ? static_cast<uint64_t>(call.args[2]) : 0,
+					             shmem_before, shmem_after);
 				}
 			}
 			static_cast<void>(started);

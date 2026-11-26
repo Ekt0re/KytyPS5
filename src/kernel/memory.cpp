@@ -2866,6 +2866,13 @@ bool ReplayMapRange(const CaptureRange& range) {
 		// Automatic (AMPR) memory lives in the AMM window, reserved first as MapAutomaticMemory does.
 		std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 		direct = ReplaceFixedRangeWithReserved(range.start, range.size);
+		if (direct != OK) {
+			// The game reserved the window first; the replay has not.
+			void* reserved = reinterpret_cast<void*>(range.start);
+			if (KernelReserveVirtualRange(&reserved, range.size, MapFixed, 0) == OK) {
+				direct = ReplaceFixedRangeWithReserved(range.start, range.size);
+			}
+		}
 		if (direct == OK) {
 			direct = MapDirectMemory(&address, range.size, range.protection, MapFixed,
 			                         static_cast<int64_t>(range.offset), 0x4000, "", range.memory_type);

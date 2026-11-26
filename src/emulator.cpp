@@ -142,7 +142,10 @@ static void Execute(const std::filesystem::path& game_patch) {
 
 void RunReplay(const RunOptions& options) {
 	Common::Subsystems subsystems(true);
-	Init(options.config, {}, subsystems);
+	// The game's param.json sets the memory layout (flexible and direct sizes) the capture used.
+	auto config          = options.config;
+	config.splash_enabled = false;
+	Init(config, options.replay / "param.json", subsystems);
 	PrintSystemInfo();
 	Libs::Graphics::FrameCapture::ReplayOptions replay;
 	replay.capture = options.replay;
