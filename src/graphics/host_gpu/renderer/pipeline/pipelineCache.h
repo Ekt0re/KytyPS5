@@ -267,6 +267,9 @@ private:
 		// Compiling pipelines keep references.
 		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
+		// Programs with calls: the resource plans of the earlier links call_source keeps, by link
+		// id, so a callee set seen before needs no translation to find its module.
+		std::unordered_map<uint64_t, ShaderRecompiler::IR::ResourcePlan> call_plans;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);

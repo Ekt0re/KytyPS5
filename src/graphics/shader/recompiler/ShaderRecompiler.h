@@ -56,7 +56,14 @@ struct ShaderSource {
 		Decoder::Program decoded;
 		std::vector<Function> functions;
 		std::vector<uint32_t> observed_function;
+		// Unique per link of this source; `revision` is the id of the current one.
+		uint64_t id = 0;
 	};
+	// Links of earlier callee sets, most recent first. A call shader that alternates between
+	// callee sets (one per object) swaps a matching one back in instead of linking again, and
+	// the pipeline cache keeps its resource plan by link id.
+	static constexpr size_t MaxPreviousLinks = 16;
+	std::vector<Linked> previous_links;
 	std::vector<uint32_t> code;
 	Decoder::Program decoded;
 	IR::ResourcePlan call_targets;
@@ -65,6 +72,7 @@ struct ShaderSource {
 	uint32_t wave_size = 64;
 	std::optional<Linked> linked;
 	uint64_t revision = 0;
+	uint64_t links_made = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };
 

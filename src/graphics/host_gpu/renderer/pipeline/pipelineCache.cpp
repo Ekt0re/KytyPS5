@@ -232,9 +232,49 @@ std::span<const uint32_t> PipelineCache::Program::FunctionCode() const {
 bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 	const auto revision = call_source->revision;
 	ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
+	bool changed = revision != call_source->revision;
+	// KYTY_CALL_LINK_REUSE=0: every callee-set switch translates the program again.
+	static const bool reuse = [] {
+		const char* value = std::getenv("KYTY_CALL_LINK_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (changed && reuse) {
+		// The plan belongs to the link being left: keep it by that link's id while
+		// call_source keeps the link, and bring back the plan of a link seen before.
+		std::erase_if(call_plans, [&](const auto& entry) {
+			return entry.first != call_source->revision &&
+			       std::ranges::none_of(call_source->previous_links,
+			                            [&](const auto& link) { return link.id == entry.first; });
+		});
+		if (std::ranges::any_of(call_source->previous_links,
+		                        [&](const auto& link) { return link.id == revision; })) {
+			call_plans.insert_or_assign(revision, std::move(resource_plan));
+		}
+		if (const auto plan = call_plans.find(call_source->revision); plan != call_plans.end()) {
+			resource_plan = std::move(plan->second);
+			call_plans.erase(plan);
+			changed = false;
+		}
+	}
 	resource_plan.source_reads = call_source->reads;
-	return revision != call_source->revision;
+	// KYTY_CALL_STATS=1: how often call shaders link, reuse a link or translate, on stderr.
+	static const bool stats = std::getenv("KYTY_CALL_STATS") != nullptr;
+	if (stats) {
+		static uint64_t refreshes = 0, switches = 0, translations = 0;
+		refreshes++;
+		switches += revision != call_source->revision ? 1u : 0u;
+		translations += changed ? 1u : 0u;
+		if ((refreshes & 0x3fffu) == 0) {
+			std::fprintf(stderr,
+			             "[call-stats] %" PRIu64 " dispatches of call shaders, %" PRIu64
+			             " callee-set switches, %" PRIu64 " needing translation, %" PRIu64
+			             " links made by this shader\n",
+			             refreshes, switches, translations, call_source->links_made);
+		}
+	}
+	return changed;
 }
+
 
 template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
@@ -413,7 +453,23 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
+			const auto link_before = cached.call_source->revision;
 			source_changed = cached.RefreshCallSource(runtime);
+			if (static const bool stats = std::getenv("KYTY_CALL_STATS") != nullptr;
+			    stats && link_before != cached.call_source->revision) {
+				// The first switches: which callees, and where the walk read the targets.
+				static uint32_t lines = 0;
+				if (lines < 64) {
+					lines++;
+					std::string text;
+					for (const auto& call: cached.call_source->calls) text += fmt::format(" {:x}", call.address);
+					text += " | reads";
+					for (const auto& [address, bytes]: cached.call_source->reads) text += fmt::format(" {:x}+{:x}", address, bytes);
+					std::fprintf(stderr, "[call-stats] CS %016" PRIx64 " link %" PRIu64 " (%" PRIu64 " made)%s: callees%s\n",
+					             m_lookup_key.hash, cached.call_source->revision, cached.call_source->links_made,
+					             source_changed ? ", translates" : "", text.c_str());
+				}
+			}
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data);
 		} else {
 			module = cached.FindModule<false>(runtime, push_data);
