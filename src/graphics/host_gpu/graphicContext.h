@@ -56,7 +56,8 @@ struct GraphicContext {
 	uint32_t                           max_push_descriptors                  = 0;
 	uint32_t                           device_clock_period_ps                = 0;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
-	uint32_t                           image_heap_capacity                   = 0;
+	// ImageHeapCapacity(*this) fills it in from the device limits on first use.
+	mutable uint32_t                   image_heap_capacity                   = 0;
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;

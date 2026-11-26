@@ -1,6 +1,7 @@
 #include "common/compilePause.h"
 #include "common/shaderCompileStatus.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -199,7 +200,7 @@ ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
 	        .compute_derivative_quads  = graphics.compute_derivative_quads_enabled,
 	        .compute_derivative_linear = graphics.compute_derivative_linear_enabled,
 	        .lds_lane_sync             = LdsLaneSyncEnabled(),
-	        .image_heap_capacity       = graphics.image_heap_capacity};
+	        .image_heap_capacity       = ImageHeapCapacity(graphics)};
 }
 
 std::filesystem::path ShaderStorePath() {

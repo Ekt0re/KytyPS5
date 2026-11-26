@@ -79,11 +79,26 @@ size_t ImageHeap::KeyHash::operator()(const Key& key) const noexcept {
 	return XXH3_64bits_withSeed(key.value.dwords.data(), sizeof(key.value.dwords), key.profile);
 }
 
+uint32_t ImageHeapCapacity(const GraphicContext& graphics) {
+	if (graphics.image_heap_capacity == 0u && graphics.physical_device) {
+		vk::PhysicalDeviceVulkan12Properties limits {};
+		vk::PhysicalDeviceProperties2        properties {};
+		properties.pNext = &limits;
+		graphics.physical_device.getProperties2(&properties);
+		const auto limit = std::min({limits.maxDescriptorSetUpdateAfterBindSampledImages,
+		                             limits.maxPerStageDescriptorUpdateAfterBindSampledImages,
+		                             limits.maxPerStageUpdateAfterBindResources});
+		graphics.image_heap_capacity =
+		    limit == 0u ? 0u : std::min(IR::ImageHeapCapacity, std::bit_floor(limit));
+	}
+	return graphics.image_heap_capacity;
+}
+
 ImageHeap::ImageHeap(RenderContext& context, PageManager& page_manager)
     : m_context(context), m_page_manager(page_manager) {
 	auto& graphics = context.GetGraphics();
-	// Set from the device limits at device creation; shaders declare the same array length.
-	m_capacity = graphics.image_heap_capacity;
+	// Shaders declare the same array length (SpirvProfile).
+	m_capacity = ImageHeapCapacity(graphics);
 	EXIT_NOT_IMPLEMENTED(m_capacity == 0u);
 
 	const vk::DescriptorBindingFlags binding_flags =

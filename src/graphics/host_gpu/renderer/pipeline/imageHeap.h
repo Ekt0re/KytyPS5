@@ -16,6 +16,13 @@
 
 namespace Libs::Graphics {
 
+struct GraphicContext;
+
+// Length of the resident image heap array: IR::ImageHeapCapacity, or the largest power of two
+// the device's update-after-bind limits allow. Shaders declare it and the heap binds it, so every
+// device (the window's and test harnesses') gets it from here.
+uint32_t ImageHeapCapacity(const GraphicContext& graphics);
+
 class Buffer;
 class CommandBuffer;
 class PageManager;

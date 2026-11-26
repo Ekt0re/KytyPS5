@@ -538,19 +538,6 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
 	graphics.ray_query_enabled                = ray_query_enabled;
-	{
-		// The resident image heap binds IR::ImageHeapCapacity sampled images, or the largest
-		// power of two below the device's update-after-bind limits.
-		vk::PhysicalDeviceVulkan12Properties descriptor_limits {};
-		vk::PhysicalDeviceProperties2        properties {};
-		properties.pNext = &descriptor_limits;
-		graphics.physical_device.getProperties2(&properties);
-		const auto limit = std::min({descriptor_limits.maxDescriptorSetUpdateAfterBindSampledImages,
-		                             descriptor_limits.maxPerStageDescriptorUpdateAfterBindSampledImages,
-		                             descriptor_limits.maxPerStageUpdateAfterBindResources});
-		graphics.image_heap_capacity =
-		    limit == 0u ? 0u : std::min(ShaderRecompiler::IR::ImageHeapCapacity, std::bit_floor(limit));
-	}
 	// A coarser alignment rounds the range up past the guest's last byte.
 	graphics.robust_buffer_access_enabled =
 	    robustness2.robustBufferAccess2 &&
