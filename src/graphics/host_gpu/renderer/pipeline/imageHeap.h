@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <deque>
@@ -79,6 +80,7 @@ private:
 
 	struct View {
 		Memory&                      memory;
+		uint64_t                     id      = 0; // Key of m_view_ids.
 		uint64_t                     step    = 0;
 		uint64_t                     first   = 0;
 		uint64_t                     count   = 0;
@@ -120,6 +122,7 @@ private:
 	void     Mark(uint32_t index, State state);
 	template <typename Fn>
 	bool     ForEachChanged(Fn&& fn);
+	void     AddUser(uint32_t index, const View& view, size_t slot);
 	void     Repoint();
 	void     TakeChanges();
 	ImageId  CurrentImage(const Image::HeapChange& change);
@@ -142,6 +145,22 @@ private:
 	std::vector<uint32_t>                             m_released; // Unselected after the upload.
 	std::vector<uint32_t>                             m_held; // Another extent holds the address.
 	std::vector<uint32_t>                             m_dcc;  // Metadata clears apply per draw.
+	// The texture preparation of an m_dcc element, kept while its descriptor and the guest
+	// mappings stay the same, so the per-draw retry only looks the texture up again.
+	struct DccPrepared {
+		Key             key;
+		uint32_t        kind       = 0;
+		uint64_t        generation = 0;
+		PreparedTexture prepared;
+	};
+	std::unordered_map<uint32_t, DccPrepared>         m_dcc_prepared;
+	// Per element, the (view id, slot word) pairs that selected it, so Repoint visits only the
+	// slots of marked elements instead of every probe of every view. Entries go stale when their
+	// slot moves on (checked when read) and are dropped with the element's last reference.
+	std::vector<std::vector<std::pair<uint64_t, uint32_t>>> m_users;
+	std::unordered_map<uint64_t, View*>               m_view_ids;
+	uint64_t                                          m_next_view_id = 1;
+	std::vector<uint32_t>                             m_marked; // Referenced since marked.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
 	uint64_t                                          m_held_serial = 0; // Image::serials.
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.

@@ -129,6 +129,7 @@ bool RenderContext::IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	m_mapping_generation.fetch_add(1, std::memory_order_acq_rel);
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
@@ -154,6 +155,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapping_generation.fetch_add(1, std::memory_order_acq_rel);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.

@@ -418,7 +418,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+PreparedTexture RenderExecutor::PrepareTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	if (resource.atomic64 && !m_context.GetGraphics().shader_image_int64_atomics_enabled) {
 		EXIT("64-bit image atomics require shaderImageInt64Atomics\n");
@@ -429,9 +429,8 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		return {};
 	}
 	// Image heap resolves do not follow the draws that sample them and storage access is not
 	// sampling: neither reports samples.
@@ -558,10 +557,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
 	// their layout.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		return {};
 	}
 	if (desc.info.data.size != 0 && !m_context.IsAnyMapped(address, desc.info.data.size)) {
-		return {.layout = vk::ImageLayout::eGeneral};
+		return {};
 	}
 	const auto alignment = desc.info.DataAlignment();
 	EXIT_NOT_IMPLEMENTED(desc.info.data.size == 0 || alignment == 0 ||
@@ -583,6 +582,26 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	desc.heap = resource.heap;
 
+	return {.resolved     = true,
+	        .desc         = std::move(desc),
+	        .descriptor   = descriptor,
+	        .format       = format,
+	        .pixel_format = pixel_format,
+	        .view_format  = view_format};
+}
+
+TextureBinding RenderExecutor::FinishTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                             PreparedTexture                            prepared) {
+	if (!prepared.resolved) {
+		return {.layout = vk::ImageLayout::eGeneral};
+	}
+	auto&      texture_cache = m_context.GetTextureCache();
+	auto&      desc          = prepared.desc;
+	const auto& descriptor   = prepared.descriptor;
+	const auto format        = prepared.format;
+	const auto pixel_format  = prepared.pixel_format;
+	const auto view_format   = prepared.view_format;
+	const bool storage       = resource.written;
 	auto id = texture_cache.FindImage(desc);
 	if (!id) {
 		// Another extent at the address holds it; the heap retries once an image is created.
@@ -609,6 +628,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                             descriptor.DstSelXYZW());
 	}
 	return {id, nullptr, std::move(desc)};
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	return FinishTexture(resource, PrepareTexture(resource, value));
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,

@@ -185,6 +185,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	if (view == views.end()) {
 		const auto count   = std::min(limit, Probes(bytes, first, request.step));
 		auto       created = std::make_unique<View>(View {.memory  = **memory,
+		                                                  .id      = m_next_view_id++,
 		                                                  .step    = request.step,
 		                                                  .first   = first,
 		                                                  .count   = count,
@@ -192,6 +193,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		                                                  .profile = profile});
 		created->slots.resize(bytes / 4u + 1u);
 		created->buffer = SlotBuffer(m_context, bytes);
+		m_view_ids.emplace(created->id, created.get());
 		UpdateProbes(*created, 0u, bytes);
 		// The first upload also clears the slots no probe selects.
 		created->dirty_begin = 0;
@@ -323,8 +325,24 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 
 void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
 	const auto previous = std::exchange(view.slots[slot], entry);
+	if (previous != entry) AddUser(entry & ElementMask, view, slot);
 	Release(previous);
 	if (previous != entry) Widen(view.dirty_begin, view.dirty_end, slot, slot + 1u);
+}
+
+void ImageHeap::AddUser(uint32_t index, const View& view, size_t slot) {
+	if (index == 0u) return;
+	if (m_users.size() <= index) m_users.resize(m_elements.size());
+	auto& users = m_users[index];
+	// Entries of slots that moved on pile up while the element lives; keep them near its refs.
+	if (users.size() >= 64u && users.size() >= 2u * m_elements[index].refs) {
+		std::erase_if(users, [&](const std::pair<uint64_t, uint32_t>& user) {
+			const auto found = m_view_ids.find(user.first);
+			return found == m_view_ids.end() ||
+			       (found->second->slots[user.second] & ElementMask) != index;
+		});
+	}
+	users.emplace_back(view.id, static_cast<uint32_t>(slot));
 }
 
 uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
@@ -351,6 +369,7 @@ void ImageHeap::Release(uint32_t entry) {
 	if (index == 0u || --m_elements[index].refs != 0u) return;
 	auto& element = m_elements[index];
 	Mark(index, State::Stale);
+	if (index < m_users.size()) m_users[index].clear();
 	auto& textures = m_context.GetTextureCache();
 	if (auto* image = textures.m_slot_images.try_get(element.image);
 	    image != nullptr && image->serial == element.serial) {
@@ -376,6 +395,7 @@ void ImageHeap::Retire() {
 void ImageHeap::Mark(uint32_t index, State state) {
 	auto& element = m_elements[index];
 	element.state = state;
+	if (element.refs != 0u) m_marked.push_back(index);
 	if (const auto found = m_index.find(element.key);
 	    found != m_index.end() && found->second == index) {
 		m_index.erase(found);
@@ -397,21 +417,57 @@ bool ImageHeap::ForEachChanged(Fn&& fn) {
 	return found;
 }
 
-// Moves the slots of every view off marked elements; pending draws keep reading those.
+// Moves the slots of every view off marked elements; pending draws keep reading those. Only the
+// slots that selected a marked element are visited, in the order of a scan of every probe of
+// every view (memories, views, then slots), so elements are interned in the same order.
 void ImageHeap::Repoint() {
-	for (const auto& memory: m_memories) {
-		for (const auto& view: memory->views) {
-			for (uint64_t probe = 0; probe < view->count; ++probe) {
-				const auto  slot    = (view->first + probe * view->step) / 4u;
-				const auto& element = m_elements[view->slots[slot] & ElementMask];
-				if (element.state == State::Buried) {
-					memory->dead[slot] = Hash(element.key.value);
-					Assign(*view, slot, 0u);
-				} else if (element.state == State::Stale) {
-					const auto key = element.key; // Intern may grow m_elements.
-					Assign(*view, slot, Intern(*view, element.kind, key));
-				}
+	if (m_marked.empty()) return;
+	std::ranges::sort(m_marked);
+	m_marked.erase(std::ranges::unique(m_marked).begin(), m_marked.end());
+	std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> order; // Memory, view.
+	for (uint32_t memory = 0; memory < m_memories.size(); ++memory) {
+		const auto& views = m_memories[memory]->views;
+		for (uint32_t view = 0; view < views.size(); ++view) {
+			order.emplace(views[view]->id, std::pair {memory, view});
+		}
+	}
+	struct Visit {
+		uint32_t memory;
+		uint32_t view;
+		uint32_t slot;
+		auto     operator<=>(const Visit&) const = default;
+	};
+	std::vector<Visit> visits;
+	for (const auto index: m_marked) {
+		if (index >= m_users.size() || m_elements[index].refs == 0u ||
+		    m_elements[index].state == State::Live) {
+			continue;
+		}
+		for (const auto& [id, slot]: m_users[index]) {
+			const auto found = order.find(id);
+			if (found == order.end()) continue;
+			const auto& view = *m_memories[found->second.first]->views[found->second.second];
+			if ((view.slots[slot] & ElementMask) != index || slot * 4u < view.first ||
+			    (slot * 4u - view.first) % view.step != 0u ||
+			    (slot * 4u - view.first) / view.step >= view.count) {
+				continue;
 			}
+			visits.push_back({found->second.first, found->second.second, slot});
+		}
+	}
+	m_marked.clear();
+	std::ranges::sort(visits);
+	visits.erase(std::ranges::unique(visits).begin(), visits.end());
+	for (const auto& visit: visits) {
+		auto&       view    = *m_memories[visit.memory]->views[visit.view];
+		const auto  slot    = visit.slot;
+		const auto& element = m_elements[view.slots[slot] & ElementMask];
+		if (element.state == State::Buried) {
+			view.memory.dead[slot] = Hash(element.key.value);
+			Assign(view, slot, 0u);
+		} else if (element.state == State::Stale) {
+			const auto key = element.key; // Intern may grow m_elements.
+			Assign(view, slot, Intern(view, element.kind, key));
 		}
 	}
 }
@@ -454,6 +510,7 @@ uint32_t ImageHeap::Allocate() {
 	const auto index = m_free.back();
 	m_free.pop_back();
 	m_elements[index] = {};
+	if (index < m_users.size()) m_users[index].clear();
 	return index;
 }
 
@@ -531,8 +588,37 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		stale = true;
 		return true;
 	};
-	// Discovery applies the color metadata clears written since the last draw.
-	std::erase_if(m_dcc, retry);
+	// Discovery applies the color metadata clears written since the last draw. The preparation
+	// of an unchanged descriptor is kept; the texture lookup (and so the clear) runs every draw.
+	const auto retry_dcc = [&](uint32_t index) {
+		const auto& element = m_elements[index];
+		if (element.state != State::Live) {
+			m_dcc_prepared.erase(index);
+			return retry(index);
+		}
+		const auto resource   = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
+		const auto generation = m_context.MappingGeneration();
+		auto&      cached     = m_dcc_prepared[index];
+		if (cached.generation != generation || cached.kind != element.kind || !(cached.key == element.key) ||
+		    cached.generation == 0u) {
+			cached = {element.key, element.kind, generation,
+			          executor.PrepareTexture(resource, element.key.value)};
+		}
+		const auto binding = executor.FinishTexture(resource, cached.prepared);
+		if (binding.image_id == element.image &&
+		    (!element.image || textures.m_slot_images[element.image].serial == element.serial)) {
+			const bool leaves = !element.image && binding.desc.info.data.Empty();
+			if (leaves) m_dcc_prepared.erase(index);
+			return leaves;
+		}
+		Mark(index, State::Stale);
+		stale = true;
+		m_dcc_prepared.erase(index);
+		return true;
+	};
+	{
+		std::erase_if(m_dcc, retry_dcc);
+	}
 	// Held elements retry once an image is created, such as a render target of their extent.
 	if (const auto serial = Image::serials.load(std::memory_order_relaxed);
 	    m_held_serial != serial) {
@@ -672,6 +758,7 @@ void ImageHeap::Drop(Memory& memory) {
 	Unwatch(memory);
 	for (auto& view: memory.views) {
 		std::erase(m_active, view.get());
+		m_view_ids.erase(view->id);
 		for (uint64_t probe = 0; probe < view->count; ++probe) {
 			Release(view->slots[(view->first + probe * view->step) / 4u]);
 		}

@@ -156,6 +156,11 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// ResolveTexture in two steps, so a caller can keep the first for unchanged descriptors.
+	[[nodiscard]] PreparedTexture PrepareTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                             const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding  FinishTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            PreparedTexture                            prepared);
 
 private:
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
