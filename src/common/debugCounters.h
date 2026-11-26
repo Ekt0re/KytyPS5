@@ -52,6 +52,23 @@ enum class Counter {
 	PresentNs, // Includes image acquire and overlay preparation.
 	PresentAcquireNs,
 	OverlayNs,
+	// CPU/GPU memory synchronisation (KYTY_SYNC_STATS=seconds prints them).
+	SyncReadFaults,    // Guest reads of pages that hold GPU-written data.
+	SyncWriteFaults,   // Guest writes to write-watched or GPU-written pages.
+	SyncFaultNs,       // Time guest threads spend in those faults.
+	SyncFaultBufferNs, // Of write faults: buffer tracker, texture cache, image heap.
+	SyncFaultTextureNs,
+	SyncFaultHeapNs,
+	SyncReadbacks,     // Synchronous buffer downloads.
+	SyncReadbackNs,    // Time the GPU thread spends in them, including the GPU wait.
+	SyncDetachedReadbacks, // Of those, read behind submitted work without a flush.
+	SyncReuploadBytes, // Buffer uploads of bytes the CPU last got from a GPU download.
+	SyncUnchangedUploadBytes, // Buffer uploads of 4 KiB pages identical to their last upload.
+	SyncStreamBytes,   // Small CPU-written ranges streamed per draw.
+	SyncBdaUploadBytes,
+	SyncProtectCalls,  // Host page-protection changes for GPU tracking.
+	SyncProtectBytes,
+	SyncProtectNs,
 	Count
 };
 

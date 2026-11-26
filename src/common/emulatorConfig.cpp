@@ -4,11 +4,76 @@
 #include "common/debugCounters.h"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <thread>
 
 namespace Config {
 
 static std::unique_ptr<ConfigOptions> g_config;
+
+// KYTY_SYNC_STATS=n prints the memory synchronisation counters every n seconds to stdout.
+static uint32_t SyncStatsPeriod() {
+	static const uint32_t period = [] {
+		const char* env = std::getenv("KYTY_SYNC_STATS");
+		return env == nullptr ? 0u : static_cast<uint32_t>(std::strtoul(env, nullptr, 10));
+	}();
+	return period;
+}
+
+static void StartSyncStatsReporter() {
+	static bool started = false;
+	const auto  period  = SyncStatsPeriod();
+	if (started || period == 0) {
+		return;
+	}
+	started = true;
+	std::thread([period] {
+		using Common::DebugCounters::Counter;
+		using Common::DebugCounters::Get;
+		constexpr auto                                  N = static_cast<size_t>(Counter::Count);
+		std::array<uint64_t, N>                         last {};
+		auto                                            last_time = std::chrono::steady_clock::now();
+		for (uint64_t index = 0;; index++) {
+			std::this_thread::sleep_for(std::chrono::seconds(period));
+			const auto now  = std::chrono::steady_clock::now();
+			const auto secs = std::chrono::duration<double>(now - last_time).count();
+			last_time       = now;
+			std::array<uint64_t, N> cur {};
+			for (size_t i = 0; i < N; i++) {
+				cur[i] = Get(static_cast<Counter>(i));
+			}
+			const auto d = [&](Counter c) {
+				return static_cast<double>(cur[static_cast<size_t>(c)] - last[static_cast<size_t>(c)]) /
+				       secs;
+			};
+			constexpr double MB = 1024.0 * 1024.0;
+			std::printf("SyncStats t=%" PRIu64 " flips/s=%.1f subs/s=%.0f draws/s=%.0f | "
+			            "faults r/s=%.0f w/s=%.0f all/s=%.0f fault_ms/s=%.1f (buf %.1f tex %.1f heap %.1f) | "
+			            "readbacks/s=%.0f detached/s=%.0f readback_ms/s=%.1f bufdown_MB/s=%.1f texdown_MB/s=%.1f | "
+			            "bufup_MB/s=%.1f reup_MB/s=%.1f unchanged_MB/s=%.1f stream_MB/s=%.1f "
+			            "bda_MB/s=%.1f texup_MB/s=%.1f | protect/s=%.0f protect_MB/s=%.1f "
+			            "protect_ms/s=%.1f | gpuwait_ms/s=%.0f gputhread_ms/s=%.0f\n",
+			            index * period, d(Counter::FlipsRequested), d(Counter::QueueSubmits),
+			            d(Counter::Draws), d(Counter::SyncReadFaults), d(Counter::SyncWriteFaults),
+			            d(Counter::GpuFaults), d(Counter::SyncFaultNs) / 1e6, d(Counter::SyncFaultBufferNs) / 1e6,
+			            d(Counter::SyncFaultTextureNs) / 1e6, d(Counter::SyncFaultHeapNs) / 1e6, d(Counter::SyncReadbacks), d(Counter::SyncDetachedReadbacks),
+			            d(Counter::SyncReadbackNs) / 1e6, d(Counter::BufferDownloadBytes) / MB,
+			            d(Counter::TextureDownloadBytes) / MB, d(Counter::BufferUploadBytes) / MB,
+			            d(Counter::SyncReuploadBytes) / MB, d(Counter::SyncUnchangedUploadBytes) / MB,
+			            d(Counter::SyncStreamBytes) / MB, d(Counter::SyncBdaUploadBytes) / MB,
+			            d(Counter::TextureUploadBytes) / MB, d(Counter::SyncProtectCalls),
+			            d(Counter::SyncProtectBytes) / MB, d(Counter::SyncProtectNs) / 1e6,
+			            d(Counter::GpuWaitNs) / 1e6, d(Counter::GpuThreadBusyNs) / 1e6);
+			std::fflush(stdout);
+			last = cur;
+		}
+	}).detach();
+}
 
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
@@ -29,7 +94,8 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
-	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
+	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled || SyncStatsPeriod() != 0);
+	StartSyncStatsReporter();
 }
 
 uint32_t GetScreenWidth() {

@@ -530,6 +530,38 @@ void TestRangeInvalidation() {
   Release(memory);
 }
 
+void TestWriteFaultWindow() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  // Page 0 uploaded (write-watched), page 1 GPU-written, page 2 uploaded, page 3 CPU-dirty.
+  tracker.ForEachUploadRange(
+      address, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  MarkGpuModified(tracker, address + page_size, page_size);
+  ResetProtectionLog();
+  tracker.MarkCleanAsCpuModified(address, page_size * 4);
+  Check(tracker.IsRegionCpuModified(address, page_size) &&
+            tracker.IsRegionCpuModified(address + 2 * page_size, page_size) &&
+            IsWritable(memory) && IsWritable(memory + 2 * page_size),
+        "write-fault window did not release the clean watched pages");
+  Check(tracker.IsRegionGpuModified(address + page_size, page_size) &&
+            !tracker.IsRegionCpuModified(address + page_size, page_size) &&
+            Protection(memory + page_size) == PAGE_NOACCESS,
+        "write-fault window changed a GPU-written page");
+  Check(g_protection_calls == 2,
+        "write-fault window did not change each run of clean pages once");
+  ResetProtectionLog();
+  tracker.MarkCleanAsCpuModified(address, page_size * 4);
+  Check(g_protection_calls == 0, "a repeated write-fault window changed protection");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, page_size);
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  Release(memory);
+}
+
 void TestGpuReacquisitionAfterInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1235,6 +1267,7 @@ int main(int argc, char **argv) {
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
+  TestWriteFaultWindow();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();
   TestExactDirtyIntervalsSharingTrackerPage();

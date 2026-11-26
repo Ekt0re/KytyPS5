@@ -134,6 +134,23 @@ public:
 		}
 	}
 
+	// Pages of the range that are neither CPU- nor GPU-modified become CPU-modified, which drops
+	// their write watch, in one protection change (a guest write fault's window).
+	void MarkCleanAsCpuModified(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
+		RegionBits changed(~m_cpu_dirty, start, end);
+		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
+			changed.UnsetRange(first, last);
+		}
+		if (changed.None()) {
+			return;
+		}
+		for (const auto [first, last]: changed) {
+			m_cpu_dirty.SetRange(first, last);
+		}
+		UpdateProtection<false, false>(changed);
+	}
+
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(offset, size);

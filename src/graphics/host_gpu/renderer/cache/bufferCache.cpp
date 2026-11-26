@@ -217,6 +217,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
+		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::SyncReadbacks,
+		                                         Common::DebugCounters::Counter::SyncReadbackNs);
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
@@ -279,6 +281,12 @@ BufferCache::~BufferCache() {
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
+	QueueBdaSync(vaddr, size);
+}
+
+void BufferCache::InvalidateWriteWindow(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.MarkCleanAsCpuModified(vaddr, size);
+	// Shader address reads see the window's CPU bytes only through these uploads.
 	QueueBdaSync(vaddr, size);
 }
 
