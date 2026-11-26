@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -76,7 +77,8 @@ std::pair<uint64_t, uint64_t> PageRange(uint64_t base, uint64_t size, size_t beg
 } // namespace
 
 size_t ImageHeap::KeyHash::operator()(const Key& key) const noexcept {
-	return XXH3_64bits_withSeed(key.value.dwords.data(), sizeof(key.value.dwords), key.profile);
+	const auto binding = (static_cast<uint32_t>(key.dimension) << 2u) | (uint32_t(key.r128) << 1u) | uint32_t(key.depth_view);
+	return XXH3_64bits_withSeed(key.value.dwords.data(), sizeof(key.value.dwords), binding);
 }
 
 uint32_t ImageHeapCapacity(const GraphicContext& graphics) {
@@ -179,10 +181,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		if (!Refresh(**memory)) return false;
 		(*memory)->draw = m_draw;
 	}
-	const auto root    = IR::ImageHeapResource(*request.root, 0u);
-	const auto profile = static_cast<uint32_t>(std::ranges::find(m_profiles, root) -
-	                                           m_profiles.begin());
-	if (profile == m_profiles.size()) m_profiles.push_back(root);
+	const auto root   = IR::ImageHeapResource(*request.root, 0u);
 	auto&      views  = (*memory)->views;
 	const auto bytes  = (*memory)->size;
 	const auto probes = Probes(size, request.first, request.step);
@@ -191,7 +190,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	const auto first = limit == UINT64_MAX ? request.first % request.step : request.first;
 	auto       view  = std::ranges::find_if(views, [&](const auto& candidate) {
 		return candidate->step == request.step && candidate->first == first &&
-		       candidate->limit == limit && candidate->profile == profile;
+		       candidate->limit == limit && candidate->root == root;
 	});
 	if (view == views.end()) {
 		const auto count   = std::min(limit, Probes(bytes, first, request.step));
@@ -201,7 +200,7 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		                                                  .first   = first,
 		                                                  .count   = count,
 		                                                  .limit   = limit,
-		                                                  .profile = profile});
+		                                                  .root    = root});
 		created->slots.resize(bytes / 4u + 1u);
 		created->buffer = SlotBuffer(m_context, bytes);
 		m_view_ids.emplace(created->id, created.get());
@@ -306,7 +305,7 @@ void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 
 void ImageHeap::UpdateProbes(View& view, uint64_t begin, uint64_t end) {
 	// A probe reads its descriptor from first + probe * step.
-	const uint64_t bytes = m_profiles[view.profile].r128 ? 16u : 32u;
+	const uint64_t bytes = view.root.r128 ? 16u : 32u;
 	auto probe = begin < view.first + bytes ? 0u : (begin - view.first - bytes) / view.step + 1u;
 	for (; probe < view.count && view.first + probe * view.step < end; ++probe) {
 		UpdateProbe(view, probe);
@@ -314,12 +313,11 @@ void ImageHeap::UpdateProbes(View& view, uint64_t begin, uint64_t end) {
 }
 
 void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
-	const auto& profile = m_profiles[view.profile];
 	const auto& words   = view.memory.words;
 	const auto  offset  = static_cast<uint32_t>((view.first + probe * view.step) / 4u);
-	Key         key {.value = {.dword_count = 8u}, .profile = view.profile};
+	Key         key {.value = {.dword_count = 8u}, .dimension = view.root.dimension, .r128 = view.root.r128};
 	std::copy_n(words.begin() + offset,
-	            std::min<size_t>(profile.r128 ? 4u : 8u, words.size() - offset),
+	            std::min<size_t>(key.r128 ? 4u : 8u, words.size() - offset),
 	            key.value.dwords.begin());
 	// A buried word stays null in every view until its descriptor changes.
 	auto& dead = view.memory.dead;
@@ -330,8 +328,14 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 		}
 		dead.erase(found);
 	}
-	const auto kind = IR::ImageHeapKind(profile, key.value);
-	Assign(view, offset, kind == 0u ? 0u : Intern(view, kind, key));
+	const auto kind = IR::ImageHeapKind(view.root, key.value);
+	if (kind == 0u) {
+		Assign(view, offset, 0u);
+		return;
+	}
+	const auto format = DecodeNativeDescriptor<ShaderTextureResource>(key.value).Format();
+	key.depth_view = SampledDepthCompareFormat(format, view.root.depth_compare).has_value();
+	Assign(view, offset, Intern(view, kind, key));
 }
 
 void ImageHeap::Assign(View& view, size_t slot, uint32_t entry) {
@@ -582,7 +586,9 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	});
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
 	const auto resolve = [&](const Element& element) {
-		const auto resource = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
+		const auto& key = element.key;
+		const auto resource = IR::ImageHeapResource(
+		    {.dimension = key.dimension, .depth_compare = key.depth_view, .r128 = key.r128}, element.kind);
 		return executor.ResolveTexture(resource, element.key.value);
 	};
 	// A listed element whose descriptor resolves to another image is stale; true once it leaves
@@ -610,7 +616,9 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			m_dcc_prepared.erase(index);
 			return retry(index);
 		}
-		const auto resource   = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
+		const auto& key       = element.key;
+		const auto  resource  = IR::ImageHeapResource(
+		    {.dimension = key.dimension, .depth_compare = key.depth_view, .r128 = key.r128}, element.kind);
 		const auto generation = m_context.MappingGeneration();
 		auto&      cached     = m_dcc_prepared[index];
 		if (cached.generation != generation || cached.kind != element.kind || !(cached.key == element.key) ||

@@ -1370,7 +1370,7 @@ void TestSignedStorageSpecialization() {
           "signed raw storage view accepted a non-atomic read/write image");
     image.atomic = true;
     // Atomics on other element sizes bind the null image.
-    Check((RawSignedStorageFormat(image, format) != F::kInvalid) == (format == F::k32SInt) &&
+    Check(RawSignedStorageFormat(image, format) == F::kInvalid &&
               MaterializeResources(plan, runtime, snapshot, specialization) &&
               (snapshot.images[0].dwords[1] == data[0]) == (format == F::k32SInt),
           "signed storage conversion changed atomic format eligibility");

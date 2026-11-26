@@ -578,6 +578,11 @@ public:
 		m_info.address_bases.clear();
 		m_info.user_address_bases.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
+		m_address_writes = std::ranges::any_of(program.blocks, [](const Block* block) {
+			return std::ranges::any_of(*block, [](const Inst& inst) {
+				return AddressOpcodeInfoOf(inst.GetOpcode()).access == AddressAccess::Write;
+			});
+		});
 	}
 
 	void Run() {
@@ -606,6 +611,7 @@ public:
 		}
 		std::vector<std::pair<const IndirectDescriptorPlan*, Value>> buffer_selections;
 		for (const auto& plan: m_indirect_descriptors) {
+			const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 			auto key = plan.key;
 			if (plan.table_read != nullptr) {
 				const auto* anchor = plan.table_indexed ? plan.handle : plan.table_read;
@@ -631,7 +637,6 @@ public:
 					    {emit(ValueOpcode::ULessThan32, {read.Arg(1), table->Arg(2)}),
 					     emit(ValueOpcode::INotEqual32, {format, Value(0u)})});
 				} else {
-					const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 					const auto dynamic = emit(ValueOpcode::BitwiseAnd32, {read.Arg(1), Value(~3u)});
 					if (plan.handle->GetOpcode() == ValueOpcode::GetSamplerResource) {
 						// Scalar offsets keep one residue of their step, so a row is the quotient.
@@ -649,7 +654,7 @@ public:
 				}
 				key = emit(ValueOpcode::SelectU32, {valid, offset, Value(UINT32_MAX)});
 				if (!plan.table_indexed) {
-					// NativeDescriptorSource proved this read reaches the image. Preserve its
+					// NativeDescriptorSource proved this read reaches the handle. Preserve its
 					// SSA Phi edges while retaining descriptor DWORDs for other consumers.
 					std::map<const Inst*, Value> projected;
 					const auto project = [&](auto&& self, Value value) -> Value {
@@ -675,8 +680,7 @@ public:
 					plan.handle->SetArg(word, Value(0u));
 				continue;
 			}
-			if (m_sources[plan.source].indirect_descriptor->table_maximum &&
-			    plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
+			if (indirect.table_maximum && plan.handle->GetOpcode() != ValueOpcode::GetBufferResource) {
 				auto* block = plan.handle->Parent();
 				const auto where = std::ranges::find_if(block->Instructions(),
 				    [&](const Inst& inst) { return &inst == plan.handle; });
@@ -700,17 +704,11 @@ public:
 					auto* block = anchor->Parent();
 					const auto where = std::ranges::find_if(block->Instructions(),
 					    [&](const Inst& inst) { return &inst == anchor; });
-					const auto& indirect = *m_sources[plan.source].indirect_descriptor;
 					if (indirect.table_maximum) {
 						key = Value(&*block->PrependNewInst(
 						    where, ValueOpcode::ShiftLeftLogical32, {key, Value(2u)}));
 					} else if (indirect.table_scalar) {
-						// Wrapped affine offsets span one power-of-two congruence class.
-						// Keep the existing mapping's byte key while compressing its empty gaps.
-						key = plan.reads[0]->Arg(1);
-						const auto shift = std::countr_zero(indirect.table_stride) - 2u;
-						if (shift != 0u) key = Value(&*block->PrependNewInst(
-						    where, ValueOpcode::ShiftRightLogical32, {key, Value(shift)}));
+						key = ScalarTableKey(*block, where, *plan.reads[0], indirect.table_stride);
 					}
 					auto& selection = *block->PrependNewInst(where, ValueOpcode::GetBufferResourceIndex, {key});
 					selection.SetFlags(plan.handle->Flags<uint32_t>());
@@ -730,10 +728,6 @@ public:
 				for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
 					plan.handle->SetArg(dword, plan.key);
 				}
-			}
-			if (plan.reads[0] != nullptr && !plan.retain_reads) {
-				for (uint32_t word = 0; word < plan.read_dwords; ++word)
-					m_program.memory_info[plan.memory[word]].planning_only = true;
 			}
 		}
 		// Project descriptor-only SSA onto its key. Existing Phis preserve dominance;
@@ -1412,7 +1406,9 @@ private:
 			const auto value = base_reg != UINT32_MAX
 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
 			descriptor.dwords[i] = LowerDescriptorValue(value);
-			if (descriptor.dwords[i].Resolve().GetType() == Type::U32 &&
+			// Flat stores may reach any address, including the guarded descriptor words the
+			// host would read (as upstream f1cd5038 restricts to resource writes).
+			if (!m_address_writes && descriptor.dwords[i].Resolve().GetType() == Type::U32 &&
 			    !ValidateRuntimeValue(m_program, descriptor.dwords[i])) {
 				std::unordered_map<const Inst*, Value> values;
 				const auto correlated = LowerDescriptorValue(
@@ -2340,6 +2336,11 @@ private:
 			    width == 0u || width > 32u - selector.bit_offset) return nullptr;
 			selector.bit_mask = width == 32u ? UINT32_MAX : (1u << width) - 1u;
 			read = ActiveValue(read->Arg(0), active).TryInstruction();
+		} else if (read != nullptr && read->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			if (ImmediateU32(read->Arg(0), selector.bit_mask)) value = read->Arg(1);
+			else if (ImmediateU32(read->Arg(1), selector.bit_mask)) value = read->Arg(0);
+			else return nullptr;
+			read = ActiveValue(value, active).TryInstruction();
 		}
 		return read;
 	}
@@ -3783,13 +3784,6 @@ private:
 			if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
 				plan.retain_reads |= handle.GetOpcode() == ValueOpcode::GetSamplerResource ||
 				    (memory->kind == ResourceKind::ScalarAddress && !UsesOnlyImageDescriptors(*read));
-			} else if (std::ranges::any_of(read->Uses(), [&](const Use& use) {
-				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
-				       std::ranges::any_of(use.user->Uses(), [&](const Use& consumer) {
-					       return !IndirectBufferAccess(*consumer.user);
-				       });
-			    })) {
-				plan.retain_reads = true;
 			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
@@ -3945,9 +3939,7 @@ private:
 		const auto& access = *use.user;
 		if (use.operand != (sampler ? 1u : 0u) ||
 		    ImageOpcodeInfoOf(access.GetOpcode()).access == ImageAccess::None) return {};
-		if (sampler && (access.GetOpcode() != ValueOpcode::ImageSampleRaw ||
-		    (m_program.memory_info[access.Flags<MemoryFlags>().index].image_sample_flags &
-		     Decoder::ImageSampleFlagAdjust) != 0u)) return {};
+		if (sampler && access.GetOpcode() != ValueOpcode::ImageSampleRaw) return {};
 		const auto mask = access.Arg(access.NumArgs() - 1u);
 		return mask.GetType() == Type::U1 ? mask : Value {};
 	}
@@ -4102,6 +4094,11 @@ private:
 					return false;
 			}
 			if ((table_offset & 3u) != 0u) return false;
+		} else if (sampler && table_stride == 4u * sizeof(uint32_t) &&
+		           table_offset == 0u && table_immediate == 0u && !plan.split_offsets) {
+			// A packed S# table has one lookup per 16-byte row of the bounded V#.
+			indirect.table_scalar = true;
+			plan.table_read = plan.reads[0];
 		} else {
 			// Keep the GPU selector and descriptor reads, and preserve the proven scalar
 			// offset domain within the bounded image table.
@@ -4319,12 +4316,14 @@ private:
 			indirect.signed_count = bound->GetOpcode() == ValueOpcode::SLessThan32;
 			return finish();
 		}
+		DescriptorSource material_source;
 		if (table_source.dword_count == 4u && !plan.split_offsets &&
 		    plan.selection_anchor != nullptr && SetExactTableMaximum(key, indirect)) {
+			if (*indirect.table_maximum >= MaxIndirectDescriptorProbes)
+				MatchUniformizedMaterialKey(key, handle, indirect, material_source, MaterialKey::Heap);
 			indirect.table_scalar = true;
 			return finish();
 		}
-		DescriptorSource material_source;
 		if (!plan.split_offsets && MatchScalarMaterialKey(key, indirect, material_source, true)) {
 			plan.retain_reads = true;
 			return finish();
@@ -4347,6 +4346,11 @@ private:
 			// A bounded V# supplies every reachable descriptor without reading the GPU key.
 			// Separate U32 offsets could wrap each DWORD to a different table position.
 			if (table_source.dword_count != 4u || plan.split_offsets) return false;
+			// U32 multiplication can wrap into other fields of a non-power-of-two record.
+			if (!std::has_single_bit(table_stride) && std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+				    const auto& memory = m_program.memory_info[use.user->Flags<MemoryFlags>().index];
+				    return memory.SupportsIndirectBufferLoad(use.user->GetOpcode());
+			    })) return false;
 			indirect.table_scalar = true;
 			return finish();
 		}
@@ -4488,7 +4492,8 @@ private:
 		if (guard.IsEmpty() ? !HasActiveLane(lane.Arg(1), lane.Parent())
 		                    : !Implies(guard, lane.Arg(1))) return {};
 		auto result = FiniteSelectorDomain(lane.Arg(0), lane.Arg(1));
-		if (result.maximum == UINT32_MAX) result.maximum = PossibleU32Bits(lane.Arg(0));
+		if (result.maximum == UINT32_MAX)
+			result.maximum = PossibleU32Bits(ActiveValue(lane.Arg(0), lane.Arg(1)));
 		return result;
 	}
 
@@ -4784,13 +4789,12 @@ private:
 		return found == m_indirect_descriptors.end() ? nullptr : &*found;
 	}
 
-	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
-		                   [&](const IndirectDescriptorPlan& plan) {
-			return plan.reads[0] != nullptr && !plan.retain_reads &&
-			       std::find(plan.memory.begin(), plan.memory.begin() + plan.read_dwords, index) !=
-			           plan.memory.begin() + plan.read_dwords;
-		});
+	// Index the dense DWORD mapping with the wrapped SMEM byte offset.
+	static Value ScalarTableKey(Block& block, Block::iterator where, const Inst& read, uint32_t stride) {
+		const auto offset = read.Arg(1);
+		const auto shift = std::countr_zero(stride) - 2u;
+		if (shift == 0u) return offset;
+		return Value(&*block.PrependNewInst(where, ValueOpcode::ShiftRightLogical32, {offset, Value(shift)}));
 	}
 
 	void PlanIndirectDescriptors() {
@@ -4854,6 +4858,20 @@ private:
 				}
 				plan_handle(inst.Arg(0), IndirectBufferAccess(inst) ? 4u : 8u,
 				            memory.resource * 4u, false);
+			}
+		}
+		// Classify shared SMEM words after every resource handle has its final plan.
+		for (const auto& plan: m_indirect_descriptors) {
+			if (plan.reads[0] == nullptr || plan.retain_reads) continue;
+			for (uint32_t word = 0; word < plan.read_dwords; ++word) {
+				if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource &&
+				    std::ranges::any_of(plan.reads[word]->Uses(), [&](const Use& use) {
+					    if (use.user == plan.handle) return false;
+					    const auto* sibling = FindIndirectDescriptor(*use.user);
+					    return sibling == nullptr || sibling->retain_reads ||
+					           sibling->handle->GetOpcode() != ValueOpcode::GetBufferResource;
+				    })) continue;
+				m_program.memory_info[plan.memory[word]].planning_only = true;
 			}
 		}
 	}
@@ -5135,7 +5153,7 @@ private:
 			Fail(flags.pc, "memory operation has no resource handle");
 		}
 		const auto& memory = m_program.memory_info[flags.index];
-		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
+		if (memory.planning_only) {
 			return;
 		}
 		Inst*    handle   = nullptr;
@@ -5305,6 +5323,7 @@ private:
 	std::map<const Inst*, Value>              m_descriptor_values;
 	mutable std::unordered_map<const Inst*, bool>   m_loop_proofs; // By loop-bound comparison.
 	bool                                       m_shader_writes = false;
+	bool                                       m_address_writes = false;
 	std::optional<bool>                        m_writes_storage_or_address;
 	mutable std::unordered_map<const Block*, bool> m_in_cycle;
 	mutable std::unordered_map<const Block*, bool> m_outside_cycles;

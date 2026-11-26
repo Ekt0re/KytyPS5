@@ -509,13 +509,7 @@ PreparedTexture RenderExecutor::PrepareTexture(const ShaderRecompiler::IR::Image
 		image_layers = std::max(image_layers, 6u);
 	}
 	auto          view_base    = static_cast<uint32_t>(base_level);
-	auto pixel_format = surface_format.vk_format;
-	if (resource.depth_compare) {
-		if (const auto* depth_format = FindGuestDepthFormatPolicy(format);
-		    depth_format && depth_format->depth_attachment_format != vk::Format::eUndefined) {
-			pixel_format = depth_format->depth_attachment_format;
-		}
-	}
+	const auto pixel_format = SampledDepthCompareFormat(format, resource.depth_compare).value_or(surface_format.vk_format);
 	const auto view_format =
 	    storage ? StorageViewFormat(resource, format, pixel_format) : pixel_format;
 	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
@@ -752,13 +746,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
-			auto size = descriptor.GetSize();
-			if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
-			    !metadata.scalar) {
-				// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
-				// still needs its full payload when NumRecords is smaller than it.
-				size = std::max(size, uint64_t {metadata.max_byte_extent});
-			}
+			auto size = BufferBindingSize(metadata, descriptor);
 			if (address == 0 || size == 0) {
 				source = {};
 				continue;

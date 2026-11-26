@@ -97,7 +97,7 @@ private:
 	ResolveCache              m_resolve_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
-	PipelineCache             m_pipeline_cache;
+	PipelineCache             m_pipeline_cache; // Warm-up needs the image heap's descriptor layout.
 	OcclusionQueries          m_occlusion_queries;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;

@@ -246,11 +246,11 @@ inline constexpr uint32_t ImageAtomicLockWords = 4096u;
 
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
-	if (image.resource_class != ImageResourceClass::Storage || !image.written)
+	if (image.resource_class != ImageResourceClass::Storage || !image.written || image.read || image.atomic)
 		return Prospero::BufferFormat::kInvalid;
-	if (format == Prospero::BufferFormat::k32SInt && (image.atomic ? !image.atomic64 : !image.read))
+	if (format == Prospero::BufferFormat::k32SInt)
 		return Prospero::BufferFormat::k32UInt;
-	if (format == Prospero::BufferFormat::k16SInt && !image.read && !image.atomic)
+	if (format == Prospero::BufferFormat::k16SInt)
 		return Prospero::BufferFormat::k16UInt;
 	return Prospero::BufferFormat::kInvalid;
 }
