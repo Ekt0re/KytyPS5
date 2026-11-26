@@ -842,7 +842,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
-                                                         ImageId merged_id, bool exact_format) {
+                                                         ImageId merged_id, bool exact_format,
+                                                         bool single_view) {
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.registered) {
 		return {merged_id};
@@ -934,6 +935,24 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		if (requested.type != cached.info.type) {
 			return {merged_id};
+		}
+		// Guest shaders write BC images through uncompressed aliases with one texel per block.
+		// A storage view of the BC image needs storage usage, which RADV refuses for 3D images
+		// with 16-byte blocks, and Vulkan allows block views of one level and layer only. Other
+		// writes go to an image of the alias format; sampling it as BC copies it back.
+		if (binding == BindingType::Storage && !merged_id && cached.info.IsBlock() &&
+		    !requested.IsBlock() &&
+		    (!(cached.backing.usage & vk::ImageUsageFlagBits::eStorage) || !single_view) &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+			static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+			if (!logged.test_and_set(std::memory_order_relaxed)) {
+				LOGF("TextureCache: storage alias %s %ux%ux%u of %s image at 0x%016" PRIx64
+				     " writes a separate image\n",
+				     vk::to_string(requested.pixel_format).c_str(), requested.extent.width,
+				     requested.extent.height, requested.extent.depth,
+				     vk::to_string(cached.info.pixel_format).c_str(), requested.data.address);
+			}
+			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
@@ -1435,7 +1454,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			// only a new view replaces the view's mip and layer.
 			for (const auto candidate: candidates) {
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto overlap = ResolveOverlap(merged_info, desc.type, candidate, result, exact_format);
+				const auto overlap =
+				    ResolveOverlap(merged_info, desc.type, candidate, result, exact_format,
+				                   desc.view_info.level_count == 1 &&
+				                       desc.view_info.layer_count == 1);
 				if (overlap.image) {
 					result = overlap.image;
 				}

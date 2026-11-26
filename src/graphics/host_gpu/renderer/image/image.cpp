@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cstdint>
 #include <fmt/format.h>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -52,6 +53,18 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 	return static_cast<bool>(properties.optimalTilingFeatures & feature);
 }
 
+// vkCmdCopyImage measures the extent in source texels; between a block-compressed and an
+// uncompressed image one block corresponds to one texel, so clamp to the destination's blocks.
+[[nodiscard]] uint32_t CopyTexels(uint32_t source_texels, uint32_t source_block,
+                                  uint32_t destination_texels, uint32_t destination_block) {
+	if (source_block == destination_block) {
+		return std::min(source_texels, destination_texels);
+	}
+	const uint32_t destination_blocks =
+	    (destination_texels + destination_block - 1) / destination_block;
+	return std::min(source_texels, destination_blocks * source_block);
+}
+
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
 	auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (info.IsBlock()) {
@@ -64,12 +77,16 @@ ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::Imag
 			                                      nullptr) == vk::Result::eSuccess) {
 				usage = storage;
 			} else {
-				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-				if (!warned.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(fmt::format(
-					    "Warning: format {} does not support storage access; block-compressed "
-					    "textures written by the guest will not render.\n",
-					    vk::to_string(info.pixel_format)));
+				// RADV refuses EXTENDED_USAGE on 3D BC images with 16-byte blocks (BC2/3/5/6H/7),
+				// as its 3D layout of them cannot be rendered to. Storage bindings of their
+				// uncompressed block aliases then write a separate image (TextureCache::
+				// ResolveOverlap) that is copied into the BC image when it is next sampled.
+				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+				if (!logged.test_and_set(std::memory_order_relaxed)) {
+					LOGF("Image: %s %s images have no storage block views; guest writes go "
+					     "through a separate uncompressed image\n",
+					     vk::to_string(info.pixel_format).c_str(),
+					     vk::to_string(HostImageType(info.type)).c_str());
 				}
 			}
 		}
@@ -342,14 +359,18 @@ void Image::CopyImage(Image& source) {
 	}
 	const auto source_aspect      = DataAspect(source.backing.format);
 	const auto destination_aspect = DataAspect(backing.format);
+	const auto source_block       = vk::blockExtent(source.backing.format);
+	const auto destination_block  = vk::blockExtent(backing.format);
 	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
 	for (uint32_t level = 0; level < levels; level++) {
 		// Overlapping cache images can differ in size; copying the source extent into a smaller
 		// destination writes out of bounds and loses the device.
-		const auto width  = std::min(std::max(source.backing.extent.width >> level, 1u),
-		                             std::max(backing.extent.width >> level, 1u));
-		const auto height = std::min(std::max(source.backing.extent.height >> level, 1u),
-		                             std::max(backing.extent.height >> level, 1u));
+		const auto width  = CopyTexels(std::max(source.backing.extent.width >> level, 1u),
+		                               source_block[0], std::max(backing.extent.width >> level, 1u),
+		                               destination_block[0]);
+		const auto height = CopyTexels(std::max(source.backing.extent.height >> level, 1u),
+		                               source_block[1], std::max(backing.extent.height >> level, 1u),
+		                               destination_block[1]);
 		const auto depth  = std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 

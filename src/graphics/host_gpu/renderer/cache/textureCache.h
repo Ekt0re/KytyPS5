@@ -232,8 +232,10 @@ private:
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
+	// single_view: the binding views one level and one layer, as a block view of a BC image must.
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged, bool exact_format);
+	                                           ImageId cached, ImageId merged, bool exact_format,
+	                                           bool single_view);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
