@@ -125,6 +125,10 @@ bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
 }
 
+bool Output1080pEnabled() {
+	return g_config->output_1080p;
+}
+
 PssrUpscaler GetPssrUpscaler() {
 	return g_config->pssr_upscaler;
 }

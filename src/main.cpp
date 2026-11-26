@@ -57,6 +57,8 @@ static void PrintUsage() {
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --trinity                            Enable experimental PS5 Pro mode for\n"
 	         "                                       supported titles. Default: off.\n");
+	::printf("  --output-1080p                       Report a 1080p video output to games instead of 4K.\n"
+	         "                                       Default: off.\n");
 	::printf("  --pssr-upscaler <value>              With --trinity, upscale PSSR with Linear,\n"
 	         "                                       DLSS, or FSR. Default: Linear.\n");
 	::printf("  --dlss-folder <folder>               DLSS model folder.\n");
@@ -202,6 +204,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-splash", &ConfigOptions::splash_enabled, false},
     {"--vr", &ConfigOptions::vr_enabled},
     {"--trinity", &ConfigOptions::pro_enabled},
+    {"--output-1080p", &ConfigOptions::output_1080p},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},

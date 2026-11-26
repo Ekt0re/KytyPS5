@@ -32,6 +32,8 @@
 #include <span>
 #include <tuple>
 #include <utility>
+#include <vector>
+#include <fmt/format.h>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -210,6 +212,26 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return BindingType::Texture;
 }
 
+// KYTY_LOG_IMAGE_SIZES lists the first sizes of large 2D images the title creates, which show
+// the resolution it renders at (for example with --output-1080p).
+static void LogLargeImageExtent(const ImageInfo& info) {
+	static const bool enabled = std::getenv("KYTY_LOG_IMAGE_SIZES") != nullptr;
+	if (!enabled || info.extent.width < 960 || info.extent.depth != 1) {
+		return;
+	}
+	static std::mutex                                 mutex;
+	static std::vector<std::pair<uint32_t, uint32_t>> seen;
+	std::lock_guard lock(mutex);
+	const std::pair size {info.extent.width, info.extent.height};
+	if (seen.size() >= 64 || std::ranges::find(seen, size) != seen.end()) {
+		return;
+	}
+	seen.push_back(size);
+	Log::WriteToConsoleAndLog(fmt::format("Image size: {}x{} format={} levels={}\n", size.first,
+	                                      size.second, static_cast<int>(info.pixel_format),
+	                                      info.resources.levels));
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	while (info.pixel_format != vk::Format::eUndefined &&
@@ -224,6 +246,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 		id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	}
 	RegisterImage(id);
+	LogLargeImageExtent(info);
 	return id;
 }
 

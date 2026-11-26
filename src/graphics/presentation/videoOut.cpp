@@ -1362,6 +1362,9 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
+	Log::WriteToConsoleAndLog(fmt::format("VideoOut: {} buffers of {}x{} registered (set {})\n",
+	                                      buffer_num, attribute->width, attribute->height,
+	                                      set_index));
 	// The headset port takes reprojection buffers with a zeroed attribute. Each names its eye
 	// texture, which is registered and flipped like a regular surface.
 	const bool headset = ctx->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
@@ -1724,9 +1727,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute);
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
+	// Primary output reports 4K unless param.json Video-out Info enables resolution detection,
+	// or --output-1080p asks for 1080p: titles size their output buffers by it.
 	status->resolution =
-	    ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160 ? 1u : 2u);
+	    (Config::Output1080pEnabled() ||
+	             ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160)
+	         ? 1u
+	         : 2u);
 	status->dynamicRange = (attribute & 0x20000000) != 0 && driver.IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
@@ -1736,7 +1743,14 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[0] = 0;
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
+	const auto resolution = status->resolution;
 	ctx->mutex.Unlock();
+
+	static std::atomic_uint32_t reported {0};
+	if (reported.exchange(resolution, std::memory_order_relaxed) != resolution) {
+		Log::WriteToConsoleAndLog(fmt::format("VideoOut: output status reports {}\n",
+		                                      resolution == 1u ? "1080p" : "4K"));
+	}
 
 	return OK;
 }
