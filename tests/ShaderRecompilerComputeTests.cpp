@@ -85,6 +85,7 @@
 #endif
 
 #include <algorithm>
+#include <csetjmp>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -1181,10 +1182,14 @@ std::string Hex(u32 value) {
   return buffer;
 }
 
+// --cases-only with SHADER_TESTS_CONTINUE=1: a failing case returns here and the next runs.
+std::jmp_buf *g_case_recover = nullptr;
+
 [[noreturn]] void Fail(const char *shader_name, const char *stage,
                        const std::string &message) {
   std::fprintf(stderr, "ShaderRecompilerComputeTests: %s failed at %s: %s\n",
                shader_name, stage, message.c_str());
+  if (g_case_recover != nullptr) std::longjmp(*g_case_recover, 1);
   std::abort();
 }
 
@@ -33639,6 +33644,49 @@ TestCase Vop1MoveRelFirstLaneIndex(bool restore_lane_zero) {
   return test;
 }
 
+// The masked multiply's lanes are the waterfall loop's: lane 1 alone computes its index (3, from
+// two extracted bits), lane 0 keeps the old index 40 outside them. The loop reads only lane 1, so
+// the relative chains fold to v12..v21 although the register merges lane 0's 40 (GTA VI compute
+// 0x21214b48a86d7fd2 has this shape; KYTY_MOVREL_LANE_BOUNDS=0 keeps every candidate).
+TestCase Vop1MoveRelMaskedLanesIndex() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "Vop1MoveRelMaskedLanesIndex";
+  test.compute_info.wave_size = test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.initial = {12, 4, 0, 0, 0, 0, 0, 0, 0};
+  auto &code = test.code;
+  for (u32 reg = 12; reg < 155; ++reg) AppendVMovU32(&code, reg, reg);
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 1, 2);
+  AppendVMovU32(&code, 155, 40);
+  AppendVMovU32(&code, 4, 99);
+  AppendVop3(&code, 0x148, 2, Vgpr(1), InlineU32(2), InlineU32(2));
+  // EXEC = the lanes where v0 == 1 (lane 1); the multiply and the loop run under it.
+  code.push_back(EncodeVopc(0xd2, InlineU32(1), 0));
+  code.push_back(EncodeVop2(0x0b, 155, InlineU32(3), 2));
+  code.push_back(EncodeSop1(0x04, 6, 126));
+  const auto loop = code.size();
+  code.insert(code.end(), {EncodeVop1(0x02, 8, Vgpr(155)), EncodeVopc(0xd2, 8, 155),
+      EncodeSMovB32(124, 8), EncodeVop1(0x43, 4, Vgpr(12)),
+      EncodeVop1(0x42, 12, InlineU32(55)), EncodeSop2(0x15, 6, 6, 126),
+      EncodeSop1(0x04, 126, 6)});
+  code.push_back(EncodeSopp(0x05, static_cast<int16_t>(loop - code.size() - 1u)));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(7)));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 52, 0, 3);
+  AppendStoreVgprAtLaneDwordOffset(&code, 15, 0, 6);
+  AppendEnd(&code);
+  // v4: lane 1 read v15; v52 (lane 0's old index) untouched; lane 1 wrote 55 to v15.
+  test.expected = {99, 15, 99, 52, 52, 52, 15, 55, 15};
+  test.max_spirv_words = 2600;
+  test.opcodes = {O::V_BFE_U32, O::V_MUL_U32_U24, O::V_READFIRSTLANE_B32,
+                  O::V_MOVRELS_B32, O::V_MOVRELD_B32};
+  return test;
+}
+
 TestCase Vop1MoveRelDestination() {
   using O = ShaderOpcode;
 
@@ -51690,6 +51738,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelSourceRuntimeIndex);
   for (bool restore : {false, true}) cases.push_back(Vop1MoveRelFirstLaneIndex(restore));
+  cases.push_back(Vop1MoveRelMaskedLanesIndex());
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
@@ -60258,6 +60307,29 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
+  // The compute and graphics case lists alone, without the device and store checks after them.
+  if (argc == 2 && std::strcmp(argv[1], "--cases-only") == 0) {
+    VulkanHarness vulkan;
+    const bool    keep_going = std::getenv("SHADER_TESTS_CONTINUE") != nullptr;
+    size_t        failed     = 0;
+    const auto    run        = [&](const char *name, auto &&body) {
+      std::jmp_buf recover;
+      if (keep_going) g_case_recover = &recover;
+      if (setjmp(recover) == 0) {
+        body();
+      } else {
+        failed++;
+        std::fprintf(stderr, "CASE FAILED: %s\n", name);
+      }
+      g_case_recover = nullptr;
+    };
+    for (const auto &test : MakeCases()) run(test.name, [&] { RunCase(&vulkan, test); });
+    for (const auto &test : MakeGraphicsCases()) {
+      run(test.name, [&] { RunGraphicsCase(&vulkan, test); });
+    }
+    std::fprintf(stderr, "cases-only: %zu failed\n", failed);
+    return failed != 0 ? 1 : 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : MakeCases()) {
@@ -60722,6 +60794,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
     VulkanHarness vulkan;
     for (bool restore : {false, true}) RunCase(&vulkan, Vop1MoveRelFirstLaneIndex(restore));
+    RunCase(&vulkan, Vop1MoveRelMaskedLanesIndex());
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }

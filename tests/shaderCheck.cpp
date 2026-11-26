@@ -1,6 +1,7 @@
 // Offline descriptor-tracking check for one dumped shader (.cap or .reg). Exits 0 on success; a
 // translation failure exits through EXIT with its message.
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
@@ -174,7 +175,73 @@ int main(int argc, char** argv) {
 		std::puts("SKIP calls");
 		return 3;
 	}
-	const auto result = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	auto result = ShaderRecompiler::TranslateProgram(source.decoded, options);
+	// SHADER_CHECK_SPIRV=<file.spv>: also emit SPIR-V (an NVIDIA-like profile, no resource
+	// specialization), write it there, and print its size and most frequent opcodes (which
+	// constructs make the largest modules).
+	if (const char* spv_path = std::getenv("SHADER_CHECK_SPIRV"); spv_path != nullptr) {
+		ShaderRecompiler::Spirv::Profile profile {};
+		profile.robust_buffer_access = true;
+		profile.ray_query            = true;
+		options.profile              = &profile;
+		// The variant's own specialization from its recipe record (<capsule>.variant, written by
+		// tools/shader/recipe_capsule.py); without one, default (unbound) entries.
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		ShaderRecompiler::IR::PushData::Window      window;
+		bool                                         from_recipe = false;
+		if (auto* in = std::fopen((std::string(argv[1]) + ".variant").c_str(), "rb"); in != nullptr) {
+			std::vector<uint8_t> raw;
+			for (int c; (c = std::fgetc(in)) != EOF;) raw.push_back(static_cast<uint8_t>(c));
+			std::fclose(in);
+			ShaderRecompiler::IR::Reader reader {raw};
+			uint8_t               type = 0;
+			ShaderType            stage {};
+			uint64_t              hash = 0, id = 0;
+			uint32_t              user_data_count = 0, wave = 0, base = 0;
+			std::vector<uint32_t> static_state, user_data;
+			std::vector<uint8_t>  input_bytes;
+			ShaderRecompiler::IR::IoAll(reader, type, stage, hash, user_data_count, static_state,
+			                            wave, base, user_data, window.begin, window.end,
+			                            specialization, id, input_bytes);
+			from_recipe = reader.ok && reader.bytes.empty() && type == 1u;
+			if (!from_recipe) {
+				specialization = {};
+				window         = {};
+			}
+		}
+		if (!from_recipe) {
+			specialization.buffers.resize(result.program.info.buffers.size());
+			specialization.images.resize(result.program.info.images.size());
+			specialization.samplers.resize(result.program.info.samplers.size());
+		}
+		std::printf("specialization: %s\n", from_recipe ? "from the recipe" : "default");
+		const auto compiled = ShaderRecompiler::CompileProgram(std::move(result), options,
+		                                                       specialization, window);
+		const auto& spirv = compiled.spirv;
+		if (auto* out = std::fopen(spv_path, "wb"); out != nullptr) {
+			std::fwrite(spirv.data(), 4, spirv.size(), out);
+			std::fclose(out);
+		}
+		std::vector<std::pair<uint64_t, uint32_t>> words_by_op(65536);
+		for (uint32_t op = 0; op < 65536; op++) words_by_op[op].second = op;
+		uint64_t instructions = 0;
+		for (size_t at = 5; at < spirv.size();) {
+			const auto length = spirv[at] >> 16u;
+			if (length == 0) break;
+			words_by_op[spirv[at] & 0xffffu].first += length;
+			instructions++;
+			at += length;
+		}
+		std::sort(words_by_op.begin(), words_by_op.end(), std::greater<>());
+		std::printf("SPIRV words=%zu instructions=%llu code_words=%zu\n", spirv.size(),
+		            static_cast<unsigned long long>(instructions), code.size());
+		for (size_t i = 0; i < 16 && words_by_op[i].first != 0; i++) {
+			std::printf("  op %u: %llu words (%.1f%%)\n", words_by_op[i].second,
+			            static_cast<unsigned long long>(words_by_op[i].first),
+			            100.0 * static_cast<double>(words_by_op[i].first) /
+			                static_cast<double>(spirv.size()));
+		}
+	}
 	std::puts("OK");
 	std::fflush(nullptr);
 	std::_Exit(0);
