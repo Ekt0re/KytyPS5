@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <memory>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -82,6 +83,21 @@ enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+// ValidateRuntimeValue for many values of one unchanged program: the proofs of shared
+// subexpressions are kept between calls instead of being rebuilt for every value.
+class RuntimeValueValidator {
+public:
+	explicit RuntimeValueValidator(const ResourcePlan& program);
+	~RuntimeValueValidator();
+	RuntimeValueValidator(const RuntimeValueValidator&)            = delete;
+	RuntimeValueValidator& operator=(const RuntimeValueValidator&) = delete;
+
+	bool Validate(Value value, RuntimeValueType type = RuntimeValueType::Any);
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> m_impl;
+};
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);

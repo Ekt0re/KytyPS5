@@ -1518,6 +1518,25 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	return RuntimeValidator(program, type).Run(value);
 }
 
+// Each Run starts from the same context (uniform, no EXEC mask), so the proofs one Run caches hold
+// for the next.
+struct RuntimeValueValidator::Impl {
+	explicit Impl(const ResourcePlan& program)
+	    : validators {RuntimeValidator(program, RuntimeValueType::Any),
+	                  RuntimeValidator(program, RuntimeValueType::Integer),
+	                  RuntimeValidator(program, RuntimeValueType::ImmutableInteger)} {}
+	std::array<RuntimeValidator, 3> validators;
+};
+
+RuntimeValueValidator::RuntimeValueValidator(const ResourcePlan& program)
+    : m_impl(std::make_unique<Impl>(program)) {}
+
+RuntimeValueValidator::~RuntimeValueValidator() = default;
+
+bool RuntimeValueValidator::Validate(Value value, RuntimeValueType type) {
+	return m_impl->validators[static_cast<size_t>(type)].Run(value);
+}
+
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
 }
