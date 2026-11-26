@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/cache/resolveStamp.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
@@ -153,6 +154,9 @@ private:
 		uint32_t        kind       = 0;
 		uint64_t        generation = 0;
 		PreparedTexture prepared;
+		// The last lookup's stamp: while ResolveCache::Reuse holds, the lookup finds the same
+		// image again and has nothing new to clear.
+		ResolveStamp stamp;
 	};
 	std::unordered_map<uint32_t, DccPrepared>         m_dcc_prepared;
 	// Per element, the (view id, slot word) pairs that selected it, so Repoint visits only the

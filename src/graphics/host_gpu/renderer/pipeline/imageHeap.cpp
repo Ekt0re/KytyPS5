@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
+#include "graphics/host_gpu/renderer/resolveCache.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -584,7 +585,10 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		return true;
 	};
 	// Discovery applies the color metadata clears written since the last draw. The preparation
-	// of an unchanged descriptor is kept; the texture lookup (and so the clear) runs every draw.
+	// of an unchanged descriptor is kept, and the texture lookup (and so the clear) is skipped
+	// while the resolve cache vouches for its last result: same image set, and for color metadata
+	// the same draw window and scheduler tick, as for the textures draws bind directly.
+	auto&      resolve_cache = m_context.GetResolveCache();
 	const auto retry_dcc = [&](uint32_t index) {
 		const auto& element = m_elements[index];
 		if (element.state != State::Live) {
@@ -598,8 +602,11 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		    cached.generation == 0u) {
 			cached = {element.key, element.kind, generation,
 			          executor.PrepareTexture(resource, element.key.value)};
+		} else if (element.image && resolve_cache.Reuse(element.image, cached.stamp)) {
+			return false;
 		}
 		const auto binding = executor.FinishTexture(resource, cached.prepared);
+		cached.stamp       = binding.desc.stamp;
 		if (binding.image_id == element.image &&
 		    (!element.image || textures.m_slot_images[element.image].serial == element.serial)) {
 			const bool leaves = !element.image && binding.desc.info.data.Empty();
