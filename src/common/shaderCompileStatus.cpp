@@ -32,7 +32,7 @@ void Monitor(const std::stop_token& stop) {
 	Clock::time_point           last_busy {};
 	Clock::time_point           last_print {};
 	uint64_t                    burst_start_done = 0;
-	uint64_t                    idle_done        = 0;
+	uint64_t                    last_done        = 0;
 	Counts                      shown {};
 	std::unique_lock            lock(mutex);
 	while (!stop.stop_requested()) {
@@ -42,18 +42,19 @@ void Monitor(const std::stop_token& stop) {
 		}
 		const auto now    = Clock::now();
 		const auto counts = Read();
-		const bool busy   = counts.queued + counts.active > 0;
+		// Work that started and ended between two ticks counts too.
+		const bool running = counts.queued + counts.active > 0;
+		const bool busy    = running || counts.done != last_done;
 		if (busy) {
 			last_busy = now;
 			if (!in_burst) {
 				in_burst         = true;
 				burst_start      = now - TICK / 2;
-				burst_start_done = idle_done;
+				burst_start_done = last_done;
 				last_print       = {};
 			}
-		} else if (!in_burst) {
-			idle_done = counts.done;
 		}
+		last_done = counts.done;
 		if (in_burst && busy && now - last_print >= PRINT_INTERVAL) {
 			last_print = now;
 			std::printf("[shaders] compiling: %llu queued, %llu active, %llu done\n",
@@ -64,9 +65,8 @@ void Monitor(const std::stop_token& stop) {
 		}
 		bool visible = in_burst;
 		if (in_burst && !busy && now - last_busy >= HOLD) {
-			in_burst  = false;
-			visible   = false;
-			idle_done = counts.done;
+			in_burst = false;
+			visible  = false;
 			std::printf("[shaders] burst done: %llu shaders in %.1f s\n",
 			            static_cast<unsigned long long>(counts.done - burst_start_done),
 			            std::chrono::duration<double>(last_busy - burst_start).count());

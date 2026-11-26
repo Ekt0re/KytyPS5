@@ -991,7 +991,8 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	if (Common::ShaderCompileStatus::BannerVisible()) {
 		const auto counts = Common::ShaderCompileStatus::Read();
 		if (counts.queued + counts.active > 0) {
-			text += fmt::format(" | COMPILING SHADERS ({} queued)", counts.queued);
+			text += fmt::format(" | COMPILING SHADERS ({} queued, {} active)", counts.queued,
+			                    counts.active);
 		}
 	}
 
