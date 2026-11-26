@@ -926,7 +926,9 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex, i);
-		executor.DrawIndex(CurrentBuffer(), {.index_count = std::min(args.indexCount, max_indices),
+		// INDEX_BUFFER_SIZE counts indices from the start of the buffer, not from the first index.
+		const uint32_t available = args.firstIndex < max_indices ? max_indices - args.firstIndex : 0u;
+		executor.DrawIndex(CurrentBuffer(), {.index_count = std::min(args.indexCount, available),
 		                                     .index_addr  = IndexAddress(args.firstIndex),
 		                                     .instance_count      = args.instanceCount,
 		                                     .index_type_and_size = m_index_type_and_size,

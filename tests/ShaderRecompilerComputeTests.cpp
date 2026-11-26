@@ -23610,6 +23610,9 @@ public:
                     "the mesh draw did not launch its expected subgroups");
           }
         };
+        // AMD hosts take the command processor's CPU-record path for mesh draws (no task shader).
+        const bool cpu_records =
+            context.GetGraphics().physical_device_properties.vendorID == 0x1002u;
         const auto check = [&](const char *step, bool indexed, u32 first, u32 count,
                                ShaderIndirectOffsets offsets, u32 index_buffer_size = 9,
                                bool covered = true) {
@@ -23617,6 +23620,54 @@ public:
               {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
           const DrawIndirectArgs records{mesh_args_address + first * stride, count, stride,
                                          offsets};
+          if (cpu_records) {
+            // The executor declines GPU records here; the command processor reads them and draws
+            // each one directly after patching the bases into the user SGPRs (graphicsRun.cpp).
+            Require("GpuMeshIndirectDraw", step,
+                    !(indexed ? RenderExecutorTestAccess::DrawIndex(
+                                    executor, scheduler.Current(),
+                                    {.index_count = index_buffer_size,
+                                     .index_addr = reinterpret_cast<const void *>(mesh_indices_address),
+                                     .index_type_and_size = 1, .indirect = records})
+                              : RenderExecutorTestAccess::DrawAuto(executor, scheduler.Current(),
+                                                                   {.indirect = records})),
+                    "the host without usable task shaders drew GPU mesh records");
+            bool drawn = true;
+            for (u32 record = first; record < first + count; record++) {
+              const bool record_indexed = record < 4u;
+              const u32 vertex = record_indexed
+                                     ? static_cast<u32>(indexed_records[record].vertexOffset)
+                                     : auto_records[record - 4u].firstVertex;
+              const u32 instance = record_indexed ? indexed_records[record].firstInstance
+                                                  : auto_records[record - 4u].firstInstance;
+              if (offsets.vertex != ShaderIndirectOffsets::None)
+                shaders.SetGsUserSgpr(offsets.vertex, vertex);
+              if (offsets.instance != ShaderIndirectOffsets::None)
+                shaders.SetGsUserSgpr(offsets.instance, instance);
+              if (record_indexed) {
+                const auto &args = indexed_records[record];
+                const u32 available =
+                    args.firstIndex < index_buffer_size ? index_buffer_size - args.firstIndex : 0u;
+                drawn &= RenderExecutorTestAccess::DrawIndex(
+                    executor, scheduler.Current(),
+                    {.index_count = std::min(args.indexCount, available),
+                     .index_addr = reinterpret_cast<const void *>(mesh_indices_address +
+                                                                   args.firstIndex * 4u),
+                     .instance_count = args.instanceCount, .index_type_and_size = 1,
+                     .base_vertex = args.vertexOffset, .first_instance = args.firstInstance,
+                     .offset_source = DrawOffsetSource::IndirectArgs});
+              } else {
+                const auto &args = auto_records[record - 4u];
+                drawn &= RenderExecutorTestAccess::DrawAuto(
+                    executor, scheduler.Current(),
+                    {.vertex_count = args.vertexCount, .instance_count = args.instanceCount,
+                     .first_vertex = args.firstVertex, .first_instance = args.firstInstance,
+                     .offset_source = DrawOffsetSource::IndirectArgs});
+              }
+            }
+            read_covered(step, drawn, covered);
+            return;
+          }
           read_covered(step, indexed
               ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
                     {.index_count = index_buffer_size,
@@ -31685,7 +31736,9 @@ TestCase VectorAddcWritesPerLaneCarryOut() {
                   O::S_ENDPGM};
   test.decoded_counts = {
       {"V_ADDC_U32 v2, vcc_lo, 0, v26.sdwa(sel=4,sext=1), vcc_lo", 1}};
-  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 3}};
+  // One compare per carry: (a + b) < a and (sum + carry-in) < sum. The always-true V_CMP_T
+  // carry-in folds to a constant and needs no compare of its own.
+  test.ir_counts = {{" = BitFieldSExtract ", 1}, {" = ULessThan32 ", 2}};
   test.required_spirv = {"OpBitFieldSExtract"};
   test.compute_info.threads_num[0] = 4;
   test.compute_info.threads_num[1] = 1;
