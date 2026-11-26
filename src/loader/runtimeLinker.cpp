@@ -733,6 +733,8 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 	}
 	r += "modules (base / size / name; * holds pc):\n";
 	Common::Singleton<RuntimeLinker>::Instance()->DescribeModules(info->exception_address, r);
+	// Which call each guest thread waits in: a watchdog abort or hang shows what stalled.
+	r += Libs::LibKernel::DumpGuestThreads();
 	std::fwrite(r.data(), 1, r.size(), stdout);
 	std::fflush(stdout);
 

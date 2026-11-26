@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "kernel/pthread.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -281,6 +282,7 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	const GuestWaitScope wait("sceKernelWaitSema", reinterpret_cast<uint64_t>(sem), need);
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;

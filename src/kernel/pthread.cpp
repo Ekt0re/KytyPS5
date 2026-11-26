@@ -429,6 +429,11 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	// GuestWaitScope
+	std::atomic<const char*> wait_call {nullptr};
+	std::atomic<uint64_t>    wait_object {0};
+	std::atomic<int64_t>     wait_value {0};
+	std::atomic<uint64_t>    wait_since {0};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -540,6 +545,7 @@ static void SchedulerBackoffOnce() {
 // A guest signal queued as a special user APC runs only when the sleep returns. The sleep lasts
 // until that much guest time has passed, so it does not end while the guest clock is held.
 static void SleepNanoInSlices(uint64_t nanoseconds) {
+	const GuestWaitScope wait_scope("sleep", 0, static_cast<int64_t>(nanoseconds));
 	constexpr uint64_t slice_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
 	const auto         start       = Common::CompilePause::GuestNowNs();
 	for (uint64_t slept = 0; slept < nanoseconds;
@@ -597,6 +603,12 @@ public:
 	void    Retire(Pthread thread);
 
 	void FreeDetachedThreads();
+
+	template <typename Function>
+	void ForEach(Function&& function) {
+		Common::LockGuard lock(m_mutex);
+		for (auto* thread: m_threads) function(thread);
+	}
 
 private:
 	std::vector<Pthread> m_threads;
@@ -1757,6 +1769,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	const GuestWaitScope wait_scope("PthreadMutexLock", reinterpret_cast<uint64_t>(mutex), static_cast<int64_t>(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -1811,6 +1824,7 @@ int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec) {
+	const GuestWaitScope wait_scope("PthreadMutexTimedlock", reinterpret_cast<uint64_t>(mutex), static_cast<int64_t>(usec));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2847,6 +2861,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	const GuestWaitScope wait_scope("PthreadCondTimedwait", reinterpret_cast<uint64_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2925,6 +2940,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	const GuestWaitScope wait_scope("PthreadCondTimedwaitAbs", reinterpret_cast<uint64_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3000,6 +3016,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	const GuestWaitScope wait_scope("PthreadCondWait", reinterpret_cast<uint64_t>(cond), static_cast<int64_t>(0));
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3059,6 +3076,51 @@ Pthread KYTY_SYSV_ABI PthreadSelf() {
 	EXIT_NOT_IMPLEMENTED(g_pthread_self == nullptr);
 
 	return g_pthread_self;
+}
+
+GuestWaitScope::GuestWaitScope(const char* call, uint64_t object, int64_t value) noexcept {
+	auto* self = g_pthread_self;
+	m_call     = self != nullptr ? self->wait_call.load(std::memory_order_relaxed) : nullptr;
+	m_object   = self != nullptr ? self->wait_object.load(std::memory_order_relaxed) : 0;
+	m_value    = self != nullptr ? self->wait_value.load(std::memory_order_relaxed) : 0;
+	m_since    = self != nullptr ? self->wait_since.load(std::memory_order_relaxed) : 0;
+	if (self == nullptr) return;
+	self->wait_object.store(object, std::memory_order_relaxed);
+	self->wait_value.store(value, std::memory_order_relaxed);
+	self->wait_since.store(Common::SteadyNs(), std::memory_order_relaxed);
+	self->wait_call.store(call, std::memory_order_release);
+}
+
+GuestWaitScope::~GuestWaitScope() {
+	auto* self = g_pthread_self;
+	if (self == nullptr) return;
+	self->wait_object.store(m_object, std::memory_order_relaxed);
+	self->wait_value.store(m_value, std::memory_order_relaxed);
+	self->wait_since.store(m_since, std::memory_order_relaxed);
+	self->wait_call.store(m_call, std::memory_order_release);
+}
+
+std::string DumpGuestThreads() {
+	std::string out = "--- Guest threads ---\n";
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) return out;
+	const auto now = Common::SteadyNs();
+	g_pthread_context->GetPthreadPool()->ForEach([&](Pthread thread) {
+		if (thread->state.load(std::memory_order_acquire) != PthreadState::Running) return;
+		const char* call = thread->wait_call.load(std::memory_order_acquire);
+		out += fmt::format("  [{}] {:<32} host={}", thread->unique_id, thread->name,
+		                   thread->host_thread_id);
+		if (call != nullptr) {
+			const auto since = thread->wait_since.load(std::memory_order_relaxed);
+			out += fmt::format(" waits in {} object=0x{:x} value={} for {:.1f} s", call,
+			                   thread->wait_object.load(std::memory_order_relaxed),
+			                   thread->wait_value.load(std::memory_order_relaxed),
+			                   since != 0 && now > since ? static_cast<double>(now - since) / 1e9 : 0.0);
+		} else {
+			out += " running";
+		}
+		out += "\n";
+	});
+	return out;
 }
 
 Pthread PthreadSelfOrNull() {
@@ -3340,6 +3402,7 @@ int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 }
 
 int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
+	const GuestWaitScope wait_scope("PthreadJoin", reinterpret_cast<uint64_t>(thread), static_cast<int64_t>(0));
 	PRINT_NAME();
 
 	if (thread == nullptr) {
