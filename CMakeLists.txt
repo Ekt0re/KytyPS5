@@ -751,6 +751,9 @@ target_link_libraries(kernel_thread_tests kyty_test_gtest)
 add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
 target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
 
+add_kyty_full_emulator_test(kernel_semaphore_tests "${KYTY_TESTS_DIR}/KernelSemaphoreTests.cpp")
+target_link_libraries(kernel_semaphore_tests kyty_test_gtest)
+
 add_kyty_full_emulator_test(video_dec2_tests "${KYTY_TESTS_DIR}/VideoDec2Tests.cpp")
 target_link_libraries(video_dec2_tests kyty_test_gtest)
 
