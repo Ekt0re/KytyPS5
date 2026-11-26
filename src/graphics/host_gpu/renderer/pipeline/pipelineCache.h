@@ -243,6 +243,8 @@ public:
 	                              const DrawTargets& targets, bool wait = true);
 	// Takes a finished compile, or with `wait` the running one.
 	static Pipeline& Resolve(Pipeline& pipeline, bool wait);
+	// Waits for a pipeline being built on a worker; the guest clock stands still while it waits.
+	static vk::Pipeline WaitForPipeline(const std::shared_future<vk::Pipeline>& compiling);
 	// Without `wait` the pipeline may still be compiling.
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info, bool wait = true);
 

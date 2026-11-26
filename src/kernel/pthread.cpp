@@ -177,12 +177,21 @@ uint64_t KernelGuestTscMultiplier() {
 	return multiplier;
 }
 
+// The host TSC on the guest clock: it stands still while a GPU queue waits for a compile.
+static uint64_t KernelHeldHostTsc() {
+#if defined(_M_X64) || defined(__x86_64__)
+	return Common::CompilePause::GuestTicks();
+#else
+	return Common::CompilePause::GuestNowNs();
+#endif
+}
+
 static uint64_t KernelReadTscNative() {
 	if (!Config::GuestTscEnabled()) {
-		return KernelHostTsc();
+		return KernelHeldHostTsc();
 	}
 	return static_cast<uint64_t>(
-	    (static_cast<unsigned __int128>(KernelHostTsc()) * KernelGuestTscMultiplier()) >> 32u);
+	    (static_cast<unsigned __int128>(KernelHeldHostTsc()) * KernelGuestTscMultiplier()) >> 32u);
 }
 
 static uint64_t KernelGetTscFrequencyNative() {
@@ -285,7 +294,7 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
 		case KERNEL_CLOCK_EXT_AD_NETWORK:
 		case KERNEL_CLOCK_EXT_RAW_NETWORK: {
-			const auto ns = Common::SteadyNs();
+			const auto ns = Common::CompilePause::GuestNowNs();
 			tp->tv_sec    = static_cast<int64_t>(ns / NANOS_PER_SEC);
 			tp->tv_nsec   = static_cast<int64_t>(ns % NANOS_PER_SEC);
 			return true;
@@ -328,7 +337,25 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 		return true;
 	}
 
-	return false;
+	switch (clock_id) {
+		case KERNEL_CLOCK_MONOTONIC:
+		case KERNEL_CLOCK_UPTIME:
+		case KERNEL_CLOCK_UPTIME_PRECISE:
+		case KERNEL_CLOCK_UPTIME_FAST:
+		case KERNEL_CLOCK_MONOTONIC_PRECISE:
+		case KERNEL_CLOCK_MONOTONIC_FAST:
+		case KERNEL_CLOCK_EXT_NETWORK:
+		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
+		case KERNEL_CLOCK_EXT_AD_NETWORK:
+		case KERNEL_CLOCK_EXT_RAW_NETWORK: {
+			// CLOCK_MONOTONIC (steady_clock) on the guest clock.
+			const auto ns = Common::CompilePause::GuestNowNs();
+			tp->tv_sec    = static_cast<int64_t>(ns / NANOS_PER_SEC);
+			tp->tv_nsec   = static_cast<int64_t>(ns % NANOS_PER_SEC);
+			return true;
+		}
+		default: return false;
+	}
 }
 #endif
 
@@ -510,14 +537,15 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
-// A guest signal queued as a special user APC runs only when the sleep returns.
+// A guest signal queued as a special user APC runs only when the sleep returns. The sleep lasts
+// until that much guest time has passed, so it does not end while the guest clock is held.
 static void SleepNanoInSlices(uint64_t nanoseconds) {
 	constexpr uint64_t slice_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
-	const auto         start       = Common::SteadyNs();
-	for (uint64_t slept = 0; slept < nanoseconds; slept = Common::SteadyNs() - start) {
+	const auto         start       = Common::CompilePause::GuestNowNs();
+	for (uint64_t slept = 0; slept < nanoseconds;
+	     slept = Common::CompilePause::GuestNowNs() - start) {
 		Common::Thread::SleepNano(std::min(nanoseconds - slept, slice_nanos));
 	}
-	if (nanoseconds >= 500000000ull) Common::CompilePause::HoldWhileCompiling();
 }
 
 struct PthreadStaticObject {

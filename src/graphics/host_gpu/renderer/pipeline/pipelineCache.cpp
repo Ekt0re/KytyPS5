@@ -705,10 +705,18 @@ void PipelineCache::MarkProgramsKnown() {
 	}
 }
 
+vk::Pipeline PipelineCache::WaitForPipeline(const std::shared_future<vk::Pipeline>& compiling) {
+	if (compiling.wait_for(std::chrono::seconds {0}) != std::future_status::ready) {
+		const Common::CompilePause::Scope compile_pause;
+		compiling.wait();
+	}
+	return compiling.get();
+}
+
 PipelineCache::Pipeline& PipelineCache::Resolve(Pipeline& pipeline, bool wait) {
 	if (pipeline.compiling.valid() &&
 	    (wait || pipeline.compiling.wait_for(std::chrono::seconds {0}) == std::future_status::ready)) {
-		pipeline.pipeline  = pipeline.compiling.get();
+		pipeline.pipeline  = WaitForPipeline(pipeline.compiling);
 		pipeline.compiling = {};
 	}
 	return pipeline;
@@ -725,7 +733,10 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_translators(TranslatorThreads()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
-	WarmUp(shader_store);
+	{
+		const Common::CompilePause::Scope compile_pause;
+		WarmUp(shader_store);
+	}
 	MarkProgramsKnown();
 }
 

@@ -1,4 +1,3 @@
-#include "common/compilePause.h"
 #include "common/shaderCompileStatus.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -502,7 +501,6 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	pipeline_info.layout              = layout;
 
 	vk::Pipeline pipeline;
-	Common::CompilePause::Scope compile_pause;
 	Common::ShaderCompileStatus::Work compile_work;
 	const auto   result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
 	                                                            nullptr, &pipeline);
@@ -539,7 +537,6 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	info.layout = layout;
 
 	vk::Pipeline pipeline;
-	Common::CompilePause::Scope compile_pause;
 	Common::ShaderCompileStatus::Work compile_work;
 	const auto   result =
 	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline);

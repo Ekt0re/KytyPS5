@@ -1251,7 +1251,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	} else {
 		m_context.GetCommandScheduler().Split(
 		    [record, compiling = pipeline.compiling](vk::CommandBuffer command) {
-			    record(command, compiling.get());
+			    record(command, PipelineCache::WaitForPipeline(compiling));
 			    command.endRendering();
 		    });
 		vk_buffer = buffer.Handle();
