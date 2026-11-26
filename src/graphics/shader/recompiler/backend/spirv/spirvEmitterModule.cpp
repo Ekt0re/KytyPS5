@@ -296,6 +296,13 @@ void DefineDescriptors(EmitterState& state) {
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
 		};
+		// The page table, shader data and flattened SRT are host-owned and never stored to by a
+		// shader: saying so lets the device compiler keep and reuse their loads across stores.
+		// Ported from batatinhafcbatatinha-pixel/KytyPS5 1a036403d (GPL-2.0).
+		const auto ReadOnly = [&](uint32_t variable) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationRestrict);
+		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
@@ -324,6 +331,7 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "bda_pagetable");
+				ReadOnly(state.bda_pagetable_variable);
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable =
@@ -332,10 +340,12 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
+				ReadOnly(state.shader_data_storage_variable);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
+				ReadOnly(state.flattened_srt_variable);
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_type = state.builder.Type(spv::OpTypeSampler);

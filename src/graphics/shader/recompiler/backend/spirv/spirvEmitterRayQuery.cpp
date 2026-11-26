@@ -45,17 +45,26 @@ uint32_t EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+// Ported from batatinhafcbatatinha-pixel/KytyPS5 658e8d1bc (GPL-2.0).
+// Whether the dispatch has a context: the queries of both lane halves are started and advanced
+// under this uniform condition only, so their traversals can be in flight together.
+uint32_t ContextPresent(EmitterState& s) {
+	return Binary(s, spv::OpINotEqual, TypeBool(s), ContextAddress(s), ConstantU64(s, 0));
+}
+
 // Only a finite ray with a nonnegative t_max is traced: any other starts a query that culls every
-// instance, a miss as in the guest's traversal.
+// instance, a miss as in the guest's traversal. Lanes the traversal does not start get such a
+// query too, so that every lane can advance its query without a branch of its own.
 void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
-	EmitIfCondition(s, ctx.Arg(inst, 8), [&] {
+	EmitIfCondition(s, ContextPresent(s), [&] {
 		const auto              f = TypeF32(s), b = TypeBool(s), zero = ConstantF32Value(s, 0.0f);
 		std::array<uint32_t, 7> ray {};
 		for (uint32_t i = 0; i < ray.size(); ++i) {
 			ray[i] = Unary(s, spv::OpBitcast, f, ctx.Arg(inst, i));
 		}
 		auto traced = Binary(s, spv::OpFOrdGreaterThanEqual, b, ray[6], zero);
+		traced      = Binary(s, spv::OpLogicalAnd, b, traced, ctx.Arg(inst, 8));
 		for (uint32_t i = 0; i < 6; ++i) {
 			const auto finite = Binary(s, spv::OpFOrdLessThan, b, EmitFAbsValue(s, ray[i]),
 			                           ConstantF32(s, 0x7f800000u));
@@ -80,11 +89,14 @@ void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+// A lane outside the condition leaves its traversal (see the ray query traversal pass), and a
+// finished query keeps returning false: advancing it is harmless.
 uint32_t EmitRayQueryProceed(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto& s = ctx.state;
-	return EmitValueOrDefaultIfCondition(
-	    s, ctx.Arg(inst, 0), TypeBool(s), ConstantBool(s, false),
+	auto&      s         = ctx.state;
+	const auto proceeded = EmitValueOrDefaultIfCondition(
+	    s, ContextPresent(s), TypeBool(s), ConstantBool(s, false),
 	    [&] { return Unary(s, spv::OpRayQueryProceedKHR, TypeBool(s), RayQuery(s)); });
+	return Binary(s, spv::OpLogicalAnd, TypeBool(s), ctx.Arg(inst, 0), proceeded);
 }
 
 // The mirror's SBT offset of an instance is its first prim record.
