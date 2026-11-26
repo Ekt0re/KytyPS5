@@ -25,6 +25,11 @@ void TogglePerformanceOverlayDetails() noexcept;
 // edge, or 0 when hidden.
 float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent);
 
+// Shows the host shader work in a box in the top-left corner while
+// Common::ShaderCompileStatus::BannerVisible(), with or without the performance panel. Same
+// threading rules as DrawPerformanceOverlay.
+void DrawShaderCompileBanner(vk::Extent2D extent);
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_PERFORMANCEOVERLAY_H_

@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
+#include "common/shaderCompileStatus.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -197,7 +198,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			});
 		}
 	}
-	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+	Common::ShaderCompileStatus::AddQueued(static_cast<int64_t>(jobs.size()));
+	Common::ParallelFor(jobs.size(), [&](size_t i) {
+		Common::ShaderCompileStatus::RemoveQueued();
+		jobs[i]();
+	});
 	// A key with a stage missing from the store keeps no pipeline.
 	std::erase_if(m_graphics_pipelines,
 	              [](const auto& entry) { return entry.second.pipeline == nullptr; });

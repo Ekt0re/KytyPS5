@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/shaderCompileStatus.h"
 #include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
@@ -772,7 +773,7 @@ void WindowContext::Run() {
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
-			if (frames != 0) {
+			if (frames != 0 || Common::ShaderCompileStatus::BannerVisible()) {
 				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
 				                        static_cast<double>(elapsed));
 			}
@@ -987,6 +988,12 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	if (Common::ShaderCompileStatus::BannerVisible()) {
+		const auto counts = Common::ShaderCompileStatus::Read();
+		if (counts.queued + counts.active > 0) {
+			text += fmt::format(" | COMPILING SHADERS ({} queued)", counts.queued);
+		}
+	}
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

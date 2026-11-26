@@ -1,4 +1,5 @@
 #include "common/compilePause.h"
+#include "common/shaderCompileStatus.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
@@ -263,7 +264,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	                                         Common::DebugCounters::Peak::ShaderCompileNs);
 	const auto profile = SpirvProfile(m_graphics);
 	options.profile    = &profile;
-	Common::CompilePause::Scope compile_pause;
+	Common::CompilePause::Scope       compile_pause;
+	Common::ShaderCompileStatus::Work compile_work;
 	auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 	                                               program.specialization, push_data);
 	auto info = std::move(result.program).TakeCompiledInfo();
@@ -345,8 +347,10 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
                                               ShaderRecompiler::IR::PushData::Window& push_data) {
 	static const bool skip_failed = std::getenv("KYTY_SKIP_FAILED_SHADERS") != nullptr;
 	if (!skip_failed) return GetProgramImpl(params, input_info, push_data);
-	std::jmp_buf recover;
+	std::jmp_buf  recover;
+	const int64_t work_depth = Common::ShaderCompileStatus::ThreadDepth();
 	if (setjmp(recover) != 0) {
+		Common::ShaderCompileStatus::Unwind(work_depth);
 		PipelineCacheLog("KYTY_SKIP shader=0x{:016x} stage={}", m_lookup_key.hash,
 		                 ShaderRecompiler::StageName(m_lookup_key.stage));
 		m_program_cache.erase(m_lookup_key);
@@ -448,13 +452,13 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	} else if (current != nullptr) {
 		if (!current->calls.empty()) {
 			if (entry == m_program_cache.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-			translated = [&] { Common::CompilePause::Scope pause; return ShaderRecompiler::TranslateProgram(current->linked->decoded, options); }();
+			translated = [&] { Common::CompilePause::Scope pause; Common::ShaderCompileStatus::Work work(false); return ShaderRecompiler::TranslateProgram(current->linked->decoded, options); }();
 			translated.program.source_reads = current->reads;
 		} else {
-			translated = [&] { Common::CompilePause::Scope pause; return ShaderRecompiler::TranslateProgram(current->decoded, options); }();
+			translated = [&] { Common::CompilePause::Scope pause; Common::ShaderCompileStatus::Work work(false); return ShaderRecompiler::TranslateProgram(current->decoded, options); }();
 		}
 	} else {
-		translated = [&] { Common::CompilePause::Scope pause; return ShaderRecompiler::TranslateProgram(params.code, options); }();
+		translated = [&] { Common::CompilePause::Scope pause; Common::ShaderCompileStatus::Work work(false); return ShaderRecompiler::TranslateProgram(params.code, options); }();
 	}
 	if (entry == m_program_cache.end()) {
 		auto retained = !source.calls.empty()
@@ -492,6 +496,7 @@ PipelineWorkers::PipelineWorkers(size_t threads) {
 			while (m_ready.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
 				const auto job = std::move(m_jobs.front());
 				m_jobs.pop();
+				Common::ShaderCompileStatus::RemoveQueued();
 				lock.unlock();
 				job();
 				lock.lock();
@@ -505,6 +510,7 @@ void PipelineWorkers::Post(Common::UniqueFunction<void>&& job) {
 		std::scoped_lock lock(m_mutex);
 		m_jobs.push(std::move(job));
 	}
+	Common::ShaderCompileStatus::AddQueued();
 	m_ready.notify_one();
 }
 
@@ -610,6 +616,7 @@ void PipelineCache::TranslateAhead(AheadJob& job) {
 		}
 		job.state = AheadJob::State::Running;
 	}
+	Common::ShaderCompileStatus::Work work;
 	const auto& code = job.code;
 	// The options GetProgramImpl gives a compute program.
 	ShaderRecompiler::CompileOptions options {.wave_size = job.input.wave_size};

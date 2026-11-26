@@ -3,6 +3,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
+#include "common/shaderCompileStatus.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "kernel/memory.h"
@@ -14,6 +15,7 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -890,6 +892,54 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	ImGui::PopStyleVar(4);
 	ImGui::PopFont();
 	return bottom;
+}
+
+namespace {
+
+// 1532 -> "1,532".
+std::string Grouped(uint64_t value) {
+	auto text = std::to_string(value);
+	for (auto i = static_cast<int>(text.size()) - 3; i > 0; i -= 3) {
+		text.insert(static_cast<size_t>(i), 1, ',');
+	}
+	return text;
+}
+
+} // namespace
+
+void DrawShaderCompileBanner(vk::Extent2D extent) {
+	if (!Common::ShaderCompileStatus::BannerVisible()) {
+		return;
+	}
+	const auto  counts = Common::ShaderCompileStatus::Read();
+	const bool  busy   = counts.queued + counts.active > 0;
+	const auto  title  = busy ? "Compiling shaders: " + Grouped(counts.queued) + " queued, " +
+	                               Grouped(counts.active) + " active (" + Grouped(counts.done) +
+	                               " done)"
+	                          : "Shaders compiled (" + Grouped(counts.done) + " done)";
+	const char* note   = busy ? "The game may look frozen until this finishes" : "Resuming";
+	const float scale  = std::clamp(std::min(static_cast<float>(extent.width) / 1920.0f,
+	                                         static_cast<float>(extent.height) / 1080.0f),
+	                                0.75f, 2.0f);
+	const float title_size = 26.0f * scale;
+	const float note_size  = 17.0f * scale;
+	const float padding    = 12.0f * scale;
+	const float margin     = 16.0f * scale;
+	auto*       font       = ImGui::GetFont();
+	const auto  title_dim  = font->CalcTextSizeA(title_size, std::numeric_limits<float>::max(), 0.0f, title.c_str());
+	const auto  note_dim   = font->CalcTextSizeA(note_size, std::numeric_limits<float>::max(), 0.0f, note);
+	const float width      = std::max(title_dim.x, note_dim.x) + 2.0f * padding;
+	const float height     = title_dim.y + note_dim.y + 2.0f * padding + 4.0f * scale;
+	const ImVec2 top_left {margin, margin};
+	const ImVec2 bottom_right {margin + width, margin + height};
+	auto*        draw = ImGui::GetForegroundDrawList();
+	draw->AddRectFilled(top_left, bottom_right, IM_COL32(255, 200, 0, 245), 6.0f * scale);
+	draw->AddRect(top_left, bottom_right, IM_COL32(0, 0, 0, 255), 6.0f * scale, 0, 3.0f * scale);
+	draw->AddText(font, title_size, {top_left.x + padding, top_left.y + padding},
+	              IM_COL32(0, 0, 0, 255), title.c_str());
+	draw->AddText(font, note_size,
+	              {top_left.x + padding, top_left.y + padding + title_dim.y + 4.0f * scale},
+	              IM_COL32(40, 30, 0, 255), note);
 }
 
 } // namespace Libs::Graphics
