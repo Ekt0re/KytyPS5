@@ -43,6 +43,8 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
+	// 64 MiB blocks: allocations above 32 MiB get memory of their own (AnyPS5 e8332d72).
+	info.preferredLargeHeapBlockSize = 64ull * 1024 * 1024;
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {

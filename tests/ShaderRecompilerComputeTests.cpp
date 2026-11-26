@@ -26495,6 +26495,33 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+// A pixel shader keeps its LDS in a Function variable, where Vulkan allows no atomics; LDS
+// atomics, append and consume there must become a load and a store (AnyPS5 bf7b51a7, 67f961e6).
+void RunPrivateLdsCases() {
+  struct Case {
+    const char *name;
+    u32 opcode;
+    bool returns;
+  };
+  constexpr Case cases[] = {
+      {"pixel-lds-add-u32", 0x00, false},     {"pixel-lds-min-u32", 0x07, false},
+      {"pixel-lds-cmpst-rtn-b32", 0x30, true}, {"pixel-lds-add-rtn-u32", 0x20, true},
+      {"pixel-lds-append", 0x3e, true},
+      {"pixel-lds-consume", 0x3d, true},
+  };
+  for (const auto &entry : cases) {
+    GraphicsCase test;
+    test.name = entry.name;
+    test.fragment_code.push_back(EncodeDs0(entry.opcode));
+    test.fragment_code.push_back(EncodeDs1Ex(entry.returns ? 2 : 0, 1, 1, 0));
+    test.fragment_code.push_back(0xbf8c0000u); // s_waitcnt 0
+    AppendEnd(&test.fragment_code);
+    // Validates the SPIR-V, which refuses atomics on Function storage.
+    CompileFragmentCase(test);
+    std::printf("[private-lds] %-28s ok\n", entry.name);
+  }
+}
+
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   if (vulkan != nullptr && !vulkan->RasterizationSupported()) {
     vulkan->SkipRasterizationCases(1);
@@ -59311,6 +59338,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop3Integer16Ternary(64));
     RunCase(&vulkan, Vop3Min3U16CapturedAndSelectors());
     RunCase(&vulkan, Vop3Med3I16Captured());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--private-lds-only") == 0) {
+    RunPrivateLdsCases();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--quadmask-only") == 0) {

@@ -112,6 +112,8 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 
 	uint32_t                                         lane_count              = 1;
+	// A native 64-wide subgroup's same-address LDS stores keep the last active lane's value.
+	bool                                             lds_last_lane_stores    = false;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
@@ -662,6 +664,15 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	// LDS of a stage without workgroup storage lives in a Function variable, where Vulkan allows no
+	// atomics; it is per invocation, so a load and a store do (AnyPS5 bf7b51a7).
+	if (kind == IR::ResourceKind::Lds && state.lds_storage_class != spv::StorageClassWorkgroup &&
+	    state.lds_storage_class != spv::StorageClassStorageBuffer) {
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer);
+		state.builder.AddFunction(spv::OpStore, pointer, desired(old));
+		return old;
+	}
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();

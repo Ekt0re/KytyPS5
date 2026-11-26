@@ -1160,6 +1160,30 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a converted image");
 			return;
 		}
+		// Vulkan has no sampling of multisampled images, no depth comparison with a 3D image and no
+		// 3D gather: refuse them instead of emitting invalid SPIR-V (AnyPS5 ae707637, 0eabf7ec,
+		// 007a98c1).
+		const auto multisampled = [&state](uint32_t resource) {
+			const auto dimension = state.program.info.images[resource].dimension;
+			return dimension == ImageDimension::Dim2DMsaa || dimension == ImageDimension::Dim2DMsaaArray;
+		};
+		const auto volume = [&state](uint32_t resource) {
+			return state.program.info.images[resource].dimension == ImageDimension::Dim3D;
+		};
+		const auto& indirect_images = state.program.info.images[mem.resource].indirect_resources;
+		if (multisampled(mem.resource) || std::ranges::any_of(indirect_images, multisampled)) {
+			ctx.Fail(inst, "samples a multisampled image");
+			return;
+		}
+		if (dref && (volume(mem.resource) || std::ranges::any_of(indirect_images, volume))) {
+			ctx.Fail(inst, "uses depth comparison with a 3D image");
+			return;
+		}
+		if (op == IR::ValueOpcode::ImageGatherRaw &&
+		    (volume(mem.resource) || std::ranges::any_of(indirect_images, volume))) {
+			ctx.Fail(inst, "gathers from a 3D image");
+			return;
+		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			uint32_t component_or_dref;
 			if (dref) {

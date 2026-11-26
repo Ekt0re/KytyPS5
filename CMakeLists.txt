@@ -855,6 +855,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --relaxed-float-only)
 	add_test(NAME shader_recompiler_vop3_conversions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
+	add_test(NAME shader_recompiler_private_lds
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --private-lds-only)
 	add_test(NAME shader_recompiler_quadmask
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
 	add_test(NAME shader_recompiler_integer16_ternary

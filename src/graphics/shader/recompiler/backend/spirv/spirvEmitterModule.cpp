@@ -856,6 +856,12 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.subgroup_arithmetic) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
+	if (state.lds_last_lane_stores) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
+	}
 	const bool fragment_barycentric =
 	    state.program.stage == ShaderType::Pixel &&
 	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {

@@ -663,6 +663,23 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+// When every active lane stores to the same word, the value of the last active lane.
+static uint32_t LastLaneValueOfSharedAddress(EmitterState& state, uint32_t index, uint32_t data) {
+	const auto scope  = ConstantU32(state, spv::ScopeSubgroup);
+	const auto shared = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformAllEqual, TypeBool(state), shared, scope, index);
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot, scope,
+	                          ConstantBool(state, true));
+	const auto last = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallotFindMSB, TypeU32(state), last, scope,
+	                          ballot);
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), value, scope, data,
+	                          last);
+	return Select(state, TypeU32(state), shared, value, data);
+}
+
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	if (resource.object_pointer == 0u) return;
@@ -670,7 +687,10 @@ void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 	const auto in_bounds = BufferIndexInBounds(ctx, inst, mem, resource,
 	    EmitStorageElementInBounds(ctx.state, resource, index));
 	EmitIfCondition(ctx.state, in_bounds, [&]() {
-		StoreWordInBounds(ctx, resource, index, data);
+		StoreWordInBounds(ctx, resource, index,
+		                  mem.kind == IR::ResourceKind::Lds && ctx.state.lds_last_lane_stores
+		                      ? LastLaneValueOfSharedAddress(ctx.state, index, data)
+		                      : data);
 	});
 }
 
@@ -1581,9 +1601,60 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+// LDS in a Function variable (stages without workgroup storage): Vulkan allows no atomics there,
+// and no other invocation can see it (AnyPS5 bf7b51a7, 67f961e6).
+static bool PrivateLdsStorage(const EmitterState& state) {
+	return state.lds_storage_class != spv::StorageClassWorkgroup &&
+	       state.lds_storage_class != spv::StorageClassStorageBuffer;
+}
+
+// What a 32- or 64-bit atomic stores over `old` in private storage.
+static uint32_t PrivateAtomicValue(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t old,
+                                   bool wide) {
+	auto&      state  = ctx.state;
+	const auto type   = wide ? TypeU64(state) : TypeU32(state);
+	const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
+	if (opcode == spv::OpAtomicCompareExchange) {
+		auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
+		auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
+		// RDNA2 DS compares DATA and stores DATA2, opposite to BUFFER atomics.
+		std::swap(desired, comparator);
+		return Select(state, type, Binary(state, spv::OpIEqual, TypeBool(state), old, comparator),
+		              desired, old);
+	}
+	const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
+	const auto glsl  = [&](GLSLstd450 op) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpExtInst, type, result, GlslStd450(state), op, old, value);
+		return result;
+	};
+	switch (opcode) {
+		case spv::OpAtomicIAdd: return Binary(state, spv::OpIAdd, type, old, value);
+		case spv::OpAtomicISub: return Binary(state, spv::OpISub, type, old, value);
+		case spv::OpAtomicSMin: return glsl(GLSLstd450SMin);
+		case spv::OpAtomicUMin: return glsl(GLSLstd450UMin);
+		case spv::OpAtomicSMax: return glsl(GLSLstd450SMax);
+		case spv::OpAtomicUMax: return glsl(GLSLstd450UMax);
+		case spv::OpAtomicAnd: return Binary(state, spv::OpBitwiseAnd, type, old, value);
+		case spv::OpAtomicOr: return Binary(state, spv::OpBitwiseOr, type, old, value);
+		case spv::OpAtomicXor: return Binary(state, spv::OpBitwiseXor, type, old, value);
+		case spv::OpAtomicExchange: return value;
+		default:
+			EXIT("LDS atomic 0x%08x in a stage without workgroup storage\n",
+			     static_cast<uint32_t>(inst.GetOpcode()));
+	}
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+		if (mem.kind == IR::ResourceKind::Lds && PrivateLdsStorage(ctx.state)) {
+			const auto old = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), old, pointer);
+			ctx.state.builder.AddFunction(spv::OpStore, pointer,
+			                              PrivateAtomicValue(ctx, inst, old, false));
+			return old;
+		}
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
@@ -1640,6 +1711,11 @@ void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    pointer, state.lds_u64_variable, ConstantU32(state, 0), native_index);
 		const auto old = state.builder.AllocateId();
 		const auto opcode = SpirvAtomicOpcode(inst.GetOpcode());
+		if (PrivateLdsStorage(state)) {
+			state.builder.AddFunction(spv::OpLoad, TypeU64(state), old, pointer);
+			state.builder.AddFunction(spv::OpStore, pointer, PrivateAtomicValue(ctx, inst, old, true));
+			return old;
+		}
 		const auto scope = ConstantU32(state, spv::ScopeWorkgroup);
 		const auto acquire_release =
 		    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | semantics);
@@ -1748,9 +1824,18 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                 Binary(state, spv::OpINotEqual, TypeBool(state), count, ConstantU32(state, 0)),
 	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
-		const auto value = state.builder.AllocateId();
+		const auto pointer = EmitMemoryElementPointer(state, access, index);
+		const auto value   = state.builder.AllocateId();
+		if (mem.kind == IR::ResourceKind::Lds && PrivateLdsStorage(state)) {
+			// AnyPS5 67f961e6.
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+			state.builder.AddFunction(
+			    spv::OpStore, pointer,
+			    Binary(state, append ? spv::OpIAdd : spv::OpISub, TypeU32(state), value, count));
+			return value;
+		}
 		state.builder.AddFunction(append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state),
-		                          value, EmitMemoryElementPointer(state, access, index),
+		                          value, pointer,
 		                          ConstantU32(state, mem.kind == IR::ResourceKind::Gds
 		                                                 ? spv::ScopeDevice
 		                                                 : spv::ScopeWorkgroup),
