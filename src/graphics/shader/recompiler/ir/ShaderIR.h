@@ -13,6 +13,7 @@
 
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <optional>
@@ -208,6 +209,9 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
+	// A storage image of a 16-bit float format: float stores keep the guest's range
+	// (KYTY_F16_STORE_CLAMP, F16StoreClampEnabled).
+	bool                          clamp_half_float  = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -215,6 +219,21 @@ struct ImageResource {
 
 	bool operator==(const ImageResource& other) const = default;
 };
+
+// KYTY_F16_STORE_CLAMP=1: 32-bit float values stored to a 16-bit float format keep the guest
+// GPU's range. The guest converts rounding toward zero, so a finite value beyond the half range
+// stores the largest half (65504) of its sign; the host's conversion gives infinity, which bloom
+// and exposure passes then spread over the frame. Covers storage images of 16-bit float formats
+// and formatted 16-bit float buffer stores (packed RTZ exports and 11/10-bit float stores already
+// saturate). Adapted from Jetsku/KytyPS5 e0f28907 (from usa-ratt/KytyPS5-GT7 cfa8a479e), GPL-2.0.
+// Read once; part of the generated code, so A/B runs need separate shader caches.
+[[nodiscard]] inline bool F16StoreClampEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F16_STORE_CLAMP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
 
 // "Image atomic operations are supported only on 32- and 64-bit-per pixel surfaces ... Atomic
 // operations treat the element as a single component of 32- or 64-bits" (RDNA ISA, Image

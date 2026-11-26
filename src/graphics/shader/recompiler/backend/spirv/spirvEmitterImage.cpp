@@ -649,6 +649,11 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 			    : Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state), packed_value, value);
 			continue;
 		}
+		if (!integer && mem.data_bits != 16u &&
+		    ctx.state.program.info.images[mem.resource].clamp_half_float) {
+			// KYTY_F16_STORE_CLAMP: a 16-bit float storage image keeps the guest's range.
+			raw = EmitClampToHalfRangeBits(ctx.state, raw);
+		}
 		values[component] = integer ? raw
 		                    : mem.data_bits == 16u
 		                        ? EmitF16BitsToF32(ctx.state, raw)

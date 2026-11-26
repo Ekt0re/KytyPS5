@@ -424,6 +424,7 @@ std::string SpecializationDiff(const ShaderRecompiler::IR::ResourceSpecializatio
 		KYTY_DIFF("image", images, skip_degamma);
 		KYTY_DIFF("image", images, fmask);
 		KYTY_DIFF("image", images, heap);
+		KYTY_DIFF("image", images, clamp_half_float);
 	}
 	for (size_t i = 0; i < a.samplers.size(); i++) {
 		KYTY_DIFF("sampler", samplers, indirect_root);

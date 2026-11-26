@@ -1283,6 +1283,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			if (raw_sint_storage || base.atomic) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
+			image.clamp_half_float =
+			    F16StoreClampEnabled() && base.written && !base.atomic &&
+			    image.numeric_class == Prospero::TextureNumericClass::Float &&
+			    (format == Prospero::BufferFormat::k16Float ||
+			     format == Prospero::BufferFormat::k16_16Float ||
+			     format == Prospero::BufferFormat::k16_16_16_16Float);
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
 		           (base.depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
@@ -2169,6 +2175,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.cube                       = source.cube;
 		image.skip_degamma               = source.skip_degamma;
 		image.heap                       = source.heap;
+		image.clamp_half_float           = source.clamp_half_float;
 		image.indirect_resources.clear();
 		// The emulated atomics read and write the texel through the plain storage view.
 		if (image.atomic && !image.atomic64 && EmulatedImageAtomicBits(image.conversion_format) != 0u) {

@@ -529,6 +529,19 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 	}
 }
 
+uint32_t EmitClampToHalfRangeBits(EmitterState& state, uint32_t f32_bits) {
+	const auto magnitude = EmitAndConstant(state, f32_bits, 0x7fffffffu);
+	// 0x477fe000 is 65504, the largest half; 0x7f800000 and above are infinity and NaN.
+	const auto beyond = Binary(
+	    state, spv::OpLogicalAnd, TypeBool(state),
+	    EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x477fe000u),
+	    EmitCompareU32Constant(state, spv::OpULessThan, magnitude, 0x7f800000u));
+	const auto largest = EmitBinaryU32(state, spv::OpBitwiseOr,
+	                                   EmitAndConstant(state, f32_bits, 0x80000000u),
+	                                   ConstantU32(state, 0x477fe000u));
+	return Select(state, TypeU32(state), beyond, largest, f32_bits);
+}
+
 uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                        uint32_t component, uint32_t data, uint32_t data_bits,
                                        UnormRounding rounding) {
@@ -591,6 +604,8 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		return is_signed ? Unary(state, spv::OpBitcast, TypeU32(state), value) : value;
 	}
 	if (bits == 16u && info.type == Format::ComponentType::Float) {
+		// KYTY_F16_STORE_CLAMP: finite overflow stores the largest half, as the guest GPU.
+		if (data_bits != 16u && IR::F16StoreClampEnabled()) data = EmitClampToHalfRangeBits(state, data);
 		const auto pair = EmitCompositeConstructF32x2(
 		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
 		return EmitPackHalf2x16(state, pair);

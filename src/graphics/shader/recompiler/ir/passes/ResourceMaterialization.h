@@ -35,6 +35,7 @@ struct ResourceSpecialization {
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
 		bool                          heap                       = false;
+		bool                          clamp_half_float           = false; // F16StoreClampEnabled
 		bool                          operator==(const Image&) const = default;
 	};
 
