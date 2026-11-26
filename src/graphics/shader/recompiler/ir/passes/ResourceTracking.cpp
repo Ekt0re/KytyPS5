@@ -144,6 +144,130 @@ bool IsNoncanonicalFlatAddress(Value high, Value active) {
 	return lower > 0x00008000u && upper < 0xffff7fffu;
 }
 
+// A constant-index extract of a composite constructor names one of its operands.
+const Inst* ExtractedComponent(const Inst& inst) {
+	const auto op = inst.GetOpcode();
+	if (op != ValueOpcode::CompositeExtractU32x2 && op != ValueOpcode::CompositeExtractU32x3 &&
+	    op != ValueOpcode::CompositeExtractU32x4) {
+		return nullptr;
+	}
+	const auto  index     = inst.Arg(1).Resolve();
+	const auto* composite = inst.Arg(0).Resolve().TryInstruction();
+	if (!index.IsImmediate() || composite == nullptr) {
+		return nullptr;
+	}
+	const auto construct = composite->GetOpcode();
+	if (construct != ValueOpcode::CompositeConstructU32x2 &&
+	    construct != ValueOpcode::CompositeConstructU32x3 &&
+	    construct != ValueOpcode::CompositeConstructU32x4) {
+		return nullptr;
+	}
+	const auto component = index.U32();
+	return component < composite->NumArgs() ? composite->Arg(component).Resolve().TryInstruction()
+	                                        : nullptr;
+}
+
+// The user-data registers an address dword derives from, within a bounded walk of its
+// operands. Lane masks and conditions (U1 operands) select between values rather than compute
+// them, and memory results are data, so the walk does not follow them. A constant-index extract
+// of a composite constructor follows only the selected operand, so the dwords of a pair built
+// with CompositeConstruct keep their own sources, and the low dword of a 64-bit sum, difference,
+// AND or left shift follows only the low dwords of its 64-bit operands: SAROS's
+// cs 12070dfbb803ca3b offsets its base {s3, s0} by the low dword of S_LSHL_B64 {loaded dword,
+// VCC_HI}, and compiled for wave32 VCC_HI is the initial s15, which is not part of the base.
+std::vector<uint32_t> AddressUserDataSources(Value root) {
+	constexpr size_t         MaxVisited = 256;
+	std::vector<uint32_t>    registers;
+	std::vector<const Inst*> visited;
+	const auto               visit = [&](const Inst* inst) {
+		if (inst != nullptr && inst->GetType() != Type::U1 && visited.size() < MaxVisited &&
+		    std::ranges::find(visited, inst) == visited.end()) {
+			visited.push_back(inst);
+		}
+	};
+	const auto visit_low = [&](auto&& self, Value wide, uint32_t depth) -> void {
+		const auto* inst = wide.Resolve().TryInstruction();
+		if (inst == nullptr) return;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::CompositeConstructU64) {
+			visit(inst->Arg(0).Resolve().TryInstruction());
+			return;
+		}
+		if (depth < 8u && (op == ValueOpcode::IAdd64 || op == ValueOpcode::ISub64 ||
+		                   op == ValueOpcode::BitwiseAnd64 || op == ValueOpcode::ShiftLeftLogical64)) {
+			for (size_t i = 0; i < inst->NumArgs(); i++) {
+				if (inst->Arg(i).Resolve().GetType() == Type::U64) {
+					self(self, inst->Arg(i), depth + 1u);
+				} else {
+					visit(inst->Arg(i).Resolve().TryInstruction());
+				}
+			}
+			return;
+		}
+		visit(inst);
+	};
+	visit(root.Resolve().TryInstruction());
+	for (size_t next = 0; next < visited.size(); next++) {
+		const auto* inst = visited[next];
+		const auto  op   = inst->GetOpcode();
+		if (op == ValueOpcode::GetUserData) {
+			if (inst->Arg(0).GetType() == Type::ScalarReg) {
+				registers.push_back(RegIndex(inst->Arg(0).ScalarRegister()));
+			}
+			continue;
+		}
+		if (BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+			continue;
+		}
+		if (const auto* component = ExtractedComponent(*inst)) {
+			visit(component);
+			continue;
+		}
+		if (op == ValueOpcode::CompositeExtractU64 && inst->Arg(1).Resolve().IsImmediate() &&
+		    inst->Arg(1).Resolve().U32() == 0u) {
+			visit_low(visit_low, inst->Arg(0), 0u);
+			continue;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); i++) {
+			visit(inst->Arg(i).Resolve().TryInstruction());
+		}
+	}
+	return registers;
+}
+
+// Whether a dword of a V# derives from memory the shader reads, within a bounded walk of its
+// operands (as AddressUserDataSources(), through Phis): the GPU computes such a V#. One whose
+// dwords all come from user data is the host's to bind, as a buffer a loop carries for instance.
+bool DerivesFromMemory(const Inst& handle) {
+	constexpr size_t         MaxVisited = 256;
+	std::vector<const Inst*> visited;
+	const auto               visit = [&](Value value) {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst != nullptr && inst->GetType() != Type::U1 && visited.size() < MaxVisited &&
+		    std::ranges::find(visited, inst) == visited.end()) {
+			visited.push_back(inst);
+		}
+	};
+	for (size_t i = 0; i < handle.NumArgs(); i++) {
+		visit(handle.Arg(i));
+	}
+	for (size_t next = 0; next < visited.size(); next++) {
+		const auto* inst = visited[next];
+		const auto  op   = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		    ImageOpcodeInfoOf(op).access != ImageAccess::None) {
+			return true;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); i++) {
+			visit(inst->Arg(i));
+		}
+	}
+	return false;
+}
+
 // CFG::ScalarOperandCode and CFG::MayWriteScalarRegister, kept here because the tracking
 // unit tests do not link the CFG builder.
 bool NativeScalarCode(const Decoder::Operand& operand, uint32_t& code) {
@@ -4791,6 +4915,55 @@ private:
 		return bound->source;
 	}
 
+	// Records the user-data register pair a GPU-computed V# takes its base from in
+	// user_address_bases, so the host caches the memory at the base before the shader runs (as
+	// for FLAT bases), and returns whether there was one. The low base dword derives from
+	// register N and the high one from N + 1 (and, through the carry, from all the low dword
+	// does); two unpaired halves that each come from one register also count, and so does each
+	// arm of a uniform branch whose Phis select between bases. (Port of TheCruZ's CollectDmaBase,
+	// KytyPS5 PR #2469 line: d002d3e2, eb965965.)
+	bool CollectUserDataBase(const Inst& handle) {
+		const auto add = [&](uint32_t low_reg, uint32_t high_reg) {
+			if (low_reg < m_program.user_data_base || high_reg < m_program.user_data_base) return false;
+			const std::array<uint32_t, 2> pair {low_reg - m_program.user_data_base,
+			                                    high_reg - m_program.user_data_base};
+			auto& bases = m_info.user_address_bases;
+			if (std::ranges::find(bases, pair) == bases.end()) bases.push_back(pair);
+			return true;
+		};
+		const auto collect = [&](Value low_value, Value high_value) {
+			const auto low      = AddressUserDataSources(low_value);
+			const auto high     = AddressUserDataSources(high_value);
+			const auto contains = [](const std::vector<uint32_t>& registers, uint32_t reg) {
+				return std::ranges::find(registers, reg) != registers.end();
+			};
+			bool found = false;
+			for (const auto reg: low) {
+				if (contains(high, reg + 1u) && !contains(low, reg + 1u)) found |= add(reg, reg + 1u);
+			}
+			if (!found && low.size() == 1u && high.size() == 1u && low[0] != high[0])
+				found = add(low[0], high[0]);
+			return found;
+		};
+		if (collect(handle.Arg(0), handle.Arg(1))) return true;
+		const auto* low_phi  = handle.Arg(0).Resolve().TryInstruction();
+		const auto* high_phi = handle.Arg(1).Resolve().TryInstruction();
+		if (low_phi == nullptr || high_phi == nullptr || low_phi->GetOpcode() != ValueOpcode::Phi ||
+		    high_phi->GetOpcode() != ValueOpcode::Phi || low_phi->Parent() != high_phi->Parent() ||
+		    low_phi->NumArgs() != high_phi->NumArgs() || low_phi->NumArgs() < 2u) {
+			return false;
+		}
+		bool found = false;
+		for (size_t arm = 0; arm < low_phi->NumArgs(); ++arm) {
+			size_t other = 0;
+			while (other < high_phi->NumArgs() && high_phi->PhiBlock(other) != low_phi->PhiBlock(arm))
+				++other;
+			if (other < high_phi->NumArgs() && collect(low_phi->Arg(arm), high_phi->Arg(other)))
+				found = true;
+		}
+		return found;
+	}
+
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -4983,6 +5156,19 @@ private:
 					return;
 				}
 				source = buffer != BufferAccess::Read ? CarriedBufferSource(*handle) : UINT32_MAX;
+				if (source == UINT32_MAX && m_program.stage == ShaderType::Compute &&
+				    memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferWrite(op) &&
+				    DerivesFromMemory(*handle) && CollectUserDataBase(*handle)) {
+					// A raw DWORD store or 32-bit integer atomic through a V# the GPU computes from a
+					// base in user data and
+					// fields it loads (a record count or offset only the GPU knows): it writes guest
+					// memory by device address, like a FLAT store, with the V#'s own bounds checked
+					// on the GPU. Only memory that a cached buffer holds is written. (Port of
+					// TheCruZ's d002d3e2 and eb965965, KytyPS5 PR #2469 line.)
+					m_program.has_address_writes            = true;
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					return;
+				}
 				if (source == UINT32_MAX) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "

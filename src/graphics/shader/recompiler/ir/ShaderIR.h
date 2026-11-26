@@ -109,6 +109,35 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
+	// Raw DWORD stores through a V# the GPU computes; they write guest memory by device address.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+	// Raw 32-bit integer atomics through a V# the GPU computes: they run on guest memory by
+	// device address, as the stores write it.
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		if (formatted || typed || data_bits != 32u) return false;
+		switch (opcode) {
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32: return true;
+			default: return false;
+		}
+	}
+	[[nodiscard]] bool SupportsIndirectBufferWrite(ValueOpcode opcode) const {
+		return SupportsIndirectBufferStore(opcode) || SupportsIndirectBufferAtomic(opcode);
+	}
+
 	bool operator==(const MemoryInfo& other) const = default;
 };
 

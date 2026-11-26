@@ -1121,6 +1121,59 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
+// A DWORD store by device address; memory without a cached buffer is not written, as indirect
+// loads read it as zero.
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, active, [&]() {
+		// RDNA2 DWORD accesses ignore the two low address bits.
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+		                            ConstantU64(state, ~uint64_t {3}));
+		const auto bda     = GetBdaPointer(state, aligned);
+		const auto present =
+		    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+		EmitIfCondition(state, present, [&]() {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+			constexpr uint32_t alignment = sizeof(uint32_t);
+			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
+			                          alignment);
+		});
+	});
+}
+
+// A raw DWORD store through a V# the GPU computes (IR::MemoryInfo::SupportsIndirectBufferStore):
+// each lane resolves the V# with the address and bounds rules of indirect loads and writes by
+// device address. (Port of TheCruZ's StoreIndirectBuffer, KytyPS5 PR #2469 line 427a75fc,
+// without its write bitmap.)
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer       = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), 0u);
+		const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+		                                 ConstantU32(state, 0));
+		const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+		                         ConstantU64(state, ~uint64_t {3}));
+		const auto data = ctx.Arg(inst, inst.NumArgs() - 2);
+		for (uint32_t component = 0; component < components; component++) {
+			auto value = data;
+			if (components != 1u) {
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, data,
+				                          component);
+			}
+			const auto address = component == 0u ? base : Binary(
+			    state, spv::OpIAdd, TypeU64(state), base, ConstantU64(state, component * 4u));
+			StoreBdaDword(ctx, address,
+			              AndCondition(state, valid_format,
+			                           IndirectBufferInBounds(state, buffer, component * 4u,
+			                                                  ConstantU32(state, 4u), false)),
+			              value);
+		}
+	});
+}
+
 uint32_t LoadIndirectFormatted(ValueEmitContext& ctx, const IndirectBufferAccess& buffer,
                                uint32_t output_component, bool coherent) {
 	auto& state = ctx.state;
@@ -1645,8 +1698,38 @@ static uint32_t PrivateAtomicValue(ValueEmitContext& ctx, const IR::Inst& inst, 
 	}
 }
 
+// A 32-bit integer atomic through a V# the GPU computes (IR::MemoryInfo::SupportsIndirectBufferAtomic):
+// it runs on guest memory by device address where StoreIndirectBuffer() writes. Memory without a
+// cached buffer returns zero, as an indirect load reads it. (Port of TheCruZ's eb965965.)
+uint32_t AtomicIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	return EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), 0u);
+		const auto valid  = AndCondition(
+		    state, Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format, ConstantU32(state, 0)),
+		    IndirectBufferInBounds(state, buffer, 0u, ConstantU32(state, 4u), false));
+		return EmitValueOrZeroIfCondition(state, valid, [&]() {
+			// RDNA2 DWORD accesses ignore the two low address bits.
+			const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+			                            ConstantU64(state, ~uint64_t {3}));
+			const auto bda     = GetBdaPointer(state, aligned);
+			const auto present =
+			    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+			return EmitValueOrZeroIfCondition(state, present, [&]() {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+				                          bda);
+				const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				EmitAtomicMemoryBarrier(state, IR::ResourceKind::IndirectBuffer);
+				return old;
+			});
+		});
+	});
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::IndirectBuffer) return AtomicIndirectBuffer(ctx, inst);
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		if (mem.kind == IR::ResourceKind::Lds && PrivateLdsStorage(ctx.state)) {
 			const auto old = ctx.state.builder.AllocateId();
@@ -1965,6 +2048,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	EmitLdsLaneSync(ctx.state, mem);
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreIndirectBuffer(ctx, inst, std::max(buffer_components, 1u));
 	else if (buffer_components > 1u)
 		StoreBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
