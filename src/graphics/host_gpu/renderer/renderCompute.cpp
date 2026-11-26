@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeToggles.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -12,6 +13,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -30,11 +32,15 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -304,6 +310,40 @@ static void RecordDispatch(CommandBuffer& buffer, const PipelineCache::Pipeline&
 	    });
 }
 
+// Diagnostic (with KYTY_TOGGLE_FILE): names the compute programs that store through
+// GPU-computed addresses, whose writes the CPU side never sees as GPU-owned. With the toggle
+// log_addr=1 every such dispatch is printed with the address bases its SRT provides and the
+// guest ranges of its written buffer bindings.
+static void LogAddressWrites(const ShaderStageRuntime& stage, uint32_t x, uint32_t y, uint32_t z) {
+	const auto& program = stage.module->info;
+	if (!program.has_address_writes || !Common::RuntimeToggles::Enabled()) return;
+	static std::mutex                   mutex;
+	static std::map<uint64_t, uint32_t> counts;
+	std::scoped_lock lock {mutex};
+	const auto n   = ++counts[program.shader_hash];
+	const bool all = Common::RuntimeToggles::Get("log_addr");
+	if (!all && (n & (n - 1u)) != 0u) return;
+	std::string text = fmt::format("Address-store dispatch: cs=0x{:016x} groups={}x{}x{} count {}",
+	                               program.shader_hash, x, y, z, n);
+	const auto& info = program.info;
+	const auto& flat = stage.resources->flattened_srt;
+	const auto& user = stage.resources->user_data;
+	for (const auto [low, high]: info.address_bases) {
+		if (low < flat.size() && high < flat.size())
+			text += fmt::format(" base=0x{:x}", flat[low] | uint64_t {flat[high]} << 32u);
+	}
+	for (const auto [low, high]: info.user_address_bases) {
+		if (low < user.size() && high < user.size())
+			text += fmt::format(" ubase=0x{:x}", user[low] | uint64_t {user[high]} << 32u);
+	}
+	for (uint32_t i = 0; i < info.buffers.size() && i < stage.resources->buffers.size(); i++) {
+		if (!info.buffers[i].written) continue;
+		const auto v = DecodeNativeDescriptor<ShaderBufferResource>(stage.resources->buffers[i]);
+		text += fmt::format(" wbuf=0x{:x}+0x{:x}", v.Base48(), v.GetSize());
+	}
+	std::printf("%s\n", text.c_str());
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -484,9 +524,14 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 
+	LogAddressWrites(input_info.stage, thread_group_x, thread_group_y, thread_group_z);
+	auto* const    graphics = &m_context.GetGraphics();
+	const uint64_t cs_hash  = program.shader_hash;
 	const auto record = [=](vk::CommandBuffer command, vk::Pipeline handle) {
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+		const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'C', cs_hash);
 		command.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		GpuBreadcrumbs::End(*graphics, command, crumb);
 	};
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
@@ -504,7 +549,9 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 					if ((x | y | z) != 0u) {
 						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 					}
+					const auto crumb = GpuBreadcrumbs::Begin(*graphics, vk_buffer, 'C', cs_hash);
 					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
+					GpuBreadcrumbs::End(*graphics, vk_buffer, crumb);
 				}
 			}
 		}
@@ -571,11 +618,15 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (HasStorageWrites(input_info, bindings)) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	LogAddressWrites(input_info.stage, 0, 0, 0);
 	RecordDispatch(buffer, pipeline,
-	               [args = args_buffer->Handle(), offset = args_offset](vk::CommandBuffer command,
-	                                                                    vk::Pipeline handle) {
+	               [args = args_buffer->Handle(), offset = args_offset,
+	                graphics = &m_context.GetGraphics(),
+	                cs_hash  = program.shader_hash](vk::CommandBuffer command, vk::Pipeline handle) {
 		               command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+		               const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'C', cs_hash);
 		               command.dispatchIndirect(args, offset);
+		               GpuBreadcrumbs::End(*graphics, command, crumb);
 	               });
 	vk_buffer = buffer.Handle();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

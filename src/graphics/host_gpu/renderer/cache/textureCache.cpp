@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeToggles.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -2075,10 +2076,11 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool
 	//   writes of the images inside it, so they take the written data too.
 	// Compressed images cannot be refreshed from a buffer. KYTY_GPU_WRITE_IMAGES=exact limits
 	// the refresh to images starting at the write, as before.
-	static const bool overlap = [] {
+	static const bool overlap_default = [] {
 		const char* value = std::getenv("KYTY_GPU_WRITE_IMAGES");
 		return value == nullptr || std::strcmp(value, "exact") != 0;
 	}();
+	const bool overlap = overlap_default && !Common::RuntimeToggles::Get("exact");
 	static std::atomic<uint32_t> logged {0};
 	std::scoped_lock lock {m_lock};
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {

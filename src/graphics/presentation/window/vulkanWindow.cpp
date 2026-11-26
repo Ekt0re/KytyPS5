@@ -7,6 +7,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
@@ -462,6 +463,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		supported.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
 		supported.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
+	// Diagnostic GPU breadcrumbs (KYTY_GPU_BREADCRUMBS=1).
+	if (GpuBreadcrumbs::Requested()) {
+		graphics.buffer_marker_enabled = add(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		graphics.device_fault_enabled  = add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		LOGF("Vulkan GPU breadcrumbs: buffer marker %s, device fault %s\n",
+		     graphics.buffer_marker_enabled ? "true" : "false",
+		     graphics.device_fault_enabled ? "true" : "false");
+	}
 	// FSR's ML upscalers run on cooperative matrices.
 	const bool fsr = Fsr::Enabled();
 	if (!fsr || !add(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
@@ -666,7 +675,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
-	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
+	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
+	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE}};
+	if (!graphics.device_fault_enabled) create.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}

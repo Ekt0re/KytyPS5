@@ -38,6 +38,9 @@ struct GraphicContext {
 	bool                               maintenance8_enabled                  = false;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               ray_query_enabled                     = false;
+	// KYTY_GPU_BREADCRUMBS diagnostics: VK_AMD_buffer_marker, VK_EXT_device_fault.
+	bool                               buffer_marker_enabled                 = false;
+	bool                               device_fault_enabled                  = false;
 	bool                               compute_derivative_quads_enabled      = false;
 	bool                               compute_derivative_linear_enabled     = false;
 	bool                               r8_srgb_views                         = false;

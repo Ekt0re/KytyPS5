@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeToggles.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -725,6 +726,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
                                       const volatile void* address) {
 	uint64_t value = 0;
 
+	if (op != 0x00 && Common::RuntimeToggles::Get("pred_off")) {
+		m_predicate_skip = false;
+		return;
+	}
 	switch (op) {
 		case 0x00:
 			m_predicate_skip = false;
@@ -760,6 +765,15 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: m_predicate_skip = (value != 0); break;
 		case 0x01: m_predicate_skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+	}
+	if (Common::RuntimeToggles::Enabled()) {
+		// Diagnostic counts: which predication ops the title uses and how often they skip.
+		static std::array<std::atomic<uint32_t>, 8> counts {};
+		const auto n = counts[(op & 3u) * 2u + (m_predicate_skip ? 1u : 0u)].fetch_add(1) + 1u;
+		if ((n & (n - 1u)) == 0u) {
+			std::printf("Predication op %u skip=%d count %u (addr %p)\n", op,
+			            m_predicate_skip ? 1 : 0, n, const_cast<const void*>(address));
+		}
 	}
 }
 

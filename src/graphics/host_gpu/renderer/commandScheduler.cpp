@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
@@ -386,6 +387,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			GpuBreadcrumbs::ReportDeviceLost(graphics, "vkQueueSubmit");
+		}
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 

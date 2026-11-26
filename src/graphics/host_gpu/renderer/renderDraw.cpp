@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -1227,12 +1228,19 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	buffer.BeginRendering(rendering);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	const auto&    last_vertex = vertex_stages.back().stage;
+	const uint64_t vs_hash = last_vertex.module != nullptr ? last_vertex.module->info.shader_hash : 0;
+	const uint64_t ps_hash = state.ps_active && state.ps_input_info.stage.module != nullptr
+	                             ? state.ps_input_info.stage.module->info.shader_hash
+	                             : 0;
+	auto* const    graphics = &m_context.GetGraphics();
 	const auto record = [=, &occlusion_queries, primitive = ucfg.GetPrimType(),
 	                     args   = args_buffer.first != nullptr ? args_buffer.first->Handle()
 	                                                           : vk::Buffer {},
 	                     offset = args_buffer.second](vk::CommandBuffer command,
 	                                                  vk::Pipeline      handle) {
 		command.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+		const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'D', vs_hash, ps_hash);
 		if (mesh_task) {
 			command.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 		} else if (mesh_active) {
@@ -1244,6 +1252,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		} else {
 			command.drawIndirect(args, offset, emit.indirect.count, emit.indirect.stride);
 		}
+		GpuBreadcrumbs::End(*graphics, command, crumb);
 		occlusion_queries.End(command, occlusion_query);
 	};
 	if (pipeline.pipeline) {

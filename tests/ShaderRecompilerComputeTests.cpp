@@ -25782,7 +25782,10 @@ private:
     Require("VulkanHarness", "dispatch",
             available_robustness2.robustBufferAccess2 == true &&
                 available_pipeline_robustness.pipelineRobustness == true &&
-                robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u,
+                (robustness2_properties.robustStorageBufferAccessSizeAlignment == 1u ||
+                 // Test-only: run on hosts with coarser bounds (RADV: 4 bytes); cases that
+                 // check sub-dword out-of-bounds bytes may then fail.
+                 std::getenv("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS") != nullptr),
             "byte-granular per-pipeline robustBufferAccess2 is not supported");
     Require("VulkanHarness", "dispatch",
             available_features.shaderStorageImageWriteWithoutFormat == true,
@@ -43222,10 +43225,15 @@ void CheckWave64WholeWaveResults() {
           tools.Disassemble(native.spirv, &native_text) &&
               tools.Disassemble(emulated.spirv, &emulated_text),
           "failed to disassemble whole-wave operations");
-  const auto ballots = CountText(native_text, "OpGroupNonUniformBallot ");
+  // A native wave64 keeps the last active lane of a same-address LDS store with one
+  // AllEqual/Ballot pair per store (AnyPS5 55fe6ebf); emulated halves do not use it, so those
+  // ballots are not whole-wave ballots to share.
+  const auto last_lane_ballots = CountText(native_text, "OpGroupNonUniformAllEqual ");
+  const auto ballots = CountText(native_text, "OpGroupNonUniformBallot ") - last_lane_ballots;
   Require(test.name, "whole-wave ballot reuse",
           ballots != 0 &&
-              CountText(emulated_text, "OpGroupNonUniformBallot ") == ballots * 2,
+              CountText(emulated_text, "OpGroupNonUniformBallot ") == ballots * 2 &&
+              CountText(emulated_text, "OpGroupNonUniformAllEqual ") == 0,
           "emulated halves repeated a whole-wave ballot");
   // READLANE still emits two shuffles per half; READFIRSTLANE needs one shared pair.
   Require(test.name, "whole-wave first-lane reuse",
