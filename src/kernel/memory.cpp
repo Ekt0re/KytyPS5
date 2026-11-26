@@ -215,6 +215,11 @@ static bool IsCommittedRangeType(VirtualRangeType type) {
 
 class VirtualRanges {
 public:
+	template <typename Function>
+	void ForEach(Function&& function) const {
+		for (const auto& entry: m_ranges) function(entry.second);
+	}
+
 	struct Range {
 		uint64_t         start          = 0;
 		uint64_t         size           = 0;
@@ -2814,6 +2819,97 @@ bool TestGuestFreeRangeBounds() {
 	       !GuestFreeRangeContains(0x10000, 0x20000, 0x40000, 0x4000);
 }
 #endif
+
+std::vector<CaptureRange> CaptureRanges() {
+	std::vector<CaptureRange> ranges;
+	std::shared_lock          state(g_memory_state_mutex);
+	g_virtual_ranges->ForEach([&](const VirtualRanges::Range& range) {
+		if (!IsCommittedRangeType(range.type)) return;
+		CaptureRange out {};
+		out.start       = range.start;
+		out.size        = range.size;
+		out.offset      = range.offset;
+		out.protection  = range.protection;
+		out.memory_type = range.memory_type;
+		switch (range.type) {
+			case VirtualRangeType::Direct: out.type = CaptureRange::Direct; break;
+			case VirtualRangeType::Flexible: out.type = CaptureRange::Flexible; break;
+			case VirtualRangeType::Pooled: out.type = CaptureRange::Pooled; break;
+			case VirtualRangeType::Stack: out.type = CaptureRange::Stack; break;
+			case VirtualRangeType::Code: out.type = CaptureRange::Code; break;
+			default: out.type = CaptureRange::Runtime; break;
+		}
+		ranges.push_back(out);
+	});
+	return ranges;
+}
+
+std::vector<CapturePhysical> CapturePhysicalBlocks() {
+	std::vector<CapturePhysical> blocks;
+	std::shared_lock             state(g_memory_state_mutex);
+	for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
+		blocks.push_back({block.start_addr, block.size, block.memory_type,
+		                  static_cast<uint32_t>(block.kind)});
+	}
+	return blocks;
+}
+
+bool ReplayAllocatePhysical(const CapturePhysical& block) {
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+	std::unique_lock                      state(g_memory_state_mutex);
+	PhysicalMemory::AllocatedBlock        existing {};
+	if (g_physical_memory->Find(block.start, &existing)) {
+		// Allocated already (the driver's own DMEM is reserved at start-up in both runs).
+		return existing.start_addr <= block.start &&
+		       block.start + block.size <= existing.start_addr + existing.size;
+	}
+	uint64_t address = 0;
+	return g_physical_memory->Alloc(block.start, block.start + block.size, block.size, 0,
+	                                &address, block.memory_type) &&
+	       address == block.start;
+}
+
+bool ReplayMapRange(const CaptureRange& range) {
+	if (!IsAmmMemoryRange(range.start, range.size)) {
+		std::shared_lock state(g_memory_state_mutex);
+		if (g_virtual_ranges->HasOverlap(range.start, range.size)) return false;
+	}
+	constexpr int MapFixed = 0x10;
+	void*         address  = reinterpret_cast<void*>(range.start);
+	int           direct   = OK;
+	if ((range.type == CaptureRange::Direct || range.type == CaptureRange::Pooled) &&
+	    IsAmmMemoryRange(range.start, range.size)) {
+		// Automatic (AMPR) memory lives in the AMM window, reserved first as MapAutomaticMemory does.
+		std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+		direct = ReplaceFixedRangeWithReserved(range.start, range.size);
+		if (direct == OK) {
+			direct = MapDirectMemory(&address, range.size, range.protection, MapFixed,
+			                         static_cast<int64_t>(range.offset), 0x4000, "", range.memory_type);
+		}
+		if (direct == OK && reinterpret_cast<uint64_t>(address) == range.start) return true;
+	} else if (range.type == CaptureRange::Direct || range.type == CaptureRange::Pooled) {
+		direct = KernelMapDirectMemory(&address, range.size, range.protection, MapFixed,
+		                               static_cast<int64_t>(range.offset), 0);
+		if (direct == OK && reinterpret_cast<uint64_t>(address) == range.start) {
+			return true;
+		}
+		address = reinterpret_cast<void*>(range.start);
+	}
+	// Flexible, code, runtime and stack ranges, and pool ranges whose pages are not direct memory,
+	// are replayed as flexible memory with the same contents.
+	const int flexible =
+	    KernelMapFlexibleMemory(&address, range.size, range.protection & ~PROT_CPU_EXEC, MapFixed);
+	if (flexible == OK && reinterpret_cast<uint64_t>(address) == range.start) return true;
+	static std::atomic<int> reported {0};
+	if (reported.fetch_add(1) < 8) {
+		std::fprintf(stderr,
+		             "[replay] map 0x%016" PRIx64 "+0x%" PRIx64 " type %u prot 0x%x offset 0x%" PRIx64
+		             ": direct 0x%x, flexible 0x%x\n",
+		             range.start, range.size, range.type, range.protection, range.offset,
+		             static_cast<unsigned>(direct), static_cast<unsigned>(flexible));
+	}
+	return false;
+}
 
 int KYTY_SYSV_ABI KernelVirtualQuery(const void* addr, int flags, VirtualQueryInfo* info,
                                      uint64_t info_size) {

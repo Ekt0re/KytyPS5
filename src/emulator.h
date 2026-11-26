@@ -16,9 +16,14 @@ struct RunOptions {
 	std::filesystem::path                game_patch;
 	std::filesystem::path                addcont_dir;
 	std::vector<Common::AddContentEntry> addcont;
+	// Frame capture replay (graphics/frameCapture.h): no game is loaded.
+	std::filesystem::path replay;
+	std::filesystem::path replay_out;
+	uint32_t              replay_repeat = 1;
 };
 
 void Run(const RunOptions& options);
+void RunReplay(const RunOptions& options);
 int LoadExec(const char* path, const char* const argv[]);
 
 } // namespace Emulator

@@ -44,6 +44,15 @@ public:
 	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
+	// Submissions accepted and completed per queue (0 graphics, 1 + n compute queue 0x20 + n),
+	// for frame capture and replay pacing (graphics/frameCapture.cpp).
+	static constexpr uint32_t PacingQueues = 1 + 7 * 8;
+	[[nodiscard]] uint64_t    AcceptedSubmissions(uint32_t queue_id) const noexcept {
+		return m_accepted[queue_id].load(std::memory_order_acquire);
+	}
+	[[nodiscard]] uint64_t CompletedSubmissions(uint32_t queue_id) const noexcept {
+		return m_completed[queue_id].load(std::memory_order_acquire);
+	}
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
 
@@ -96,6 +105,8 @@ private:
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	std::atomic_int m_done_num = 0;
+	std::array<std::atomic<uint64_t>, QueueCount> m_accepted {};
+	std::array<std::atomic<uint64_t>, QueueCount> m_completed {};
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

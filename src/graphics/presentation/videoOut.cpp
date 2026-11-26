@@ -9,6 +9,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/frameCapture.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -31,6 +32,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <thread>
+#include <cstring>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -1192,8 +1194,12 @@ bool FlipQueue::Flip() {
 	return due;
 }
 
+namespace Capture = Graphics::FrameCapture;
+
 KYTY_SYSV_ABI int VideoOutSetFlipMaster(int slave_handle, int master_handle) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::SetFlipMaster,
+	                      std::array<int64_t, 2> {slave_handle, master_handle});
 	return DriverState().SetFlipMaster(slave_handle, master_handle);
 }
 
@@ -1210,11 +1216,15 @@ KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void*
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
-	return DriverState().Open(bus_type, index);
+	const int handle = DriverState().Open(bus_type, index);
+	Capture::VideoOutCall(Capture::VideoOutCallKind::Open,
+	                      std::array<int64_t, 3> {bus_type, index, handle});
+	return handle;
 }
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::Close, std::array<int64_t, 1> {handle});
 
 	return DriverState().Close(handle) ? OK : VIDEO_OUT_ERROR_INVALID_HANDLE;
 }
@@ -1253,6 +1263,8 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
 
 KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::SetFlipRate,
+	                      std::array<int64_t, 2> {handle, rate});
 
 	LOGF("\trate = %d\n", rate);
 
@@ -1323,6 +1335,19 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
                                            const VideoOutBufferAttribute2* attribute, int category,
                                            void* option) {
 	PRINT_NAME();
+
+	if (Capture::Enabled() && buffers != nullptr && attribute != nullptr && buffer_num > 0) {
+		std::vector<uint8_t> blob(sizeof(VideoOutBufferAttribute2) +
+		                          sizeof(VideoOutBuffers) * static_cast<size_t>(buffer_num));
+		static_assert(sizeof(VideoOutBuffers) == 32);
+		const auto buffer_bytes = sizeof(VideoOutBuffers) * static_cast<size_t>(buffer_num);
+		std::memcpy(blob.data(), buffers, buffer_bytes);
+		std::memcpy(blob.data() + buffer_bytes, attribute, sizeof(VideoOutBufferAttribute2));
+		Capture::VideoOutCall(
+		    Capture::VideoOutCallKind::RegisterBuffers2,
+		    std::array<int64_t, 5> {handle, set_index, buffer_index_start, buffer_num, category},
+		    blob);
+	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1450,6 +1475,12 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
                                                        const VideoOutBufferAttribute2* attribute,
                                                        void*                           option) {
 	PRINT_NAME();
+	if (attribute != nullptr) {
+		Capture::VideoOutCall(Capture::VideoOutCallKind::SubmitChangeBufferAttribute2,
+		                      std::array<int64_t, 2> {handle, set_index},
+		                      {reinterpret_cast<const uint8_t*>(attribute),
+		                       sizeof(VideoOutBufferAttribute2)});
+	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1490,6 +1521,8 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 
 KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::UnregisterBuffers,
+	                      std::array<int64_t, 2> {handle, set_index});
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1518,6 +1551,8 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::SubmitFlip,
+	                      std::array<int64_t, 4> {handle, index, flip_mode, flip_arg});
 
 	auto&     driver     = DriverState();
 	uint64_t  request_id = 0;
@@ -1529,6 +1564,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	if (result != OK) {
 		return result;
 	}
+	Capture::NoteFlip();
 	driver.Renderer().GetGpu().SubmitFlipPreparation(request_id);
 
 	return OK;
@@ -1543,9 +1579,24 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	if (result != OK) {
 		return result;
 	}
+	Capture::NoteFlip();
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
 
 	return OK;
+}
+
+bool VideoOutCurrentImage(int handle, Graphics::ImageInfo* info) {
+	auto* cfg = DriverState().Get(handle);
+	if (cfg == nullptr || info == nullptr) return false;
+	Common::LockGuard lock(cfg->mutex);
+	const int         index = cfg->flip_status.currentBuffer;
+	if (index < 0 || IsSpecialBufferIndex(index) ||
+	    static_cast<size_t>(index) >= std::size(cfg->buffers) || !cfg->buffers[index].Occupied()) {
+		return false;
+	}
+	const auto& surface = cfg->buffers[index];
+	*info               = cfg->groups[surface.group_index].ImageInfo(surface);
+	return true;
 }
 
 void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer) {

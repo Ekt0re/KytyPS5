@@ -12,6 +12,7 @@
 namespace Libs::Graphics {
 class CommandBuffer;
 class Presenter;
+struct ImageInfo;
 } // namespace Libs::Graphics
 
 namespace Libs::VideoOut {
@@ -51,6 +52,8 @@ void                          VideoOutShutdown();
 // The labels the flip and wait packets name a port's buffers by, and the port's bus; nullptr for a
 // closed port.
 uint64_t* VideoOutGetBufferLabels(int handle, int* bus);
+// The image of the buffer a port shows now (frame capture replay); false if it shows none.
+bool VideoOutCurrentImage(int handle, Graphics::ImageInfo* info);
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);

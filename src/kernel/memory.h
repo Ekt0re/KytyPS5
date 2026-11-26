@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/virtualMemory.h"
+#include <vector>
 
 namespace Libs::Graphics {
 class RenderContext;
@@ -163,6 +164,29 @@ void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+
+// Frame capture (graphics/frameCapture.cpp): the committed guest ranges and allocated physical
+// blocks, and their re-creation at the same addresses in a replay.
+struct CaptureRange {
+	enum Type : uint32_t { Direct, Flexible, Pooled, Stack, Code, Runtime };
+	uint64_t start;
+	uint64_t size;
+	uint64_t offset;
+	int32_t  protection;
+	int32_t  memory_type;
+	uint32_t type;
+	uint32_t reserved;
+};
+struct CapturePhysical {
+	uint64_t start;
+	uint64_t size;
+	int32_t  memory_type;
+	uint32_t kind;
+};
+[[nodiscard]] std::vector<CaptureRange>    CaptureRanges();
+[[nodiscard]] std::vector<CapturePhysical> CapturePhysicalBlocks();
+[[nodiscard]] bool                         ReplayAllocatePhysical(const CapturePhysical& block);
+[[nodiscard]] bool                         ReplayMapRange(const CaptureRange& range);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

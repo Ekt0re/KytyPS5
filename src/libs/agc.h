@@ -22,6 +22,9 @@ struct MemoryRange {
 
 void Initialize();
 void Shutdown();
+// The renderer the AGC driver submits to; nullptr before Initialize.
+class RenderContext;
+[[nodiscard]] RenderContext* AgcRenderer() noexcept;
 
 struct Lifecycle {
 	static constexpr const char* name       = "Graphics";

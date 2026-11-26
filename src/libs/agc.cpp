@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/frameCapture.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -82,6 +83,10 @@ void Initialize() {
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(AgcDriver::Initialize() != OK);
 	ShaderInit();
+}
+
+RenderContext* AgcRenderer() noexcept {
+	return g_renderer;
 }
 
 void Shutdown() {
@@ -1536,6 +1541,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
+	FrameCapture::SuspendPoint();
 	g_renderer->GetGpu().SuspendPoint();
 
 	return OK;
@@ -3585,6 +3591,7 @@ int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
 
 	cmd[1] = (cmd[1] & 0x7fffffffu) | (static_cast<uint32_t>(state) << 31u);
 	if (state != 0 && g_renderer != nullptr) {
+		FrameCapture::ReleaseRewind(cmd);
 		g_renderer->GetGpu().ReleaseRewind(cmd);
 	}
 	return OK;
@@ -4237,6 +4244,7 @@ struct TessellationDriverState {
 static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	FrameCapture::Submit(0, dcb, size_in_dwords);
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords});
 }
@@ -4297,6 +4305,7 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 		return;
 	}
 
+	FrameCapture::Submit(queue, acb, size_in_dwords);
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
 }

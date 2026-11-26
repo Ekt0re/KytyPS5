@@ -11,6 +11,7 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "graphics/frameCapture.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
@@ -135,6 +136,19 @@ static void Execute(const std::filesystem::path& game_patch) {
 	std::thread([game_patch] {
 		Common::Singleton<Loader::RuntimeLinker>::Instance()->Execute(game_patch);
 	}).detach();
+	Libs::Graphics::WindowRun();
+	std::quick_exit(0);
+}
+
+void RunReplay(const RunOptions& options) {
+	Common::Subsystems subsystems(true);
+	Init(options.config, {}, subsystems);
+	PrintSystemInfo();
+	Libs::Graphics::FrameCapture::ReplayOptions replay;
+	replay.capture = options.replay;
+	replay.output  = options.replay_out.empty() ? options.replay / "replay" : options.replay_out;
+	replay.repeat  = options.replay_repeat;
+	std::thread([replay] { Libs::Graphics::FrameCapture::RunReplay(replay); }).detach();
 	Libs::Graphics::WindowRun();
 	std::quick_exit(0);
 }

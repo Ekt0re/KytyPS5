@@ -25,6 +25,10 @@ static void PrintUsage() {
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+	::printf("  --replay <dir>                       Replay a frame capture (KYTY_FRAME_CAPTURE=<dir>)\n"
+	         "                                       without a game.\n");
+	::printf("  --replay-out <dir>                   Replay results (default <capture>/replay).\n");
+	::printf("  --replay-repeat <num>                Replay the captured frames this many times.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
 	::printf(
 	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
@@ -262,6 +266,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			return false;
 		}
 
+		if (arg == "--replay") {
+			options.replay = Common::PathFromUtf8(value);
+			continue;
+		}
+		if (arg == "--replay-out") {
+			options.replay_out = Common::PathFromUtf8(value);
+			continue;
+		}
+		if (arg == "--replay-repeat") {
+			if (!ParseUint32(value, options.replay_repeat) || options.replay_repeat == 0) {
+				::printf("invalid replay repeat count: %s\n", value.c_str());
+				return false;
+			}
+			continue;
+		}
+
 		if (arg == "--game") {
 			if (!options.app0_dir.empty()) {
 				::printf("--game can only be specified once\n");
@@ -467,7 +487,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		options.config.vulkan_validation_enabled = true;
 	}
 
-	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
+	return show_help || !options.replay.empty() || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
 static int Main(int argc, char* argv[]) {
@@ -491,6 +511,10 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	if (!options.replay.empty()) {
+		RunReplay(options);
+		return 0;
+	}
 	Run(options);
 
 	return 0;
