@@ -20,8 +20,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -2041,11 +2044,47 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 	return tick;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool full_write) {
+	// A GPU buffer write also refreshes the images it overlaps at other addresses (after
+	// middletooth-glitch/KytyPS5 96a411672e, 9757165f56, 98a6e4cd3e, 7f3bfa1bdb):
+	// - an image without GPU writes of its own takes the buffer's bytes on its next use, so it
+	//   does not keep the contents from before the write;
+	// - a write that covers every byte of the range (a fill or a copy) is newer than the GPU
+	//   writes of the images inside it, so they take the written data too.
+	// Compressed images cannot be refreshed from a buffer. KYTY_GPU_WRITE_IMAGES=exact limits
+	// the refresh to images starting at the write, as before.
+	static const bool overlap = [] {
+		const char* value = std::getenv("KYTY_GPU_WRITE_IMAGES");
+		return value == nullptr || std::strcmp(value, "exact") != 0;
+	}();
+	static std::atomic<uint32_t> logged {0};
 	std::scoped_lock lock {m_lock};
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
-		if (image.info.data.address != address) {
+		if (image.info.data.address == address) {
+			image.ClearGpuModified();
+			image.MarkBufferModified();
 			return;
+		}
+		if (!overlap || image.info.metadata.compression != VideoOutCompression::Uncompressed) {
+			return;
+		}
+		const bool inside = image.info.data.address >= address &&
+		                    image.info.data.End() <= address + size;
+		const bool refresh = !image.IsGpuModified() || (full_write && inside);
+		if (!refresh) {
+			return;
+		}
+		const auto count = logged.fetch_add(1, std::memory_order_relaxed);
+		if (count < 32u || (count & (count - 1u)) == 0u) {
+			char message[256];
+			std::snprintf(message, sizeof(message),
+			              "GPU buffer write refreshes an overlapped image (#%u): write 0x%016" PRIx64
+			              "+0x%" PRIx64 " full=%d, image 0x%016" PRIx64 "+0x%" PRIx64
+			              " %ux%u gpu_modified=%d\n",
+			              count + 1u, address, size, full_write ? 1 : 0, image.info.data.address,
+			              image.info.data.size, image.info.extent.width, image.info.extent.height,
+			              image.IsGpuModified() ? 1 : 0);
+			Log::WriteToConsoleAndLog(message);
 		}
 		image.ClearGpuModified();
 		image.MarkBufferModified();

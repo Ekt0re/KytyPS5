@@ -75,7 +75,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// full_write: the GPU write covers every byte of the range, so images inside it take the
+	// written data even when they hold GPU writes of their own.
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
+	                                           bool full_write = false);
 	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
 	// returns false for any other copy.
 	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);

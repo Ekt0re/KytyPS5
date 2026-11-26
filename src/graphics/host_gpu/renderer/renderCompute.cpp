@@ -196,8 +196,14 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 		// CPU fills invalidate overlapping cached images. Preserve the native dispatch for
 		// partial or ambiguous image backings, including pooled metadata aliases.
 		if ((descriptor.Base48() & 3u) != 0 ||
-		    !m_context.IsMapped(descriptor.Base48(), size) ||
-		    cache.IsRegionRegistered(descriptor.Base48(), size)) {
+		    !m_context.IsMapped(descriptor.Base48(), size)) {
+			return false;
+		}
+		if (cache.IsRegionRegistered(descriptor.Base48(), size)) {
+			// The native dispatch writes every byte of the range, after the GPU writes of the
+			// images inside it, so those images take the filled data (after
+			// middletooth-glitch/KytyPS5 98a6e4cd3e, there keyed to one Demon's Souls shader).
+			cache.InvalidateMemoryFromGPU(descriptor.Base48(), size, true);
 			return false;
 		}
 		// Metadata need not have an image backing yet. Keep proven fills in guest memory
