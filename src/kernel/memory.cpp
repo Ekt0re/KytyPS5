@@ -715,6 +715,10 @@ private:
 	// Track backing ownership while a transaction changes views before publishing VirtualRanges.
 	// Names, protections and memory types live only in VirtualRanges. Physical offsets may alias.
 	std::map<uint64_t, Mapping> m_mappings;
+	// How many mappings cover each physical byte: segment start -> count up to the next key. An
+	// unmap finds what is still mapped in its physical range without walking every mapping.
+	std::map<uint64_t, uint32_t> m_phys_coverage {{0, 0u}};
+	void                         CoverPhysical(uint64_t start, uint64_t size, int delta);
 };
 
 class FlexibleMemory {
@@ -1241,10 +1245,13 @@ void PhysicalMemory::ReclaimAutomatic(uint64_t start, uint64_t size) {
 		automatic = true;
 	}
 	if (automatic) {
-		for (const auto& [vaddr, mapping]: m_mappings) {
-			const auto first = std::max(start, mapping.start_addr);
-			const auto last  = std::min(end, mapping.start_addr + mapping.size);
-			if (first < last) {
+		// The bytes some mapping still covers stay allocated.
+		auto it = std::prev(m_phys_coverage.upper_bound(start));
+		for (; it != m_phys_coverage.end() && it->first < end; ++it) {
+			const auto next  = std::next(it);
+			const auto first = std::max(start, it->first);
+			const auto last  = next == m_phys_coverage.end() ? end : std::min(end, next->first);
+			if (it->second != 0u && first < last) {
 				RemoveFreeRange(m_automatic_free, first, last - first);
 			}
 		}
@@ -1293,6 +1300,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len) {
 	}
 
 	m_mappings.emplace_hint(next, vaddr, Mapping {phys_addr, len});
+	CoverPhysical(phys_addr, len, 1);
 	RemoveFreeRange(m_automatic_free, phys_addr, len);
 	return true;
 }
@@ -1366,6 +1374,30 @@ std::map<uint64_t, PhysicalMemory::Mapping>::iterator PhysicalMemory::SplitMappi
 	return next;
 }
 
+void PhysicalMemory::CoverPhysical(uint64_t start, uint64_t size, int delta) {
+	if (size == 0) return;
+	const auto split = [&](uint64_t at) {
+		auto it = std::prev(m_phys_coverage.upper_bound(at));
+		if (it->first != at) it = m_phys_coverage.emplace_hint(std::next(it), at, it->second);
+		return it;
+	};
+	const auto end   = start + size;
+	auto       first = split(start);
+	const auto last  = end < start ? m_phys_coverage.end() : split(end);
+	for (auto it = first; it != last; ++it) {
+		it->second = static_cast<uint32_t>(static_cast<int64_t>(it->second) + delta);
+	}
+	// Merge equal neighbours at both edges so the map stays as small as the coverage.
+	const auto merge = [&](std::map<uint64_t, uint32_t>::iterator it) {
+		if (it != m_phys_coverage.end() && it != m_phys_coverage.begin() &&
+		    std::prev(it)->second == it->second) {
+			m_phys_coverage.erase(it);
+		}
+	};
+	merge(last);
+	merge(first);
+}
+
 bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || UINT64_MAX - vaddr < size) {
 		return false;
@@ -1388,6 +1420,7 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size) {
 	first           = SplitMapping(vaddr);
 	while (first != last) {
 		const auto removed = first->second;
+		CoverPhysical(removed.start_addr, removed.size, -1);
 		first              = m_mappings.erase(first);
 		ReclaimAutomatic(removed.start_addr, removed.size);
 	}
