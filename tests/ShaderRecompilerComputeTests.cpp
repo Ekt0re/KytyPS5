@@ -33463,6 +33463,52 @@ TestCase VectorReadlaneSelectsTwoKeysWithinWave() {
   return test;
 }
 
+// EXEC-masked merges that IR::EliminateExecSelects (KYTY_EXEC_SELECTS) must keep or may drop.
+// Under EXEC = lanes 0..3, v1 is written twice and v2 once. V_READLANE then reads lane 5 of v1,
+// which is inactive and must still see its old value, and both registers stay live after EXEC is
+// restored, where the inactive lanes keep theirs. Wave64 runs two guest lanes per host invocation
+// on a 32-wide host.
+TestCase VectorExecMaskedMerges(u32 wave_size) {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 100);
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(0), 1)); // v1 = 100 + lane
+  AppendVMovU32(&code, 5, 1000);
+  AppendVMovU32(&code, 2, 7);
+  code.push_back(EncodeSop1(0x04, 6, 126));        // s[6:7] = exec
+  code.push_back(EncodeVopc(0xd4, InlineU32(4), 0)); // EXEC = lanes where 4 > lane
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(5), 1)); // v1 += 1000
+  code.push_back(EncodeVop2(0x25, 1, Vgpr(5), 1)); // v1 += 1000 (second write, same EXEC)
+  code.push_back(EncodeVop1(0x01, 2, Vgpr(1)));    // v2 = v1
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(5), 2)); // v2 += 1000
+  AppendVop3(&code, 0x360, 8, Vgpr(1), InlineU32(5)); // s8 = v1 of lane 5 (inactive)
+  code.push_back(EncodeSop1(0x04, 126, 6));        // exec = s[6:7]
+  code.push_back(EncodeVop1(0x01, 3, 8));          // v3 = s8
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, wave_size);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 2u * wave_size);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 64u ? "VectorExecMaskedMergesWave64" : "VectorExecMaskedMergesWave32";
+  test.code = std::move(code);
+  test.expected.resize(3u * wave_size);
+  for (u32 lane = 0; lane < wave_size; lane++) {
+    test.expected[lane]                  = lane < 4u ? 2100u + lane : 100u + lane;
+    test.expected[wave_size + lane]      = 105u;
+    test.expected[2u * wave_size + lane] = lane < 4u ? 3100u + lane : 7u;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B64, O::V_CMPX_GT_U32,
+                  O::V_READLANE_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorPermlanex16() {
   using O = ShaderOpcode;
 
@@ -52182,6 +52228,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1MoveRelSourceRuntimeIndex);
   for (bool restore : {false, true}) cases.push_back(Vop1MoveRelFirstLaneIndex(restore));
   cases.push_back(Vop1MoveRelMaskedLanesIndex());
+  for (u32 wave : {32u, 64u}) cases.push_back(VectorExecMaskedMerges(wave));
   AddCase(Vop1MoveRelDestination);
   AddCase(Vop1MoveRelDestinationSkipsLaneSpill);
   AddCase(VectorFloatSpecialOps);
@@ -61256,6 +61303,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     for (bool restore : {false, true}) RunCase(&vulkan, Vop1MoveRelFirstLaneIndex(restore));
     RunCase(&vulkan, Vop1MoveRelMaskedLanesIndex());
+    for (u32 wave : {32u, 64u}) RunCase(&vulkan, VectorExecMaskedMerges(wave));
     RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
     return 0;
   }
