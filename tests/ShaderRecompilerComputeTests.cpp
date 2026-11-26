@@ -46058,8 +46058,12 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
         std::vector<u32> stores;
         u32 bda_function = 0, conversion_function = 0, geometry_function = 0, function = 0;
         u32 bda_calls = 0, conversion_calls = 0, conversion_definitions = 0;
-        u32 geometry_calls = 0, geometry_definitions = 0, geometry_switches = 0;
+        u32 geometry_calls = 0, geometry_definitions = 0, geometry_loads = 0;
         bool geometry_pure = true, geometry_cases = true;
+        // The geometry reads one entry of a constant private table (one per format; invalid
+        // formats select entry zero) instead of switching over the formats.
+        std::map<u32, std::pair<u32, u32>> variables; // id -> storage class, initializer
+        std::map<u32, u32> composites, access_bases;  // id -> constituent count; chain -> base
         for (size_t offset = 5; offset < compiled.spirv.size();) {
           const auto words = std::span(compiled.spirv).subspan(offset, compiled.spirv[offset] >> 16u);
           const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
@@ -46077,18 +46081,23 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
             conversion_definitions += function == conversion_function;
             geometry_definitions += function == geometry_function;
           }
+          if (opcode == spv::OpVariable && words.size() >= 4u)
+            variables[words[2]] = {words[3], words.size() >= 5u ? words[4] : 0u};
+          if (opcode == spv::OpConstantComposite) composites[words[2]] = u32(words.size()) - 3u;
+          if (opcode == spv::OpAccessChain) access_bases[words[2]] = words[3];
           if (function == geometry_function && function != 0u) {
-            geometry_pure &= opcode != spv::OpLoad && opcode != spv::OpStore &&
-                             opcode != spv::OpFunctionCall;
-            if (opcode == spv::OpSwitch) {
-              ++geometry_switches;
+            geometry_pure &= opcode != spv::OpStore && opcode != spv::OpFunctionCall &&
+                             opcode != spv::OpSwitch;
+            if (opcode == spv::OpLoad) {
+              ++geometry_loads;
               constexpr u32 formats = u32(Prospero::BufferFormat::k32_32_32_32Float) + 1u;
-              geometry_cases &= words.size() == 3u + 2u * formats;
-              if (words.size() == 3u + 2u * formats) {
-                geometry_cases &= words[2] == words[4]; // Invalid formats use format zero.
-                for (u32 format = 0; format < formats; ++format)
-                  geometry_cases &= words[3u + 2u * format] == format;
-              }
+              const auto base = access_bases.find(words[3]);
+              const auto table = base == access_bases.end() ? variables.end()
+                                                            : variables.find(base->second);
+              geometry_cases &= table != variables.end() &&
+                                table->second.first == u32(spv::StorageClassPrivate) &&
+                                composites.contains(table->second.second) &&
+                                composites[table->second.second] == formats;
             }
           }
           if (opcode == spv::OpFunctionCall) {
@@ -46104,7 +46113,7 @@ void CheckBoundedFormattedBufferCopy(VulkanHarness &vulkan) {
                 "formatted loads must call one conversion function across virtual halves");
         Require(test.name, "one shared pure format geometry",
                 geometry_definitions == 1u && geometry_calls == conversion_calls &&
-                    geometry_switches == 1u && geometry_cases && geometry_pure,
+                    geometry_loads == 1u && geometry_cases && geometry_pure,
                 "format geometry duplicated, lost a format/default or acquired memory accesses");
         Require(test.name, "one shared indirect store per virtual half",
                 std::ranges::count_if(stores, [&](u32 pointer) { return nonuniform.contains(pointer); }) ==
