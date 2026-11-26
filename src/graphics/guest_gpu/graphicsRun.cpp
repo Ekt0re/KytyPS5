@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -33,7 +34,10 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <tuple>
 #include <vector>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics {
 
@@ -851,6 +855,62 @@ static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectO
 	return true;
 }
 
+// KYTY_READBACK_STATS: every 10 s, the indirect draws whose records or count the CPU read back
+// and the time those readbacks took.
+namespace {
+struct IndirectReadbackStats {
+	uint64_t packets = 0, records = 0, count_reads = 0, ns = 0;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+
+	static IndirectReadbackStats* Get() {
+		static const bool enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		static IndirectReadbackStats stats;
+		return enabled ? &stats : nullptr;
+	}
+	void Add(std::chrono::steady_clock::time_point start, uint64_t record_count, bool count) {
+		const auto now = std::chrono::steady_clock::now();
+		packets += record_count != 0 ? 1 : 0;
+		records += record_count;
+		count_reads += count ? 1 : 0;
+		ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+		if (now - last >= std::chrono::seconds(10)) {
+			last = now;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Indirect readback stats: {} packets, {} records, {} count reads, {:.0f} ms\n",
+			    packets, records, count_reads, static_cast<double>(ns) / 1e6));
+		}
+	}
+};
+} // namespace
+
+// A record no real draw produces, such as one a writer the emulator dropped left as garbage
+// ("4 billion vertices"), would launch enough work to trip the GPU watchdog or a host launch
+// limit. Such records are clamped: at most 2^24 vertices or indices, 2^26 of them over all
+// instances, and a first vertex or index past 2^28 draws nothing.
+static void SanitizeIndirectRecord(uint32_t& count, uint32_t& instances, uint32_t first,
+                                   uint64_t addr) {
+	constexpr uint32_t MaxCount = 1u << 24u;
+	constexpr uint64_t MaxWork  = uint64_t {1} << 26u;
+	constexpr uint32_t MaxFirst = 1u << 28u;
+	const auto         original = std::tuple {count, instances, first};
+	if (first >= MaxFirst) {
+		count = 0;
+	}
+	count = std::min(count, MaxCount);
+	if (count != 0 && uint64_t {count} * instances > MaxWork) {
+		instances = static_cast<uint32_t>(MaxWork / count);
+	}
+	if (original != std::tuple {count, instances, first}) {
+		static std::atomic_uint32_t warned {0};
+		if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "GPU: clamped an implausible indirect draw record at 0x{:016x}: count={} "
+			    "instances={} first={}\n",
+			    addr, std::get<0>(original), std::get<1>(original), std::get<2>(original)));
+		}
+	}
+}
+
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
@@ -873,7 +933,11 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	};
 	if (count_addr != nullptr) {
+		const auto start = std::chrono::steady_clock::now();
 		read_gpu_data(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
+		if (auto* stats = IndirectReadbackStats::Get()) {
+			stats->Add(start, 0, true);
+		}
 	}
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
@@ -906,14 +970,19 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 	// The records may have been written by the GPU: bring them back before the CPU reads them,
 	// as DispatchIndirect does (ported from KytyPS5 PR #2302, de49ee9186).
+	const auto readback_start = std::chrono::steady_clock::now();
 	read_gpu_data(args_addr, static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
 	                             (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                      : sizeof(vk::DrawIndirectCommand)));
+	if (auto* stats = IndirectReadbackStats::Get()) {
+		stats->Add(readback_start, draw_count, false);
+	}
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
 		if (!indexed) {
-			const auto& args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
+			auto args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
+			SanitizeIndirectRecord(args.vertexCount, args.instanceCount, args.firstVertex, addr);
 			PatchIndirectDrawOffsets(*this, registers, args.firstVertex, args.firstInstance, 0, i);
 			executor.DrawAuto(CurrentBuffer(), {.vertex_count   = args.vertexCount,
 			                                    .instance_count = args.instanceCount,
@@ -923,7 +992,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			continue;
 		}
 
-		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
+		auto args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
+		SanitizeIndirectRecord(args.indexCount, args.instanceCount, args.firstIndex, addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex, i);
 		// INDEX_BUFFER_SIZE counts indices from the start of the buffer, not from the first index.
