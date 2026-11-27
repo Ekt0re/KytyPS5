@@ -610,6 +610,13 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	// while the resolve cache vouches for its last result: same image set, and for color metadata
 	// the same draw window and scheduler tick, as for the textures draws bind directly.
 	auto&      resolve_cache = m_context.GetResolveCache();
+	// A lookup applies color metadata clears only from blocks the GPU wrote (MaterializeColorClear);
+	// with none in the metadata range, the clear keys cannot change what it does.
+	auto&      buffers            = m_context.GetBufferCache();
+	const auto MetadataGpuWritten = [&](const PreparedTexture& prepared) {
+		const auto& range = prepared.desc.info.metadata.range;
+		return range.size != 0u && buffers.IsRegionGpuModified(range.address, range.size);
+	};
 	const auto retry_dcc = [&](uint32_t index) {
 		const auto& element = m_elements[index];
 		if (element.state != State::Live) {
@@ -625,7 +632,9 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		    cached.generation == 0u) {
 			cached = {element.key, element.kind, generation,
 			          executor.PrepareTexture(resource, element.key.value)};
-		} else if (element.image && resolve_cache.Reuse(element.image, cached.stamp)) {
+		} else if (element.image && (resolve_cache.Reuse(element.image, cached.stamp) ||
+		                             (!MetadataGpuWritten(cached.prepared) &&
+		                              resolve_cache.ReuseImageSet(element.image, cached.stamp)))) {
 			return false;
 		}
 		const auto binding = executor.FinishTexture(resource, cached.prepared);

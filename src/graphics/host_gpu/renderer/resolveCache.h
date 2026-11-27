@@ -25,6 +25,9 @@ public:
 	// Whether FindImage, given the same inputs, would find `id` again; if so, accesses it as
 	// FindImage does.
 	[[nodiscard]] bool Reuse(ImageId id, const ResolveStamp& stamp);
+	// Reuse without the draw window and tick of color clear keys: for a caller that knows the
+	// lookup's color metadata holds no GPU-written blocks, so the keys cannot change its result.
+	[[nodiscard]] bool ReuseImageSet(ImageId id, const ResolveStamp& stamp);
 
 	// The last target resolved from the same arguments, while Reuse holds.
 	[[nodiscard]] bool FindColor(uint32_t slot, const HW::RenderTarget& rt, bool exact_format,

@@ -38,6 +38,15 @@ bool ResolveCache::Reuse(ImageId id, const ResolveStamp& stamp) {
 	return true;
 }
 
+bool ResolveCache::ReuseImageSet(ImageId id, const ResolveStamp& stamp) {
+	if (stamp.epoch != m_epoch) {
+		return false;
+	}
+	auto& cache                                = m_context.GetTextureCache();
+	cache.m_slot_images[id].tick_accessed_last = cache.m_gc_tick;
+	return true;
+}
+
 bool ResolveCache::FindColor(uint32_t slot, const HW::RenderTarget& rt, bool exact_format,
                              RenderColorInfo& r) {
 	const auto& last = m_colors[slot];
