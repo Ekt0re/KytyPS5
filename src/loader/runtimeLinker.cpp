@@ -22,6 +22,7 @@
 #include "kernel/guestWait.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/libs.h"
 #include "kytyGitVersion.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
@@ -821,6 +822,25 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 	}
 	r += "modules (base / size / name; * holds pc):\n";
 	Common::Singleton<RuntimeLinker>::Instance()->DescribeModules(info->exception_address, r);
+	// The last library calls of the faulting thread, for the call that led here. Every value in a
+	// record was copied on the host at call time; no guest memory is read by this reporter.
+	if (Config::TraceCallsEnabled()) {
+		r += "recent library calls on faulting thread (oldest -> newest):\n";
+		Libs::GetThreadCallRing().ForEachOldestFirst([&](const Libs::CallRecord& rec, size_t idx) {
+			r += fmt::format(" [{:3}] {}::{}(0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}) = ",
+			                 idx, rec.library, rec.function, rec.args[0], rec.args[1], rec.args[2],
+			                 rec.args[3], rec.args[4], rec.args[5]);
+			r += rec.completed ? fmt::format("0x{:x}", rec.result) : "<in-flight>";
+			r += fmt::format(" ret=0x{:016x}", rec.guest_ret_addr);
+			const auto* program =
+			    Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(rec.guest_ret_addr);
+			if (program != nullptr) {
+				r += fmt::format(" ({}+0x{:x})", program->file_name.filename().string(),
+				                 rec.guest_ret_addr - program->base_vaddr);
+			}
+			r += "\n";
+		});
+	}
 	// Which call each guest thread waits in: a watchdog abort or hang shows what stalled.
 	r += Libs::LibKernel::DumpGuestThreads();
 	std::fwrite(r.data(), 1, r.size(), stdout);

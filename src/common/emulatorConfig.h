@@ -9,6 +9,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace Config {
@@ -50,6 +51,21 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 	return user_id >= 0 && user_id <= MAX_USER_ID && user_id != USER_ID_EVERYONE &&
 	       user_id != USER_ID_SYSTEM;
 }
+
+// KYTY_TRACE_CALLS=<lib,lib,...|all>. Off (unset, empty or 0) keeps library thunks at their
+// ordinary cost. Named libraries log every call with arguments and result; "all" names every
+// library. With the switch on, a failed call is also logged through a power-of-two rate limit.
+struct TraceCallsFilter {
+	bool                     enabled   = false;
+	bool                     all       = false;
+	std::vector<std::string> libraries;
+};
+
+// Pure parse of the environment value, so the rules can be tested without changing the process
+// environment. Whitespace and empty names are ignored; a value with no names is off.
+[[nodiscard]] TraceCallsFilter ParseTraceCallsFilter(std::string_view value);
+// Read once, like the other KYTY_* diagnostics.
+[[nodiscard]] const TraceCallsFilter& GetTraceCallsFilter();
 
 struct ConfigOptions {
 	uint32_t               screen_width                = 1280;
@@ -136,6 +152,9 @@ struct ConfigOptions {
 };
 
 void Load(const ConfigOptions& cfg);
+
+// Convenience for reporters: the switch is on when at least one library is selected.
+[[nodiscard]] bool TraceCallsEnabled();
 
 uint32_t GetScreenWidth();
 uint32_t GetScreenHeight();

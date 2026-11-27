@@ -26,6 +26,47 @@ static uint32_t SyncStatsPeriod() {
 	return period;
 }
 
+TraceCallsFilter ParseTraceCallsFilter(std::string_view value) {
+	TraceCallsFilter result;
+	if (value.empty() || value == "0") {
+		return result;
+	}
+	result.enabled = true;
+	if (value == "all") {
+		result.all = true;
+		return result;
+	}
+	size_t pos = 0;
+	while (pos < value.size()) {
+		const size_t comma = value.find(',', pos);
+		const auto token =
+		    comma == std::string_view::npos ? value.substr(pos) : value.substr(pos, comma - pos);
+		if (!token.empty()) {
+			result.libraries.emplace_back(token);
+		}
+		if (comma == std::string_view::npos) {
+			break;
+		}
+		pos = comma + 1;
+	}
+	if (result.libraries.empty()) {
+		result.enabled = false;
+	}
+	return result;
+}
+
+const TraceCallsFilter& GetTraceCallsFilter() {
+	static const TraceCallsFilter filter = [] {
+		const char* env = std::getenv("KYTY_TRACE_CALLS");
+		return ParseTraceCallsFilter(env == nullptr ? std::string_view {} : std::string_view {env});
+	}();
+	return filter;
+}
+
+bool TraceCallsEnabled() {
+	return GetTraceCallsFilter().enabled;
+}
+
 static void StartSyncStatsReporter() {
 	static bool started = false;
 	const auto  period  = SyncStatsPeriod();
