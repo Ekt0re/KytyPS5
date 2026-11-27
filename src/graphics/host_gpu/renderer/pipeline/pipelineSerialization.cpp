@@ -613,6 +613,18 @@ bool ResolveStoredPlan(StoredModule& stored) {
 
 bool PipelineCache::TakeStoredPlan(Program& program) {
 	const auto stored = std::move(program.stored_plan);
+	// How much of the store a run uses: its programs are looked up here once each.
+	{
+		static const auto start = std::chrono::steady_clock::now();
+		static uint32_t   used  = 0;
+		if (++used % 100u == 0u) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader cache: {} stored programs used, {} of them not decoded yet, {:.0f} s after "
+			    "the first ({} programs known)\n",
+			    used, g_demand_plans.load(), MillisecondsSince(start) / 1000.0,
+			    m_program_cache.size()));
+		}
+	}
 	if (!stored->plan_decoded.load(std::memory_order_acquire)) {
 		const auto start = std::chrono::steady_clock::now();
 		ResolveStoredPlan(*stored);
