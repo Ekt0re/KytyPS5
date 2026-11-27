@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/shaderTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -1250,6 +1251,22 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const uint64_t ps_hash = state.ps_active && state.ps_input_info.stage.module != nullptr
 	                             ? state.ps_input_info.stage.module->info.shader_hash
 	                             : 0;
+	if (const auto frame = m_context.GetGpu().GetFrameNum(); ShaderTrace::Active(frame)) {
+		std::string stages;
+		for (const auto& stage: vertex_stages) {
+			if (stage.stage.module != nullptr) {
+				stages += fmt::format("{}=0x{:016x} ",
+				                      ShaderTrace::StageName(static_cast<int>(stage.logical_stage)),
+				                      stage.stage.module->info.shader_hash);
+			}
+		}
+		LOGF("TRACE f=%" PRIu64 " n=%u D %sps=0x%016" PRIx64 " %s idx=%u inst=%u indirect=%u "
+		     "mesh_groups=%u task=%d prim=%u colors=%u depth=%d\n",
+		     frame, ShaderTrace::NextSeq(), stages.c_str(), ps_hash, draw.Name(),
+		     draw.index_count, draw.instance_count, emit.indirect.count, mesh_groups,
+		     mesh_task ? 1 : 0, static_cast<uint32_t>(ucfg.GetPrimType()), m_targets.color_count,
+		     static_cast<bool>(m_targets.depth.image_id) ? 1 : 0);
+	}
 	auto* const    graphics = &m_context.GetGraphics();
 	const auto record = [=, &occlusion_queries, primitive = ucfg.GetPrimType(),
 	                     args   = args_buffer.first != nullptr ? args_buffer.first->Handle()

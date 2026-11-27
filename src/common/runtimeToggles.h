@@ -15,6 +15,7 @@
 // read as 0. Known names:
 //   exact     - GPU buffer writes refresh only images starting at the write (overlap refresh off)
 //   pred_off  - SET_PREDICATION never skips draws or dispatches
+//   trace_shaders - log draws and dispatches with their shader hashes (see shaderTrace.h)
 namespace Common::RuntimeToggles {
 
 namespace Detail {

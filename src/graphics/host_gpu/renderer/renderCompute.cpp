@@ -8,6 +8,7 @@
 #include "common/profiler.h"
 #include "common/runtimeToggles.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/shaderTrace.h"
 #include "gpu_tiler_shaders/dispatch_args_guard_spv.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -721,6 +722,13 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	LogAddressWrites(input_info.stage, thread_group_x, thread_group_y, thread_group_z);
+	if (const auto frame = m_context.GetGpu().GetFrameNum(); ShaderTrace::Active(frame)) {
+		LOGF("TRACE f=%" PRIu64 " n=%u C cs=0x%016" PRIx64 " groups=%ux%ux%u local=%ux%ux%u "
+		     "buffers=%zu images=%zu\n",
+		     frame, ShaderTrace::NextSeq(), program.shader_hash, thread_group_x, thread_group_y,
+		     thread_group_z, input_info.threads_num[0], input_info.threads_num[1],
+		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size());
+	}
 	auto* const    graphics = &m_context.GetGraphics();
 	const uint64_t cs_hash  = program.shader_hash;
 	const auto record = [=](vk::CommandBuffer command, vk::Pipeline handle) {
@@ -928,6 +936,13 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	LogAddressWrites(input_info.stage, 0, 0, 0);
+	if (const auto frame = m_context.GetGpu().GetFrameNum(); ShaderTrace::Active(frame)) {
+		LOGF("TRACE f=%" PRIu64 " n=%u C cs=0x%016" PRIx64 " indirect=%s groups=%ux%ux%u "
+		     "local=%ux%ux%u buffers=%zu images=%zu\n",
+		     frame, ShaderTrace::NextSeq(), program.shader_hash, args_known ? "known" : "gpu", args.x,
+		     args.y, args.z, input_info.threads_num[0], input_info.threads_num[1],
+		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size());
+	}
 	RecordDispatch(buffer, pipeline,
 	               [args = dispatch_args.buffer, offset = dispatch_args.offset, direct,
 	                counts   = args, graphics = &m_context.GetGraphics(),
