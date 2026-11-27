@@ -10,6 +10,12 @@
 #include "graphics/shader/shaderCompiler.h"
 
 #include <csetjmp>
+#include <thread>
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 #include <cstdlib>
 #include <algorithm>
@@ -101,7 +107,7 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle and the SPIR-V report fields come from the SPIR-V; stored programs have no
 	// function code.
 	auto& [id, handle, info, specialization, function_code, rect_parameters, mesh_task, spirv_words,
-	       spirv] = stage;
+	       spirv, stored] = stage;
 	IoAll(io, id, info, specialization, rect_parameters, mesh_task);
 }
 
@@ -173,6 +179,21 @@ bool SyncWarmUp() {
 std::atomic<uint64_t> g_decode_zstd_ns {0};
 std::atomic<uint64_t> g_decode_plan_ns {0};
 std::atomic<uint64_t> g_decode_spirv_ns {0};
+// Decompression at start, for the keys.
+std::atomic<uint64_t> g_index_zstd_ns {0};
+// Plans the command thread found not decoded yet, and its time on them (waits included).
+std::atomic<uint64_t> g_demand_plans {0};
+std::atomic<uint64_t> g_demand_plan_ns {0};
+
+// KYTY_EAGER_SHADER_STORE=1 (or KYTY_FAILED_SPIRV_DUMP=1): every record is decoded before the
+// game starts, as before, instead of on first use and in the background.
+bool EagerStore() {
+	static const bool eager = [] {
+		const char* env = std::getenv("KYTY_EAGER_SHADER_STORE");
+		return (env != nullptr && env[0] == '1') || RetainModuleSpirv();
+	}();
+	return eager;
+}
 
 uint64_t NanosecondsSince(std::chrono::steady_clock::time_point start) {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -191,7 +212,6 @@ double MillisecondsSince(std::chrono::steady_clock::time_point start) {
 struct PipelineCache::LoadedRecord {
 	uint8_t                            type = 0; // Record
 	ProgramKey                         key;
-	ShaderRecompiler::IR::ResourcePlan plan;
 	ShaderModule                       module;
 	GraphicsPipelineKey                pipeline_key;
 	uint64_t                           layout_key = 0;
@@ -207,8 +227,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (header.empty()) {
 		return;
 	}
-	const auto           start = std::chrono::steady_clock::now();
-	std::vector<uint8_t> bytes;
+	const auto start      = std::chrono::steady_clock::now();
+	auto       store_data = std::make_shared<std::vector<uint8_t>>();
+	auto&      bytes      = *store_data;
 	if (Common::File file;
 	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
 		bytes.resize(file.Size());
@@ -236,28 +257,49 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			frames.push_back(rest.first(sizeof(frame) + frame.compressed_size));
 			rest = rest.subspan(sizeof(frame) + frame.compressed_size);
 		}
+		// Only the keys and the pipeline fields here; the resource plans and shader modules, which
+		// take nearly all the time, on first use and on the background decoders.
 		std::vector<LoadedRecord> loaded(frames.size());
-		Common::ParallelFor(frames.size(), [&](size_t i) { DecodeRecord(frames[i], loaded[i]); });
+		Common::ParallelFor(frames.size(), [&](size_t i) {
+			DecodeRecord(frames[i], loaded[i]);
+			if (loaded[i].module.stored != nullptr) {
+				loaded[i].module.stored->store = store_data;
+			}
+		});
 		size_t kept = 0;
+		std::vector<std::shared_ptr<StoredModule>> stored;
+
 		for (; kept < loaded.size() && loaded[kept].ok; kept++) {
+			if (loaded[kept].module.stored != nullptr) {
+				stored.push_back(loaded[kept].module.stored);
+			}
 			InsertRecord(std::move(loaded[kept]));
 			records = records.subspan(frames[kept].size());
 		}
-		// Modules of the records after a damaged one were created too.
-		for (auto i = kept; i < loaded.size(); i++) {
-			if (loaded[i].ok && static_cast<Record>(loaded[i].type) == Record::Module) {
-				m_graphics.device.destroyShaderModule(loaded[i].module.module, nullptr);
+		loaded.clear();
+		if (EagerStore()) {
+			Common::ParallelFor(stored.size(), [&](size_t i) {
+				if (stored[i]->want_plan) ResolveStoredPlan(*stored[i]);
+				if (!stored[i]->module_dropped) ResolveStoredModule(*stored[i]);
+			});
+			if (RetainModuleSpirv()) {
+				for (auto& program: m_program_cache | std::views::values) {
+					for (auto& module: program.modules) {
+						if (module.stored != nullptr) module.spirv = std::move(module.stored->spirv);
+					}
+				}
 			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader cache: record time over all threads: zstd {:.0f} ms, resource plans {:.0f} "
+			    "ms, shader modules {:.0f} ms\n",
+			    static_cast<double>(g_decode_zstd_ns) / 1e6,
+			    static_cast<double>(g_decode_plan_ns) / 1e6,
+			    static_cast<double>(g_decode_spirv_ns) / 1e6));
+		} else if (!stored.empty()) {
+			StartStoreDecoders(std::move(stored));
 		}
 	}
 	const auto parse_ms = MillisecondsSince(start) - read_ms;
-	if (reusable) {
-		Log::WriteToConsoleAndLog(fmt::format(
-		    "Shader cache: record time over all threads: zstd {:.0f} ms, resource plans {:.0f} ms, "
-		    "shader modules {:.0f} ms\n",
-		    static_cast<double>(g_decode_zstd_ns) / 1e6, static_cast<double>(g_decode_plan_ns) / 1e6,
-		    static_cast<double>(g_decode_spirv_ns) / 1e6));
-	}
 	// A damaged record ends the store; the records before it stay.
 	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
 
@@ -339,11 +381,12 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	OpenRecipes(path);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {:.0f} ms (read {:.0f} ms, "
-	    "records {:.0f} ms, pipelines {:.0f} ms{})\n",
+	    "records {:.0f} ms, pipelines {:.0f} ms{}{})\n",
 	    m_program_cache.size(), modules.size() - 1,
 	    m_graphics_pipelines.size() + m_compute_pipelines.size(), MillisecondsSince(start),
 	    read_ms, parse_ms, MillisecondsSince(start) - read_ms - parse_ms,
-	    sync ? "" : ", creation continues in the background"));
+	    sync ? "" : ", creation continues in the background",
+	    m_store_decoders != nullptr ? ", records decode on first use and in the background" : ""));
 }
 
 void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& loaded) {
@@ -354,39 +397,40 @@ void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& 
 	    ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != frame.raw_size) {
 		return;
 	}
-	auto                 part = std::chrono::steady_clock::now();
+	const auto           part = std::chrono::steady_clock::now();
 	std::vector<uint8_t> raw(frame.raw_size);
 	if (ZSTD_decompress(raw.data(), raw.size(), compressed.data(), compressed.size()) != raw.size()) {
 		return;
 	}
-	g_decode_zstd_ns += NanosecondsSince(part);
+	g_index_zstd_ns += NanosecondsSince(part);
 	Reader     reader {raw};
 	const auto complete = [&] { return reader.ok && reader.bytes.empty(); };
+	const auto offset   = [&] { return static_cast<uint32_t>(raw.size() - reader.bytes.size()); };
+	// Skips a stored vector of `element` bytes each, returning its count and offset.
+	const auto skip = [&](size_t element, uint32_t& count) {
+		IoAll(reader, count);
+		const auto at = offset();
+		reader.ok     = reader.ok && uint64_t {count} * element <= reader.bytes.size();
+		if (reader.ok) reader.bytes = reader.bytes.subspan(count * element);
+		return at;
+	};
 	auto type = Record::Module;
 	IoAll(reader, type);
 	loaded.type = static_cast<uint8_t>(type);
 	switch (type) {
 		case Record::Module: {
-			std::vector<uint8_t>  plan;
-			std::vector<uint32_t> spirv;
+			auto stored = std::make_shared<StoredModule>();
 			IoKey(reader, loaded.key);
-			IoAll(reader, plan);
+			stored->plan_offset = skip(1, stored->plan_size);
 			IoModule(reader, loaded.module);
-			IoAll(reader, spirv);
-			part = std::chrono::steady_clock::now();
-			if (!complete() || !ShaderRecompiler::IR::LoadResourcePlan(plan, loaded.plan)) {
+			stored->spirv_offset = skip(sizeof(uint32_t), stored->spirv_words);
+			if (!complete() || stored->spirv_words == 0) {
 				return;
 			}
-			g_decode_plan_ns += NanosecondsSince(part);
-			// KYTY_RT_OFF: stored BVH modules walk the scene; InsertRecord drops them, and their
-			// programs translate again with the miss.
-			if (loaded.module.info.info.bvh && ShaderRecompiler::Spirv::BvhIntersectAlwaysMisses()) {
-				break;
-			}
-			part = std::chrono::steady_clock::now();
-			loaded.module.module = CompileSPV(spirv, m_graphics.device);
-			g_decode_spirv_ns += NanosecondsSince(part);
-			RetainModuleSpirv(loaded.module, spirv);
+			stored->frame               = record;
+			stored->device              = m_graphics.device;
+			loaded.module.spirv_words   = stored->spirv_words;
+			loaded.module.stored        = std::move(stored);
 			break;
 		}
 		case Record::GraphicsPipeline: {
@@ -408,14 +452,95 @@ void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& 
 	loaded.ok = true;
 }
 
+namespace {
+
+// The record's decompressed bytes; the frame was checked and decompressed once at start, so this
+// cannot fail.
+std::vector<uint8_t> DecompressStored(const StoredModule& stored) {
+	Frame frame;
+	std::memcpy(&frame, stored.frame.data(), sizeof(frame));
+	const auto compressed = stored.frame.subspan(sizeof(frame));
+	const auto part       = std::chrono::steady_clock::now();
+	std::vector<uint8_t> raw(frame.raw_size);
+	EXIT_IF(ZSTD_decompress(raw.data(), raw.size(), compressed.data(), compressed.size()) !=
+	        raw.size());
+	g_decode_zstd_ns += NanosecondsSince(part);
+	return raw;
+}
+
+void FinishStoredPart(StoredModule& stored) {
+	if (stored.parts_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+		stored.store.reset();
+	}
+}
+
+} // namespace
+
+vk::ShaderModule ResolveStoredModule(StoredModule& stored) {
+	std::call_once(stored.module_once, [&] {
+		auto                  raw = DecompressStored(stored);
+		std::vector<uint32_t> spirv(stored.spirv_words);
+		std::memcpy(spirv.data(), raw.data() + stored.spirv_offset, spirv.size() * sizeof(uint32_t));
+		raw             = {};
+		const auto part = std::chrono::steady_clock::now();
+		stored.handle   = CompileSPV(spirv, stored.device);
+		g_decode_spirv_ns += NanosecondsSince(part);
+		if (RetainModuleSpirv()) {
+			stored.spirv = std::move(spirv);
+		}
+		stored.decoded.store(true, std::memory_order_release);
+		FinishStoredPart(stored);
+	});
+	return stored.handle;
+}
+
+bool ResolveStoredPlan(StoredModule& stored) {
+	std::call_once(stored.plan_once, [&] {
+		const auto raw  = DecompressStored(stored);
+		const auto part = std::chrono::steady_clock::now();
+		stored.plan_ok  = ShaderRecompiler::IR::LoadResourcePlan(
+            std::span(raw).subspan(stored.plan_offset, stored.plan_size), stored.plan);
+		g_decode_plan_ns += NanosecondsSince(part);
+		stored.plan_decoded.store(true, std::memory_order_release);
+		FinishStoredPart(stored);
+	});
+	return stored.plan_ok;
+}
+
+bool PipelineCache::TakeStoredPlan(Program& program) {
+	const auto stored = std::move(program.stored_plan);
+	if (!stored->plan_decoded.load(std::memory_order_acquire)) {
+		const auto start = std::chrono::steady_clock::now();
+		ResolveStoredPlan(*stored);
+		g_demand_plans++;
+		g_demand_plan_ns += NanosecondsSince(start);
+	}
+	if (!ResolveStoredPlan(*stored)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader cache: a stored resource plan could not be decoded; translating the program "
+		    "again\n"));
+		return false;
+	}
+	// Decoded once; no other thread touches the plan any more.
+	program.resource_plan = std::move(stored->plan);
+	return true;
+}
+
 void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 	switch (static_cast<Record>(loaded.type)) {
 		case Record::Module: {
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(loaded.key));
 			if (inserted) {
-				program->second.resource_plan = std::move(loaded.plan);
+				loaded.module.stored->want_plan  = true;
+				loaded.module.stored->parts_left = 2;
+				program->second.stored_plan     = loaded.module.stored;
 			}
+			// KYTY_RT_OFF: stored BVH modules walk the scene; they are dropped (their records give
+			// only the plan), and their programs translate again with the miss.
 			if (loaded.module.info.info.bvh && ShaderRecompiler::Spirv::BvhIntersectAlwaysMisses()) {
+				auto& stored          = *loaded.module.stored;
+				stored.module_dropped = true;
+				if (stored.parts_left.fetch_sub(1) == 1) stored.store.reset();
 				break;
 			}
 			program->second.modules.push_back(std::move(loaded.module));
@@ -426,6 +551,85 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 		case Record::TessellationLayout:
 			m_tess_layouts.try_emplace(loaded.layout_key, loaded.layout);
 			break;
+	}
+}
+
+// Background decoders: a few low-priority threads decode, in store order (the order a run first
+// needed the records in), every record no lookup or pipeline creation decoded first.
+struct PipelineCache::StoreDecoders {
+	std::vector<std::shared_ptr<StoredModule>> records;
+	std::atomic<size_t>                        next = 0;
+	std::atomic<bool>                          stop = false;
+	std::vector<std::jthread>                  threads;
+};
+
+namespace {
+
+void LowerThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#elif !defined(__APPLE__)
+	// Linux: a nice value of one thread.
+	setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 19);
+#endif
+}
+
+size_t StoreDecoderThreads() {
+	if (const char* env = std::getenv("KYTY_STORE_DECODE_THREADS"); env != nullptr && env[0] != 0) {
+		return std::strtoull(env, nullptr, 10);
+	}
+	return Common::ParallelThreads();
+}
+
+} // namespace
+
+void PipelineCache::StartStoreDecoders(std::vector<std::shared_ptr<StoredModule>>&& records) {
+	auto decoders     = std::make_shared<StoreDecoders>();
+	decoders->records = std::move(records);
+	const auto count  = StoreDecoderThreads();
+	auto       left   = std::make_shared<std::atomic<size_t>>(count);
+	const auto start  = std::chrono::steady_clock::now();
+	// Shown in the shader banner like other shader work.
+	Common::ShaderCompileStatus::AddQueued(static_cast<int64_t>(decoders->records.size()));
+	for (size_t i = 0; i < count; i++) {
+		decoders->threads.emplace_back([state = decoders.get(), left, start] {
+			LowerThreadPriority();
+			while (true) {
+				const auto index = state->next++;
+				if (index >= state->records.size()) break;
+				Common::ShaderCompileStatus::RemoveQueued();
+				if (state->stop) continue;
+				const Common::ShaderCompileStatus::Work work;
+				auto& record = *state->records[index];
+				if (record.want_plan && !record.plan_decoded.load(std::memory_order_acquire)) {
+					ResolveStoredPlan(record);
+				}
+				if (!record.module_dropped && !record.decoded.load(std::memory_order_acquire)) {
+					ResolveStoredModule(record);
+				}
+			}
+			if (left->fetch_sub(1) == 1 && !state->stop) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Shader cache: all {} stored modules decoded {:.1f} s after decoding "
+				    "started (over all threads: zstd {:.0f} ms at start and {:.0f} ms since, "
+				    "resource plans {:.0f} ms, shader modules {:.0f} ms); {} plans were decoded "
+				    "on first use ({:.0f} ms on the command thread)\n",
+				    state->records.size(), MillisecondsSince(start) / 1000.0,
+				    static_cast<double>(g_index_zstd_ns) / 1e6,
+				    static_cast<double>(g_decode_zstd_ns) / 1e6,
+				    static_cast<double>(g_decode_plan_ns) / 1e6,
+				    static_cast<double>(g_decode_spirv_ns) / 1e6, g_demand_plans.load(),
+				    static_cast<double>(g_demand_plan_ns) / 1e6));
+			}
+		});
+	}
+	m_store_decoders = std::move(decoders);
+}
+
+void PipelineCache::StopStoreDecoders() {
+	if (m_store_decoders != nullptr) {
+		m_store_decoders->stop = true;
+		m_store_decoders->threads.clear(); // Joins.
 	}
 }
 
@@ -495,8 +699,8 @@ bool PipelineCache::CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPip
 // store holds, for each module the store got, what its translation read (the guest code, the user
 // data, the stage input and the specialization) and the graphics pipeline keys. Unlike the store,
 // nothing in it depends on the translator, so it is kept when a new stamp discards the store. At
-// start, modules the store lacks are translated again on background threads (KYTY_RECIPE_THREADS,
-// default a sixteenth of the hardware threads, at least one), keep their ids, and so let the
+// start, modules the store lacks are translated again on low-priority background threads
+// (KYTY_RECIPE_THREADS, default half the hardware threads), keep their ids, and so let the
 // recipes' pipeline keys be created in the background as well. KYTY_SHADER_RECIPES=0 turns it off.
 // The guest code makes the file private to the dump it came from.
 namespace {
@@ -658,8 +862,7 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 	const auto threads = [] {
 		const char* env = std::getenv("KYTY_RECIPE_THREADS");
 		const auto  value = env != nullptr ? std::strtoul(env, nullptr, 10) : 0ul;
-		return value != 0 ? size_t {value}
-		                  : std::max<size_t>(1, std::thread::hardware_concurrency() / 16);
+		return value != 0 ? size_t {value} : Common::ParallelThreads();
 	}();
 	m_replay_start = std::chrono::steady_clock::now();
 	m_replay_left  = jobs.size();
@@ -675,6 +878,10 @@ void PipelineCache::ReplayRecipe(RecipeJob& job) {
 	if (m_ahead_stop) {
 		return;
 	}
+	// The game's own translations go first: a program it needs now is translated on the command
+	// thread at normal priority.
+	static thread_local const bool lowered = (LowerThreadPriority(), true);
+	(void)lowered;
 	const Common::ShaderCompileStatus::Work work;
 	const auto                              profile = SpirvProfile(m_graphics);
 	ShaderRecompiler::CompileOptions        options {.wave_size = job.wave_size};

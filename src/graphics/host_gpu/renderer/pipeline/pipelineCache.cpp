@@ -574,8 +574,14 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 		return &module;
 	};
 	bool source_changed = false;
+	// A stored program whose plan cannot be decoded: translated again for its plan.
+	bool plan_lost = false;
 	const bool known_program = entry != m_program_cache.end();
-	if (entry != m_program_cache.end()) {
+	if (entry != m_program_cache.end() && entry->second.stored_plan != nullptr &&
+	    !entry->second.skip_dispatch) {
+		plan_lost = !TakeStoredPlan(entry->second);
+	}
+	if (entry != m_program_cache.end() && !plan_lost) {
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
@@ -667,6 +673,11 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	} else if (source_changed) {
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
 		if (const auto* module = entry->second.FindModule<true>(runtime, push_data)) {
+			return bind(*module);
+		}
+	} else if (plan_lost) {
+		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		if (const auto* module = entry->second.FindModule<false>(runtime, push_data)) {
 			return bind(*module);
 		}
 	}
@@ -1243,6 +1254,7 @@ PipelineCache::~PipelineCache() {
 	// anything they use goes.
 	m_ahead_stop = true;
 	*m_deferred_stop = true;
+	StopStoreDecoders();
 	m_replayers.reset();
 	m_translators.Finish();
 	m_workers.Finish();
@@ -1265,7 +1277,11 @@ PipelineCache::~PipelineCache() {
 	destroy(m_compute_pipelines);
 	for (const auto& program: m_program_cache | std::views::values) {
 		for (const auto& module: program.modules) {
-			m_graphics.device.destroyShaderModule(module.module, nullptr);
+			// Stored modules nothing asked for have no handle.
+			const auto handle = module.stored == nullptr ? module.module
+			                    : module.stored->decoded ? module.stored->handle
+			                                             : vk::ShaderModule {};
+			m_graphics.device.destroyShaderModule(handle, nullptr);
 		}
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);

@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -452,7 +453,13 @@ private:
 	Xbyak::CodeGenerator&                             m_code;
 	std::vector<Value>                                m_masks {Value {}};
 	std::deque<Node>                                  m_nodes;
-	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
+	// Hashed: a plan load evaluates every read through it (the ordered map was 9% of a warm start).
+	struct MemoHash {
+		size_t operator()(const std::pair<const Inst*, uint32_t>& key) const {
+			return std::hash<const void*> {}(key.first) ^ (size_t {key.second} * 0x9e3779b97f4a7c15ull);
+		}
+	};
+	std::unordered_map<std::pair<const Inst*, uint32_t>, uint32_t, MemoHash> m_memo;
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	// Per user-data base pair of a read, the scratch slot holding the base for the walk.

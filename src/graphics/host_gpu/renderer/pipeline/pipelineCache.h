@@ -120,6 +120,40 @@ struct alignas(4) GraphicsPipelineKey {
 // Keys are compared and hashed as bytes.
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
+// A module record of the shader store, decoded on first use or by the store's background decoders
+// (pipelineSerialization.cpp): the store keeps only its key and pipeline fields decoded at start.
+struct StoredModule {
+	// The store's bytes, released once decoded, and the record's frame and fields in them.
+	std::shared_ptr<const std::vector<uint8_t>> store;
+	std::span<const uint8_t>                    frame;
+	uint32_t                                    plan_offset  = 0;
+	uint32_t                                    plan_size    = 0;
+	uint32_t                                    spirv_offset = 0;
+	uint32_t                                    spirv_words  = 0;
+	vk::Device                                  device;
+	// The first record of a program also gives the program's resource plan. The module (cheap)
+	// and the plan (most of the time) decode separately: pipeline creation needs only the module.
+	bool                                        want_plan = false;
+	// A module the run does not use (KYTY_RT_OFF); its record may still give the plan.
+	bool                                        module_dropped = false;
+	std::once_flag                              module_once;
+	std::once_flag                              plan_once;
+	std::atomic<bool>                           decoded      = false; // The module.
+	std::atomic<bool>                           plan_decoded = false;
+	// Parts still to decode; the last one releases the store's bytes.
+	std::atomic<int>                            parts_left = 1;
+	vk::ShaderModule                            handle     = nullptr;
+	ShaderRecompiler::IR::ResourcePlan          plan;
+	bool                                        plan_ok = false;
+	// With RetainModuleSpirv().
+	std::vector<uint32_t>                       spirv;
+};
+// Safe on any thread: decodes the record's module once (a call during another thread's decode
+// waits for it) and returns its handle.
+vk::ShaderModule ResolveStoredModule(StoredModule& stored);
+// The same for the resource plan of a program's first record; false when it cannot be decoded.
+bool ResolveStoredPlan(StoredModule& stored);
+
 // A compiled stage with what pipeline creation needs from it besides the key.
 struct ShaderModule {
 	uint64_t                                     id     = 0;
@@ -135,6 +169,12 @@ struct ShaderModule {
 	// pipeline the driver fails to create (after Axellito/VIKyng bcee3021).
 	size_t                                       spirv_words = 0;
 	std::vector<uint32_t>                        spirv;
+	// A module loaded from the shader store has no handle until Handle() first asks for it.
+	std::shared_ptr<StoredModule>                stored;
+
+	[[nodiscard]] vk::ShaderModule Handle() const {
+		return stored != nullptr ? ResolveStoredModule(*stored) : module;
+	}
 };
 
 // KYTY_FAILED_SPIRV_DUMP=1: modules keep their SPIR-V, written to the shader log folder's failed/
@@ -328,6 +368,8 @@ private:
 		// Compiling pipelines keep references.
 		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
+		// A program from the shader store whose resource plan is still in its first record.
+		std::shared_ptr<StoredModule>                stored_plan;
 		// Programs with calls: the resource plans of the earlier links call_source keeps, by link
 		// id, so a callee set seen before needs no translation to find its module.
 		std::unordered_map<uint64_t, ShaderRecompiler::IR::ResourcePlan> call_plans;
@@ -432,6 +474,9 @@ private:
 	size_t                                      m_replay_merged = 0;
 	size_t                                      m_replay_dropped = 0;
 	std::chrono::steady_clock::time_point       m_replay_start;
+	// Decode the store's records not asked for yet, in store order, at low priority.
+	struct StoreDecoders;
+	std::shared_ptr<StoreDecoders> m_store_decoders;
 	// Declared last, so its jobs end before anything they use is destroyed.
 	std::unique_ptr<PipelineWorkers> m_replayers;
 	PipelineWorkers m_workers;
@@ -484,6 +529,11 @@ private:
 	// Safe on any thread: checks, decompresses and decodes one framed record.
 	void DecodeRecord(std::span<const uint8_t> record, LoadedRecord& loaded);
 	void InsertRecord(LoadedRecord&& loaded);
+	// On the command thread: moves a stored program's resource plan in, decoding its record if no
+	// decoder did yet; false when the plan cannot be decoded (the program is translated again).
+	bool TakeStoredPlan(Program& program);
+	void StartStoreDecoders(std::vector<std::shared_ptr<StoredModule>>&& records);
+	void StopStoreDecoders();
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);

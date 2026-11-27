@@ -326,7 +326,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		if (stage != nullptr) {
 			auto& info = shader_stages[shader_stage_count++];
 			info       = {.stage  = NativeShaderStage(stage->info.stage),
-			              .module = stage->module,
+			              .module = stage->Handle(),
 			              .pName  = "main"};
 			const auto wave_size = stage->info.wave_size;
 			if (info.stage == vk::ShaderStageFlagBits::eFragment &&
@@ -524,7 +524,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = module.module;
+	comp_shader_stage_info.module = module.Handle();
 	comp_shader_stage_info.pName  = "main";
 	const auto wave_size = module.info.wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
