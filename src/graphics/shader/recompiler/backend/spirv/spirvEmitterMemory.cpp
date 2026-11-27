@@ -997,12 +997,12 @@ struct IndirectBufferAccess {
 	uint32_t raw_index_in_bounds;
 };
 
-// Data bits, components, coherence, and 0 for raw, 1 for V# formatted or 2 + format for typed loads.
-std::array<uint32_t, 4> IndirectBufferLoadKey(const IR::MemoryInfo& mem, uint32_t components) {
-	const auto format = mem.typed ? 2u + static_cast<uint32_t>(Format::DecodeTBufferFormat(
-	                                         mem.data_format, mem.number_format))
-	                              : uint32_t(mem.formatted);
-	return {mem.data_bits, components, uint32_t(mem.coherent), format};
+// Data bits, components, coherence, formatted flag, and the decoded typed format (UINT32_MAX for
+// untyped loads).
+std::array<uint32_t, 5> IndirectBufferLoadKey(const IR::MemoryInfo& mem, uint32_t components) {
+	return {mem.data_bits, components, uint32_t(mem.coherent), uint32_t(mem.formatted),
+	        mem.typed ? uint32_t(Format::DecodeTBufferFormat(mem.data_format, mem.number_format))
+	                  : UINT32_MAX};
 }
 
 std::array<uint32_t, 8> IndirectBufferArgs(ValueEmitContext& ctx, const IR::Inst& inst) {
