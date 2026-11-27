@@ -348,6 +348,12 @@ public:
 		return runs == 1 && !gapped ? alias : 0;
 	}
 
+	// Where a guest page lives in the backing, or UINT64_MAX for a page that has none.
+	[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr) const {
+		const auto entry = LoadPage(vaddr >> PageBits);
+		return entry != 0 ? (uint64_t {entry - 1u} << PageBits) + (vaddr & PageMask) : UINT64_MAX;
+	}
+
 	// Needs no lock either, as the alias stays mapped. A read racing an unmap copies the backing's
 	// current bytes, or zeros for a page unmapped between the check and the copy.
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) const {
@@ -358,6 +364,25 @@ public:
 			std::memset(destination, 0, bytes);
 		});
 		return true;
+	}
+
+	// The alias address of a range that one contiguous run of backing holds, or nullptr. Needs
+	// no lock, like TryReadBacking; the alias stays mapped for the store's lifetime.
+	[[nodiscard]] const uint8_t* TryGetBackingView(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const auto first = LoadPage(vaddr >> PageBits);
+		if (first == 0) {
+			return nullptr;
+		}
+		auto expected = first;
+		for (auto page = (vaddr >> PageBits) + 1u; page <= (vaddr + size - 1u) >> PageBits; ++page) {
+			if (LoadPage(page) != ++expected) {
+				return nullptr;
+			}
+		}
+		return m_backing_base + ((uint64_t {first - 1u} << PageBits) + (vaddr & PageMask));
 	}
 
 	// The same bytes as TryReadBacking, read through the file where the host can: a file read
@@ -822,6 +847,14 @@ public:
 
 	bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBackingUncommitted(vaddr, data, size);
+	}
+
+	[[nodiscard]] const void* TryGetBackingView(uint64_t vaddr, uint64_t size) const {
+		return m_backing->TryGetBackingView(vaddr, size);
+	}
+
+	[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr) const {
+		return m_backing->BackingOffset(vaddr);
 	}
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {

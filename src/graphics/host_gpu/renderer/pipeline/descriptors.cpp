@@ -1200,7 +1200,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                               static_cast<uint32_t>(m_descriptor_writes.size()),
 			                               m_descriptor_writes.data());
 		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
+			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout,
+			                                                          pipeline.descriptor_sizes);
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}

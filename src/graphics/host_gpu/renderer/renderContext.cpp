@@ -238,6 +238,76 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
+void RenderContext::DropCachedMemory(uint64_t vaddr, uint64_t size) {
+	// Check cache ownership on the GPU thread. Guest-memory callbacks can still
+	// access a range with no cached data, so they must finish before it is unmapped.
+	if (m_command_scheduler.Active() &&
+	    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+	     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+	     m_command_scheduler.HasPendingPriorityOperations())) {
+		const auto tick = m_command_scheduler.CurrentTick();
+		m_command_scheduler.Finish();
+		m_command_scheduler.WaitPriorityOperations(tick);
+	}
+	m_buffer_cache.UnmapZeroCopy(vaddr, size);
+	m_buffer_cache.InvalidateMemory(vaddr, size);
+	m_texture_cache.UnmapMemory(vaddr, size);
+	m_image_heap.UnmapMemory(vaddr, size);
+}
+
+// KYTY_SYNC_FRESH_MAPS=1: a guest thread that maps memory over a free or reserved range waits
+// for the GPU thread again, as before.
+static bool DeferFreshMaps() {
+	static const bool defer = [] {
+		const char* env = std::getenv("KYTY_SYNC_FRESH_MAPS");
+		return env == nullptr || env[0] != '1';
+	}();
+	return defer;
+}
+
+void RenderContext::PostDropCachedMemory(uint64_t vaddr, uint64_t size) {
+	if (CommandScheduler::InDeferredOperation()) {
+		EXIT("unsupported cache drop from an asynchronous GPU completion, "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+		     vaddr, size);
+	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::GpuUnmaps);
+	if (m_gpu == nullptr || m_gpu->IsStopping() || GuestGpu::IsGpuThread()) {
+		DropCachedMemory(vaddr, size);
+		return;
+	}
+	// A sender faster than the GPU thread waits for it now and then; the commands before this
+	// one run first.
+	constexpr uint32_t MaxPendingCommands = 1024;
+	if (m_gpu->PendingCommands() >= MaxPendingCommands) {
+		m_gpu->SendCommandSync([this, vaddr, size] { DropCachedMemory(vaddr, size); });
+		return;
+	}
+	m_gpu->SendCommand([this, vaddr, size] { DropCachedMemory(vaddr, size); });
+}
+
+void RenderContext::MapFreshMemory(uint64_t vaddr, uint64_t size) {
+	// The unmap that made the range free or reserved wrote its GPU-written buffer bytes back
+	// (BufferCache::InvalidateMemory downloads GPU-dirty pages and clears their marks), so the
+	// buffer cache holds none for it. If it still does (GPU work that wrote the range after its
+	// unmap, or a write-back that did not clear the marks), a deferred drop would write those
+	// bytes into the new mapping: unmap first and wait, as before. The query takes no lock.
+	if (!DeferFreshMaps() || m_buffer_cache.IsRegionGpuModified(vaddr, size)) {
+		UnmapMemory(vaddr, size);
+		MapMemory(vaddr, size);
+		return;
+	}
+	// The range was free or reserved until now: no guest thread and no GPU work could reach its
+	// memory, so nothing has to finish before the memory changes, unlike an unmap. The range is
+	// mapped for the GPU at once (a guest write fault in it is handled from now on); what the
+	// caches still hold for these addresses from an earlier mapping is dropped by an ordered
+	// command. GTA VI commits a 3.3 GiB heap 64 KiB at a time while it loads (54,000 maps), and
+	// waiting for the GPU thread cost each of them two thread wake-ups: 0.4 ms on an idle host,
+	// 1.5 ms and more on a loaded one, which is longer than the game's 30 s hang check allows.
+	MapMemory(vaddr, size);
+	PostDropCachedMemory(vaddr, size);
+}
+
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
@@ -246,20 +316,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	}
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::GpuUnmaps);
 	const auto unmap = [this, vaddr, size] {
-		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
-		// access a range with no cached data, so they must finish before it is unmapped.
-		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
-		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
-		     m_command_scheduler.HasPendingPriorityOperations())) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
-		m_buffer_cache.UnmapZeroCopy(vaddr, size);
-		m_buffer_cache.InvalidateMemory(vaddr, size);
-		m_texture_cache.UnmapMemory(vaddr, size);
-		m_image_heap.UnmapMemory(vaddr, size);
+		DropCachedMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		NoteMappingChange(vaddr, size);

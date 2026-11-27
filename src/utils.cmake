@@ -124,4 +124,35 @@ endif()
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${KYTY_C_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KYTY_CPP_FLAGS}")
 
+kyty_config_lto()
+
+endmacro()
+
+# Opt-in ThinLTO (default OFF, so every build is unchanged unless it asks for it). Clang only:
+# clang + lld (Linux, MinGW-style Windows) or clang-cl + lld-link (Windows). Other toolchains ignore it.
+#   KYTY_ENABLE_LTO=ON   compile to LLVM bitcode and optimize across objects at link time
+#   KYTY_LTO_JOBS=<n>    parallel ThinLTO backend jobs while linking (default 4)
+# Incremental links reuse <build dir>/thinlto-cache (pruned to 4 GB, 72 h).
+option(KYTY_ENABLE_LTO "Build with ThinLTO (clang/lld and clang-cl/lld-link only)" OFF)
+set(KYTY_LTO_JOBS "4" CACHE STRING "Parallel ThinLTO backend jobs at link time")
+
+macro(kyty_config_lto)
+	if(KYTY_ENABLE_LTO)
+		set(_kyty_lto_cache "${CMAKE_BINARY_DIR}/thinlto-cache")
+		if(KYTY_CLANG_CL)
+			add_compile_options(-flto=thin)
+			add_link_options("/opt:lldltojobs=${KYTY_LTO_JOBS}" "/lldltocache:${_kyty_lto_cache}"
+				"/lldltocachepolicy:cache_size_bytes=4g:prune_after=72h")
+			message(STATUS "Kyty ThinLTO: on (lld-link)")
+		elseif(CLANG AND (KYTY_LINKER STREQUAL LLD))
+			add_compile_options(-flto=thin)
+			# every target (tests too, which otherwise link with the system default linker) must link with lld
+			add_link_options(-flto=thin "-fuse-ld=lld" "-Wl,--thinlto-jobs=${KYTY_LTO_JOBS}"
+				"-Wl,--thinlto-cache-dir=${_kyty_lto_cache}"
+				"-Wl,--thinlto-cache-policy=cache_size_bytes=4g:prune_after=72h")
+			message(STATUS "Kyty ThinLTO: on (lld)")
+		else()
+			message(WARNING "KYTY_ENABLE_LTO needs clang with lld or clang-cl with lld-link; ignored")
+		endif()
+	endif()
 endmacro()
