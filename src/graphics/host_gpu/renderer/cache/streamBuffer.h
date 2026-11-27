@@ -87,6 +87,8 @@ public:
 	uint8_t  zero_copy_judgment = 0;
 	// Zero-copy: the newest scheduler tick that records a GPU write to this buffer.
 	uint64_t last_write_tick    = 0;
+	// Zero-copy: the tick whose completion already returns this buffer's pages to the CPU.
+	uint64_t release_tick       = 0;
 	// Zero-copy: LibKernel::Memory::BackingGeneration() when the import was last known valid.
 	uint64_t backing_generation = 0;
 

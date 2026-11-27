@@ -536,6 +536,32 @@ bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
 	return true;
 }
 
+void BufferCache::ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick) {
+	// The writes are in guest memory once the tick completes. A newer write keeps the pages until
+	// its own release; a buffer deleted or rebuilt since is not this one.
+	if (IsBufferInvalid(id)) {
+		return;
+	}
+	auto& buffer = m_slot_buffers[id];
+	if (!buffer.IsZeroCopy() || buffer.CpuAddress() != vaddr || buffer.Size() != size ||
+	    buffer.last_write_tick != tick) {
+		return;
+	}
+	bool any = false;
+	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size,
+	                                             [&](uint64_t address, uint64_t bytes) noexcept {
+		                                             any = true;
+		                                             m_gpu_modified_ranges.Subtract(address, bytes);
+		                                             ForgetColorMetadataChecks(address, bytes);
+	                                             });
+	if (!any) {
+		return;
+	}
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReleases);
+}
+
 void BufferCache::JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
 	auto& new_buffer = m_slot_buffers[new_id];
 	auto& overlap    = m_slot_buffers[overlap_id];
@@ -562,8 +588,18 @@ void BufferCache::JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumu
 	DeleteBuffer(overlap_id);
 }
 
+// Read-back faults before a buffer is judged for zero-copy; KYTY_ZERO_COPY_THRESHOLD=<n> changes it.
+static uint32_t ZeroCopyThreshold() {
+	static const uint32_t threshold = [] {
+		const char* text  = std::getenv("KYTY_ZERO_COPY_THRESHOLD");
+		const auto  value = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
+		return value != 0 ? static_cast<uint32_t>(value) : 16u;
+	}();
+	return threshold;
+}
+
 void BufferCache::MaybeMigrateToZeroCopy(BufferId id) {
-	constexpr uint32_t Threshold = 16;
+	const uint32_t     Threshold = ZeroCopyThreshold();
 	constexpr uint64_t MaxSize   = 512ull * 1024 * 1024;
 	auto&              buffer    = m_slot_buffers[id];
 	if (buffer.IsZeroCopy() || buffer.readback_faults < Threshold ||
@@ -864,6 +900,19 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
+	if (is_written && buffer.IsZeroCopy() && buffer.release_tick != buffer.last_write_tick) {
+		static const bool release = [] {
+			const char* text = std::getenv("KYTY_ZERO_COPY_RELEASE");
+			return text == nullptr || text[0] != '0';
+		}();
+		if (release) {
+			buffer.release_tick = buffer.last_write_tick;
+			m_scheduler.DeferOperation([this, id, address = buffer.CpuAddress(),
+			                            bytes = buffer.Size(), tick = buffer.last_write_tick] {
+				ReleaseZeroCopyWrites(id, address, bytes, tick);
+			});
+		}
+	}
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_pending_writes.Add(vaddr, size);

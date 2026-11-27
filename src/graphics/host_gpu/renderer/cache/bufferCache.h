@@ -221,6 +221,9 @@ private:
 	// Settles the pending GPU writes of a zero-copy buffer: false when none are tracked. With
 	// `wait`, waits for its last write and returns its pages to the CPU.
 	[[nodiscard]] bool ResolveZeroCopy(Buffer& buffer, bool wait);
+	// When `tick` completes and it was the buffer's last write, returns its pages to the CPU, so
+	// a later CPU access does not fault (KYTY_ZERO_COPY_RELEASE=0 waits for the fault instead).
+	void               ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick);
 	void               JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	void               MaybeMigrateToZeroCopy(BufferId id);
 	// False (and the buffer dropped) when the guest range moved to other backing.
