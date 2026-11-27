@@ -148,6 +148,11 @@ uint64_t               BackingGeneration();
 // Whether pages of [vaddr, vaddr + size) were bound or unbound after `generation` (true when
 // that is too long ago to tell).
 bool                   BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size);
+// The host address of the range in the backing alias when one contiguous run of backing holds
+// all of it, else nullptr. The GPU resource tracker never protects the alias, so reads through it
+// never fault: they see what the CPU (and every publication of GPU data) stored last, not GPU
+// writes that were not read back yet. Raw command-buffer decoding (KYTY_RAW_CMDBUF) uses it.
+[[nodiscard]] const void* TryGetBackingView(uint64_t vaddr, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.

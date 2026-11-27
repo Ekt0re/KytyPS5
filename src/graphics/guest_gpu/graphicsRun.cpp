@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/computePrescan.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/rawCommandBuffer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -454,6 +455,9 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		if (!dst_gds) {
+			RefreshLiveCommands(dst_address_or_offset, num_bytes);
+		}
 		return;
 	}
 	bool src_gds = false;
@@ -465,6 +469,9 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
+	if (!dst_gds) {
+		RefreshLiveCommands(dst_address_or_offset, num_bytes);
+	}
 }
 
 void GuestGpu::Enqueue(Submission submission) {
@@ -630,6 +637,13 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	// Once per submission (the toggle takes a mutex). A resumed submission resolves its views
+	// again: the guest may have remapped or rewritten the rest of a span while it waited.
+	m_raw_mode = RawCommandBuffer::SubmissionMode();
+	for (auto& cursor: execution.m_buffer_stack) {
+		cursor.view_ready = false;
+	}
+	RawCommandBuffer::MaybeReport();
 	// GPU writes recorded from here on belong to this queue's indirect-argument window.
 	m_renderer.GetBufferCache().SetGuestQueue(static_cast<uint32_t>(m_interrupt_event_id));
 
@@ -654,6 +668,49 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	g_current_execution->m_chain       = chain;
 }
 
+void CommandProcessor::ResolveCommandView(Pm4Execution::BufferCursor& cursor) {
+	cursor.view_ready = true;
+	cursor.view       = nullptr;
+	if (m_raw_mode == RawCommandBuffer::Mode::Off) {
+		return;
+	}
+	RawCommandBuffer::Add(RawCommandBuffer::Stat::Spans);
+	cursor.view = RawCommandBuffer::View(cursor.commands);
+	if (cursor.view == nullptr) {
+		RawCommandBuffer::Add(RawCommandBuffer::Stat::Fallback);
+		return;
+	}
+	RawCommandBuffer::Add(RawCommandBuffer::Stat::Raw);
+	if (m_raw_mode == RawCommandBuffer::Mode::Verify) {
+		(void)RawCommandBuffer::Verify(cursor.commands.subspan(cursor.offset_dw),
+		                               cursor.view + cursor.offset_dw);
+	}
+}
+
+void CommandProcessor::RefreshLiveCommands(uint64_t dst, uint64_t size) {
+	if (m_raw_mode == RawCommandBuffer::Mode::Off || g_current_execution == nullptr) {
+		return;
+	}
+	std::array<RawCommandBuffer::LiveRange, 16> live {};
+	size_t                                      count = 0;
+	for (const auto& cursor: g_current_execution->m_buffer_stack) {
+		if (cursor.view == nullptr || count == live.size()) {
+			continue;
+		}
+		const auto base = reinterpret_cast<uint64_t>(cursor.commands.data());
+		live[count++]   = {base + uint64_t {cursor.offset_dw} * 4u, base + cursor.commands.size_bytes()};
+	}
+	const auto overlaps = RawCommandBuffer::ForEachLiveOverlap(
+	    std::span(live.data(), count), dst, size, [](uint64_t begin, uint64_t bytes) {
+		    // Publishes the GPU-written bytes into guest memory, which the alias shows.
+		    std::vector<uint8_t> scratch(bytes);
+		    (void)LibKernel::Memory::TryReadBufferBacking(begin, scratch.data(), bytes);
+	    });
+	if (overlaps != 0) {
+		RawCommandBuffer::Add(RawCommandBuffer::Stat::LiveRefreshes, overlaps);
+	}
+}
+
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
@@ -670,8 +727,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			execution.m_buffer_stack.pop_back();
 			continue;
 		}
+		if (!cursor.view_ready) {
+			ResolveCommandView(cursor);
+		}
 
-		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+		// Handlers read packet DWORDs only; addresses come from packet values, never from here.
+		const auto* const decode_base =
+		    cursor.view != nullptr ? cursor.view : cursor.commands.data();
+		const auto* const packet        = decode_base + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
@@ -705,8 +768,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			const auto offset = cursor.offset_dw;
 			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
 			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
-			     reinterpret_cast<uint64_t>(packet));
+			     reinterpret_cast<uint64_t>(cursor.commands.data()), total_dw, offset,
+			     reinterpret_cast<uint64_t>(cursor.commands.data() + offset));
 			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
 			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
 			auto* const base       = packet - offset;

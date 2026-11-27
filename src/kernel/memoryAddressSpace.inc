@@ -360,6 +360,25 @@ public:
 		return true;
 	}
 
+	// The alias address of a range that one contiguous run of backing holds, or nullptr. Needs
+	// no lock, like TryReadBacking; the alias stays mapped for the store's lifetime.
+	[[nodiscard]] const uint8_t* TryGetBackingView(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const auto first = LoadPage(vaddr >> PageBits);
+		if (first == 0) {
+			return nullptr;
+		}
+		auto expected = first;
+		for (auto page = (vaddr >> PageBits) + 1u; page <= (vaddr + size - 1u) >> PageBits; ++page) {
+			if (LoadPage(page) != ++expected) {
+				return nullptr;
+			}
+		}
+		return m_backing_base + ((uint64_t {first - 1u} << PageBits) + (vaddr & PageMask));
+	}
+
 	// The same bytes as TryReadBacking, read through the file where the host can: a file read
 	// of shared memory that was never written returns zeros without allocating it, where a copy
 	// from the mapping commits every page it touches. For readers of whole address spaces (frame
@@ -822,6 +841,10 @@ public:
 
 	bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBackingUncommitted(vaddr, data, size);
+	}
+
+	[[nodiscard]] const void* TryGetBackingView(uint64_t vaddr, uint64_t size) const {
+		return m_backing->TryGetBackingView(vaddr, size);
 	}
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {

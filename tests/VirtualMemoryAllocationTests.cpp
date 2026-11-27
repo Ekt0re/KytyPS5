@@ -4,6 +4,8 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/command_processor/rawCommandBuffer.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -892,6 +894,106 @@ void TestTrackerProtectSharesBackingReads() {
 	      "tracker protection waited for a sparse backing read");
 	Check(test, excluded && guest_result == OK,
 	      "guest mprotect completed while a sparse backing read held its lock");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// KYTY_RAW_CMDBUF: a command span whose guest pages are read-protected (as the resource tracker
+// protects GPU-written pages) decodes identically through the backing view without touching the
+// guest pages; a DMA write into the live part of the span is published and then seen through
+// the view, one into the decoded part is not refreshed; CP WRITE_DATA (a CPU store through the
+// guest address) is seen at once; a span that is not one backing run gets no view.
+void TestRawCommandBufferView() {
+	using namespace Libs::LibKernel::Memory;
+	namespace Raw = Libs::Graphics::RawCommandBuffer;
+	namespace Pm4 = Libs::Graphics::Pm4;
+	const char*    test = "RawCommandBufferView";
+	const uint64_t size = SceKernelPageSize * 2;
+	const auto     base = MapNamedFlexible(test, size, SceKernelProtCpuRw, "raw_cmdbuf");
+
+	// SET_SH_REG (3 values), NOP padding to the second page, WRITE_DATA (2 values), NOP tail.
+	std::vector<uint32_t> stream;
+	stream.push_back(KYTY_PM4(5, Pm4::IT_SET_SH_REG, 0u));
+	stream.insert(stream.end(), {0x40u, 0x11111111u, 0x22222222u, 0x33333333u});
+	const auto pad_dw = static_cast<uint32_t>(SceKernelPageSize / 4u) - 5u - 2u;
+	stream.push_back(KYTY_PM4(pad_dw + 2u, Pm4::IT_NOP, 0u));
+	stream.insert(stream.end(), pad_dw + 1u, 0xdeadbeefu);
+	const auto write_data_at = static_cast<uint32_t>(stream.size());
+	stream.push_back(KYTY_PM4(6, Pm4::IT_WRITE_DATA, 0u));
+	stream.insert(stream.end(), {0x500u, 0x1000u, 0u, 0xaaaaaaaau, 0xbbbbbbbbu});
+	const auto tail_dw = static_cast<uint32_t>(size / 4u) - static_cast<uint32_t>(stream.size());
+	stream.push_back(KYTY_PM4(tail_dw, Pm4::IT_NOP, 0u));
+	stream.resize(size / 4u, 0x5a5a5a5au);
+	std::memcpy(reinterpret_cast<void*>(base), stream.data(), size);
+
+	const std::span<const uint32_t> guest(reinterpret_cast<const uint32_t*>(base), size / 4u);
+	Check(test, ProtectGuestHostMemory(base, size, Common::VirtualMemory::Mode::NoAccess),
+	      "ProtectGuestHostMemory(NoAccess)");
+	const auto* view = Raw::View(guest);
+	Check(test, view != nullptr, "no backing view of a flexible span");
+	if (view == nullptr) {
+		return;
+	}
+	Check(test, view != guest.data(), "the view is the guest address");
+	// Decode the packets through the view, as ProcessPm4 walks them.
+	std::vector<uint32_t> packet_starts;
+	for (uint32_t at = 0; at < guest.size();) {
+		packet_starts.push_back(at);
+		at += KYTY_PM4_LEN(view[at]);
+	}
+	Check(test, packet_starts == std::vector<uint32_t>({0u, 5u, write_data_at, write_data_at + 6u}),
+	      "packets decoded through the view differ");
+	Check(test, std::memcmp(view, stream.data(), size) == 0,
+	      "the view of a read-protected span differs from the stream");
+
+	// A DMA into the live part (from the WRITE_DATA packet on) is published, then visible.
+	const std::array<Raw::LiveRange, 1> live {
+	    {{base + uint64_t {write_data_at} * 4u, base + size}}};
+	const auto dma_dst = base + uint64_t {write_data_at + 4u} * 4u;
+	const std::array<uint32_t, 2> published {0x12345678u, 0x9abcdef0u};
+	std::vector<std::pair<uint64_t, uint64_t>> refreshed;
+	const auto publish = [&](uint64_t begin, uint64_t bytes) {
+		refreshed.emplace_back(begin, bytes);
+		// What the buffer cache's readback does: the GPU bytes land in guest memory.
+		Check(test,
+		      TryWriteBacking(begin,
+		                      reinterpret_cast<const uint8_t*>(published.data()) + (begin - dma_dst),
+		                      bytes),
+		      "TryWriteBacking(publication)");
+	};
+	Check(test, Raw::ForEachLiveOverlap(live, dma_dst, sizeof(published), publish) == 1 &&
+	                refreshed.size() == 1 && refreshed[0].first == dma_dst &&
+	                refreshed[0].second == sizeof(published),
+	      "a DMA into the live span was not refreshed exactly");
+	Check(test, view[write_data_at + 4u] == published[0] && view[write_data_at + 5u] == published[1],
+	      "the refreshed DWORDs are not visible through the view");
+	refreshed.clear();
+	const auto record = [&](uint64_t begin, uint64_t bytes) { refreshed.emplace_back(begin, bytes); };
+	Check(test, Raw::ForEachLiveOverlap(live, base, 16, record) == 0 && refreshed.empty(),
+	      "a DMA into the decoded part was refreshed");
+	Check(test,
+	      Raw::ForEachLiveOverlap(live, base + uint64_t {write_data_at} * 4u - 8u, 16, record) == 1 &&
+	          refreshed.size() == 1 &&
+	          refreshed[0].first == base + uint64_t {write_data_at} * 4u && refreshed[0].second == 8,
+	      "a DMA straddling the decode position was not clipped to the live part");
+
+	// CP WRITE_DATA stores through the guest address (the fault handler publishes first).
+	Check(test, ProtectGuestHostMemory(base, size, Common::VirtualMemory::Mode::ReadWrite),
+	      "ProtectGuestHostMemory(ReadWrite)");
+	*reinterpret_cast<volatile uint32_t*>(base + uint64_t {write_data_at + 3u} * 4u) = 0xc0ffee00u;
+	Check(test, view[write_data_at + 3u] == 0xc0ffee00u,
+	      "a CPU store into the live span is not visible through the view");
+	Check(test, Raw::Verify(guest, view) == 0, "verify found differences in an unprotected span");
+	CheckOk(test, KernelMunmap(base, size), "KernelMunmap");
+
+	// Not one backing run: no view (the parser decodes through the guest address).
+	const auto hole = MapPageBeforeHole(test, "raw_cmdbuf_hole");
+	Check(test,
+	      Raw::View({reinterpret_cast<const uint32_t*>(hole + SceKernelPageSize - 8u), 4u}) ==
+	          nullptr,
+	      "a view of a span that runs into a hole");
+	Check(test, Raw::View({reinterpret_cast<const uint32_t*>(hole), 4u}) != nullptr,
+	      "no view of a backed span before a hole");
+	CheckOk(test, KernelMunmap(hole, SceKernelPageSize), "KernelMunmap(hole)");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6650,6 +6752,7 @@ int main(int argc, char** argv) {
 	RunTest(TestQueriesWaitForStateChanges);
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestClampRangeSkipsStateLock);
+	RunTest(TestRawCommandBufferView);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFragmentedGuestFreeRangeHints);

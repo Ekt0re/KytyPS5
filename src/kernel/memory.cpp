@@ -863,6 +863,10 @@ bool BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->BackingChangedSince(generation, vaddr, size);
 }
 
+const void* TryGetBackingView(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space->TryGetBackingView(vaddr, size);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
