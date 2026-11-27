@@ -841,13 +841,32 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				const auto  limit =
 				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 				    (graphics.StorageMinAlignment() - 1);
-				size = Libs::LibKernel::Memory::ClampRangeSize(
+				size = Libs::LibKernel::Memory::TryClampRangeSize(
 				    address, std::min({size, uint64_t {256} * 1024 * 1024, limit}));
 			} else if (size >= (uint64_t {1} << 30u)) {
 				//  PPSA18026
 				// Finite descriptors can span sparse PRT holes; oversized pool windows are mapped
 				// in pieces, so they end at their last committed range.
-				size = Libs::LibKernel::Memory::ClampRangeSize(address, size, true);
+				size = Libs::LibKernel::Memory::TryClampRangeSize(address, size, true);
+			}
+			// Like the indirect table rows above, any descriptor can name memory that is not
+			// mapped (the clamp returns 0) or, below 1 GiB where nothing is clamped, a range
+			// outside guest memory: typically a table entry the game has not written yet. It is
+			// bound as null, as those rows are, instead of ending the run here or in FindBuffer.
+			if (size == 0 || !GuestRange {address, size}.Valid()) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "GPU: buffer {} of shader 0x{:016x} names {} at 0x{:011x} (size 0x{:x}, "
+					    "records 0x{:x}, stride {}, {}); bound as null\n",
+					    resource, program.shader_hash,
+					    size == 0 ? "unmapped memory" : "an invalid range", address,
+					    BufferBindingSize(metadata, descriptor), descriptor.NumRecords(),
+					    static_cast<uint32_t>(descriptor.Stride()),
+					    metadata.written ? "written" : "read"));
+				}
+				source = {};
+				continue;
 			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}
