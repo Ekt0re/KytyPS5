@@ -1037,6 +1037,11 @@ uint64_t LoadSnapshot(const std::filesystem::path& path, bool invalidate) {
 			Unpack(packed, raw);
 		}
 		if (invalidate) {
+			// Before the write, as a CPU store's fault would: GPU-written bytes the buffer cache
+			// still holds are downloaded over the range here, not over the restored bytes.
+			if (GuestRange {header.address, raw.size()}.Valid()) {
+				Memory::InvalidateMemory(header.address, raw.size());
+			}
 			WriteGuest(header.address, raw.data(), raw.size());
 		} else if (header.packed != 0) {
 			// Page by page: writing a zero page would commit it, and a chunk is mostly zero pages
@@ -1058,9 +1063,6 @@ uint64_t LoadSnapshot(const std::filesystem::path& path, bool invalidate) {
 			}
 		}
 		if (header.packed != 0 && !invalidate) ScanShaders(header.address, raw);
-		if (invalidate && GuestRange {header.address, raw.size()}.Valid()) {
-			Memory::InvalidateMemory(header.address, raw.size());
-		}
 		chunks++;
 	}
 	return chunks;
@@ -1072,11 +1074,24 @@ void ApplyPages(const std::vector<uint8_t>& blob) {
 		at -= sizeof(PageHeader);
 		const auto header = Take<PageHeader>(blob, at);
 		if (at + header.bytes > blob.size()) Fatal("truncated memory record");
-		WriteGuest(header.address, blob.data() + at, header.bytes);
-		ScanShaders(header.address, {blob.data() + at, header.bytes});
+		// Invalidated before the write, as the guest's store would fault first: the buffer cache
+		// downloads GPU-written bytes of the range then, and doing it after the write would put
+		// them over the recorded CPU bytes (a released REWIND read back as unreleased).
 		if (GuestRange {header.address, header.bytes}.Valid()) {
 			Memory::InvalidateMemory(header.address, header.bytes);
 		}
+		WriteGuest(header.address, blob.data() + at, header.bytes);
+		static const uint64_t watch_address = EnvNumber("KYTY_REPLAY_WATCH", 0);
+		if (watch_address >= header.address && watch_address + 4 <= header.address + header.bytes) {
+			uint32_t written = 0;
+			uint32_t read    = 0;
+			std::memcpy(&written, blob.data() + at + (watch_address - header.address), 4);
+			std::memcpy(&read, reinterpret_cast<const void*>(watch_address), 4);
+			std::printf("[replay] watch: record writes 0x%08x, reads back 0x%08x (backing offset 0x%" PRIx64
+			            ")\n",
+			            written, read, Memory::BackingOffset(watch_address));
+		}
+		ScanShaders(header.address, {blob.data() + at, header.bytes});
 		at += header.bytes;
 	}
 }
@@ -1149,7 +1164,7 @@ private:
 
 // Before a call: the GPU is as far as it was when the guest made it. A wait the GPU cannot meet
 // (it stands at a REWIND or a wait the call itself releases) ends once the GPU is parked.
-void WaitFor(const std::vector<Wait>& waits, Pacing& pacing) {
+void WaitFor(const std::vector<Wait>& waits, Pacing& pacing, uint64_t ordinal) {
 	if (waits.empty()) return;
 	auto&      gpu      = Gpu();
 	for (const auto& wait: waits) {
@@ -1172,7 +1187,17 @@ void WaitFor(const std::vector<Wait>& waits, Pacing& pacing) {
 		};
 		while (!reached()) {
 			if (watch.Stalled()) {
-				pacing.stalls++;
+				if (pacing.stalls++ < 20 && std::getenv("KYTY_REPLAY_DEBUG") != nullptr) {
+					std::string text;
+					for (const auto& other: waits) {
+						if (other.kind != Wait::Packets || other.queue >= GuestGpu::PacingQueues) continue;
+						text += fmt::format(" q{} {}/{}", other.queue,
+						                    gpu.ExecutedPackets(other.queue) - pacing.packets[other.queue],
+						                    other.completed);
+					}
+					std::printf("[replay] stall before call %" PRIu64 ":%s\n%s", ordinal, text.c_str(),
+					            gpu.DescribeUnfinished().c_str());
+				}
 				return;
 			}
 			if (std::chrono::steady_clock::now() > deadline) {
@@ -1413,7 +1438,7 @@ void RunReplay(const ReplayOptions& options) {
 			const auto pass_start        = NowNs();
 			Phase()                      = "calls";
 			for (const auto& call: calls) {
-				WaitFor(call.waits, pacing);
+				WaitFor(call.waits, pacing, call.ordinal);
 				switch (call.kind) {
 					case CallKind::Memory: {
 						// Between two packets of the GPU, as one step: the guest wrote a chained
@@ -1518,6 +1543,18 @@ void RunReplay(const ReplayOptions& options) {
 					}
 					case CallKind::FrameEnd:
 					case CallKind::End: break;
+				}
+				// KYTY_REPLAY_WATCH=<hex address>: the calls after which a guest dword changed.
+				static const uint64_t watch_address = EnvNumber("KYTY_REPLAY_WATCH", 0);
+				if (watch_address != 0) {
+					static uint32_t watched = 0xdeadbeefu;
+					uint32_t        value   = 0;
+					std::memcpy(&value, reinterpret_cast<const void*>(watch_address), 4);
+					if (value != watched) {
+						std::printf("[replay] watch 0x%" PRIx64 " = 0x%08x after call %" PRIu64 " (kind %u)\n",
+						            watch_address, value, call.ordinal, static_cast<unsigned>(call.kind));
+						watched = value;
+					}
 				}
 			}
 			static_cast<void>(started);
