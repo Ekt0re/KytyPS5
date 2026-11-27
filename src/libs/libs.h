@@ -163,8 +163,12 @@ bool IsFailureReturn(const Ret& value, uint64_t& raw_result) {
 	}
 }
 
+// Exports whose type is not a plain KYTY_SYSV_ABI function pointer (on Windows, a host-ABI function
+// such as chmod) keep their original address.
 template <auto Fn, FixedString Library, FixedString Name, typename Sig>
-struct LibThunkHelper;
+struct LibThunkHelper {
+	static uint64_t Addr() { return reinterpret_cast<uint64_t>(Fn); }
+};
 
 template <auto Fn, FixedString Library, FixedString Name, typename Ret, typename... Args>
 struct LibThunkHelper<Fn, Library, Name, Ret (KYTY_SYSV_ABI*)(Args...)> {
