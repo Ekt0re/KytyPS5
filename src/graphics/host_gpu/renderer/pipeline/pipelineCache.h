@@ -330,6 +330,8 @@ public:
 		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Per descriptor type, the descriptors one set of descriptor_set_layout holds.
+		std::vector<vk::DescriptorPoolSize> descriptor_sizes;
 
 		[[nodiscard]] PendingPipeline Pending() const { return {compiling, deferred}; }
 	};
@@ -354,6 +356,11 @@ public:
 	// while full-screen passes, depth or stencil writers, draws whose shaders write memory and
 	// all dispatches wait; 2 also skips depth and stencil writers.
 	static int AsyncPipelineMode();
+	// KYTY_LAZY_SHADER_STORE=1 (frame replays): the shader store decodes a record only when a
+	// lookup needs it and creates a stored pipeline only when a draw or dispatch needs it, with no
+	// background decoders, pipeline creation, recipes or Vulkan pipeline cache file. Keeps the
+	// memory a replay needs small.
+	static bool LazyShaderStore();
 	// A draw skipped because its pipeline was not ready; reported every 5 s.
 	static void NoteSkippedDraw();
 	// Waits for a pipeline being built on a worker; the guest clock stands still while it waits.

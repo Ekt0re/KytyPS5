@@ -46,6 +46,8 @@
 #include <utility>
 #include <vector>
 #include <xxhash.h>
+#include "common/runtimeToggles.h"
+#include "graphics/host_gpu/readWatchFilter.h"
 
 namespace Common {
 extern thread_local std::jmp_buf* g_dbg_recover;
@@ -127,6 +129,50 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+// SRT walker loads from pages that share GPU-written bytes: served like the fault handler serves
+// them, without the fault.
+static bool GuardedWalkerLoad(uint64_t address, uint32_t& value) {
+	return Libs::LibKernel::Memory::TryReadBufferBacking(address, &value, sizeof(value));
+}
+
+// The walker guard is on by default. KYTY_WALKER_GUARD=0 turns it off, =verify also walks plainly
+// and compares. A walker_guard=0|1 line in KYTY_TOGGLE_FILE switches it at run time (verify stays
+// verify when switched on). With either variable set, the guard counts its loads and prints the
+// counts every 2^18 program lookups; otherwise it counts nothing.
+static void UpdateWalkerGuard() {
+	using ShaderRecompiler::IR::SrtWalkerGuardMode;
+	static const char*              env      = std::getenv("KYTY_WALKER_GUARD");
+	static const bool               report   = env != nullptr || Common::RuntimeToggles::Enabled();
+	static const SrtWalkerGuardMode env_mode = [] {
+		ShaderRecompiler::IR::SetSrtWalkerGuard(ReadWatchFilter::g_counts, ReadWatchFilter::SlotCount,
+		                                        GuardedWalkerLoad);
+		ShaderRecompiler::IR::SetSrtWalkerGuardCounting(report);
+		const auto mode = env == nullptr || env[0] == 0 ? SrtWalkerGuardMode::On
+		                  : env[0] == '0'               ? SrtWalkerGuardMode::Off
+		                  : env[0] == 'v'               ? SrtWalkerGuardMode::Verify
+		                                                : SrtWalkerGuardMode::On;
+		ShaderRecompiler::IR::SetSrtWalkerGuardMode(mode);
+		return mode;
+	}();
+	static uint32_t calls = 0;
+	if ((calls++ & 0xffu) != 0) return;
+	if (Common::RuntimeToggles::Enabled()) {
+		const int toggle = Common::RuntimeToggles::Find("walker_guard");
+		if (toggle >= 0) {
+			ShaderRecompiler::IR::SetSrtWalkerGuardMode(
+			    toggle == 0 ? SrtWalkerGuardMode::Off
+			                : (env_mode == SrtWalkerGuardMode::Verify ? env_mode : SrtWalkerGuardMode::On));
+		}
+	}
+	if (report && (calls & 0x3ffffu) == 1) {
+		const auto stats = ShaderRecompiler::IR::GetSrtWalkerGuardStats();
+		std::fprintf(stderr,
+		             "[walker-guard] %" PRIu64 " walks, %" PRIu64 " loads served, %" PRIu64
+		             " passed on, %" PRIu64 " walks verified, %" PRIu64 " mismatches\n",
+		             stats.walks, stats.served, stats.declined, stats.verified, stats.mismatches);
+	}
 }
 
 void DumpShader(std::span<const uint32_t> words, const std::string& name) {
@@ -825,6 +871,10 @@ void PipelineCache::StartDeferredCompile(Pipeline&                              
 	    });
 	pipeline.compiling = deferred->Result();
 	pipeline.deferred  = deferred;
+	if (LazyShaderStore()) {
+		// Created by the first draw or dispatch that needs it (Resolve, Expedite).
+		return;
+	}
 	m_workers.Post(
 	    [deferred = std::move(deferred), stop = m_deferred_stop] {
 		    // No draw waits for it yet; one that does runs it itself or via Expedite.
@@ -1304,6 +1354,12 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
+	if (LazyShaderStore()) {
+		// Loading it costs a replay 1 GB or more; the driver's own disk cache still serves the
+		// pipelines a frame creates.
+		PipelineCacheLog("Vulkan pipeline cache: not used (lazy shader store)");
+		return;
+	}
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	// Our own pipeline binaries: the driver's cache alone does not keep them across builds or past
 	// its size (PipelineBinaryStore).
@@ -1694,6 +1750,7 @@ bool PipelineCache::PrepareGraphicsStages(const HW::Context& context, const HW::
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	UpdateWalkerGuard();
 	MergeReplayed();
 	GraphicsStageInputs inputs;
 	if (!PrepareGraphicsStages(command.GetRegisters(), command.GetUserConfig(), command.GetShaders(),
@@ -1733,6 +1790,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
+	UpdateWalkerGuard();
 	MergeReplayed();
 	input_info.host_subgroup_size = m_compute_subgroup_size;
 	const auto        params      = PrepareProgram(regs, input_info);

@@ -4,6 +4,8 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/command_processor/rawCommandBuffer.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -892,6 +894,106 @@ void TestTrackerProtectSharesBackingReads() {
 	      "tracker protection waited for a sparse backing read");
 	Check(test, excluded && guest_result == OK,
 	      "guest mprotect completed while a sparse backing read held its lock");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+// KYTY_RAW_CMDBUF: a command span whose guest pages are read-protected (as the resource tracker
+// protects GPU-written pages) decodes identically through the backing view without touching the
+// guest pages; a DMA write into the live part of the span is published and then seen through
+// the view, one into the decoded part is not refreshed; CP WRITE_DATA (a CPU store through the
+// guest address) is seen at once; a span that is not one backing run gets no view.
+void TestRawCommandBufferView() {
+	using namespace Libs::LibKernel::Memory;
+	namespace Raw = Libs::Graphics::RawCommandBuffer;
+	namespace Pm4 = Libs::Graphics::Pm4;
+	const char*    test = "RawCommandBufferView";
+	const uint64_t size = SceKernelPageSize * 2;
+	const auto     base = MapNamedFlexible(test, size, SceKernelProtCpuRw, "raw_cmdbuf");
+
+	// SET_SH_REG (3 values), NOP padding to the second page, WRITE_DATA (2 values), NOP tail.
+	std::vector<uint32_t> stream;
+	stream.push_back(KYTY_PM4(5, Pm4::IT_SET_SH_REG, 0u));
+	stream.insert(stream.end(), {0x40u, 0x11111111u, 0x22222222u, 0x33333333u});
+	const auto pad_dw = static_cast<uint32_t>(SceKernelPageSize / 4u) - 5u - 2u;
+	stream.push_back(KYTY_PM4(pad_dw + 2u, Pm4::IT_NOP, 0u));
+	stream.insert(stream.end(), pad_dw + 1u, 0xdeadbeefu);
+	const auto write_data_at = static_cast<uint32_t>(stream.size());
+	stream.push_back(KYTY_PM4(6, Pm4::IT_WRITE_DATA, 0u));
+	stream.insert(stream.end(), {0x500u, 0x1000u, 0u, 0xaaaaaaaau, 0xbbbbbbbbu});
+	const auto tail_dw = static_cast<uint32_t>(size / 4u) - static_cast<uint32_t>(stream.size());
+	stream.push_back(KYTY_PM4(tail_dw, Pm4::IT_NOP, 0u));
+	stream.resize(size / 4u, 0x5a5a5a5au);
+	std::memcpy(reinterpret_cast<void*>(base), stream.data(), size);
+
+	const std::span<const uint32_t> guest(reinterpret_cast<const uint32_t*>(base), size / 4u);
+	Check(test, ProtectGuestHostMemory(base, size, Common::VirtualMemory::Mode::NoAccess),
+	      "ProtectGuestHostMemory(NoAccess)");
+	const auto* view = Raw::View(guest);
+	Check(test, view != nullptr, "no backing view of a flexible span");
+	if (view == nullptr) {
+		return;
+	}
+	Check(test, view != guest.data(), "the view is the guest address");
+	// Decode the packets through the view, as ProcessPm4 walks them.
+	std::vector<uint32_t> packet_starts;
+	for (uint32_t at = 0; at < guest.size();) {
+		packet_starts.push_back(at);
+		at += KYTY_PM4_LEN(view[at]);
+	}
+	Check(test, packet_starts == std::vector<uint32_t>({0u, 5u, write_data_at, write_data_at + 6u}),
+	      "packets decoded through the view differ");
+	Check(test, std::memcmp(view, stream.data(), size) == 0,
+	      "the view of a read-protected span differs from the stream");
+
+	// A DMA into the live part (from the WRITE_DATA packet on) is published, then visible.
+	const std::array<Raw::LiveRange, 1> live {
+	    {{base + uint64_t {write_data_at} * 4u, base + size}}};
+	const auto dma_dst = base + uint64_t {write_data_at + 4u} * 4u;
+	const std::array<uint32_t, 2> published {0x12345678u, 0x9abcdef0u};
+	std::vector<std::pair<uint64_t, uint64_t>> refreshed;
+	const auto publish = [&](uint64_t begin, uint64_t bytes) {
+		refreshed.emplace_back(begin, bytes);
+		// What the buffer cache's readback does: the GPU bytes land in guest memory.
+		Check(test,
+		      TryWriteBacking(begin,
+		                      reinterpret_cast<const uint8_t*>(published.data()) + (begin - dma_dst),
+		                      bytes),
+		      "TryWriteBacking(publication)");
+	};
+	Check(test, Raw::ForEachLiveOverlap(live, dma_dst, sizeof(published), publish) == 1 &&
+	                refreshed.size() == 1 && refreshed[0].first == dma_dst &&
+	                refreshed[0].second == sizeof(published),
+	      "a DMA into the live span was not refreshed exactly");
+	Check(test, view[write_data_at + 4u] == published[0] && view[write_data_at + 5u] == published[1],
+	      "the refreshed DWORDs are not visible through the view");
+	refreshed.clear();
+	const auto record = [&](uint64_t begin, uint64_t bytes) { refreshed.emplace_back(begin, bytes); };
+	Check(test, Raw::ForEachLiveOverlap(live, base, 16, record) == 0 && refreshed.empty(),
+	      "a DMA into the decoded part was refreshed");
+	Check(test,
+	      Raw::ForEachLiveOverlap(live, base + uint64_t {write_data_at} * 4u - 8u, 16, record) == 1 &&
+	          refreshed.size() == 1 &&
+	          refreshed[0].first == base + uint64_t {write_data_at} * 4u && refreshed[0].second == 8,
+	      "a DMA straddling the decode position was not clipped to the live part");
+
+	// CP WRITE_DATA stores through the guest address (the fault handler publishes first).
+	Check(test, ProtectGuestHostMemory(base, size, Common::VirtualMemory::Mode::ReadWrite),
+	      "ProtectGuestHostMemory(ReadWrite)");
+	*reinterpret_cast<volatile uint32_t*>(base + uint64_t {write_data_at + 3u} * 4u) = 0xc0ffee00u;
+	Check(test, view[write_data_at + 3u] == 0xc0ffee00u,
+	      "a CPU store into the live span is not visible through the view");
+	Check(test, Raw::Verify(guest, view) == 0, "verify found differences in an unprotected span");
+	CheckOk(test, KernelMunmap(base, size), "KernelMunmap");
+
+	// Not one backing run: no view (the parser decodes through the guest address).
+	const auto hole = MapPageBeforeHole(test, "raw_cmdbuf_hole");
+	Check(test,
+	      Raw::View({reinterpret_cast<const uint32_t*>(hole + SceKernelPageSize - 8u), 4u}) ==
+	          nullptr,
+	      "a view of a span that runs into a hole");
+	Check(test, Raw::View({reinterpret_cast<const uint32_t*>(hole), 4u}) != nullptr,
+	      "no view of a backed span before a hole");
+	CheckOk(test, KernelMunmap(hole, SceKernelPageSize), "KernelMunmap(hole)");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -2821,6 +2923,94 @@ void TestDirectReleaseUnmapsGpuRuns() {
 	      "release did not unmap adjacent views from the GPU once");
 	for (uint64_t i = 0; i < 4; ++i)
 		ExpectUnmapped(test, base + i * page);
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+std::vector<std::pair<uint64_t, size_t>> g_gpu_fresh_maps;
+
+void ObserveGpuFreshMap(uint64_t address, size_t size) {
+	g_gpu_fresh_maps.emplace_back(address, size);
+}
+
+// A map over a free or reserved range does not wait for the GPU thread; a map that replaces
+// memory the guest and the GPU could use does.
+void TestFreshMapsDoNotWaitForGpu() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "FreshMapsDoNotWaitForGpu";
+	constexpr uint64_t page     = SceKernelPageSize;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 4 * page, page,
+	                                   SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	using Fresh     = std::vector<std::pair<uint64_t, size_t>>;
+	g_gpu_range_events.clear();
+	g_gpu_fresh_maps.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	TestSetGpuFreshMapCallback(ObserveGpuFreshMap);
+
+	// Direct memory over a reserved span, the way a game commits a heap page by page.
+	void* address = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        KernelMapDirectMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed, physical,
+	                              page),
+	        "KernelMapDirectMemory(reserved)");
+	Check(test, g_gpu_fresh_maps == Fresh {{base, page}},
+	      "a direct map over a reserved span waited for the GPU thread");
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {true, base, page}},
+	      "a direct map over a reserved span did not drop and map its range on the GPU");
+
+	// The same addresses again, now live: the GPU may hold data for them and use them.
+	g_gpu_range_events.clear();
+	g_gpu_fresh_maps.clear();
+	CheckOk(test,
+	        KernelMapDirectMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                              physical + page, page),
+	        "KernelMapDirectMemory(live direct)");
+	Check(test, g_gpu_fresh_maps.empty(), "a direct map over live memory did not wait for the GPU");
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {true, base, page}},
+	      "a direct map over live memory did not unmap and map its range on the GPU");
+
+	// Flexible memory over the rest of the reservation, then over itself.
+	g_gpu_range_events.clear();
+	void* flexible = reinterpret_cast<void*>(base + 2 * page);
+	CheckOk(test, KernelMapFlexibleMemory(&flexible, page, SceKernelProtCpuRw, SceKernelMapFixed),
+	        "KernelMapFlexibleMemory(reserved)");
+	Check(test, g_gpu_fresh_maps == Fresh {{base + 2 * page, page}},
+	      "a flexible map over a reserved span waited for the GPU thread");
+	g_gpu_fresh_maps.clear();
+	CheckOk(test, KernelMapFlexibleMemory(&flexible, page, SceKernelProtCpuRw, SceKernelMapFixed),
+	        "KernelMapFlexibleMemory(live flexible)");
+	Check(test, g_gpu_fresh_maps.empty(),
+	      "a flexible map over live memory did not wait for the GPU");
+	Check(test,
+	      !g_gpu_range_events.empty() &&
+	          g_gpu_range_events.back() == GpuRangeEvent {true, base + 2 * page, page} &&
+	          std::ranges::count(g_gpu_range_events,
+	                             GpuRangeEvent {false, base + 2 * page, page}) >= 2,
+	      "a flexible map over live memory did not unmap its range on the GPU");
+
+	// A map the kernel places itself lands in free space.
+	g_gpu_fresh_maps.clear();
+	void* placed = nullptr;
+	CheckOk(test, KernelMapDirectMemory(&placed, page, SceKernelProtCpuRw, 0, physical + 2 * page, page),
+	        "KernelMapDirectMemory(free)");
+	Check(test, g_gpu_fresh_maps == Fresh {{reinterpret_cast<uint64_t>(placed), page}},
+	      "a direct map into free space waited for the GPU thread");
+
+	TestSetGpuFreshMapCallback(nullptr);
+	TestSetGpuRangeCallback(nullptr);
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(placed), page), "KernelMunmap(placed)");
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap(reservation)");
+	CheckOk(test, KernelReleaseDirectMemory(physical, 4 * page), "KernelReleaseDirectMemory");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -6562,6 +6752,7 @@ int main(int argc, char** argv) {
 	RunTest(TestQueriesWaitForStateChanges);
 	RunTest(TestTrackerProtectSharesBackingReads);
 	RunTest(TestClampRangeSkipsStateLock);
+	RunTest(TestRawCommandBufferView);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFragmentedGuestFreeRangeHints);
@@ -6608,6 +6799,7 @@ int main(int argc, char** argv) {
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseUnmapsGpuRuns);
+	RunTest(TestFreshMapsDoNotWaitForGpu);
 	RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);

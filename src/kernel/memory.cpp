@@ -85,6 +85,7 @@ static uint64_t                 g_gpu_table_memory     = INCLUDED_TABLE_MEMORY;
 static Graphics::RenderContext* g_gpu_resources        = nullptr;
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 static void (*g_test_gpu_range)(bool, uint64_t, size_t) = nullptr;
+static void (*g_test_gpu_fresh_map)(uint64_t, size_t)   = nullptr;
 #endif
 
 static Graphics::RenderContext& GetGpuResources() {
@@ -104,6 +105,22 @@ static void MapGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	GetGpuResources().MapMemory(vaddr, size);
+}
+
+// A map over a range that was free or reserved: what an unmap followed by a map tells the GPU,
+// without waiting for the GPU thread.
+static void MapFreshGpuRange(uint64_t vaddr, uint64_t size) {
+#if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+	if (g_test_gpu_fresh_map != nullptr) g_test_gpu_fresh_map(vaddr, size);
+	if (g_test_gpu_range != nullptr) {
+		g_test_gpu_range(false, vaddr, size);
+		g_test_gpu_range(true, vaddr, size);
+	}
+#endif
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	GetGpuResources().MapFreshMemory(vaddr, size);
 }
 
 static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
@@ -844,6 +861,22 @@ uint64_t BackingGeneration() {
 
 bool BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->BackingChangedSince(generation, vaddr, size);
+}
+
+const void* TryGetBackingView(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space->TryGetBackingView(vaddr, size);
+}
+
+uint64_t BackingOffset(uint64_t vaddr) {
+	return g_guest_address_space->BackingOffset(vaddr);
+}
+
+uint64_t BackingAliasBase() {
+	return g_guest_address_space->GetBackingBase();
+}
+
+uint64_t BackingAliasSize() {
+	return g_guest_address_space->GetBackingSize();
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
@@ -1687,6 +1720,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
 	uint64_t out_addr        = 0;
 	bool     reserved_target = false;
+	bool     was_free        = false;
 
 	if ((flags & GUEST_MAP_FIXED) != 0) {
 		if (in_addr == 0 || (in_addr & (PAGE_SIZE - 1)) != 0 ||
@@ -1697,22 +1731,24 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 			return KERNEL_ERROR_ENOMEM;
 		}
 		if (!IsReservedSpan(in_addr, len)) {
+			was_free = !g_virtual_ranges->HasOverlap(in_addr, len);
 			replacing.emplace(in_addr, in_addr + len);
 			const int result = ReplaceFixedRangeWithReserved(in_addr, len);
 			if (result != OK) {
 				return result;
 			}
+			if (!was_free) {
+				UnmapGpuRange(in_addr, len);
+			}
 		}
-		UnmapGpuRange(in_addr, len);
 		reserved_target = true;
 		out_addr        = in_addr;
 	} else {
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
 		out_addr               = FindGuestFreeRange(search_addr, len, map_alignment);
-		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
-		}
 	}
+	// A target that was free or reserved all along needs no wait for the GPU thread.
+	const bool fresh_target = !replacing.has_value() || was_free;
 
 	*addr_in_out = reinterpret_cast<void*>(out_addr);
 
@@ -1744,7 +1780,11 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	     "\t name     = %s\n",
 	     in_addr, out_addr, len, magic_enum::enum_name(mode), static_cast<uint32_t>(flags), name);
 
-	MapGpuRange(out_addr, len);
+	if (fresh_target) {
+		MapFreshGpuRange(out_addr, len);
+	} else {
+		MapGpuRange(out_addr, len);
+	}
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -2367,6 +2407,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	auto                              in_addr        = reinterpret_cast<uint64_t>(*addr);
 	uint64_t                          target         = 0;
 	bool                              replace_target = false;
+	bool                              was_free       = false;
 	auto                              replaced_type  = VirtualRangeType::Reserved;
 	auto                              shared_failure = GuestBackingStore::FailureReason::None;
 	std::vector<VirtualRanges::Range> replaced;
@@ -2391,6 +2432,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		                    replaced.front().type == VirtualRangeType::Prt)) {
 			replaced_type = replaced.front().type;
 		} else {
+			was_free = !g_virtual_ranges->HasOverlap(in_addr, len);
 			replacing.emplace(in_addr, in_addr + len);
 			const int result = ReplaceFixedRangeWithReserved(in_addr, len);
 			if (result != OK) {
@@ -2412,8 +2454,13 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 	char      range_name[KERNEL_MAXIMUM_NAME_LENGTH];
 	CopyVirtualRangeName(range_name, name);
 	uint64_t out_addr = 0;
+	// A target that was free or reserved all along needs no wait for the GPU thread.
+	const bool fresh_target =
+	    (!replacing.has_value() || was_free) && replaced_type == VirtualRangeType::Reserved;
 	if (target != 0) {
-		UnmapGpuRange(target, len);
+		if (!fresh_target) {
+			UnmapGpuRange(target, len);
+		}
 		std::lock_guard state(g_memory_state_mutex);
 		if (replaced_type == VirtualRangeType::Direct) {
 			for (const auto& old: replaced) {
@@ -2459,7 +2506,11 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		return KERNEL_ERROR_ENOMEM;
 	}
 
-	MapGpuRange(out_addr, len);
+	if (fresh_target) {
+		MapFreshGpuRange(out_addr, len);
+	} else {
+		MapGpuRange(out_addr, len);
+	}
 
 	if (g_alloc_callback != nullptr) {
 		g_alloc_callback(out_addr, len);
@@ -2729,6 +2780,10 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void TestSetGpuRangeCallback(void (*callback)(bool, uint64_t, size_t)) {
 	g_test_gpu_range = callback;
+}
+
+void TestSetGpuFreshMapCallback(void (*callback)(uint64_t, size_t)) {
+	g_test_gpu_fresh_map = callback;
 }
 
 void TestBeforeNextBackingMap(callback_func_t callback) {

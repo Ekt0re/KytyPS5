@@ -74,6 +74,15 @@ public:
 	[[nodiscard]] bool IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// Maps a range that was free or reserved, without waiting for the GPU thread.
+	void               MapFreshMemory(uint64_t vaddr, uint64_t size);
+	// Drops what the caches hold for a range (cached buffers' contents, images, image heap
+	// tables) on the GPU thread without waiting for it. The GPU thread runs its commands in the
+	// order they were sent and before the next packet of any submission, so the drop comes
+	// before every draw, dispatch and upload of GPU work the guest submits after this call, and
+	// after every command sent before it. Only for a range whose memory stays valid: before
+	// memory goes away, UnmapMemory has to wait for the GPU work and write-backs that use it.
+	void               PostDropCachedMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
 	// Scans the fault bitmap once the current work has run.
 	void               RequestFaultScan() { m_fault_process_pending = true; }
@@ -86,6 +95,8 @@ public:
 private:
 	// With m_mapped_ranges_mutex held for writing.
 	void NoteMappingChange(uint64_t vaddr, uint64_t size) noexcept;
+	// On the GPU thread: drops what the caches hold for the range.
+	void DropCachedMemory(uint64_t vaddr, uint64_t size);
 
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;

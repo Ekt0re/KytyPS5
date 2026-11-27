@@ -6,6 +6,8 @@
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "common/logging/log.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -166,6 +168,7 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.descriptor_sizes      = DescriptorSetLayoutSizes(bindings);
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -206,6 +209,19 @@ void CreatePipelineLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pi
 		pipeline.push_stages |= vk::ShaderStageFlagBits::eFragment;
 	}
 	CreateLayouts(graphics, pipeline, bindings);
+	if (!pipeline.uses_push_descriptors && !FitsStandardDescriptorPool(pipeline.descriptor_sizes)) {
+		std::string shaders;
+		for (const auto* stage: stages) {
+			if (stage != nullptr) {
+				shaders += fmt::format(" {}:0x{:016x}", static_cast<int>(stage->info.stage),
+				                       stage->info.shader_hash);
+			}
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Descriptor set layout of shaders{} exceeds the standard descriptor pool ({}): its "
+		    "sets come from a dedicated pool\n",
+		    shaders, DescribeDescriptorSetSizes(pipeline.descriptor_sizes)));
+	}
 }
 
 // Formats with a narrower host variant drop the components the shader does not read.
