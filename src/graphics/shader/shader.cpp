@@ -95,12 +95,14 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
-	std::scoped_lock lock(g_shader_map_mutex);
-
-	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
-		return iter->second;
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+			return iter->second;
+		}
 	}
-
+	// Not under the lock: a translation ahead recovers from this error with a longjmp, which
+	// would leave the mutex held and stop every later shader lookup.
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
 
