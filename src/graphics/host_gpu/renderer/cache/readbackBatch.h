@@ -105,6 +105,40 @@ private:
 	size_t                    m_next = 0;
 };
 
+// How a synchronous download reaches the GPU.
+enum class ReadbackPath {
+	// Copy queue (KYTY_COPY_QUEUE): the copy goes to a queue of its own, behind every submitted
+	// tick (a GPU wait on the master timeline), and the open command buffer stays open.
+	CopyQueue,
+	// The copy goes first into one submission with the open command buffer.
+	Fused,
+	// The copy is submitted on its own on the universal queue, then the open command buffer.
+	Detached,
+	// A write of the ranges is still in the open command buffer: the copy goes behind it, the
+	// command buffer is submitted and waited for.
+	Flush,
+};
+
+struct ReadbackPathInput {
+	// No write of the ranges is unsubmitted (BufferCache::CanDownloadDetached for every part).
+	bool detached = false;
+	// The device has a copy queue and KYTY_COPY_QUEUE / toggle copy_queue selects it.
+	bool copy_queue = false;
+	// The batched caller asks for the fused submission, and the scheduler can make it.
+	bool fuse = false;
+};
+
+[[nodiscard]] constexpr ReadbackPath ChooseReadbackPath(ReadbackPathInput input) noexcept {
+	if (!input.detached) {
+		// The producer is in the open command buffer: it has to be submitted first anyway.
+		return ReadbackPath::Flush;
+	}
+	if (input.copy_queue) {
+		return ReadbackPath::CopyQueue;
+	}
+	return input.fuse ? ReadbackPath::Fused : ReadbackPath::Detached;
+}
+
 } // namespace Libs::Graphics::ReadbackBatch
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_READBACKBATCH_H_

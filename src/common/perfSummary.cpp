@@ -36,6 +36,11 @@ constexpr std::array<const char*, N> g_names = {
     "rb_wait_us",    "rb_copy_us",    "rb_write_calls", "rb_write_us",
     "rb_queue_ticks", "rb_prod_done", "rb_prod_pending", "rb_prod_open", "rb_after_ticks",
     "rb_prod_wait_us",
+    "rb_path_cq", "rb_path_cq_wait_us", "rb_path_cq_total_us",
+    "rb_path_fused", "rb_path_fused_wait_us", "rb_path_fused_total_us",
+    "rb_path_det", "rb_path_det_wait_us", "rb_path_det_total_us",
+    "rb_path_flush", "rb_path_flush_wait_us", "rb_path_flush_total_us",
+    "rb_cq_submits", "rb_cq_fence_us", "rb_cq_gpu_busy",
 };
 
 struct Sample {

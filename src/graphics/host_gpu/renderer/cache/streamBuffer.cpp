@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <array>
 #include <bit>
 #include <cstring>
 #include <numeric>
@@ -72,6 +73,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size  = size;
 	buffer_info.usage = flags;
+	// KYTY_COPY_QUEUE: readback copies read these buffers on the copy queue too, without queue
+	// family ownership transfers (buffers have no compressed layout, so this costs nothing).
+	const std::array<uint32_t, 2> families {graphics.queue_family, graphics.copy_queue_family};
+	if (graphics.copy_queue != nullptr) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+		buffer_info.pQueueFamilyIndices   = families.data();
+	}
 
 	const bool              with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};

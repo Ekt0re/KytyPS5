@@ -93,6 +93,10 @@ CommandScheduler::~CommandScheduler() {
 		m_graphics.device.destroySemaphore(m_detached_timeline, nullptr);
 		m_graphics.device.destroyCommandPool(m_detached_pool, nullptr);
 	}
+	if (m_copy_pool != nullptr) {
+		m_graphics.device.destroyFence(m_copy_fence, nullptr);
+		m_graphics.device.destroyCommandPool(m_copy_pool, nullptr);
+	}
 }
 
 // Detached submissions follow KytyPS5 PR #1254 by NeySlim ("gpu: read back submitted buffer
@@ -195,6 +199,86 @@ void CommandScheduler::EndDetachedWithCurrent() {
 		RequireVulkanSuccess(result, "wait for detached timeline semaphore");
 	}
 	RequireVulkanSuccess(m_detached_command.reset({}), "reset detached command buffer");
+}
+
+bool CommandScheduler::HasCopyQueue() const noexcept {
+	return m_graphics.copy_queue != nullptr;
+}
+
+vk::CommandBuffer CommandScheduler::BeginCopyQueue() {
+	CheckActive();
+	auto& device = m_graphics.device;
+	if (m_copy_pool == nullptr) {
+		vk::CommandPoolCreateInfo create {};
+		create.queueFamilyIndex = m_graphics.copy_queue_family;
+		create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		RequireVulkanSuccess(device.createCommandPool(&create, nullptr, &m_copy_pool),
+		                     "create copy-queue command pool");
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_copy_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		RequireVulkanSuccess(device.allocateCommandBuffers(&allocate, &m_copy_command),
+		                     "allocate copy-queue command buffer");
+		const vk::FenceCreateInfo fence {};
+		RequireVulkanSuccess(device.createFence(&fence, nullptr, &m_copy_fence),
+		                     "create copy-queue fence");
+	}
+	// With the command recorder, earlier ticks may still wait on its thread for their submission:
+	// their timeline signals must be submitted before the copy waits on them.
+	if (Recorder::Enabled() && m_master.SubmittedTick() + 1 < m_master.CurrentTick()) {
+		Recorder::SyncAll();
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(m_copy_command.begin(&begin), "begin copy-queue command buffer");
+	return m_copy_command;
+}
+
+void CommandScheduler::EndCopyQueue() {
+	if (Recorder::IsDeferred(static_cast<VkCommandBuffer>(m_copy_command))) {
+		Recorder::Sync(m_copy_command);
+	}
+	RequireVulkanSuccess(m_copy_command.end(), "end copy-queue command buffer");
+	// Every tick handed out before the open one: the same work a detached copy on the universal
+	// queue would follow, as a GPU-side wait on the master timeline (free when it has finished).
+	const uint64_t                wait_value = m_master.CurrentTick() - 1;
+	const vk::Semaphore           wait_semaphore = m_master.Handle();
+	const vk::PipelineStageFlags  wait_stage     = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount = 1;
+	timeline_info.pWaitSemaphoreValues    = &wait_value;
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext              = &timeline_info;
+	submit_info.waitSemaphoreCount = 1;
+	submit_info.pWaitSemaphores    = &wait_semaphore;
+	submit_info.pWaitDstStageMask  = &wait_stage;
+	submit_info.commandBufferCount = 1;
+	submit_info.pCommandBuffers    = &m_copy_command;
+	vk::Result result;
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbSubmitUs);
+		result = m_graphics.copy_queue.submit(1, &submit_info, m_copy_fence);
+	}
+	if (result == vk::Result::eErrorDeviceLost) {
+		GpuBreadcrumbs::ReportDeviceLost(m_graphics, "copy-queue submit");
+	}
+	RequireVulkanSuccess(result, "submit copy-queue command buffer");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbSubmits);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbCqSubmits);
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbWaitUs);
+		Common::PerfSummary::ScopedMicros path_timer(Common::PerfSummary::Counter::RbCqFenceUs);
+		result = m_graphics.device.waitForFences(1, &m_copy_fence, VK_TRUE, UINT64_MAX);
+		if (result == vk::Result::eErrorDeviceLost) {
+			GpuBreadcrumbs::ReportDeviceLost(m_graphics, "copy-queue wait");
+		}
+		RequireVulkanSuccess(result, "wait for copy-queue fence");
+	}
+	RequireVulkanSuccess(m_graphics.device.resetFences(1, &m_copy_fence), "reset copy-queue fence");
+	RequireVulkanSuccess(m_copy_command.reset({}), "reset copy-queue command buffer");
 }
 
 void CommandScheduler::Shutdown() {

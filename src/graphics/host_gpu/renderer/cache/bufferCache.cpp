@@ -298,7 +298,59 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 	                                         Common::DebugCounters::Counter::SyncReadbackNs);
 	using Common::PerfSummary::Counter;
 	using Common::PerfSummary::ScopedMicros;
-	if (detached) {
+	const bool copy_queue = detached && CopyQueue();
+	const auto path       = ReadbackBatch::ChooseReadbackPath(
+        {.detached   = detached,
+	           .copy_queue = copy_queue,
+	           .fuse       = fuse && m_detached_readback == DetachedReadback::Submit &&
+	                   m_scheduler.CanSubmitDetachedWithCurrent()});
+	struct PathCounters {
+		Counter count, wait, total;
+	};
+	const auto counters = [path]() -> PathCounters {
+		switch (path) {
+			case ReadbackBatch::ReadbackPath::CopyQueue:
+				return {Counter::RbPathCq, Counter::RbPathCqWaitUs, Counter::RbPathCqTotalUs};
+			case ReadbackBatch::ReadbackPath::Fused:
+				return {Counter::RbPathFused, Counter::RbPathFusedWaitUs, Counter::RbPathFusedTotalUs};
+			case ReadbackBatch::ReadbackPath::Detached:
+				return {Counter::RbPathDetached, Counter::RbPathDetachedWaitUs,
+				        Counter::RbPathDetachedTotalUs};
+			case ReadbackBatch::ReadbackPath::Flush: break;
+		}
+		return {Counter::RbPathFlush, Counter::RbPathFlushWaitUs, Counter::RbPathFlushTotalUs};
+	}();
+	Common::PerfSummary::Add(counters.count);
+	ScopedMicros path_total_timer(counters.total);
+	if (path == ReadbackBatch::ReadbackPath::CopyQueue) {
+		// As a detached copy, but on the copy queue: it waits on the GPU for the submitted ticks
+		// only (on the universal queue it also queued behind the work submitted ahead of it),
+		// and the open command buffer is not submitted.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncDetachedReadbacks);
+		const auto tick = m_scheduler.CurrentTick();
+		if (Common::PerfSummary::Enabled()) {
+			auto& master = m_scheduler.GetMasterSemaphore();
+			if (!master.IsFree(tick - 1)) {
+				master.Refresh();
+				if (!master.IsFree(tick - 1)) {
+					Common::PerfSummary::Add(Counter::RbCqGpuBusy);
+				}
+			}
+		}
+		{
+			ScopedMicros path_wait_timer(counters.wait);
+			(void)m_scheduler.SubmitOnCopyQueue(record);
+			ScopedMicros wait_timer(Counter::RbWaitUs);
+			m_scheduler.WaitPriorityOperations(tick - 1);
+		}
+		// KYTY_COPY_QUEUE_FLUSH=1: the open command buffer is still submitted (without a wait), as
+		// the detached path does.
+		if (CopyQueueFlush()) {
+			ScopedMicros flush_timer(Counter::RbFlushUs);
+			m_scheduler.Flush();
+			Common::PerfSummary::Add(Counter::RbSubmits);
+		}
+	} else if (detached) {
 		// The barrier orders the copy after every submitted command, and no unsubmitted command
 		// writes these ranges: the copy reads what a flush and wait would have read.
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncDetachedReadbacks);
@@ -308,14 +360,21 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 		// Batched: the copy and the open command buffer go to the GPU in one submission, the copy
 		// first, and only the copy is waited for. Unbatched: the copy's own submission and wait,
 		// then the open command buffer's submission.
-		if (fuse && m_detached_readback == DetachedReadback::Submit &&
-		    m_scheduler.SubmitDetachedWithCurrent(record)) {
+		// The fused path's wait counter includes submitting the open command buffer: its wait
+		// happens inside SubmitDetachedWithCurrent.
+		std::optional<ScopedMicros> fused_wait_timer;
+		if (path == ReadbackBatch::ReadbackPath::Fused) {
+			fused_wait_timer.emplace(counters.wait);
+		}
+		if (path == ReadbackBatch::ReadbackPath::Fused && m_scheduler.SubmitDetachedWithCurrent(record)) {
 			Common::PerfSummary::Add(Counter::RbFused);
 			ScopedMicros wait_timer(Counter::RbWaitUs);
 			m_scheduler.WaitPriorityOperations(tick - 1);
 		} else {
-			m_scheduler.SubmitDetached(record);
+			fused_wait_timer.reset();
 			{
+				ScopedMicros path_wait_timer(counters.wait);
+				m_scheduler.SubmitDetached(record);
 				ScopedMicros wait_timer(Counter::RbWaitUs);
 				m_scheduler.WaitPriorityOperations(tick - 1);
 			}
@@ -346,6 +405,7 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 			m_scheduler.Flush();
 		}
 		ScopedMicros wait_timer(Counter::RbWaitUs);
+		ScopedMicros path_wait_timer(counters.wait);
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 	}
@@ -581,6 +641,30 @@ void BufferCache::ProbeReadbackQueue(const std::vector<DownloadPart>& parts) {
 	// up to the producing work and the part for work queued behind it.
 	Common::PerfSummary::ScopedMicros timer(Counter::RbProducerWaitUs);
 	master.Wait(producer);
+}
+
+bool BufferCache::CopyQueue() {
+	if (!m_scheduler.HasCopyQueue()) {
+		return false;
+	}
+	if (!Common::RuntimeToggles::Enabled()) {
+		return true;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now >= m_copy_queue_next) {
+		m_copy_queue_next  = now + std::chrono::milliseconds(250);
+		const int toggle   = Common::RuntimeToggles::Find("copy_queue");
+		m_copy_queue       = toggle != 0;
+	}
+	return m_copy_queue;
+}
+
+bool BufferCache::CopyQueueFlush() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COPY_QUEUE_FLUSH");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 bool BufferCache::BatchReadback() {

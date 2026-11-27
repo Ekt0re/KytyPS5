@@ -10,6 +10,8 @@
 namespace {
 
 using Libs::Graphics::ReadbackBatch::AccessWindow;
+using Libs::Graphics::ReadbackBatch::ChooseReadbackPath;
+using Libs::Graphics::ReadbackBatch::ReadbackPath;
 using Libs::Graphics::ReadbackBatch::NeighbourHistory;
 using Libs::Graphics::ReadbackBatch::Range;
 using Libs::Graphics::ReadbackBatch::SplitByOwner;
@@ -130,7 +132,25 @@ void TestNeighbourHistory() {
 
 } // namespace
 
+void TestReadbackPath() {
+	// detached, copy_queue, fuse
+	static_assert(ChooseReadbackPath({false, false, false}) == ReadbackPath::Flush);
+	Check(ChooseReadbackPath({.detached = false, .copy_queue = true, .fuse = true}) == ReadbackPath::Flush,
+	      "a producer in the open command buffer flushes and waits, copy queue or not");
+	Check(ChooseReadbackPath({.detached = false, .copy_queue = false, .fuse = true}) == ReadbackPath::Flush,
+	      "a producer in the open command buffer is never fused");
+	Check(ChooseReadbackPath({.detached = true, .copy_queue = true, .fuse = true}) == ReadbackPath::CopyQueue,
+	      "a finished or submitted producer copies on the copy queue when it is on");
+	Check(ChooseReadbackPath({.detached = true, .copy_queue = true, .fuse = false}) == ReadbackPath::CopyQueue,
+	      "unbatched downloads use the copy queue too");
+	Check(ChooseReadbackPath({.detached = true, .copy_queue = false, .fuse = true}) == ReadbackPath::Fused,
+	      "without the copy queue a batched detached download is fused");
+	Check(ChooseReadbackPath({.detached = true, .copy_queue = false, .fuse = false}) == ReadbackPath::Detached,
+	      "without the copy queue and fusion it is a detached submission");
+}
+
 int main() {
+	TestReadbackPath();
 	TestAccessWindow();
 	TestSplitOneBuffer();
 	TestSplitSeveralBuffers();

@@ -71,6 +71,12 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// KYTY_COPY_QUEUE=1: a queue of a compute/transfer family without graphics, for synchronous
+	// buffer readbacks that do not have to wait behind graphics work (null when the device has no
+	// such family; buffers are then exclusive to queue_family). With it, buffers are created
+	// VK_SHARING_MODE_CONCURRENT over both families. Only the GPU thread submits to it.
+	uint32_t                           copy_queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                          copy_queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

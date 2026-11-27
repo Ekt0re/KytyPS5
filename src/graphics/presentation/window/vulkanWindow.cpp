@@ -29,9 +29,11 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -692,11 +694,46 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.robust_buffer_access_enabled ? "robustBufferAccess2" : "shader checks");
 
 	const float                     queue_priority = 1.0f;
-	const vk::DeviceQueueCreateInfo queue_create_info {
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	queue_create_infos[0] = vk::DeviceQueueCreateInfo {
 	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+	uint32_t queue_create_count = 1;
+	// KYTY_COPY_QUEUE=1: a second queue for synchronous buffer readbacks, from a family with
+	// compute or transfer but without graphics (RADV: the compute family). Without one (or
+	// without the switch) everything stays on the one universal queue.
+	graphics.copy_queue_family = static_cast<uint32_t>(-1);
+	if (const char* copy_queue = std::getenv("KYTY_COPY_QUEUE");
+	    copy_queue != nullptr && copy_queue[0] == '1') {
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		uint32_t best = static_cast<uint32_t>(-1);
+		for (uint32_t family = 0; family < family_count; family++) {
+			const auto flags = families[family].queueFlags;
+			if (family == queue_family || families[family].queueCount == 0 ||
+			    (flags & vk::QueueFlagBits::eGraphics) ||
+			    !(flags & (vk::QueueFlagBits::eCompute | vk::QueueFlagBits::eTransfer))) {
+				continue;
+			}
+			// A compute family first: it copies buffers like the universal queue does.
+			if (best == static_cast<uint32_t>(-1) || (flags & vk::QueueFlagBits::eCompute)) {
+				best = family;
+				if (flags & vk::QueueFlagBits::eCompute) break;
+			}
+		}
+		if (best != static_cast<uint32_t>(-1)) {
+			queue_create_infos[1] = vk::DeviceQueueCreateInfo {
+			    .queueFamilyIndex = best, .queueCount = 1, .pQueuePriorities = &queue_priority};
+			queue_create_count         = 2;
+			graphics.copy_queue_family = best;
+		}
+		LOGF("Vulkan copy queue: %s (family %d)\n", best != static_cast<uint32_t>(-1) ? "yes" : "no family",
+		     static_cast<int>(best));
+	}
 	const auto                 extension_count = static_cast<uint32_t>(device_extensions.size());
-	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = 1,
-	                                        .pQueueCreateInfos       = &queue_create_info,
+	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = queue_create_count,
+	                                        .pQueueCreateInfos       = queue_create_infos.data(),
 	                                        .enabledExtensionCount   = extension_count,
 	                                        .ppEnabledExtensionNames = device_extensions.data(),
 	                                        .pEnabledFeatures        = &device_features};
@@ -1110,6 +1147,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.copy_queue_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.copy_queue_family, 0, &graphic_ctx.copy_queue);
+	}
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
@@ -1161,6 +1201,7 @@ WindowContext::~WindowContext() {
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;
 		graphic_ctx.queue  = nullptr;
+		graphic_ctx.copy_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);

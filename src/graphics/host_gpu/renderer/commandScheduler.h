@@ -50,6 +50,21 @@ public:
 		return true;
 	}
 	[[nodiscard]] bool CanSubmitDetachedWithCurrent() const;
+	// KYTY_COPY_QUEUE: records a small command buffer for the copy queue (another queue family,
+	// GraphicContext::copy_queue), submits it waiting on the GPU for every tick handed out before
+	// the current one (the master timeline, not the open command buffer, which stays open and is
+	// not submitted), and waits for it on the host. False, with nothing recorded, without a copy
+	// queue. Only from the thread that records the current command buffer.
+	template <typename Record>
+	bool SubmitOnCopyQueue(Record&& record) {
+		if (!HasCopyQueue()) {
+			return false;
+		}
+		record(BeginCopyQueue());
+		EndCopyQueue();
+		return true;
+	}
+	[[nodiscard]] bool HasCopyQueue() const noexcept;
 	// Moves recording to a new command buffer. `tail` records what is left of the current one when
 	// the commands are submitted, so a draw can wait there for its pipeline while this thread goes
 	// on. The tail ends the rendering if it is open.
@@ -127,6 +142,8 @@ private:
 	vk::CommandBuffer BeginDetached();
 	void              EndDetached();
 	void              EndDetachedWithCurrent();
+	vk::CommandBuffer BeginCopyQueue();
+	void              EndCopyQueue();
 	uint64_t          SubmitWith(SubmitInfo submit, const DetachedPrefix* prefix);
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
@@ -139,6 +156,9 @@ private:
 	vk::Fence                    m_detached_fence   = nullptr;
 	vk::Semaphore                m_detached_timeline = nullptr;
 	uint64_t                     m_detached_value    = 0;
+	vk::CommandPool              m_copy_pool         = nullptr;
+	vk::CommandBuffer            m_copy_command      = nullptr;
+	vk::Fence                    m_copy_fence        = nullptr;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;

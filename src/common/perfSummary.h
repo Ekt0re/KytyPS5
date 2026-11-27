@@ -57,6 +57,24 @@ enum class Counter {
 	RbProducerOpen,     // Downloads whose producing tick is the open (unsubmitted) one.
 	RbAfterTicks,       // Pending: submitted ticks queued behind the producing tick (sum).
 	RbProducerWaitUs,   // Pending: microseconds until the producing tick finished.
+	// Synchronous downloads per path (ReadbackBatch::ReadbackPath): count, microseconds submitting
+	// and waiting for the copy (fused: with the open command buffer's submission), microseconds
+	// from recording the copy to the end of the wait (with flushes).
+	RbPathCq,         // Copy queue (KYTY_COPY_QUEUE): own queue, open command buffer stays open.
+	RbPathCqWaitUs,
+	RbPathCqTotalUs,
+	RbPathFused,      // Detached copy in the same submission as the open command buffer.
+	RbPathFusedWaitUs,
+	RbPathFusedTotalUs,
+	RbPathDetached,   // Detached copy in a submission of its own, then the open command buffer.
+	RbPathDetachedWaitUs,
+	RbPathDetachedTotalUs,
+	RbPathFlush,      // A write of the ranges is in the open command buffer: flush and wait.
+	RbPathFlushWaitUs,
+	RbPathFlushTotalUs,
+	RbCqSubmits,      // Copy-queue submissions.
+	RbCqFenceUs,      // ... microseconds waiting for their fence (part of rb_path_cq_wait_us).
+	RbCqGpuBusy,      // Copy-queue downloads that found submitted graphics work unfinished.
 	Count
 };
 

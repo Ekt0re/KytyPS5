@@ -224,6 +224,12 @@ private:
 	// download copies every buffer of the access's window, in the open command buffer's
 	// submission when it can run detached.
 	[[nodiscard]] bool BatchReadback();
+	// KYTY_COPY_QUEUE=1 (the device then has a copy queue), overridden by toggle copy_queue when
+	// the toggle file has that line (re-read 4x per second): detached synchronous downloads copy
+	// on the copy queue (ReadbackBatch::ReadbackPath::CopyQueue).
+	[[nodiscard]] bool        CopyQueue();
+	// KYTY_COPY_QUEUE_FLUSH=1: a copy-queue download still submits the open command buffer.
+	[[nodiscard]] static bool CopyQueueFlush();
 	// KYTY_RB_QUEUE_PROBE=1 (with KYTY_PERF_SUMMARY): measures the GPU queue ahead of each
 	// synchronous download and waits for its producing tick first, timed on its own.
 	[[nodiscard]] static bool QueueProbe();
@@ -289,6 +295,8 @@ private:
 	bool                                              m_batch_readback_env = true;
 	bool                                              m_batch_readback     = true;
 	std::chrono::steady_clock::time_point             m_batch_readback_next {};
+	bool                                              m_copy_queue = true;
+	std::chrono::steady_clock::time_point             m_copy_queue_next {};
 	// KYTY_BATCH_READBACK_PREFETCH=KiB: a batch also copies this much on both sides of the window.
 	uint64_t                                          m_batch_prefetch = 0;
 	ReadbackBatch::NeighbourHistory                   m_readback_neighbours;
