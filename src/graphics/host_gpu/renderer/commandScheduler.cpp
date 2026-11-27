@@ -171,8 +171,10 @@ void CommandScheduler::EndDetached() {
 }
 
 bool CommandScheduler::CanSubmitDetachedWithCurrent() const {
-	// The recorder ends and submits recorded buffers on its own thread, in its own order.
-	return !Recorder::Enabled() && !m_command.IsInvalid();
+	// The recorder ends and submits recorded buffers on its own thread, in its own order. A
+	// buffer it does not record (paused, KYTY_TOGGLE_FILE) is submitted here, so it can carry one.
+	return !m_command.IsInvalid() &&
+	       !(Recorder::Enabled() && Recorder::IsDeferred(static_cast<VkCommandBuffer>(m_command.m_buffer)));
 }
 
 void CommandScheduler::EndDetachedWithCurrent() {

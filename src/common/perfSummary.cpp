@@ -50,12 +50,14 @@ constexpr std::array<const char*, N> g_names = {
     "f_module_lookups", "f_module_hits", "f_module_misses",
     "f_handler_us", "f_invalidate_us", "f_protect_us", "f_lock_wait_us", "f_fast_skips",
     "f_storm_marked", "f_storm_kept", "f_storm_expired",
+    "rec_records", "rec_drains", "rec_drain_us",
 };
 
 struct Sample {
 	std::chrono::steady_clock::time_point time;
 	std::array<uint64_t, N>               counters {};
 	double   gpu_cpu_ms       = 0.0;
+	double   rec_cpu_ms       = 0.0; // The recording thread (KYTY_RECORDER=1).
 	uint64_t gpu_instr_user   = 0;
 	uint64_t gpu_instr_kernel = 0;
 	uint64_t gpu_csw_vol      = 0;
@@ -90,6 +92,9 @@ int               g_fd_kernel = -1; // In kernel mode; needs perf_event_paranoid
 #if defined(__linux__)
 
 clockid_t g_gpu_clock    = 0;
+clockid_t         g_rec_clock    = 0;
+double            g_rec_cpu_base = 0.0;
+std::atomic<bool> g_rec_registered {false};
 pid_t     g_gpu_tid      = 0;
 double    g_gpu_cpu_base = 0.0;
 
@@ -148,6 +153,9 @@ void TakeHost(Sample& s) {
 		s.gpu_instr_kernel = ReadCounter(g_fd_kernel);
 		ReadThreadSwitches(g_gpu_tid, s.gpu_csw_vol, s.gpu_csw_invol);
 	}
+	if (g_rec_registered.load(std::memory_order_acquire)) {
+		s.rec_cpu_ms = ClockMs(g_rec_clock) - g_rec_cpu_base;
+	}
 	rusage usage {};
 	if (getrusage(RUSAGE_SELF, &usage) == 0) {
 		s.proc_cpu_ms = static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1e3 +
@@ -201,6 +209,11 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 	}
 #if defined(__linux__)
 	add(" gpu_cpu_ms=%.0f", gpu_ms);
+	if (g_rec_registered.load(std::memory_order_acquire)) {
+		// Busy share: CPU time of the recording thread per wall second (its short spins count).
+		const double rec_ms = to.rec_cpu_ms - from.rec_cpu_ms;
+		add(" rec_cpu_ms=%.0f rec_busy=%.3f", rec_ms, rec_ms / (secs > 0.0 ? secs * 1e3 : 1.0));
+	}
 #else
 	line += " gpu_cpu_ms=na";
 #endif
@@ -443,6 +456,17 @@ void Start() {
 			last = now;
 		}
 	}).detach();
+}
+
+void RegisterRecorderThread() {
+#if defined(__linux__)
+	if (!Detail::g_enabled.load(std::memory_order_relaxed) || g_rec_registered.load(std::memory_order_acquire)) {
+		return;
+	}
+	pthread_getcpuclockid(pthread_self(), &g_rec_clock);
+	g_rec_cpu_base = ClockMs(g_rec_clock);
+	g_rec_registered.store(true, std::memory_order_release);
+#endif
 }
 
 void RegisterGpuThread() {

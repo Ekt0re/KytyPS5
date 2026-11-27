@@ -27,7 +27,9 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
+#include "common/runtimeToggles.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include <array>
@@ -150,6 +152,7 @@ public:
 		};
 		header->size = static_cast<uint32_t>(m_pending_size);
 		m_write_local += m_pending_size;
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::RecRecords);
 		// seq_cst store and load: either the recorder sees the new write position before it
 		// sleeps, or this thread sees it sleeping and wakes it.
 		m_write.store(m_write_local, std::memory_order_seq_cst);
@@ -164,6 +167,8 @@ public:
 		if (m_done.load(std::memory_order_acquire) >= target) {
 			return;
 		}
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::RecDrains);
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RecDrainUs);
 		Kick();
 		while (m_done.load(std::memory_order_acquire) < target) {
 			SpinOrYield();
@@ -183,6 +188,7 @@ private:
 #if defined(__linux__)
 		pthread_setname_np(pthread_self(), "Thread_Recorder");
 #endif
+		Common::PerfSummary::RegisterRecorderThread();
 		// Reading the write position after every record pulls its cache line away from the
 		// producer, whose next publish then waits for it back: during a burst the position is
 		// read again only once the records seen are done.
@@ -335,9 +341,10 @@ void ForgetDirect(VkCommandBuffer buffer) {
 // KYTY_RECORDER_TOGGLE=<file>: while the file starts with '0', buffers the GPU thread begins are
 // recorded and submitted on that thread (as with KYTY_RECORDER=0), so one game run can measure
 // both. Read at most every 250 ms, by the GPU thread when it begins a command buffer.
+// With KYTY_TOGGLE_FILE, its "recorder" line decides instead (0 = paused, 1 = on; abrun.sh).
 bool Paused() {
 	static const char* const path = std::getenv("KYTY_RECORDER_TOGGLE");
-	if (path == nullptr) {
+	if (path == nullptr && !Common::RuntimeToggles::Enabled()) {
 		return false;
 	}
 	static bool paused = false;
@@ -345,11 +352,15 @@ bool Paused() {
 	const auto  now    = std::chrono::steady_clock::now();
 	if (now >= next) {
 		next = now + std::chrono::milliseconds(250);
-		bool  value = false;
-		FILE* file  = std::fopen(path, "rb");
-		if (file != nullptr) {
-			value = std::fgetc(file) == '0';
-			std::fclose(file);
+		bool value = false;
+		if (const int toggle = Common::RuntimeToggles::Find("recorder"); toggle >= 0) {
+			value = toggle == 0;
+		} else if (path != nullptr) {
+			FILE* file = std::fopen(path, "rb");
+			if (file != nullptr) {
+				value = std::fgetc(file) == '0';
+				std::fclose(file);
+			}
 		}
 		if (value != paused) {
 			paused = value;

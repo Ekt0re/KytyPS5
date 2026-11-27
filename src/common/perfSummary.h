@@ -113,6 +113,10 @@ enum class Counter {
 	FaultStormMarked, // Pages the fault-storm rule marked as always dirty.
 	FaultStormKept,   // Marked pages kept unwatched this interval.
 	FaultStormExpired, // Marked pages that were re-armed this interval.
+	// KYTY_RECORDER=1: the recording thread (recorder.cpp).
+	RecRecords,  // Commands queued for it.
+	RecDrains,   // Waits until it replayed everything queued (any thread, mostly the GPU thread).
+	RecDrainUs,  // Their microseconds.
 	Count
 };
 
@@ -186,6 +190,9 @@ void Start();
 // Called once on the GPU command thread: its CPU time, instructions and context switches are
 // the per-frame cost the summary reports.
 void RegisterGpuThread();
+
+// Called once on the recording thread (KYTY_RECORDER=1): its CPU time is reported as rec_cpu_ms.
+void RegisterRecorderThread();
 
 } // namespace Common::PerfSummary
 
