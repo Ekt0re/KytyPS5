@@ -165,6 +165,7 @@ void RunReplay(const RunOptions& options) {
 	replay.capture = options.replay;
 	replay.output  = options.replay_out.empty() ? options.replay / "replay" : options.replay_out;
 	replay.repeat  = options.replay_repeat;
+	replay.shaders = options.replay_shaders;
 	std::thread([replay] { Libs::Graphics::FrameCapture::RunReplay(replay); }).detach();
 	Libs::Graphics::WindowRun();
 	std::quick_exit(0);

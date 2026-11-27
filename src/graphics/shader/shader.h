@@ -350,6 +350,9 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// The hash ShaderMapUserData gives a shader binary of size_bytes (shader store, traces and
+// pipeline names use it); hashed_bytes receives how many bytes it covers.
+uint64_t ShaderCodeHash(const uint32_t* binary, uint32_t size_bytes, uint32_t* hashed_bytes);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

@@ -19,6 +19,12 @@
 // addresses, filled from the snapshot, and the calls issued in their order, each one once the GPU
 // has completed as many submissions as it had when the guest made it. Frame times and the final
 // display image (PNG) are written to --replay-out.
+//
+// The capture also keeps the image the game itself showed (reference.png, skipped with
+// KYTY_FRAME_CAPTURE_REFERENCE=0); the replay compares its own frame with it (replay.json "image",
+// diff.png). With --replay-repeat n, passes 2..n give the steady frame times ("steady"), the
+// figure to compare builds with (tools/replay/replay_ab.py). --replay-shaders <dir> writes every
+// shader of the capture and replays nothing. See docs/frame-capture.md.
 namespace Libs::Graphics {
 struct ShaderMappedData;
 } // namespace Libs::Graphics
@@ -55,6 +61,8 @@ struct ReplayOptions {
 	std::filesystem::path capture;
 	std::filesystem::path output;
 	uint32_t              repeat = 1;
+	// Not empty: write every shader of the capture there and replay nothing.
+	std::filesystem::path shaders;
 };
 
 // Runs on a thread of its own while the main thread runs the window loop; exits the process.

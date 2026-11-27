@@ -29,6 +29,8 @@ static void PrintUsage() {
 	         "                                       without a game.\n");
 	::printf("  --replay-out <dir>                   Replay results (default <capture>/replay).\n");
 	::printf("  --replay-repeat <num>                Replay the captured frames this many times.\n");
+	::printf("  --replay-shaders <dir>               Write the capture's shaders to <dir> and replay\n"
+	         "                                       nothing (shaders.json, <type>-<hash>.bin).\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
 	::printf(
 	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
@@ -289,6 +291,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		}
 		if (arg == "--replay-out") {
 			options.replay_out = Common::PathFromUtf8(value);
+			continue;
+		}
+		if (arg == "--replay-shaders") {
+			options.replay_shaders = Common::PathFromUtf8(value);
 			continue;
 		}
 		if (arg == "--replay-repeat") {

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -283,12 +284,7 @@ static vk::Format InputFormat(uint8_t raw_format, uint32_t used_components) {
 
 // Under RenderDoc (--rd), pipelines carry their guest shader hashes, so a captured draw or
 // dispatch maps back to the guest program.
-static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
-                         std::span<const ShaderModule* const> stages) {
-	if (!Config::RenderDocEnabled() || pipeline == nullptr ||
-	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
-		return;
-	}
+static std::string PipelineName(std::span<const ShaderModule* const> stages) {
 	std::string name;
 	for (const auto* stage: stages) {
 		if (stage == nullptr) continue;
@@ -296,6 +292,20 @@ static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
 		name += fmt::format("{}_{:016x}", ShaderRecompiler::StageName(stage->info.stage),
 		                    stage->info.shader_hash);
 	}
+	return name;
+}
+
+// Also records the pipeline's driver statistics (KYTY_PIPELINE_STATS).
+static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
+                         std::span<const ShaderModule* const> stages) {
+	if (graphics.pipeline_statistics_enabled && pipeline != nullptr) {
+		PipelineStats::Record(graphics, pipeline, PipelineName(stages));
+	}
+	if (!Config::RenderDocEnabled() || pipeline == nullptr ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
+		return;
+	}
+	const auto                      name = PipelineName(stages);
 	vk::DebugUtilsObjectNameInfoEXT info {};
 	info.objectType   = vk::ObjectType::ePipeline;
 	info.objectHandle = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
@@ -519,6 +529,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	if (!optimize) {
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
+	if (graphics.pipeline_statistics_enabled) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
@@ -557,6 +570,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	}
 	if (!optimize) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
+	if (graphics.pipeline_statistics_enabled) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
 	}
 	info.stage  = comp_shader_stage_info;
 	info.layout = layout;

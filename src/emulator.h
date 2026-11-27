@@ -20,6 +20,7 @@ struct RunOptions {
 	std::filesystem::path replay;
 	std::filesystem::path replay_out;
 	uint32_t              replay_repeat = 1;
+	std::filesystem::path replay_shaders; // --replay-shaders: dump the shaders, replay nothing
 };
 
 void Run(const RunOptions& options);
