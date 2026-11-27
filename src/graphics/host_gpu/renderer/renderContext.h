@@ -19,9 +19,11 @@
 #include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -65,6 +67,10 @@ public:
 	[[nodiscard]] uint64_t MappingGeneration() const noexcept {
 		return m_mapping_generation.load(std::memory_order_acquire);
 	}
+	// Whether a range that overlaps the given one was mapped or unmapped after `generation`. True
+	// as well once the changes since then are no longer on record.
+	[[nodiscard]] bool MappingChangedSince(uint64_t generation, uint64_t vaddr,
+	                                       uint64_t size) const noexcept;
 	[[nodiscard]] bool IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
@@ -78,6 +84,9 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	// With m_mapped_ranges_mutex held for writing.
+	void NoteMappingChange(uint64_t vaddr, uint64_t size) noexcept;
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;
@@ -102,6 +111,9 @@ private:
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::atomic<uint64_t>     m_mapping_generation {0};
+	// m_mapping_changes[generation % size] is the range whose change started `generation`, for
+	// the last `size` generations. Guarded by m_mapped_ranges_mutex.
+	std::array<std::pair<uint64_t, uint64_t>, 64> m_mapping_changes {};
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

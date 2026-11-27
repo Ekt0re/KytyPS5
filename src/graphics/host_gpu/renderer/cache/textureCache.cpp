@@ -310,7 +310,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
-	m_resolve_cache.Invalidate();
+	m_resolve_cache.Invalidate(data.address, data.size);
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -333,7 +333,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
 	image.registered = false;
-	m_resolve_cache.Invalidate();
+	m_resolve_cache.Invalidate(image.info.data.address, image.info.data.size);
 }
 
 void TextureCache::DeleteImage(ImageId id) {

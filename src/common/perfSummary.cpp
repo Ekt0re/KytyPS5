@@ -29,7 +29,7 @@ constexpr std::array<const char*, N> g_names = {
     "flips",         "draws",       "dispatches",  "indirect_dispatches", "write_faults",
     "read_faults",   "buf_readbacks", "tex_readbacks", "tex_lookups",     "buf_lookups",
     "desc_writes",   "heap_desc_writes", "pipe_lookups", "pipe_created",  "amm_maps",
-    "amm_unmaps",    "gpu_unmaps",
+    "amm_unmaps",    "gpu_unmaps",  "heap_rebinds", "heap_lookups",       "heap_range_skips",
 };
 
 struct Sample {

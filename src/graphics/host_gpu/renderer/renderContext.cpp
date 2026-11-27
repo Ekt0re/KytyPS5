@@ -209,10 +209,32 @@ bool RenderContext::IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Intersects(vaddr, size);
 }
 
+void RenderContext::NoteMappingChange(uint64_t vaddr, uint64_t size) noexcept {
+	const auto next = m_mapping_generation.load(std::memory_order_relaxed) + 1u;
+	m_mapping_changes[next % m_mapping_changes.size()] = {vaddr, size};
+	m_mapping_generation.store(next, std::memory_order_release);
+}
+
+bool RenderContext::MappingChangedSince(uint64_t generation, uint64_t vaddr,
+                                        uint64_t size) const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	const auto       current = m_mapping_generation.load(std::memory_order_relaxed);
+	if (generation > current || current - generation >= m_mapping_changes.size()) {
+		return true;
+	}
+	for (auto change = generation + 1u; change <= current; ++change) {
+		const auto& [address, bytes] = m_mapping_changes[change % m_mapping_changes.size()];
+		if (vaddr >= address ? vaddr - address < bytes : address - vaddr < size) {
+			return true;
+		}
+	}
+	return false;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
-	m_mapping_generation.fetch_add(1, std::memory_order_acq_rel);
+	NoteMappingChange(vaddr, size);
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
@@ -239,7 +261,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
-		m_mapping_generation.fetch_add(1, std::memory_order_acq_rel);
+		NoteMappingChange(vaddr, size);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.

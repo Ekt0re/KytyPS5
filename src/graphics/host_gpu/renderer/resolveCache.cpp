@@ -38,6 +38,23 @@ bool ResolveCache::Reuse(ImageId id, const ResolveStamp& stamp) {
 	return true;
 }
 
+bool ResolveCache::ChangedSince(uint64_t epoch, uint64_t address, uint64_t size) const noexcept {
+	if (epoch == m_epoch) {
+		return false;
+	}
+	if (epoch == 0 || epoch > m_epoch || m_epoch - epoch >= m_changes.size()) {
+		return true;
+	}
+	for (auto change = epoch + 1; change <= m_epoch; ++change) {
+		const auto& range = m_changes[change % m_changes.size()];
+		if (address >= range.address ? address - range.address < range.size
+		                             : range.address - address < size) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool ResolveCache::ReuseImageSet(ImageId id, const ResolveStamp& stamp) {
 	if (stamp.epoch != m_epoch) {
 		return false;

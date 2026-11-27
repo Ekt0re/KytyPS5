@@ -3,7 +3,9 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/perfSummary.h"
+#include "common/runtimeToggles.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -16,10 +18,14 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
-#include <fmt/format.h>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <iterator>
 #include <xxhash.h>
 
@@ -57,6 +63,133 @@ void Widen(size_t& begin, size_t& end, size_t first, size_t last) {
 // Probes at first + k * step whose first dword lies within a table of size bytes.
 uint64_t Probes(uint64_t size, uint64_t first, uint64_t step) {
 	return size >= first + 4u ? (size - first - 4u) / step + 1u : 0u;
+}
+
+bool EnvFlag(const char* name, bool fallback) {
+	const char* value = std::getenv(name);
+	return value == nullptr ? fallback : value[0] != '0';
+}
+
+// KYTY_HEAP_RANGED=0, or the runtime toggle heap_full=1: discovery looks a texture up again
+// after any change of the image set or of the guest mappings, as before, instead of only after
+// one at the texture's own guest range. Called on the GPU thread; the toggle is read every 64th
+// call.
+bool RangedDiscovery() {
+	static const bool enabled = EnvFlag("KYTY_HEAP_RANGED", true);
+	static bool       full    = false;
+	static uint32_t   calls   = 0;
+	if (Common::RuntimeToggles::Enabled() && (calls++ & 63u) == 0u) {
+		full = Common::RuntimeToggles::Get("heap_full");
+	}
+	return enabled && !full;
+}
+
+// KYTY_HEAP_VERIFY=1: every lookup the guest range saves is made anyway and must find what the
+// element holds; mismatches are counted and the first ones logged.
+bool VerifyDiscovery() {
+	static const bool enabled = EnvFlag("KYTY_HEAP_VERIFY", false);
+	return enabled;
+}
+
+// KYTY_HEAP_STATS=1: what discovery did, on stdout about every two seconds.
+struct HeapStats {
+	enum Count : uint32_t {
+		Rebinds,
+		Idle, // Rebinds without a lookup, a change or a new element.
+		Changes,
+		ChangedScans,
+		DccElements,
+		DccReuse,     // Kept by the resolve cache as before.
+		DccCarried,   // Kept because the image set changed elsewhere.
+		DccRemapped,  // Preparation kept because the mappings changed elsewhere.
+		DccPrepare,   // Looked up: mappings or the descriptor changed.
+		DccNoStamp,   // Looked up: the last lookup gave no reusable stamp.
+		DccRange,     // Looked up: the image set changed at its range.
+		DccUnknown,   // Looked up: the changes since the stamp are off the record.
+		DccClearKeys, // Looked up: GPU-written metadata in another draw window or tick.
+		DccStale,
+		HeldRuns,
+		HeldElements,
+		HeldCarried,
+		HeldLookups,
+		Pending,
+		Repoints,
+		Mismatches,
+		CountEnd
+	};
+	enum Time : uint32_t { TChanges, TDcc, THeld, TRepoint, TPending, TWrite, TimeEnd };
+
+	static bool Enabled() {
+		static const bool enabled = EnvFlag("KYTY_HEAP_STATS", false);
+		return enabled;
+	}
+	void Add(Count count, uint64_t value = 1) { counts[count] += value; }
+	// Ends the running part and starts `next`.
+	void Lap(Time next) {
+		if (!Enabled()) return;
+		const auto now = std::chrono::steady_clock::now();
+		ns[part] += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+		start = now;
+		part  = next;
+	}
+	void Begin() {
+		if (!Enabled()) return;
+		start = std::chrono::steady_clock::now();
+		part  = TChanges;
+	}
+	void Report(uint64_t epoch) {
+		if (!Enabled()) return;
+		const auto secs = std::chrono::duration<double>(start - last).count();
+		if (secs < 2.0) return;
+		const auto per = [&](Count count) {
+			return counts[Rebinds] == 0 ? 0.0
+			                            : static_cast<double>(counts[count]) /
+			                                  static_cast<double>(counts[Rebinds]);
+		};
+		const auto ms = [&](Time time) { return static_cast<double>(ns[time]) / 1e6 / secs; };
+		std::printf("[heap-stats] rebinds/s=%.0f idle=%.0f epochs/s=%.0f | per rebind: changes=%.2f "
+		            "scans=%.2f dcc=%.1f (reuse %.1f carried %.1f remapped %.1f; lookups: prepare %.2f nostamp "
+		            "%.2f range %.2f unknown %.2f clearkeys %.2f; stale %.3f) held runs=%.2f "
+		            "elements=%.1f (carried %.1f lookups %.2f) pending=%.2f repoints=%.3f | "
+		            "mismatches=%" PRIu64 " | ms/s: changes=%.1f dcc=%.1f held=%.1f repoint=%.1f "
+		            "pending=%.1f write=%.1f\n",
+		            static_cast<double>(counts[Rebinds]) / secs,
+		            static_cast<double>(counts[Idle]) / secs,
+		            static_cast<double>(epoch - last_epoch) / secs, per(Changes), per(ChangedScans),
+		            per(DccElements), per(DccReuse), per(DccCarried), per(DccRemapped), per(DccPrepare),
+		            per(DccNoStamp), per(DccRange), per(DccUnknown), per(DccClearKeys),
+		            per(DccStale), per(HeldRuns), per(HeldElements), per(HeldCarried),
+		            per(HeldLookups), per(Pending), per(Repoints), mismatches + counts[Mismatches],
+		            ms(TChanges), ms(TDcc), ms(THeld), ms(TRepoint), ms(TPending), ms(TWrite));
+		std::fflush(stdout);
+		mismatches += counts[Mismatches];
+		counts     = {};
+		ns         = {};
+		last       = start;
+		last_epoch = epoch;
+	}
+
+	std::array<uint64_t, CountEnd>        counts {};
+	std::array<uint64_t, TimeEnd>         ns {};
+	uint64_t                              mismatches = 0;
+	uint64_t                              last_epoch = 0;
+	Time                                  part       = TChanges;
+	std::chrono::steady_clock::time_point start;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+
+// Discovery runs on the GPU thread only.
+HeapStats g_stats;
+
+void LogMismatch(const char* list, uint32_t index, uint64_t address, uint64_t size) {
+	static uint32_t logged = 0;
+	if (logged < 16u) {
+		++logged;
+		LOGF("ImageHeap: KYTY_HEAP_VERIFY: %s element %u at %016" PRIx64 "+%" PRIx64
+		     " was kept, but its lookup finds another image\n",
+		     list, index, address, size);
+	}
 }
 
 uint64_t Hash(const IR::DescriptorValue& value) {
@@ -395,6 +528,10 @@ void ImageHeap::Release(uint32_t entry) {
 	    image != nullptr && image->serial == element.serial) {
 		image->heap_refs.fetch_sub(1u, std::memory_order_relaxed);
 		image->tick_accessed_last = textures.m_gc_tick;
+		// A held element at this address may resolve now (Rebind).
+		if (!m_held.empty()) {
+			m_unpinned.emplace_back(image->info.data.address, image->info.data.size);
+		}
 	}
 	m_released.push_back(index);
 }
@@ -404,8 +541,8 @@ void ImageHeap::Release(uint32_t entry) {
 void ImageHeap::Retire() {
 	if (m_released.empty()) return;
 	const auto released = [&](uint32_t index) { return m_elements[index].refs == 0u; };
-	std::erase_if(m_held, released);
-	std::erase_if(m_dcc, released);
+	std::erase_if(m_held, [&](const HeldEntry& entry) { return released(entry.index); });
+	std::erase_if(m_dcc, [&](const DccEntry& entry) { return released(entry.index); });
 	const auto tick = m_context.GetCommandScheduler().CurrentTick();
 	for (const auto index: m_released) m_retired.emplace_back(tick, index);
 	m_released.clear();
@@ -574,9 +711,19 @@ void ImageHeap::Resize(Memory& memory, uint64_t base, uint64_t size) {
 
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
-	auto& textures = m_context.GetTextureCache();
+	namespace Perf = Common::PerfSummary;
+	Perf::Add(Perf::Counter::HeapRebinds);
+	auto&      textures = m_context.GetTextureCache();
+	const bool ranged   = RangedDiscovery();
+	const bool verify   = VerifyDiscovery();
+	uint64_t   lookups  = 0;
+	uint64_t   carried  = 0;
+	g_stats.Begin();
+	g_stats.Add(HeapStats::Rebinds);
 	// A changed image refreshes; one that changed identity needs new elements.
 	TakeChanges();
+	g_stats.Add(HeapStats::Changes, m_changes.size());
+	const bool had_work = !m_changes.empty() || !m_pending.empty();
 	std::erase_if(m_changes, [&](const Image::HeapChange& change) {
 		const auto id = CurrentImage(change);
 		if (id) {
@@ -589,11 +736,14 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		}
 		return static_cast<bool>(id);
 	});
+	if (!m_changes.empty()) g_stats.Add(HeapStats::ChangedScans);
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	g_stats.Lap(HeapStats::TDcc);
 	const auto resolve = [&](const Element& element) {
 		const auto& key = element.key;
 		const auto resource = IR::ImageHeapResource(
 		    {.dimension = key.dimension, .depth_compare = key.depth_view, .r128 = key.r128}, element.kind);
+		++lookups;
 		return executor.ResolveTexture(resource, element.key.value);
 	};
 	// A listed element whose descriptor resolves to another image is stale; true once it leaves
@@ -615,41 +765,111 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	// while the resolve cache vouches for its last result: same image set, and for color metadata
 	// the same draw window and scheduler tick, as for the textures draws bind directly.
 	auto&      resolve_cache = m_context.GetResolveCache();
-	// A lookup applies color metadata clears only from blocks the GPU wrote (MaterializeColorClear);
-	// with none in the metadata range, the clear keys cannot change what it does.
-	auto&      buffers            = m_context.GetBufferCache();
-	const auto MetadataGpuWritten = [&](const PreparedTexture& prepared) {
-		const auto& range = prepared.desc.info.metadata.range;
-		return range.size != 0u && buffers.IsRegionGpuModified(range.address, range.size);
+	auto&      buffers       = m_context.GetBufferCache();
+	// The image set changes with every image created or freed, which while textures stream in
+	// is every few draws; a lookup searches only its texture's guest range, so a stamp is carried
+	// over changes at other ranges (ResolveCache::Carry).
+	const auto same_image = [&](const Element& element, const TextureBinding& binding) {
+		return binding.image_id == element.image &&
+		       (!element.image || textures.m_slot_images[element.image].serial == element.serial);
 	};
-	const auto retry_dcc = [&](uint32_t index) {
+	// The list entry holds what the decision reads, so an element that is kept costs no look at
+	// its preparation: most of the several hundred elements are kept by most draws.
+	const auto retry_dcc = [&](DccEntry& entry) {
+		const auto  index   = entry.index;
 		const auto& element = m_elements[index];
 		if (element.state != State::Live) {
 			m_dcc_prepared.erase(index);
 			return retry(index);
 		}
-		const auto& key       = element.key;
-		const auto  resource  = IR::ImageHeapResource(
-		    {.dimension = key.dimension, .depth_compare = key.depth_view, .r128 = key.r128}, element.kind);
+		g_stats.Add(HeapStats::DccElements);
 		const auto generation = m_context.MappingGeneration();
-		auto&      cached     = m_dcc_prepared[index];
+		bool       moved      = false;
+		bool       counted    = false;
+		// A preparation reads which guest ranges are mapped only at its texture's data.
+		const bool remapped = ranged && entry.prepared && entry.generation != generation &&
+		                      entry.data_size != 0u &&
+		                      !m_context.MappingChangedSince(entry.generation, entry.data_address,
+		                                                     entry.data_size);
+		if (remapped) {
+			entry.generation = generation;
+			g_stats.Add(HeapStats::DccRemapped);
+		}
+		if (entry.prepared && entry.generation == generation && element.image) {
+			if (HeapStats::Enabled() && entry.stamp.epoch != resolve_cache.Epoch()) {
+				counted = true;
+				g_stats.Add(entry.stamp.epoch == 0u
+				                ? HeapStats::DccNoStamp
+				                : !resolve_cache.ChangedSince(entry.stamp.epoch, entry.data_address,
+				                                              entry.data_size)
+				                      ? HeapStats::DccCarried
+				                      : resolve_cache.OnRecord(entry.stamp.epoch)
+				                            ? HeapStats::DccRange
+				                            : HeapStats::DccUnknown);
+			}
+			moved = ranged &&
+			        resolve_cache.Carry(entry.stamp, entry.data_address, entry.data_size);
+			// A lookup applies color metadata clears only from blocks the GPU wrote
+			// (MaterializeColorClear); with none in the metadata range, the clear keys cannot
+			// change what it does.
+			if (resolve_cache.Reuse(element.image, entry.stamp) ||
+			    (!(entry.metadata_size != 0u &&
+			       buffers.IsRegionGpuModified(entry.metadata_address, entry.metadata_size)) &&
+			     resolve_cache.ReuseImageSet(element.image, entry.stamp))) {
+				if (moved || remapped) {
+					++carried;
+				} else {
+					g_stats.Add(HeapStats::DccReuse);
+				}
+				if (!(moved || remapped) || !verify) return false;
+			} else if (!counted) {
+				counted = true;
+				g_stats.Add(HeapStats::DccClearKeys);
+			}
+		}
+		const auto& key      = element.key;
+		const auto  resource = IR::ImageHeapResource(
+		    {.dimension = key.dimension, .depth_compare = key.depth_view, .r128 = key.r128}, element.kind);
+		auto& cached = m_dcc_prepared[index];
+		if (remapped) {
+			if (verify) {
+				auto fresh = executor.PrepareTexture(resource, element.key.value);
+				if (fresh.resolved != cached.prepared.resolved ||
+				    !(fresh.desc.info.data == cached.prepared.desc.info.data)) {
+					g_stats.Add(HeapStats::Mismatches);
+					LogMismatch("remapped", index, entry.data_address, entry.data_size);
+				}
+				cached.prepared = std::move(fresh);
+			}
+			cached.generation = generation;
+		}
 		if (cached.generation != generation || cached.kind != element.kind || !(cached.key == element.key) ||
 		    cached.generation == 0u) {
 			cached = {element.key, element.kind, generation,
 			          executor.PrepareTexture(resource, element.key.value)};
-		} else if (element.image && (resolve_cache.Reuse(element.image, cached.stamp) ||
-		                             (!MetadataGpuWritten(cached.prepared) &&
-		                              resolve_cache.ReuseImageSet(element.image, cached.stamp)))) {
-			return false;
+			g_stats.Add(HeapStats::DccPrepare);
+		} else if (!counted && !moved && !remapped) {
+			g_stats.Add(HeapStats::DccNoStamp);
 		}
-		const auto binding = executor.FinishTexture(resource, cached.prepared);
-		cached.stamp       = binding.desc.stamp;
-		if (binding.image_id == element.image &&
-		    (!element.image || textures.m_slot_images[element.image].serial == element.serial)) {
+		++lookups;
+		const auto binding     = executor.FinishTexture(resource, cached.prepared);
+		entry.prepared         = true;
+		entry.generation       = generation;
+		entry.stamp            = binding.desc.stamp;
+		entry.data_address     = cached.prepared.desc.info.data.address;
+		entry.data_size        = cached.prepared.desc.info.data.size;
+		entry.metadata_address = cached.prepared.desc.info.metadata.range.address;
+		entry.metadata_size    = cached.prepared.desc.info.metadata.range.size;
+		if (same_image(element, binding)) {
 			const bool leaves = !element.image && binding.desc.info.data.Empty();
 			if (leaves) m_dcc_prepared.erase(index);
 			return leaves;
 		}
+		if (moved || remapped) {
+			g_stats.Add(HeapStats::Mismatches);
+			LogMismatch("metadata", index, entry.data_address, entry.data_size);
+		}
+		g_stats.Add(HeapStats::DccStale);
 		Mark(index, State::Stale);
 		stale = true;
 		m_dcc_prepared.erase(index);
@@ -658,15 +878,73 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	{
 		std::erase_if(m_dcc, retry_dcc);
 	}
-	// Held elements retry once an image is created, such as a render target of their extent.
-	if (const auto serial = Image::serials.load(std::memory_order_relaxed);
-	    m_held_serial != serial) {
-		m_held_serial = serial;
-		std::erase_if(m_held, retry);
+	g_stats.Lap(HeapStats::THeld);
+	// Held elements retry once an image is created, such as a render target of their extent:
+	// those whose guest range saw an image registered or unregistered, or lost a heap reference
+	// (the extent that held the address may have left the heap), since they last retried.
+	// They retry at the same draws as before (after an image was created), so discovery makes
+	// no lookup the full one would not make: a held element's lookup is not free of effects (it
+	// can replace an image of another extent at its address), and extra ones change what later
+	// draws find.
+	const auto held_serial = Image::serials.load(std::memory_order_relaxed);
+	const auto retry_held = [&](HeldEntry& entry) {
+		const auto  index   = entry.index;
+		const auto& element = m_elements[index];
+		if (element.state != State::Live) return true;
+		g_stats.Add(HeapStats::HeldElements);
+		const auto generation = m_context.MappingGeneration();
+		const bool kept =
+		    ranged && entry.size != 0u &&
+		    (entry.generation == generation ||
+		     !m_context.MappingChangedSince(entry.generation, entry.address, entry.size)) &&
+		    !resolve_cache.ChangedSince(entry.epoch, entry.address, entry.size) &&
+		    std::ranges::none_of(m_unpinned, [&](const std::pair<uint64_t, uint64_t>& unpinned) {
+			    return unpinned.first < entry.address + entry.size &&
+			           entry.address < unpinned.first + unpinned.second;
+		    });
+		if (kept) {
+			++carried;
+			g_stats.Add(HeapStats::HeldCarried);
+			if (!verify) {
+				entry.generation = generation;
+				entry.epoch      = resolve_cache.Epoch();
+				return false;
+			}
+		}
+		g_stats.Add(HeapStats::HeldLookups);
+		const auto binding = resolve(element);
+		if (same_image(element, binding)) {
+			const bool  leaves = !element.image && binding.desc.info.data.Empty();
+			const auto& data   = binding.desc.info.data;
+			if (kept && leaves) {
+				g_stats.Add(HeapStats::Mismatches);
+				LogMismatch("held", index, entry.address, entry.size);
+			}
+			entry = {index, generation, resolve_cache.Epoch(), data.address, data.size};
+			return leaves;
+		}
+		if (kept) {
+			g_stats.Add(HeapStats::Mismatches);
+			LogMismatch("held", index, entry.address, entry.size);
+		}
+		Mark(index, State::Stale);
+		stale = true;
+		return true;
+	};
+	if (m_held_serial != held_serial) {
+		m_held_serial = held_serial;
+		g_stats.Add(HeapStats::HeldRuns);
+		std::erase_if(m_held, retry_held);
+		m_unpinned.clear();
 	}
+	if (m_held.empty()) m_unpinned.clear();
+	g_stats.Lap(HeapStats::TRepoint);
+	if (stale) g_stats.Add(HeapStats::Repoints);
 	if (stale) Repoint();
+	g_stats.Lap(HeapStats::TPending);
 	for (const auto index: m_pending) {
 		if (m_elements[index].refs == 0u) continue;
+		g_stats.Add(HeapStats::Pending);
 		auto binding = resolve(m_elements[index]);
 		if (binding.image_id) {
 			auto& image   = textures.GetImage(binding.image_id);
@@ -677,15 +955,23 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			element.serial     = image.serial;
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
-			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back(index);
+			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back({index});
 			m_away.emplace_back(image.serial, binding.image_id);
 		} else if (!binding.desc.info.data.Empty()) {
-			m_held.push_back(index);
+			const auto& data = binding.desc.info.data;
+			m_held.push_back({index, m_context.MappingGeneration(), resolve_cache.Epoch(),
+			                  data.address, data.size});
 		}
 		m_writes.push_back({index, {nullptr, binding.image_view, binding.layout}});
 	}
 	m_pending.clear();
+	g_stats.Lap(HeapStats::TWrite);
 	WriteDescriptors();
+	Perf::Add(Perf::Counter::HeapLookups, lookups);
+	Perf::Add(Perf::Counter::HeapRangeSkips, carried);
+	if (lookups == 0u && !had_work && !stale) g_stats.Add(HeapStats::Idle);
+	g_stats.Lap(HeapStats::TChanges);
+	g_stats.Report(resolve_cache.Epoch());
 }
 
 void ImageHeap::WriteDescriptors() {

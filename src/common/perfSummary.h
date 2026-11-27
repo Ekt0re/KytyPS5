@@ -29,6 +29,9 @@ enum class Counter {
 	AmmMaps, // AMM map commands of every kind (direct, automatic, PRT).
 	AmmUnmaps,
 	GpuUnmaps, // Guest unmaps the GPU thread serviced (they drop cached images and buffers).
+	HeapRebinds,    // Image heap discoveries (one per draw or dispatch that uses the heap).
+	HeapLookups,    // Texture lookups those made.
+	HeapRangeSkips, // Lookups saved because the image set changed only at other addresses.
 	Count
 };
 
