@@ -734,6 +734,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    binding == BindingType::Texture && cached.info.IsDepth() && !cached.info.HasStencil() &&
 	    !requested.IsVolume() && requested.samples == cached.info.samples &&
 	    IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
+	// A depth-only target renders the depth aspect of a depth/stencil image of its depth format.
+	const bool share_depth = binding == BindingType::DepthTarget && m_share_depth_stencil &&
+	                         cached.info.IsDepth() && !stencil_match &&
+	                         CanRenderDepthAspectOf(cached.info, requested);
 	bool recreate = !cached.info.resources.Contains(requested.resources) ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
@@ -745,13 +749,23 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
-			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match) && !share_depth;
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
 	if (!recreate) {
+		if (share_depth) {
+			static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+			if (!logged.test_and_set(std::memory_order_relaxed)) {
+				LOGF("TextureCache: depth-only %s target renders the depth aspect of the %s image "
+				     "at 0x%016" PRIx64 "\n",
+				     vk::to_string(requested.pixel_format).c_str(),
+				     vk::to_string(cached.info.pixel_format).c_str(), requested.data.address);
+			}
+		}
 		return cached_id;
 	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::DepthRecreates);
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -1555,6 +1569,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			desc.view_info.base_layer += image.stencil_subresources.base_layer;
 			result                = image.depth_id;
 			desc.view_info.format = m_slot_images[result].backing.format;
+		} else if (desc.type == BindingType::DepthTarget) {
+			// A depth-only target of a depth/stencil image renders its depth aspect.
+			desc.view_info.format =
+			    DepthTargetViewFormat(image.backing.format, desc.info.pixel_format);
 		}
 		image.tick_accessed_last = m_gc_tick;
 		TouchImage(image);
@@ -2298,6 +2316,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	m_share_depth_stencil = ShareDepthStencilDefault() && !Common::RuntimeToggles::Get("depth_split");
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

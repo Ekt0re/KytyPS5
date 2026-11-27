@@ -280,6 +280,30 @@ inline bool ImageInfo::IsDepth() const noexcept {
 	return ImageAspectMask(pixel_format) != vk::ImageAspectFlagBits::eColor;
 }
 
+// PS5 titles bind one depth buffer both with and without its stencil plane in a frame. A
+// depth-only target can render into the depth aspect of the depth/stencil image already at its
+// address when both store the same depth format, so the image is not converted to a depth-only
+// image and back (every conversion copies it and makes the image heaps look their views up again).
+[[nodiscard]] inline bool CanRenderDepthAspectOf(const ImageInfo& image,
+                                                 const ImageInfo& target) noexcept {
+	const auto depth = DepthAspectTransferFormat(target.pixel_format);
+	return depth != vk::Format::eUndefined && !target.HasStencil() &&
+	       image.HasSeparateStencil() && DepthAspectTransferFormat(image.pixel_format) == depth &&
+	       image.samples == target.samples && image.bytes_per_block == target.bytes_per_block;
+}
+
+// The attachment format of a depth-only target view (depth aspect) of an image with the backing
+// format: the backing format itself when the view renders the depth aspect of a depth/stencil
+// image, since rendering formats and pipelines must name the view's format.
+[[nodiscard]] inline constexpr vk::Format DepthTargetViewFormat(vk::Format backing,
+                                                                vk::Format view) noexcept {
+	const auto depth = DepthAspectTransferFormat(view);
+	return view != backing && depth == view && backing != depth &&
+	               DepthAspectTransferFormat(backing) == depth
+	           ? backing
+	           : view;
+}
+
 [[nodiscard]] inline constexpr uint32_t DepthStencilTransferBytes(vk::Format format) noexcept {
 	if (format == vk::Format::eS8Uint) return 1;
 	switch (DepthAspectTransferFormat(format)) {
