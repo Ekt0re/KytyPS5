@@ -5662,10 +5662,18 @@ public:
 
     // Mode 2 keeps the open command buffer after a detached download, so the tick shows which
     // downloads flushed; the default mode's submission is checked at the end.
+#ifdef _WIN32
+    _putenv_s("KYTY_DETACHED_READBACK", "2");
+#else
     setenv("KYTY_DETACHED_READBACK", "2", 1);
+#endif
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
+#ifdef _WIN32
+    _putenv_s("KYTY_DETACHED_READBACK", "");
+#else
     unsetenv("KYTY_DETACHED_READBACK");
+#endif
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
     HW::UserConfig user_config{};
