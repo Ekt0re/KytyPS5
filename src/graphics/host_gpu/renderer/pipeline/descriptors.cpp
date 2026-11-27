@@ -934,7 +934,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	auto                           vk_buffer              = buffer.Handle();
+	const auto                     entry_buffer           = buffer.Handle();
 	size_t                         image_descriptor_count = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
@@ -952,6 +952,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
+	}
+	// Nothing here may restart the scheduler: the caller recorded state for this draw already.
+	// The handle is still read after the heap's uploads, so that a restart would at least keep
+	// the bindings and the draw in one command buffer.
+	const auto vk_buffer = buffer.Handle();
+	if (vk_buffer != entry_buffer) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+			LOGF("CommitBindings: the command buffer was submitted while bindings were committed; "
+			     "state recorded for this draw before them is lost\n");
+		}
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();

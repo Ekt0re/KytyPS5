@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <xxhash.h>
 
@@ -707,9 +709,36 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		if (view->dirty_begin == view->dirty_end) continue;
 		const auto slots  = std::span(view->slots).subspan(view->dirty_begin,
 		                                                   view->dirty_end - view->dirty_begin);
-		auto&      stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-		const auto offset = stream.Copy(slots.data(), slots.size_bytes(), sizeof(uint32_t));
-		view->buffer->CopyFrom(buffer, stream, offset, view->dirty_begin * sizeof(uint32_t),
+		// The draw is being recorded: its targets, vertex buffers and bindings are in the current
+		// command buffer or about to follow, so this upload must not wait for the stream ring. A
+		// wait for ring space that the current tick wrote submits the command buffer and starts
+		// another, which would get this draw without the state recorded so far, and with the
+		// rest of its bindings recorded into the submitted one. Slots that do not fit the ring
+		// now (several new views of a large table fill it within one tick) go through a buffer
+		// of their own.
+		auto&         stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+		const Buffer* source = &stream;
+		// KYTY_HEAP_UPLOAD_WAIT=1 restores the waiting upload, only to show the test failing.
+		static const bool wait = [] {
+			const char* value = std::getenv("KYTY_HEAP_UPLOAD_WAIT");
+			return value != nullptr && value[0] == '1';
+		}();
+		auto [mapped, offset] = stream.Map(slots.size_bytes(), sizeof(uint32_t), wait);
+		if (mapped != nullptr) {
+			std::memcpy(mapped, slots.data(), slots.size_bytes());
+			stream.Commit();
+		} else {
+			auto& scheduler = m_context.GetCommandScheduler();
+			auto temporary = std::make_unique<Buffer>(
+			    m_context.GetGraphics(), scheduler, MemoryUsage::Upload, 0,
+			    vk::BufferUsageFlagBits::eTransferSrc, slots.size_bytes());
+			std::memcpy(temporary->Mapped().data(), slots.data(), slots.size_bytes());
+			temporary->Flush(0, slots.size_bytes());
+			source = temporary.get();
+			offset = 0;
+			scheduler.DeferRelease([owner = std::move(temporary)] {});
+		}
+		view->buffer->CopyFrom(buffer, *source, offset, view->dirty_begin * sizeof(uint32_t),
 		                       slots.size_bytes());
 		view->dirty_begin = view->dirty_end = 0;
 	}

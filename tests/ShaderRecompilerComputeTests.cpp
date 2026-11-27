@@ -7131,7 +7131,29 @@ public:
                   views[1]->slots[0] == filtered.slots[0] && ImageHeapTestAccess::ElementCount(heap) == 3u,
               "filtered and unfiltered slots duplicated the same image binding");
       const auto &idle = *views[1];
-      draw();
+      // The first draw uploads both views' slots while the stream ring has no room that an
+      // earlier tick wrote. The upload runs inside the draw's binding commit, after its other
+      // state was recorded: waiting for the ring there submitted the command buffer under the
+      // draw (GTA VI: GPU fault in the first dispatch of a shader with new heap views).
+      {
+        auto &stream = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+        const std::vector<uint8_t> filler(1u << 20u);
+        for (;;) {
+          const auto [mapped, offset] = stream.Map(filler.size(), 4, false);
+          if (mapped == nullptr) break;
+          std::memcpy(mapped, filler.data(), filler.size());
+          stream.Commit();
+        }
+        const auto tick = scheduler.CurrentTick();
+        const auto command = scheduler.Current().Handle();
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        Require(name, "slot upload with a full stream ring",
+                scheduler.CurrentTick() == tick && scheduler.Current().Handle() == command,
+                "committing the heap submitted the command buffer of the draw being recorded");
+        scheduler.Finish();
+        heap.BeginDraw();
+      }
       const auto resident = ImageHeapTestAccess::ImageOf(heap, filtered.slots[0]);
       Require(name, "resident images",
               resident && textures.GetImage(resident).heap_refs.load() == 1u,
@@ -60169,6 +60191,11 @@ int main(int argc, char **argv) {
         RunCase(&vulkan, test);
       }
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-heap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckResidentImageHeap();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
