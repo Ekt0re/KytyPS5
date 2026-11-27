@@ -8,7 +8,9 @@
 #include "graphics/shader/recompiler/frontend/decode/VectorAluOps.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <cstdio>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
@@ -427,7 +429,22 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program,
 		}
 	}
 
-	EXIT("shader decode reached the code boundary before S_ENDPGM");
+	// Diagnostic: keep the raw words and the partial decode for offline analysis.
+	static std::atomic<uint32_t> dump_index {0};
+	const auto                   base = fmt::format("decode_boundary_{:03}", dump_index.fetch_add(1));
+	if (auto* file = std::fopen((base + ".bin").c_str(), "wb")) {
+		const uint32_t header[] {static_cast<uint32_t>(code.size()), instr_words};
+		std::fwrite(header, sizeof(header), 1, file);
+		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+		std::fclose(file);
+	}
+	if (auto* file = std::fopen((base + ".txt").c_str(), "wb")) {
+		const auto text = ProgramToString(program);
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+	EXIT("shader decode reached the code boundary before S_ENDPGM (code dump: %s.bin)",
+	     base.c_str());
 }
 
 std::string OperandToString(const Operand& operand) {
