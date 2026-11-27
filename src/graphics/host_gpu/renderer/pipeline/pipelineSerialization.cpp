@@ -414,7 +414,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			    static_cast<double>(g_decode_zstd_ns) / 1e6,
 			    static_cast<double>(g_decode_plan_ns) / 1e6,
 			    static_cast<double>(g_decode_spirv_ns) / 1e6));
-		} else if (!stored.empty() && !PrecompileMode() && !LazyShaderStore()) {
+		} else if (!stored.empty() && !PrecompileMode() && !OnDemandShaderStore()) {
 			// A precompile decodes only the modules its pipelines need, on their workers.
 			StartStoreDecoders(std::move(stored));
 		}
@@ -638,6 +638,14 @@ bool PipelineCache::LazyShaderStore() {
 		return env != nullptr && env[0] == '1';
 	}();
 	return lazy;
+}
+
+bool PipelineCache::OnDemandShaderStore() {
+	static const bool on_demand = [] {
+		const char* env = std::getenv("KYTY_ON_DEMAND_SHADER_STORE");
+		return (env != nullptr && env[0] == '1') || LazyShaderStore();
+	}();
+	return on_demand;
 }
 
 bool PipelineCache::TakeStoredPlan(Program& program) {

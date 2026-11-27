@@ -366,6 +366,12 @@ public:
 	// background decoders, pipeline creation, recipes or Vulkan pipeline cache file. Keeps the
 	// memory a replay needs small.
 	static bool LazyShaderStore();
+	// KYTY_ON_DEMAND_SHADER_STORE=1 (game runs): like the lazy store, records are decoded when a
+	// lookup needs them and stored pipelines are created when a draw or dispatch needs them, so a
+	// start does not spend a minute of CPU on all of them; unlike it, the recipes and the Vulkan
+	// pipeline cache file stay on, so the first use of a pipeline is a driver cache hit. Also true
+	// with KYTY_LAZY_SHADER_STORE=1.
+	static bool OnDemandShaderStore();
 	// A draw skipped because its pipeline was not ready; reported every 5 s.
 	static void NoteSkippedDraw();
 	// Waits for a pipeline being built on a worker; the guest clock stands still while it waits.

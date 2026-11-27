@@ -871,7 +871,7 @@ void PipelineCache::StartDeferredCompile(Pipeline&                              
 	    });
 	pipeline.compiling = deferred->Result();
 	pipeline.deferred  = deferred;
-	if (LazyShaderStore()) {
+	if (OnDemandShaderStore()) {
 		// Created by the first draw or dispatch that needs it (Resolve, Expedite).
 		return;
 	}
