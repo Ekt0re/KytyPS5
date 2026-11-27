@@ -350,6 +350,9 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
+  static void SetShareDepthStencil(TextureCache &cache, bool share) {
+    cache.m_share_depth_stencil = share;
+  }
   // Suspend points that collect nothing.
   static void SkipFrames(TextureCache &cache, uint64_t frames) {
     cache.m_gc_tick += frames;
@@ -8262,6 +8265,116 @@ public:
                   wide_download != nullptr && wide_download_offset % 16 == 0,
               "wide/block image readback was not aligned to its texel block");
       resources.MapMemory(base, allocation_size);
+
+      {
+        // A depth-only target, an R16 texture and a D16 depth-compare texture at the address of a
+        // D16S8 target share its image through the depth aspect; depth_split converts as before.
+        constexpr uint64_t d16s8_offset = 0x340000;
+        constexpr uint64_t d16s8_stencil_offset = 0x341000;
+        constexpr std::array<uint16_t, 4> d16s8_values{0x0000u, 0x2468u, 0xabcdu,
+                                                       0xffffu};
+        constexpr std::array<uint16_t, 4> d16s8_stale{};
+        std::memcpy(memory + d16s8_offset, d16s8_values.data(), sizeof(d16s8_values));
+        std::memset(memory + d16s8_stencil_offset, 0x3c, 4);
+        auto d16s8_desc = MakeLinearDesc(
+            base + d16s8_offset, sizeof(d16s8_values), vk::Format::eD16UnormS8Uint,
+            Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 2,
+            1);
+        d16s8_desc.type = BindingType::DepthTarget;
+        d16s8_desc.info.stencil = {base + d16s8_stencil_offset, 4};
+        d16s8_desc.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        d16s8_desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        const auto read_depth = [&](ImageId id) {
+          auto readback = CreateHostBuffer(name, 4 * sizeof(u32),
+                                           vk::BufferUsageFlagBits::eTransferDst,
+                                           std::vector<u32>(4, 0));
+          auto &image = texture_cache.GetImage(id);
+          image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                        vk::AccessFlagBits2::eTransferRead, {},
+                        scheduler.Current().Handle());
+          const vk::BufferImageCopy copy{
+              0, 4, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, {4, 1, 1}};
+          scheduler.Current().Handle().copyImageToBuffer(
+              image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+              readback.buffer, 1, &copy);
+          vk::BufferMemoryBarrier barrier{};
+          barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+          barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+          barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.buffer = readback.buffer;
+          barrier.size = readback.size;
+          scheduler.Current().Handle().pipelineBarrier(
+              vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+              nullptr, 1, &barrier, 0, nullptr);
+          scheduler.Finish();
+          auto words = ReadBuffer(name, readback, 4);
+          DestroyBuffer(&readback);
+          return words;
+        };
+        TextureCacheTestAccess::SetShareDepthStencil(texture_cache, true);
+        const auto d16s8_image = texture_cache.FindImage(d16s8_desc);
+        (void)texture_cache.FindDepthTarget(d16s8_image, d16s8_desc);
+        texture_cache.MarkGpuWritten(d16s8_image);
+        Libs::LibKernel::Memory::WriteBacking(base + d16s8_offset, d16s8_stale.data(),
+                                              sizeof(d16s8_stale));
+        auto d16_only_desc = d16s8_desc;
+        d16_only_desc.info.stencil = {};
+        d16_only_desc.info.pixel_format = vk::Format::eD16Unorm;
+        d16_only_desc.view_info.format = vk::Format::eD16Unorm;
+        d16_only_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        auto d16_shared_desc = d16_only_desc;
+        const auto d16_shared_image = texture_cache.FindImage(d16_shared_desc);
+        const bool d16_shared_view =
+            d16_shared_image == d16s8_image &&
+            texture_cache.FindDepthTarget(d16_shared_image, d16_shared_desc) != nullptr;
+        Require(name, "depth-only target shares the D16S8 image",
+                d16_shared_view &&
+                    TextureCacheTestAccess::Contains(texture_cache, d16s8_image) &&
+                    d16_shared_desc.view_info.format == vk::Format::eD16UnormS8Uint &&
+                    d16_shared_desc.view_info.aspect == vk::ImageAspectFlagBits::eDepth &&
+                    texture_cache.GetImage(d16s8_image).info.HasStencil(),
+                "a depth-only target converted the depth/stencil image to D16");
+        auto d16_r16_texture = MakeLinearDesc(
+            base + d16s8_offset, sizeof(d16s8_values), vk::Format::eR16Unorm,
+            Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D,
+            {4, 1, 1}, 1, 2, 1);
+        auto d16_compare_texture = d16_r16_texture;
+        d16_compare_texture.info.pixel_format = vk::Format::eD16Unorm;
+        d16_compare_texture.view_info.format = vk::Format::eD16Unorm;
+        d16_compare_texture.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        const auto d16_r16_image = texture_cache.FindImage(d16_r16_texture);
+        const auto d16_compare_image = texture_cache.FindImage(d16_compare_texture);
+        Require(name, "D16S8 depth aspect sampled as R16 and D16",
+                d16_r16_image == d16s8_image && d16_compare_image == d16s8_image &&
+                    texture_cache.FindTexture(d16_r16_image, d16_r16_texture) != nullptr &&
+                    texture_cache.FindTexture(d16_compare_image, d16_compare_texture) !=
+                        nullptr,
+                "a sampled D16 or R16 view replaced the depth/stencil image");
+        const auto d16_shared_words =
+            read_depth(d16s8_image);
+        Require(name, "shared D16S8 depth values",
+                std::memcmp(d16_shared_words.data(), d16s8_values.data(),
+                            sizeof(d16s8_values)) == 0,
+                "sharing the depth aspect lost the D16 depth values");
+        TextureCacheTestAccess::SetShareDepthStencil(texture_cache, false);
+        auto d16_split_desc = d16_only_desc;
+        const auto d16_split_image = texture_cache.FindImage(d16_split_desc);
+        TextureCacheTestAccess::SetShareDepthStencil(texture_cache, false);
+        const auto d16_split_words =
+            read_depth(d16_split_image);
+        Require(name, "depth_split converts to a D16 image",
+                d16_split_image != d16s8_image &&
+                    !TextureCacheTestAccess::Contains(texture_cache, d16s8_image) &&
+                    texture_cache.GetImage(d16_split_image).backing.format ==
+                        vk::Format::eD16Unorm &&
+                    d16_split_desc.view_info.format == vk::Format::eD16Unorm &&
+                    std::memcmp(d16_split_words.data(), d16s8_values.data(),
+                                sizeof(d16s8_values)) == 0,
+                "the depth_split switch did not keep the previous conversion");
+        texture_cache.UnmapMemory(base + d16s8_offset, 0x2000);
+      }
 
       {
         constexpr uint64_t offset = 0x4800000;
@@ -54581,6 +54694,63 @@ void CheckRenderTargetFormatContract() {
   std::_Exit(0x7f);
 }
 
+// A depth-only target or sampled depth view of a D16S8 image uses its depth aspect; other
+// depth formats and stencil-bearing targets keep their own images.
+void CheckDepthAspectSharing() {
+  constexpr const char *name = "DepthAspectSharing";
+  const auto depth_info = [](vk::Format format, bool stencil, uint32_t bytes,
+                             uint32_t samples = 1) {
+    Libs::Graphics::ImageInfo info{};
+    info.data = {0x100000, 0x1000};
+    if (stencil) info.stencil = {0x200000, 0x800};
+    info.pixel_format = format;
+    info.bytes_per_block = bytes;
+    info.samples = samples;
+    return info;
+  };
+  const auto d16s8 = depth_info(vk::Format::eD16UnormS8Uint, true, 2);
+  const auto d16 = depth_info(vk::Format::eD16Unorm, false, 2);
+  Require(name, "D16 target on D16S8", CanRenderDepthAspectOf(d16s8, d16),
+          "a D16 target did not share the D16S8 image's depth aspect");
+  Require(name, "D32 target on D32S8",
+          CanRenderDepthAspectOf(depth_info(vk::Format::eD32SfloatS8Uint, true, 4),
+                                 depth_info(vk::Format::eD32Sfloat, false, 4)),
+          "a D32 target did not share the D32S8 image's depth aspect");
+  Require(name, "rejected pairs",
+          !CanRenderDepthAspectOf(d16, d16s8) &&
+              !CanRenderDepthAspectOf(d16s8, d16s8) &&
+              !CanRenderDepthAspectOf(d16, d16) &&
+              !CanRenderDepthAspectOf(depth_info(vk::Format::eD24UnormS8Uint, true, 2), d16) &&
+              !CanRenderDepthAspectOf(depth_info(vk::Format::eD32SfloatS8Uint, true, 4), d16) &&
+              !CanRenderDepthAspectOf(depth_info(vk::Format::eD16UnormS8Uint, true, 2, 4), d16) &&
+              !CanRenderDepthAspectOf(depth_info(vk::Format::eS8Uint, true, 1), d16) &&
+              !CanRenderDepthAspectOf(d16s8, depth_info(vk::Format::eR16Unorm, false, 2)),
+          "a stencil, sample-count, format or color mismatch shared a depth aspect");
+  Require(name, "view formats",
+          DepthTargetViewFormat(vk::Format::eD16UnormS8Uint, vk::Format::eD16Unorm) ==
+                  vk::Format::eD16UnormS8Uint &&
+              DepthTargetViewFormat(vk::Format::eD32SfloatS8Uint, vk::Format::eD32Sfloat) ==
+                  vk::Format::eD32SfloatS8Uint &&
+              DepthTargetViewFormat(vk::Format::eD16Unorm, vk::Format::eD16Unorm) ==
+                  vk::Format::eD16Unorm &&
+              DepthTargetViewFormat(vk::Format::eD16UnormS8Uint,
+                                    vk::Format::eD16UnormS8Uint) ==
+                  vk::Format::eD16UnormS8Uint &&
+              DepthTargetViewFormat(vk::Format::eD24UnormS8Uint, vk::Format::eD16Unorm) ==
+                  vk::Format::eD16Unorm &&
+              DepthTargetViewFormat(vk::Format::eD32Sfloat, vk::Format::eD16Unorm) ==
+                  vk::Format::eD16Unorm &&
+              DepthTargetViewFormat(vk::Format::eD16Unorm, vk::Format::eD16UnormS8Uint) ==
+                  vk::Format::eD16UnormS8Uint,
+          "a depth-only target view did not name its attachment's format");
+  // Sampled views of the shared image: depth-only and R16 views read the depth aspect.
+  Require(name, "sampled D16S8 views",
+          IsSupportedSampledDepthFormat(vk::Format::eD16UnormS8Uint, vk::Format::eD16Unorm) &&
+              IsSupportedSampledDepthFormat(vk::Format::eD16UnormS8Uint,
+                                            vk::Format::eR16Unorm),
+          "the D16S8 depth aspect cannot be sampled as D16 or R16");
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckSampledColorViews() {
   Require("SampledColorViews", "identity",
@@ -60224,6 +60394,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-heap-only") == 0) {
+    CheckDepthAspectSharing();
     VulkanHarness vulkan;
     vulkan.CheckResidentImageHeap();
     return 0;
@@ -61524,6 +61695,7 @@ int main(int argc, char **argv) {
   bool skipped_device_checks = false;
   CheckRenderTargetFormatContract();
   CheckSampledColorViews();
+  CheckDepthAspectSharing();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();

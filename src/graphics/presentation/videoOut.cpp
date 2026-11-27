@@ -242,6 +242,8 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip();
 	void Wait(VideoOutConfig& cfg, int index);
+	// Every request of every port is done.
+	void WaitAll();
 
 private:
 	enum class RequestState { Reserved, Ready, Presenting };
@@ -1103,6 +1105,13 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
+void FlipQueue::WaitAll() {
+	Common::LockGuard lock(m_mutex);
+	while (!m_requests.empty() || !m_cpu_requests.empty()) {
+		m_done_cond_var.Wait(&m_mutex);
+	}
+}
+
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
@@ -1697,6 +1706,12 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 
 void VideoOutDriver::WaitFlipDone(const uint64_t* label) {
 	auto* ctx = m_impl->GetByLabel(label);
+	if (ctx == nullptr && Graphics::FrameCapture::Replaying()) {
+		// The labels the recorded commands name were in the recorded process: wait for every
+		// flip instead, which includes the one the packet waits for.
+		m_impl->GetFlipQueue().WaitAll();
+		return;
+	}
 	EXIT_IF(ctx == nullptr);
 
 	m_impl->GetFlipQueue().Wait(*ctx, static_cast<int>(label - ctx->labels.data()));

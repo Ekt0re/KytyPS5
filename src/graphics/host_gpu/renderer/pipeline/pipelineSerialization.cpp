@@ -410,7 +410,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			    static_cast<double>(g_decode_zstd_ns) / 1e6,
 			    static_cast<double>(g_decode_plan_ns) / 1e6,
 			    static_cast<double>(g_decode_spirv_ns) / 1e6));
-		} else if (!stored.empty() && !PrecompileMode()) {
+		} else if (!stored.empty() && !PrecompileMode() && !LazyShaderStore()) {
 			// A precompile decodes only the modules its pipelines need, on their workers.
 			StartStoreDecoders(std::move(stored));
 		}
@@ -621,6 +621,14 @@ bool ResolveStoredPlan(StoredModule& stored) {
 		FinishStoredPart(stored);
 	});
 	return stored.plan_ok;
+}
+
+bool PipelineCache::LazyShaderStore() {
+	static const bool lazy = [] {
+		const char* env = std::getenv("KYTY_LAZY_SHADER_STORE");
+		return env != nullptr && env[0] == '1';
+	}();
+	return lazy;
 }
 
 bool PipelineCache::TakeStoredPlan(Program& program) {
@@ -840,7 +848,7 @@ constexpr uint64_t RecipeMagic = 0x3150435259544b59ull; // "YKTYRCP1"
 bool RecipesEnabled() {
 	static const bool enabled = [] {
 		const char* env = std::getenv("KYTY_SHADER_RECIPES");
-		return env == nullptr || env[0] != '0';
+		return (env == nullptr || env[0] != '0') && !PipelineCache::LazyShaderStore();
 	}();
 	return enabled;
 }

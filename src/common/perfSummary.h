@@ -32,6 +32,7 @@ enum class Counter {
 	HeapRebinds,    // Image heap discoveries (one per draw or dispatch that uses the heap).
 	HeapLookups,    // Texture lookups those made.
 	HeapRangeSkips, // Lookups saved because the image set changed only at other addresses.
+	DepthRecreates, // Depth images replaced by one of another format, layout or binding kind.
 	Count
 };
 

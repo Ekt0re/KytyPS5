@@ -348,6 +348,12 @@ public:
 		return runs == 1 && !gapped ? alias : 0;
 	}
 
+	// Where a guest page lives in the backing, or UINT64_MAX for a page that has none.
+	[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr) const {
+		const auto entry = LoadPage(vaddr >> PageBits);
+		return entry != 0 ? (uint64_t {entry - 1u} << PageBits) + (vaddr & PageMask) : UINT64_MAX;
+	}
+
 	// Needs no lock either, as the alias stays mapped. A read racing an unmap copies the backing's
 	// current bytes, or zeros for a page unmapped between the check and the copy.
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) const {
@@ -845,6 +851,10 @@ public:
 
 	[[nodiscard]] const void* TryGetBackingView(uint64_t vaddr, uint64_t size) const {
 		return m_backing->TryGetBackingView(vaddr, size);
+	}
+
+	[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr) const {
+		return m_backing->BackingOffset(vaddr);
 	}
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {

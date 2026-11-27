@@ -37,6 +37,13 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// The packet the execution stands at (null when it has none), for diagnostics.
+	[[nodiscard]] const uint32_t* Position() const noexcept {
+		if (m_buffer_stack.empty()) return nullptr;
+		const auto& cursor = m_buffer_stack.back();
+		return cursor.offset_dw < cursor.commands.size() ? cursor.commands.data() + cursor.offset_dw
+		                                                 : nullptr;
+	}
 
 private:
 	friend class CommandProcessor;
