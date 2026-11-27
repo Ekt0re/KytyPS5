@@ -489,6 +489,19 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+
+// KYTY_BALLOT_GUARDS=0: scalar-branch guards are OpGroupNonUniformAny/All again (an A/B switch for
+// EmitConditionRef). The shader store is keyed to the executable, not to this switch, so it keeps
+// serving modules built with the other setting: move _PipelineCache/<title>.shaders aside before
+// comparing the two in a run.
+bool BallotGuardsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BALLOT_GUARDS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -891,10 +904,26 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
-	                              TypeBool(ctx.state), result,
-	                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
+	if (!BallotGuardsEnabled()) {
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
+		                              TypeBool(ctx.state), result,
+		                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
+		return result;
+	}
+	// Any(p) is Ballot(p) != 0 and All(p) is Ballot(!p) == 0. NVIDIA's compiler spends ~45 ms on
+	// each OpGroupNonUniformAny/All and little on a ballot (KytyPS5 #2469). The ballot has bits only
+	// for active invocations, the same set the vote covers, and every word is compared, so this
+	// holds for any host subgroup size.
+	auto&      state  = ctx.state;
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup),
+	                          zero ? EmitLogicalNotBool(state, predicate) : predicate);
+	const auto words = Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual,
+	                          TypeBoolVector(state, 4), ballot, ConstantU32CompositeZero(state, 4));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(zero ? spv::OpAll : spv::OpAny, TypeBool(state), result, words);
 	return result;
 }
 

@@ -13737,12 +13737,21 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
+    // KYTY_BALLOT_GUARDS (on unless "0") emits each vote as one ballot compared with zero.
+    const bool ballot_guards = Spirv::Emitter::BallotGuardsEnabled();
+    const uint32_t votes = ballot_guards ? 0u : 3u;
+    // A 64-wide wave on 32-wide invocations already requires the ballot capability.
+    const bool ballot_capability = ballot_guards || wave != host;
     Check(compiled.program.info.subgroup_vote && !compiled.program.info.subgroup_ballot &&
-              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 0,
-          "condition votes used ballots, duplicated halves, or lost their capability");
+              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) != ballot_guards &&
+              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformBallot) ==
+                  ballot_capability &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 6u - 2u * votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpAll) == 3u - votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpAny) == 3u - votes,
+          "condition votes used the wrong form, duplicated halves, or lost their capability");
     Check(scalar.TryInstruction()->Definition(0) == predicate.TryInstruction()->Definition(0),
           "scalar instruction condition acquired a subgroup vote");
     if (wave != host) {

@@ -54,6 +54,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -38166,6 +38167,18 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
+// Scalar-branch guards are a ballot compared with zero unless KYTY_BALLOT_GUARDS=0 restores
+// OpGroupNonUniformAny/All (`vote`).
+void SetScalarBranchGuardSpirv(TestCase *test, const char *vote) {
+  if (ShaderRecompiler::Spirv::Emitter::BallotGuardsEnabled()) {
+    test->required_spirv = {"OpGroupNonUniformBallot"};
+    test->forbidden_spirv = {"OpGroupNonUniformAny ", "OpGroupNonUniformAll "};
+  } else {
+    test->required_spirv = {vote};
+    test->forbidden_spirv.clear();
+  }
+}
+
 TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool upper_nonzero = false) {
   using O = ShaderOpcode;
   TestCase test;
@@ -38204,12 +38217,75 @@ TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads, bool uppe
                   upper_nonzero ? O::S_CBRANCH_EXECNZ : O::S_CBRANCH_EXECZ,
                   O::V_READLANE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"OpGroupNonUniformAny"};
+  SetScalarBranchGuardSpirv(&test, "OpGroupNonUniformAny");
   test.compute_info.wave_size = wave_size;
   test.compute_info.threads_num[0] = threads;
   test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
+}
+
+// S_CBRANCH_VCCNZ (a vote of any lane) and S_CBRANCH_VCCZ (a vote of every lane) on a partly
+// filled wave. VCC is set only in lane `hit` (none when hit >= threads, which also covers lanes
+// past the dispatch that a wave64 split over 32-wide invocations still runs), so the lanes
+// disagree. The branch picks 42, the fall-through 11.
+TestCase ScalarBranchVoteOverPartialWave(u32 wave_size, u32 threads, bool vccz, u32 hit) {
+  using O = ShaderOpcode;
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 1, 0),                 // v1 = s0 (group id)
+      EncodeVop2(0x1a, 1, InlineU32(6), 1),   // v1 <<= 6
+      EncodeVop2(0x25, 1, Vgpr(0), 1),        // v1 += lane
+      EncodeVop2(0x1a, 3, InlineU32(2), 1),   // v3 = v1 * 4
+      EncodeVopc(0xc2, InlineU32(hit), 0),    // vcc = (lane == hit)
+      EncodeSopp(vccz ? 0x06 : 0x07, 2),
+      EncodeVop1(0x01, 2, InlineU32(11)),
+      EncodeSopp(0x02, 1),
+  };
+  AppendVMovU32(&code, 2, 42);
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  // [wave64][vccz][first lane, last lane, no lane]
+  static constexpr const char *names[2][2][3] = {
+      {{"ScalarBranchVccnzFirstLaneWave32", "ScalarBranchVccnzLastLaneWave32",
+        "ScalarBranchVccnzNoLaneWave32"},
+       {"ScalarBranchVcczFirstLaneWave32", "ScalarBranchVcczLastLaneWave32",
+        "ScalarBranchVcczNoLaneWave32"}},
+      {{"ScalarBranchVccnzFirstLaneWave64", "ScalarBranchVccnzUpperLaneWave64",
+        "ScalarBranchVccnzNoLaneWave64"},
+       {"ScalarBranchVcczFirstLaneWave64", "ScalarBranchVcczUpperLaneWave64",
+        "ScalarBranchVcczNoLaneWave64"}}};
+  test.name = names[wave_size == 64u][vccz][hit == 0u ? 0 : hit < threads ? 1 : 2];
+  test.code = std::move(code);
+  const bool any = hit < threads;
+  test.expected.assign(threads, (vccz ? !any : any) ? 42u : 11u);
+  test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::V_CMP_EQ_U32,       vccz ? O::S_CBRANCH_VCCZ : O::S_CBRANCH_VCCNZ,
+                  O::S_BRANCH,           O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // Translation emits a zero kind as the negated vote of the nonzero kind, so both are Any.
+  SetScalarBranchGuardSpirv(&test, "OpGroupNonUniformAny ");
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.has_compute_info = true;
+  return test;
+}
+
+std::vector<TestCase> ScalarBranchVoteOverPartialWaveCases() {
+  std::vector<TestCase> cases;
+  for (const auto [wave, threads] : {std::pair{32u, 20u}, std::pair{64u, 40u}}) {
+    for (const bool vccz : {false, true}) {
+      for (const u32 hit : {0u, threads - 1u, threads}) {
+        cases.push_back(ScalarBranchVoteOverPartialWave(wave, threads, vccz, hit));
+      }
+    }
+  }
+  return cases;
 }
 
 // Each case spins until S_MEMREALTIME advances 64 ticks, capped at 2^20 reads, and stores
@@ -52330,6 +52406,9 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 4); });
   AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 32, true); });
   AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 64, true); });
+  for (auto &test : ScalarBranchVoteOverPartialWaveCases()) {
+    cases.push_back(std::move(test));
+  }
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
   for (auto &test : ScalarMemRealtimeCases()) {
     cases.push_back(std::move(test));
@@ -60642,6 +60721,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 4));
     RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 32, true));
     RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 64, true));
+    for (const auto &test : ScalarBranchVoteOverPartialWaveCases()) RunCase(&vulkan, test);
     RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
     RunCase(&vulkan, ImageSampleAndGather());
     RunCase(&vulkan, ImageGatherExplicitLod());

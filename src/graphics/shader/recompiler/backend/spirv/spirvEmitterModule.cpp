@@ -844,10 +844,12 @@ void DefineModule(EmitterState& state) {
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	// Scalar-branch guards (subgroup_vote) are ballots unless KYTY_BALLOT_GUARDS=0.
+	const bool guard_ballots = state.program.info.subgroup_vote && BallotGuardsEnabled();
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot || guard_ballots) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
-	if (state.program.info.subgroup_vote) {
+	if (state.program.info.subgroup_vote && !guard_ballots) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	if (state.program.info.subgroup_shuffle) {

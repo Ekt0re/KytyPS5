@@ -371,6 +371,10 @@ uint32_t ConstantU64(EmitterState& state, uint64_t value);
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 
+// Whether scalar-branch guards are ballots compared with zero (KYTY_BALLOT_GUARDS, on by default)
+// rather than OpGroupNonUniformAny/All.
+bool BallotGuardsEnabled();
+
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
 void     DefineModule(EmitterState& state);
