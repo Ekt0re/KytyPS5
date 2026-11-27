@@ -1306,6 +1306,9 @@ int KYTY_SYSV_ABI FontCloseFont(FontHandle font_handle) {
 	PRINT_NAME();
 
 	auto* font = static_cast<FontState*>(font_handle);
+	if (font == nullptr) {
+		return FONT_ERROR_INVALID_FONT_HANDLE;
+	}
 	delete font;
 
 	return OK;
@@ -1809,7 +1812,7 @@ int KYTY_SYSV_ABI FontCharacterGetBidiLevel(FontTextCharacter text_character, in
 	PRINT_NAME();
 
 	if (text_character == nullptr || bidi_level == nullptr) {
-		return -1;
+		return FONT_ERROR_INVALID_PARAMETER;
 	}
 
 	*bidi_level = 0;

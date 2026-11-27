@@ -17,7 +17,6 @@ LIB_NAME("Rtc", "Rtc");
 
 namespace Rtc {
 
-constexpr int RTC_ERROR_DATETIME_UNINITIALIZED = 0x7ffef9fe;
 constexpr int RTC_ERROR_INVALID_POINTER        = -2135621630; /* 0x80B50002 */
 constexpr int RTC_ERROR_INVALID_VALUE          = -2135621629; /* 0x80B50003 */
 constexpr int RTC_ERROR_INVALID_YEAR           = -2135621624; /* 0x80B50008 */
@@ -222,7 +221,7 @@ static int KYTY_SYSV_ABI RtcGetCurrentTick(RtcTick* tick) {
 	PRINT_NAME();
 
 	if (tick == nullptr) {
-		return RTC_ERROR_DATETIME_UNINITIALIZED;
+		return RTC_ERROR_INVALID_POINTER;
 	}
 
 	const auto now_us =
@@ -243,7 +242,7 @@ static int KYTY_SYSV_ABI RtcGetCurrentClock(RtcDateTime* time, int time_zone_min
 	PRINT_NAME();
 
 	if (time == nullptr) {
-		return RTC_ERROR_DATETIME_UNINITIALIZED;
+		return RTC_ERROR_INVALID_POINTER;
 	}
 
 	RtcTick tick {};
