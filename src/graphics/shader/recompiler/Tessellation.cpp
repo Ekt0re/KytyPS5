@@ -276,10 +276,11 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 } // namespace
 
 void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
-                                 ShaderTessellationInputInfo& info) {
+                                 ShaderTessellationInputInfo& info,
+                                 uint32_t control_instruction_words) {
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
-	Decoder::DecodeProgram(control, control_program);
+	Decoder::DecodeProgram(control, control_program, control_instruction_words);
 	ReflectTessellationLayout(local_program, true, info);
 	ReflectTessellationLayout(control_program, false, info);
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "

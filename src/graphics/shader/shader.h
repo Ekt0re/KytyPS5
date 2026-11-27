@@ -345,6 +345,8 @@ struct ShaderMappedData {
 	ShaderSemantic* input_semantics     = nullptr;
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
+	// Code region size in bytes, without the trailing literal buffer; 0 when unknown.
+	uint32_t        instruction_size_bytes = 0;
 	uint32_t        scratch_size_dwords = 0;
 };
 

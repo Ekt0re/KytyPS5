@@ -666,6 +666,8 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
+	options.instruction_words      = params.instruction_words;
+	options.back_instruction_words = params.back_instruction_words;
 	DumpShaderCapsule(params, input_info, options);
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
@@ -1083,6 +1085,8 @@ void PipelineCache::TranslateAhead(AheadJob& job) {
 	} else {
 		options.user_data = std::span(job.params.user_data).first(job.params.user_data_count);
 		options.back_code = job.back_code;
+		options.instruction_words      = job.params.instruction_words;
+		options.back_instruction_words = job.params.back_instruction_words;
 		if (job.stage == ShaderType::Pixel) {
 			options.wave_size        = job.pixel.wave_size;
 			options.input_info.pixel = &job.pixel;
@@ -1564,7 +1568,8 @@ bool PipelineCache::PrepareGraphicsStages(const HW::Context& context, const HW::
 		    XXH3_64bits(layout_key, sizeof(layout_key)), vertex_info[0].tess);
 		if (inserted) {
 			ShaderRecompiler::AnalyzeTessellationPrograms(vertex_params[0].code,
-			                                              vertex_params[1].code, layout->second);
+			                                              vertex_params[1].code, layout->second,
+			                                              vertex_params[1].instruction_words);
 			StoreLayout(layout->first, layout->second);
 		}
 		for (auto& stage: vertex_info) {

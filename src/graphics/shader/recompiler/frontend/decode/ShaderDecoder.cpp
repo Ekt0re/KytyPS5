@@ -386,14 +386,21 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	return result;
 }
 
-void DecodeProgram(std::span<const uint32_t> code, Program& program) {
+void DecodeProgram(std::span<const uint32_t> code, Program& program,
+                   uint32_t instruction_words) {
 	program.instructions.clear();
-	program.instructions.reserve(code.size());
 	program.code = code;
 	program.has_swap_pc = false;
 
+	// code also holds the literal buffer after the instructions; instruction_words bounds the
+	// real code region (0 = the whole span, for callers without footer information).
+	const auto instr_words = instruction_words == 0
+	                            ? static_cast<uint32_t>(code.size())
+	                            : std::min(instruction_words, static_cast<uint32_t>(code.size()));
+	program.instructions.reserve(instr_words);
+
 	std::vector<bool> branch_targets;
-	for (uint32_t word_index = 0; word_index < code.size();) {
+	for (uint32_t word_index = 0; word_index < instr_words;) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
@@ -404,16 +411,16 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
 			if (branch_targets.empty()) {
-				branch_targets.resize(code.size());
+				branch_targets.resize(instr_words);
 			}
-			if (target_index < code.size()) {
+			if (target_index < instr_words) {
 				branch_targets[target_index] = true;
 			}
 		}
 		// Code may follow an early-exit S_ENDPGM when a branch lands past it; keep decoding
-		// while any recorded target lies ahead, not only at the next word.
+		// while any recorded target lies ahead within the instruction region.
 		if (inst.opcode == Opcode::S_ENDPGM &&
-		    (word_index >= code.size() || branch_targets.empty() ||
+		    (word_index >= instr_words || branch_targets.empty() ||
 		     std::find(branch_targets.begin() + word_index, branch_targets.end(), true) ==
 		         branch_targets.end())) {
 			return;

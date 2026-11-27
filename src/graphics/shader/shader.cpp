@@ -60,9 +60,12 @@ void ShaderInit() {
 }
 
 // The program's code and, at align16(code size), its literal buffer, as sized by the 0x30-byte
-// footer that ends a binary; the whole binary when the footer is unknown.
-static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size) {
+// footer that ends a binary; the whole binary when the footer is unknown. instruction_bytes
+// receives the code region alone, without the literal buffer.
+static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size,
+                                  uint32_t* instruction_bytes) {
 	constexpr uint32_t FooterSize = 0x30;
+	*instruction_bytes            = size;
 	if (size < FooterSize) return size;
 	// Magic, then version, code size and literal buffer size at +0x10.
 	const auto* footer = binary + (size - FooterSize) / 4;
@@ -71,6 +74,7 @@ static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size) {
 	    end % 4 != 0 || end > size - FooterSize) {
 		return size;
 	}
+	*instruction_bytes = static_cast<uint32_t>(Common::AlignUp(uint64_t {footer[5]}, 16));
 	return static_cast<uint32_t>(end);
 }
 
@@ -84,7 +88,9 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	const auto*   binary = reinterpret_cast<const uint32_t*>(addr);
 	ShaderMapData mapped {data};
 	// Translation reads the bytes the hash covers.
-	mapped.code_size_bytes = ShaderProgramSize(binary, data.code_size_bytes);
+	uint32_t instruction_bytes = 0;
+	mapped.code_size_bytes     = ShaderProgramSize(binary, data.code_size_bytes, &instruction_bytes);
+	mapped.instruction_size_bytes = instruction_bytes;
 	const auto hash        = XXH3_64bits(binary, mapped.code_size_bytes);
 	mapped.vertex_error =
 	    ShaderReadVertexMetadata(data, HW::UserSgprInfo::SGPRS_MAX, mapped.vertex);
@@ -115,6 +121,11 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, uint64_t hash,
 	    .code            = code,
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
 	    .hash            = hash,
+	    .instruction_words =
+	        data.instruction_size_bytes == 0
+	            ? 0u
+	            : static_cast<uint32_t>(
+	                  std::min<uint64_t>(data.instruction_size_bytes / sizeof(uint32_t), code_words)),
 	};
 	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
 	        params.user_data_count > params.user_data.size());
@@ -600,6 +611,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		const auto back_params =
 		    GetShaderParams(regs.gs_regs.data_addr, back_hash, {}, back);
 		params.back_code = back_params.code;
+		params.back_instruction_words = back_params.instruction_words;
 		params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
 		params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
 		const uint64_t hashes[] = {params.hash, back_params.hash};

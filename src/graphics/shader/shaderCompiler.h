@@ -20,6 +20,9 @@ struct ShaderParams {
 	uint32_t                  user_data_count = 0;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
+	// Instruction-region sizes in dwords, excluding each program's literal buffer; 0 = whole span.
+	uint32_t                  instruction_words      = 0;
+	uint32_t                  back_instruction_words = 0;
 
 	[[nodiscard]] uint64_t Base() const {
 		return reinterpret_cast<uint64_t>(code.data());

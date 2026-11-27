@@ -440,7 +440,8 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 }
 
 Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<const uint32_t> back,
-                                    std::vector<uint32_t>& joined_code) {
+                                    std::vector<uint32_t>& joined_code,
+                                    uint32_t back_instruction_words = 0) {
 	EXIT_IF(back.empty());
 	auto       result      = Decoder::DecodeFrontProgram(front);
 	const auto front_words = static_cast<uint32_t>(result.code.size());
@@ -452,7 +453,7 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	result.instructions.back()    = {};
 	Decoder::DecodeInstruction(joined_code, front_words - 1u, result.instructions.back());
 	Decoder::Program back_program;
-	Decoder::DecodeProgram(back, back_program);
+	Decoder::DecodeProgram(back, back_program, back_instruction_words);
 	result.has_swap_pc |= back_program.has_swap_pc;
 	const auto back_pc = front_words * sizeof(uint32_t);
 	for (auto& inst: back_program.instructions) {
@@ -501,14 +502,15 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	EXIT_IF(code.empty());
 	ShaderSource source;
 	if (!options.back_code.empty()) {
-		source.decoded = DecodeFusedProgram(code, options.back_code, source.code);
+		source.decoded = DecodeFusedProgram(code, options.back_code, source.code,
+		                                    options.back_instruction_words);
 	} else if (options.stage == ShaderType::Local) {
 		source.decoded = Decoder::DecodeFrontProgram(code);
 		auto& handoff = source.decoded.instructions.back();
 		handoff.opcode = Decoder::Opcode::S_ENDPGM;
 		handoff.src_count = 0;
 	} else {
-		Decoder::DecodeProgram(code, source.decoded);
+		Decoder::DecodeProgram(code, source.decoded, options.instruction_words);
 	}
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTargets(source, options);
