@@ -330,6 +330,8 @@ public:
 		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Per descriptor type, the descriptors one set of descriptor_set_layout holds.
+		std::vector<vk::DescriptorPoolSize> descriptor_sizes;
 
 		[[nodiscard]] PendingPipeline Pending() const { return {compiling, deferred}; }
 	};
