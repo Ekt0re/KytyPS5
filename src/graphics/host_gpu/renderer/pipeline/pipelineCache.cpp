@@ -408,20 +408,28 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	return module;
 }
 
-// Diagnostic only: writes everything a shader translation reads, for tools/shaderCheck.
+// Diagnostic only: writes everything a shader translation reads, for shader_check. The sidecar
+// uses the recipe variant record, so direct capsule dumps replay the same first-use specialization
+// as capsules made by tools/shader/recipe_capsule.py.
 template <typename InputInfo>
 static void DumpShaderCapsule(const ShaderParams& params, const InputInfo& input_info,
-                              const ShaderRecompiler::CompileOptions& options) {
+                              const std::vector<uint32_t>&                        static_state,
+                              const ShaderRecompiler::CompileOptions&             options,
+                              const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+                              ShaderRecompiler::IR::PushData::Window push_data, uint64_t id) {
 	static const char* dir = std::getenv("KYTY_SHADER_CAPSULES");
 	if (dir == nullptr) return;
 	const auto path = fmt::format("{}/{}_{:016x}.cap", dir,
 	                              ShaderRecompiler::StageName(options.stage), params.hash);
-	auto* file = std::fopen(path.c_str(), "wbx");
+	auto*      file = std::fopen(path.c_str(), "wbx");
 	if (file == nullptr) return;
 	auto copy  = input_info;
 	copy.stage = {};
-	const uint32_t header[] {0x5041434bu, static_cast<uint32_t>(options.stage), options.wave_size,
-	                         options.user_data_base, params.user_data_count,
+	const uint32_t header[] {0x5041434bu,
+	                         static_cast<uint32_t>(options.stage),
+	                         options.wave_size,
+	                         options.user_data_base,
+	                         params.user_data_count,
 	                         static_cast<uint32_t>(sizeof(copy)),
 	                         static_cast<uint32_t>(params.code.size()),
 	                         static_cast<uint32_t>(params.back_code.size()),
@@ -433,6 +441,19 @@ static void DumpShaderCapsule(const ShaderParams& params, const InputInfo& input
 	std::fwrite(params.code.data(), 4, params.code.size(), file);
 	std::fwrite(params.back_code.data(), 4, params.back_code.size(), file);
 	std::fclose(file);
+
+	std::vector<uint8_t> input_bytes(sizeof(copy));
+	std::memcpy(input_bytes.data(), &copy, sizeof(copy));
+	ShaderRecompiler::IR::Writer variant;
+	uint8_t                      type = 1;
+	std::vector<uint32_t>        user_data(options.user_data.begin(), options.user_data.end());
+	ShaderRecompiler::IR::IoAll(variant, type, options.stage, params.hash, params.user_data_count,
+	                            static_state, options.wave_size, options.user_data_base, user_data,
+	                            push_data.begin, push_data.end, specialization, id, input_bytes);
+	if (auto* sidecar = std::fopen((path + ".variant").c_str(), "wbx"); sidecar != nullptr) {
+		std::fwrite(variant.bytes.data(), 1, variant.bytes.size(), sidecar);
+		std::fclose(sidecar);
+	}
 }
 
 namespace {
@@ -670,7 +691,6 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
-	DumpShaderCapsule(params, input_info, options);
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;
@@ -741,8 +761,10 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	const auto reason = CompileReason(entry->first, known_program, entry->second.specialization,
 	                                  push_data, source_changed);
 	const auto compile_start = std::chrono::steady_clock::now();
-	auto& module = CompileModule(entry->second, entry->first, options, std::move(translated),
-	                             push_data);
+	auto&      module =
+	    CompileModule(entry->second, entry->first, options, std::move(translated), push_data);
+	DumpShaderCapsule(params, input_info, entry->first.static_state, options,
+	                  entry->second.specialization, push_data, module.id);
 	if (entry->second.call_source == nullptr) {
 		RecordRecipe(entry->first, params, options, push_data, module);
 	}
