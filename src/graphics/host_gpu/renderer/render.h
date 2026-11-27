@@ -38,11 +38,29 @@ enum class DrawOffsetSource : uint8_t {
 
 // Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
-	uint64_t              address = 0;
-	uint32_t              count   = 0;
-	uint32_t              stride  = 0;
+	uint64_t              address       = 0;
+	uint64_t              count_address = 0;
+	uint32_t              count         = 0;
+	uint32_t              stride        = 0;
 	ShaderIndirectOffsets offsets;
 };
+
+[[nodiscard]] inline constexpr uint64_t IndirectDrawRecordsSize(uint32_t count, uint32_t stride,
+                                                               uint32_t record_size) noexcept {
+	return count == 0 ? 0 : static_cast<uint64_t>(count - 1) * stride + record_size;
+}
+
+[[nodiscard]] inline constexpr uint32_t ClampIndirectDrawCount(uint32_t count,
+                                                              uint32_t max_count) noexcept {
+	return count < max_count ? count : max_count;
+}
+
+[[nodiscard]] inline constexpr bool CanUseGpuIndirectDrawCount(uint64_t count_address,
+                                                              uint32_t max_count,
+                                                              uint32_t max_device_count) noexcept {
+	return count_address != 0 && (count_address & 3u) == 0 && max_count != 0 &&
+	       max_count <= max_device_count;
+}
 
 struct DrawIndexArgs {
 	uint32_t         index_count         = 0;

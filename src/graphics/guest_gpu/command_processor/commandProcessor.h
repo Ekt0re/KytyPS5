@@ -159,6 +159,11 @@ private:
 	// read only when a later draw inherits it.
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
+	// A GPU-counted multi-draw defers the count read until NUM_INSTANCES is inherited.
+	uint64_t m_num_instances_count_addr = 0;
+	uint64_t m_num_instances_args_addr  = 0;
+	uint32_t m_num_instances_max_count  = 0;
+	uint32_t m_num_instances_stride     = 0;
 
 	const int      m_interrupt_event_id;
 	const uint32_t m_flush_draws                 = Config::GetFlushDraws();

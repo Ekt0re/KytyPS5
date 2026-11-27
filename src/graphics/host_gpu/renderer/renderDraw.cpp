@@ -1200,11 +1200,25 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
+	std::pair<Buffer*, uint64_t> count_buffer {};
 	if (emit.indirect.address != 0) {
-		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
-		                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-		                                : sizeof(vk::DrawIndirectCommand));
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
+		const auto size = IndirectDrawRecordsSize(
+		    emit.indirect.count, emit.indirect.stride,
+		    draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+		                 : sizeof(vk::DrawIndirectCommand));
+		auto& buffer_cache = m_context.GetBufferCache();
+		if (emit.indirect.count_address != 0) {
+			EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().draw_indirect_count_enabled);
+			// Discover both ranges first so acquiring the second cannot merge and invalidate the first.
+			const auto args_id  = buffer_cache.FindBuffer(emit.indirect.address, size);
+			const auto count_id = buffer_cache.FindBuffer(emit.indirect.count_address, sizeof(uint32_t));
+			args_buffer  = buffer_cache.ObtainBuffer(emit.indirect.address, size, false, false, args_id);
+			count_buffer = buffer_cache.ObtainBuffer(emit.indirect.count_address, sizeof(uint32_t),
+			                                         false, false, count_id);
+			EXIT_IF((count_buffer.second & 3u) != 0);
+		} else {
+			args_buffer = buffer_cache.ObtainBuffer(emit.indirect.address, size, false);
+		}
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
 	vk::PipelineStageFlags shader_write_stages = {};
@@ -1332,8 +1346,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const auto record = [=, &occlusion_queries, primitive = ucfg.GetPrimType(),
 	                     args   = args_buffer.first != nullptr ? args_buffer.first->Handle()
 	                                                           : vk::Buffer {},
-	                     offset = args_buffer.second](vk::CommandBuffer command,
-	                                                  vk::Pipeline      handle) {
+	                     offset = args_buffer.second,
+	                     count  = count_buffer.first != nullptr ? count_buffer.first->Handle()
+	                                                          : vk::Buffer {},
+	                     count_offset = count_buffer.second](vk::CommandBuffer command,
+	                                                        vk::Pipeline      handle) {
 		command.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
 		const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'D', vs_hash, ps_hash);
 		if (mesh_task) {
@@ -1342,6 +1359,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			command.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else if (!args) {
 			EmitDrawPrimitives(primitive, command, draw, emit);
+		} else if (count) {
+			if (draw.indexed) {
+				command.drawIndexedIndirectCount(args, offset, count, count_offset,
+				                                 emit.indirect.count, emit.indirect.stride);
+			} else {
+				command.drawIndirectCount(args, offset, count, count_offset, emit.indirect.count,
+				                          emit.indirect.stride);
+			}
 		} else if (draw.indexed) {
 			command.drawIndexedIndirect(args, offset, emit.indirect.count, emit.indirect.stride);
 		} else {
@@ -1398,7 +1423,9 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	if (indirect.address != 0) {
 		if (!vs.indirect_draw ||
 		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
-		    vs.indirect_offsets != indirect.offsets) {
+		    vs.indirect_offsets != indirect.offsets ||
+		    (indirect.count_address != 0 && vs.stage.module != nullptr &&
+		     vs.stage.module->info.stage == ShaderType::Mesh)) {
 			return std::nullopt;
 		}
 		return DrawEmitInfo {.indirect = indirect};

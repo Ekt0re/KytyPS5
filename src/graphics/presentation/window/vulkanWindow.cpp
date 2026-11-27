@@ -527,10 +527,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
+	graphics.draw_indirect_count_enabled        = supported12.drawIndirectCount;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
 	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
+	features12.drawIndirectCount        = graphics.draw_indirect_count_enabled;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "

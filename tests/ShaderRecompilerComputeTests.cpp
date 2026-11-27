@@ -23921,10 +23921,15 @@ public:
           std::memcpy(reinterpret_cast<void *>(args_address + (records_per_kind + i) * stride),
                       &auto_records[i], sizeof(auto_records[i]));
         }
+        constexpr uint64_t records_bytes = 2 * records_per_kind * stride;
+        constexpr uint64_t count_one_address = args_address + records_bytes;
+        constexpr uint64_t count_two_address = count_one_address + sizeof(uint32_t);
+        *reinterpret_cast<uint32_t *>(count_one_address) = 1;
+        *reinterpret_cast<uint32_t *>(count_two_address) = 2;
         // Larger than a caching page, so the arguments are cached instead of streamed.
         (void)context.GetBufferCache().ObtainBuffer(
             vertices_address, BufferCache::CACHING_PAGESIZE * 2, false);
-        const std::array<u32, 2 * records_per_kind * stride / 4> zeros{};
+        const std::array<u32, records_bytes / 4> zeros{};
         Require("GpuIndirectDraw", "CPU backing",
                 LibKernel::Memory::TryWriteBacking(args_address, zeros.data(), sizeof(zeros)),
                 "the CPU copy of the arguments could not be cleared");
@@ -23965,11 +23970,13 @@ public:
           shaders.SetGsUserSgpr(i, static_cast<u32>(tables[i / 2] >> (i % 2 * 32)));
         }
         const auto check = [&](const char *step, uint64_t vertex_shader, bool indexed, u32 first,
-                               ShaderIndirectOffsets offsets = {}) {
+                               ShaderIndirectOffsets offsets = {}, uint64_t count_address = 0,
+                               bool expect_draw = true) {
           shaders.SetEsShaderBase(vertex_shader);
           TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
               {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
-          const DrawIndirectArgs records{args_address + first * stride, 2, stride, offsets};
+          DrawIndirectArgs records{args_address + first * stride, 0, 2, stride, offsets};
+          records.count_address = count_address;
           const bool drawn = indexed
               ? RenderExecutorTestAccess::DrawIndex(executor, scheduler.Current(),
                     {.index_count = 3, .index_addr = reinterpret_cast<const void *>(index_address),
@@ -23979,8 +23986,9 @@ public:
           const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
                                               {}, {extent, extent, 1});
           for (size_t component = 0; component < pixels.size(); component++) {
+            const u32 color = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
             Require("GpuIndirectDraw", step,
-                    drawn && pixels[component] == (component % 4 == 3 ? 0x3f800000u : 0x3e800000u),
+                    drawn && pixels[component] == (expect_draw ? color : 0u),
                     "the draw did not take every record, offsets included, from the GPU");
           }
         };
@@ -23988,6 +23996,14 @@ public:
         check("auto embedded fetch", fetch_vs, false, records_per_kind);
         check("indexed native fetch", vertex_address, true, 2);
         check("auto native fetch", vertex_address, false, records_per_kind + 2);
+        if (context.GetGraphics().draw_indirect_count_enabled) {
+          check("indexed GPU count one", fetch_vs, true, 2, {}, count_one_address, false);
+          check("indexed GPU count two", fetch_vs, true, 2, {}, count_two_address, true);
+          check("auto GPU count one", fetch_vs, false, records_per_kind + 2, {},
+                count_one_address, false);
+          check("auto GPU count two", fetch_vs, false, records_per_kind + 2, {},
+                count_two_address, true);
+        }
         // Pipelines created from only their key and stage modules draw the same.
         scheduler.Finish();
         Require("PipelineFromKey", "vertex input pipelines",
@@ -24179,7 +24195,7 @@ public:
                                bool covered = true) {
           TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
               {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
-          const DrawIndirectArgs records{mesh_args_address + first * stride, count, stride,
+          const DrawIndirectArgs records{mesh_args_address + first * stride, 0, count, stride,
                                          offsets};
           if (cpu_records) {
             // The executor declines GPU records here; the command processor reads them and draws
@@ -26181,7 +26197,8 @@ public:
 #include "RayQueryTraversalGpuTests.inc"
 
 private:
-  bool m_rasterization_supported = true;
+  bool m_rasterization_supported      = true;
+  bool m_draw_indirect_count_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -26218,6 +26235,7 @@ private:
     context.r8_srgb_views = context.SamplesFiltered(vk::Format::eR8Srgb);
     context.r8g8_srgb_views = context.SamplesFiltered(vk::Format::eR8G8Srgb);
     context.conditional_rendering_enabled = true;
+    context.draw_indirect_count_enabled = m_draw_indirect_count_supported;
     context.sampler_filter_minmax_enabled = true;
     context.attachment_feedback_loop_enabled = m_rasterization_supported;
     context.provoking_vertex_last_enabled = m_rasterization_supported;
@@ -26452,6 +26470,7 @@ private:
             available_acceleration_structure.accelerationStructure == true &&
                 available_ray_query.rayQuery == true,
             "acceleration structures and ray queries are not supported");
+    m_draw_indirect_count_supported = available_features12.drawIndirectCount;
     m_rasterization_supported = available_features.fillModeNonSolid &&
                                 available_features.tessellationShader &&
                                 available_features.drawIndirectFirstInstance &&
@@ -26484,6 +26503,7 @@ private:
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
     device_features12.samplerFilterMinmax = true;
+    device_features12.drawIndirectCount = m_draw_indirect_count_supported;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;

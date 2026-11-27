@@ -571,6 +571,12 @@ add_executable(recorder_tests EXCLUDE_FROM_ALL
 target_link_libraries(recorder_tests fmt::fmt common)
 target_include_directories(recorder_tests PRIVATE ${inc_headers})
 
+add_executable(draw_indirect_count_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DrawIndirectCountTests.cpp"
+)
+target_link_libraries(draw_indirect_count_tests kyty_test_gtest Vulkan::Headers)
+target_include_directories(draw_indirect_count_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexMetadata.cpp"
@@ -869,6 +875,7 @@ if(BUILD_TESTING)
 	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)
 	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
+	add_test(NAME draw_indirect_count COMMAND $<TARGET_FILE:draw_indirect_count_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -1020,6 +1027,7 @@ if(BUILD_TESTING)
 		readback_batch_tests
 		shader_store_tests
 		common_tests
+		draw_indirect_count_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
