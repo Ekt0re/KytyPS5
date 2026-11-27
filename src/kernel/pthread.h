@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "kernel/guestWait.h"
 
 #include <cstdint>
 #include <string>
@@ -94,21 +95,6 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
-// The blocking call the current guest thread is in (call name, wait object, a call-specific
-// value), for the thread dump of the crash report. Nested scopes restore the outer one.
-class GuestWaitScope {
-public:
-	GuestWaitScope(const char* call, uint64_t object, int64_t value = 0) noexcept;
-	~GuestWaitScope();
-	GuestWaitScope(const GuestWaitScope&)            = delete;
-	GuestWaitScope& operator=(const GuestWaitScope&) = delete;
-
-private:
-	const char* m_call;
-	uint64_t    m_object;
-	int64_t     m_value;
-	uint64_t    m_since;
-};
 // One line per live guest thread: name, host thread id, the call it waits in and for how long.
 std::string DumpGuestThreads();
 Pthread               PthreadSwapSelfForSignal(Pthread thread);

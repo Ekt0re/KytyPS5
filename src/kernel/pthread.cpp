@@ -429,11 +429,7 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
-	// GuestWaitScope
-	std::atomic<const char*> wait_call {nullptr};
-	std::atomic<uint64_t>    wait_object {0};
-	std::atomic<int64_t>     wait_value {0};
-	std::atomic<uint64_t>    wait_since {0};
+	GuestWaitState        wait;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -1026,6 +1022,7 @@ void PthreadInitSelfForMainThread() {
 #endif
 
 	g_pthread_self = new PthreadPrivate {};
+	SetCurrentGuestWaitState(&g_pthread_self->wait);
 	PthreadAttrInit(&g_pthread_self->attr);
 	g_pthread_self->attr->affinity = 0x1fff;
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
@@ -3078,42 +3075,20 @@ Pthread KYTY_SYSV_ABI PthreadSelf() {
 	return g_pthread_self;
 }
 
-GuestWaitScope::GuestWaitScope(const char* call, uint64_t object, int64_t value) noexcept {
-	auto* self = g_pthread_self;
-	m_call     = self != nullptr ? self->wait_call.load(std::memory_order_relaxed) : nullptr;
-	m_object   = self != nullptr ? self->wait_object.load(std::memory_order_relaxed) : 0;
-	m_value    = self != nullptr ? self->wait_value.load(std::memory_order_relaxed) : 0;
-	m_since    = self != nullptr ? self->wait_since.load(std::memory_order_relaxed) : 0;
-	if (self == nullptr) return;
-	self->wait_object.store(object, std::memory_order_relaxed);
-	self->wait_value.store(value, std::memory_order_relaxed);
-	self->wait_since.store(Common::SteadyNs(), std::memory_order_relaxed);
-	self->wait_call.store(call, std::memory_order_release);
-}
-
-GuestWaitScope::~GuestWaitScope() {
-	auto* self = g_pthread_self;
-	if (self == nullptr) return;
-	self->wait_object.store(m_object, std::memory_order_relaxed);
-	self->wait_value.store(m_value, std::memory_order_relaxed);
-	self->wait_since.store(m_since, std::memory_order_relaxed);
-	self->wait_call.store(m_call, std::memory_order_release);
-}
-
 std::string DumpGuestThreads() {
 	std::string out = "--- Guest threads ---\n";
 	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) return out;
 	const auto now = Common::SteadyNs();
 	g_pthread_context->GetPthreadPool()->ForEach([&](Pthread thread) {
 		if (thread->state.load(std::memory_order_acquire) != PthreadState::Running) return;
-		const char* call = thread->wait_call.load(std::memory_order_acquire);
+		const char* call = thread->wait.call.load(std::memory_order_acquire);
 		out += fmt::format("  [{}] {:<32} host={}", thread->unique_id, thread->name,
 		                   thread->host_thread_id);
 		if (call != nullptr) {
-			const auto since = thread->wait_since.load(std::memory_order_relaxed);
+			const auto since = thread->wait.since.load(std::memory_order_relaxed);
 			out += fmt::format(" waits in {} object=0x{:x} value={} for {:.1f} s", call,
-			                   thread->wait_object.load(std::memory_order_relaxed),
-			                   thread->wait_value.load(std::memory_order_relaxed),
+			                   thread->wait.object.load(std::memory_order_relaxed),
+			                   thread->wait.value.load(std::memory_order_relaxed),
 			                   since != 0 && now > since ? static_cast<double>(now - since) / 1e9 : 0.0);
 		} else {
 			out += " running";
@@ -3130,6 +3105,7 @@ Pthread PthreadSelfOrNull() {
 Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
 	g_pthread_self = thread;
+	SetCurrentGuestWaitState(thread != nullptr ? &thread->wait : nullptr);
 	return previous;
 }
 
@@ -3258,6 +3234,7 @@ static void* RunThread(void* arg) {
 
 	Loader::RuntimeLinker::CreateThreadTls();
 	g_pthread_self = thread;
+	SetCurrentGuestWaitState(&thread->wait);
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

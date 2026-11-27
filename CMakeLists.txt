@@ -701,6 +701,7 @@ add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/descriptors.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guestWait.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
 target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
@@ -721,6 +722,7 @@ target_include_directories(win_read_efault_tests PRIVATE ${inc_headers})
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guestWait.cpp"
 )
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
