@@ -457,6 +457,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
+      m_guest_imports(graphics),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -826,7 +827,9 @@ bool BufferCache::ZeroCopyEnabled() const {
 		const char* text = std::getenv("KYTY_ZERO_COPY");
 		return text != nullptr && text[0] == '1';
 	}();
-	return enabled && m_graphics.external_memory_host_enabled;
+	// GuestBackingImports::Available() settles on first use and is cheap after that.
+	return enabled && (m_graphics.external_memory_host_enabled ||
+	                   const_cast<GuestBackingImports&>(m_guest_imports).Available());
 }
 
 bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
@@ -1012,12 +1015,25 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		const auto         alias =
 		    length <= MaxZeroCopy ? LibKernel::Memory::ContiguousBackingAlias(overlap.begin, length) : 0;
 		if (alias != 0 && (alias & 0xfffu) == 0) {
-			id        = m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
-			                                  reinterpret_cast<void*>(alias), flags, length);
-			zero_copy = m_slot_buffers[id].IsZeroCopy();
+			// The backing's own Vulkan memory where it has some (KYTY_VK_GUEST_BACKING=1),
+			// otherwise a host-pointer import (VK_EXT_external_memory_host).
+			bool inserted = false;
+			if (const auto imported = m_guest_imports.Find(alias, length)) {
+				id       = m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
+				                                 reinterpret_cast<void*>(alias), imported->memory,
+				                                 imported->offset, imported->memory_size,
+				                                 imported->memory_type, imported->handle_type, flags,
+				                                 length);
+				inserted = true;
+			} else if (m_graphics.external_memory_host_enabled) {
+				id       = m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
+				                                 reinterpret_cast<void*>(alias), flags, length);
+				inserted = true;
+			}
+			zero_copy = inserted && m_slot_buffers[id].IsZeroCopy();
 			if (zero_copy) {
 				m_slot_buffers[id].backing_generation = generation;
-			} else {
+			} else if (inserted) {
 				m_slot_buffers.erase(id);
 			}
 		}
@@ -1026,8 +1042,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		} else {
 			m_zero_copy.Subtract(overlap.begin, length);
 		}
-		if (++m_zero_copy_created <= 64 || !zero_copy) {
-			std::printf("Zero-copy: buffer 0x%011llx+0x%llx %s\n",
+		if (++m_zero_copy_created <= 64 || !zero_copy || (m_zero_copy_created & 255u) == 0) {
+			std::printf("Zero-copy: #%llu buffer 0x%011llx+0x%llx %s\n",
+			            static_cast<unsigned long long>(m_zero_copy_created),
 			            static_cast<unsigned long long>(overlap.begin),
 			            static_cast<unsigned long long>(length),
 			            zero_copy    ? "imports guest memory"

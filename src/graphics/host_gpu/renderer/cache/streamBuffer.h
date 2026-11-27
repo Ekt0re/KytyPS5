@@ -47,6 +47,14 @@ public:
 	// the driver refuses the import.
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
 	       void* host_pointer, vk::BufferUsageFlags flags, uint64_t size);
+	// Zero-copy over guest memory the renderer imported from the backing's Vulkan chunks
+	// (KYTY_VK_GUEST_BACKING=1, GuestBackingImports): bound to `memory` at `memory_offset`, which
+	// holds the alias at `host_pointer`. `memory` belongs to GuestBackingImports. Handle() is null
+	// when the buffer can't be bound there.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       void* host_pointer, vk::DeviceMemory memory, uint64_t memory_offset,
+	       uint64_t memory_size, uint32_t memory_type, vk::ExternalMemoryHandleTypeFlagBits handle_type,
+	       vk::BufferUsageFlags flags, uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -54,7 +62,7 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
-	[[nodiscard]] bool               IsZeroCopy() const noexcept { return m_imported != nullptr; }
+	[[nodiscard]] bool               IsZeroCopy() const noexcept { return m_zero_copy; }
 	[[nodiscard]] uint64_t           HostPointer() const noexcept { return m_host_pointer; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
@@ -115,6 +123,37 @@ private:
 	std::span<uint8_t>            m_mapped;
 	vk::DeviceMemory              m_imported     = nullptr;
 	uint64_t                      m_host_pointer = 0;
+	bool                          m_zero_copy    = false;
+};
+
+// KYTY_VK_GUEST_BACKING=1 (Linux): the backing's Vulkan chunks imported into the renderer's
+// device on first use, one VkDeviceMemory per chunk for the device's lifetime, so zero-copy
+// buffers bind to guest memory at an offset instead of importing host pointers.
+class GuestBackingImports {
+public:
+	explicit GuestBackingImports(GraphicContext& graphics): m_graphics(&graphics) {}
+	~GuestBackingImports();
+	KYTY_CLASS_NO_COPY(GuestBackingImports);
+
+	// Whether the backing is in Vulkan chunks this device can import.
+	[[nodiscard]] bool Available();
+
+	struct Range {
+		vk::DeviceMemory                    memory;
+		uint64_t                            offset;
+		uint64_t                            memory_size;
+		uint32_t                            memory_type;
+		vk::ExternalMemoryHandleTypeFlagBits handle_type;
+	};
+	// The imported memory that holds the backing alias range [alias, alias + size).
+	[[nodiscard]] std::optional<Range> Find(uint64_t alias, uint64_t size);
+
+private:
+	GraphicContext*                m_graphics  = nullptr;
+	int                            m_available = -1;
+	std::vector<vk::DeviceMemory>  m_memory;
+	std::vector<uint32_t>          m_types;
+	std::vector<uint8_t>           m_failed;
 };
 
 class StreamBuffer final: public Buffer {

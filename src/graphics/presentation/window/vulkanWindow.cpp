@@ -422,6 +422,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	       pipeline_binary, unified_layouts] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	graphics.external_memory_host_enabled = add(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (LibKernel::Memory::VulkanBackingActive()) {
+		graphics.external_memory_fd_enabled = add(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+		graphics.external_memory_dma_buf_enabled =
+		    graphics.external_memory_fd_enabled && add(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+	}
+#endif
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
