@@ -406,10 +406,16 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 			if (branch_targets.empty()) {
 				branch_targets.resize(code.size());
 			}
-			branch_targets[target_index] = true;
+			if (target_index < code.size()) {
+				branch_targets[target_index] = true;
+			}
 		}
+		// Code may follow an early-exit S_ENDPGM when a branch lands past it; keep decoding
+		// while any recorded target lies ahead, not only at the next word.
 		if (inst.opcode == Opcode::S_ENDPGM &&
-		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
+		    (word_index >= code.size() || branch_targets.empty() ||
+		     std::find(branch_targets.begin() + word_index, branch_targets.end(), true) ==
+		         branch_targets.end())) {
 			return;
 		}
 	}
