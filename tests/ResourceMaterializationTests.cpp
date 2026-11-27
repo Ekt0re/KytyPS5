@@ -3,6 +3,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
 
+#include <vector>
+#include <atomic>
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -156,6 +159,58 @@ void TestWalkerLoadsBypassSpecializationReader() {
   Check(snapshot.flattened_srt.size() == 1 &&
             snapshot.flattened_srt[0] == dword,
         "walker did not load the mapped SRT DWORD");
+}
+
+// The walker asks the guard before loading from a page the host may have made inaccessible, and
+// loads plainly when the page is not listed, the guard declines or the guard is off.
+void TestWalkerGuardServesWatchedLoads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  static const uint32_t dword = 0x12345678;
+  static bool decline = false;
+  static std::vector<std::atomic<uint16_t>> counts(size_t{1} << 20u);
+  const auto address = reinterpret_cast<uint64_t>(&dword);
+  auto plan = Extract(SrtProgram(address));
+  uint32_t specialization_reads = 0;
+  const SrtRuntime runtime{.userdata = &specialization_reads,
+                           .read_specialization_memory =
+                               RejectSpecializationRead};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto walk = [&] {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt.size() == 1,
+          "guarded SRT stage materialization failed");
+    return snapshot.flattened_srt[0];
+  };
+  SetSrtWalkerGuard(counts.data(), counts.size(),
+                    [](uint64_t load, uint32_t& value) {
+                      if (decline) return false;
+                      value = *reinterpret_cast<const uint32_t*>(load) ^ 0xffu;
+                      return true;
+                    });
+  SetSrtWalkerGuardCounting(true);
+  auto& slot = counts[(address >> 12u) & (counts.size() - 1)];
+  slot = 1;
+  Check(walk() == dword && GetSrtWalkerGuardStats().served == 0,
+        "walker guard served a load while off");
+  SetSrtWalkerGuardMode(SrtWalkerGuardMode::On);
+  Check(walk() == (dword ^ 0xffu) && GetSrtWalkerGuardStats().served == 1,
+        "walker guard did not serve a listed page's load");
+  decline = true;
+  Check(walk() == dword && GetSrtWalkerGuardStats().declined == 1,
+        "walker did not load plainly after the guard declined");
+  decline = false;
+  slot = 0;
+  Check(walk() == dword && GetSrtWalkerGuardStats().served == 1,
+        "walker guard served an unlisted page's load");
+  slot = 1;
+  SetSrtWalkerGuardMode(SrtWalkerGuardMode::Verify);
+  const auto mismatches = GetSrtWalkerGuardStats().mismatches;
+  Check(walk() == dword && GetSrtWalkerGuardStats().mismatches > mismatches,
+        "walker guard verification missed a differing load");
+  SetSrtWalkerGuardMode(SrtWalkerGuardMode::Off);
+  slot = 0;
+  Check(specialization_reads == 0, "guarded walker load used the specialization reader");
 }
 
 void TestNativeNestedSrtRefresh() {
@@ -915,8 +970,14 @@ void TestEmptyTraversalSkipsUnmappedDescriptor(bool independent_mask, bool count
     const bool inactive = !independent_mask && (!reads.readable || reads.count == 0u);
     Check(snapshot.buffers[0].dwords[0] == (inactive ? 0u : 0x8000u),
           "empty traversal kept its descriptor or an uncertain traversal lost it");
-    Check(specialization.buffers[0].zero_stride_oob == inactive,
-          "inactive traversal did not expose dead vector reads to specialization");
+    // The dead vector reads read zero through an empty binding instead of a module variant.
+    Libs::Graphics::ShaderBufferResource bound_descriptor;
+    std::copy_n(snapshot.buffers[0].dwords.begin(), 4, bound_descriptor.fields);
+    auto bound = program.info.buffers[0];
+    bound.packed_stride = specialization.buffers[0].packed_stride;
+    Check(!specialization.buffers[0].zero_stride_oob &&
+              (BufferBindingSize(bound, bound_descriptor) == 0u) == inactive,
+          "inactive traversal did not bind its dead vector reads empty");
     Check(reads.descriptors == (inactive ? 0u : 4u),
           "inactive traversal read its descriptor or an uncertain traversal skipped it");
     if (inactive) {
@@ -1046,6 +1107,86 @@ void TestBackEdgeReachesPhiPredecessor() {
     Check(ReachedBlocks(plan, {.user_data = user_data}) ==
               (selected == 0u ? std::vector<uint8_t>{1, 1, 1, 1} : std::vector<uint8_t>{1, 1, 0, 1}),
           "Phi restart followed a rejected edge or missed a reachable one");
+  }
+}
+
+// A direct V# reads its stride from shader data, so unbinding a buffer (stride 0, bounds mode 0)
+// or binding another stride keeps one module. The empty one binds zero bytes and reads zero.
+void TestRuntimeStrideSharesEmptyBufferModule() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto make_program = [](bool written) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.user_data_count = 4u;
+    auto &block = AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 4u;
+    for (uint32_t word = 0; word < 4u; ++word)
+      source.dwords[word] = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+          {Value(static_cast<ScalarReg>(word))}));
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0u, .read = true, .written = written});
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0u, .data_dwords = 1u,
+                                   .data_bits = 32u});
+    const auto handle = Value(&block.AppendNewInst(ValueOpcode::GetBufferResource,
+        {source.dwords[0], source.dwords[1], source.dwords[2], source.dwords[3]}));
+    auto &read = block.AppendNewInst(ValueOpcode::LoadBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0u});
+    block.AppendNewInst(ValueOpcode::Identity, {Value(&read)});
+    return program;
+  };
+  const auto loads = [](const Program &program) {
+    uint32_t count = 0u;
+    for (const auto *block : program.blocks)
+      for (const auto &inst : *block) count += inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+    return count;
+  };
+  std::array<uint32_t, 4> descriptor{};
+  uint32_t reads = 0u;
+  const SrtRuntime runtime{.user_data = descriptor, .userdata = &reads,
+                           .read_specialization_memory = RejectSpecializationRead};
+  FakeGuestMemory fake(RejectSpecializationRead, &reads);
+  for (const bool written : {false, true}) {
+    auto plan = Extract(make_program(written));
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization, first;
+    // Bound with stride 4, unbound (stride 0, mode 0), bound with stride 12, all-zero V#.
+    for (const auto [stride, records] : {std::pair{4u, 16u}, {0u, 64u}, {12u, 16u}, {0u, 0u}}) {
+      descriptor = {stride == 0u && records == 0u ? 0u : 0x8000u, stride << 16u, records,
+                    stride == 0u && records == 0u ? 0u : 0x4dfacu};
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) && reads == 0u,
+            "direct V# materialization failed or read guest memory");
+      const auto &buffer = specialization.buffers[0];
+      Check((buffer.packed_stride & BufferResource::RuntimeStride) != 0u &&
+                (buffer.packed_stride & 0x3fffu) == 0u,
+            "direct V# kept its numeric stride in the module key");
+      // Stores (and scalar reads) still fold the out-of-bounds reads in the module.
+      Check(buffer.zero_stride_oob == (written && stride == 0u),
+            "zero-stride specialization did not follow the buffer's access kinds");
+      if (!written) {
+        if (first.buffers.empty()) first = specialization;
+        Check(specialization == first, "an empty or restrided buffer created a shader variant");
+      }
+      auto program = make_program(written);
+      ApplyResourceSpecialization(program, specialization);
+      Check(loads(program) == (written && stride == 0u ? 0u : 1u),
+            "runtime-stride buffer lost or kept its load against its specialization");
+      program.info.buffers[0].descriptor_index = 1u;
+      Bindings bindings;
+      bindings.descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] = 2u;
+      std::vector<uint32_t> shader_data(bindings.ShaderDataDwords(), 0xffffffffu);
+      PackBufferRuntimeStrides(program.info.buffers, bindings, snapshot, shader_data);
+      Check(shader_data[bindings.BufferStrideDword()] == (0xffffu | (stride << 16u)),
+            "runtime stride was not packed into its binding's half of shader data");
+      Libs::Graphics::ShaderBufferResource bound;
+      std::copy_n(snapshot.buffers[0].dwords.begin(), 4, bound.fields);
+      const auto size = BufferBindingSize(program.info.buffers[0], bound);
+      const auto expected = stride == 0u ? (written ? uint64_t{records} : 0u)
+                                         : uint64_t{stride} * records;
+      Check(size == expected, "empty zero-stride buffer was not bound with zero bytes");
+    }
   }
 }
 
@@ -1225,6 +1366,53 @@ void TestIndirectStorageSwizzles() {
         "indirect storage candidates sharing one swizzle were incompatible");
 }
 
+// GPU-selected indexed V#s with ADD_TID: compute stages keep the bit for the emitter, which adds the
+// lane to the index and to its bound; other stages and byte-offset roots reject it.
+void TestIndexedAddTidIndirectBuffers() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const auto stage : {Libs::Graphics::ShaderType::Compute, Libs::Graphics::ShaderType::Pixel}) {
+    for (const bool indexed : {true, false}) {
+      Program program;
+      program.stage = stage;
+      program.srt_plan_complete = program.resource_tracking_complete = true;
+      for (const uint32_t base : {0x10000u, 0x20000u}) {
+        DescriptorSource source;
+        source.dword_count = 4u;
+        source.dwords.fill(Value(0u));
+        source.dwords[0] = Value(base);
+        source.dwords[1] = Value(16u << 16u); // stride 16
+        source.dwords[2] = Value(8u);         // 8 records
+        // 32UInt, identity, ADD_TID, OOB mode 0 (indexed) or 3 (raw bytes)
+        source.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) | (20u << 12u) | (1u << 23u) |
+                                 ((indexed ? 0u : 3u) << 28u));
+        program.descriptor_sources.push_back(source);
+      }
+      DescriptorSource root;
+      root.dword_count = 4u;
+      root.dwords.fill(Value(0u));
+      auto& indirect = root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
+      indirect.sources = {0, 1};
+      indirect.indexed = indexed;
+      program.descriptor_sources.push_back(root);
+      program.info.buffers.push_back(
+          {.source = 2u, .max_byte_extent = 4u, .read = true, .raw = true});
+      auto plan = Extract(program);
+      const SrtRuntime runtime{};
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+      const bool expected = indexed && stage == Libs::Graphics::ShaderType::Compute;
+      Check(materialized == expected,
+            "an ADD_TID candidate was accepted outside an indexed compute access, or rejected in one");
+      if (!expected) continue;
+      bool lane = specialization.buffers.size() > 1u;
+      for (size_t i = 1; i < specialization.buffers.size(); ++i)
+        lane &= (specialization.buffers[i].packed_stride & (1u << 20u)) != 0u;
+      Check(lane, "an indexed ADD_TID candidate lost the lane bit of its packed stride");
+    }
+  }
+}
+
 // A storage swizzle that fills only the channels an unconverted format lacks becomes the identity.
 void TestStorageFillSwizzle() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
@@ -1321,12 +1509,15 @@ void TestSignedStorageSpecialization() {
               !MaterializeResources(plan, runtime, snapshot, specialization),
           "signed raw storage view accepted a non-atomic read/write image");
     image.atomic = true;
+    // Atomics on other element sizes bind the null image.
     Check(RawSignedStorageFormat(image, format) == F::kInvalid &&
-              MaterializeResources(plan, runtime, snapshot, specialization) == (format == F::k32SInt),
+              MaterializeResources(plan, runtime, snapshot, specialization) &&
+              (snapshot.images[0].dwords[1] == data[0]) == (format == F::k32SInt),
           "signed storage conversion changed atomic format eligibility");
     image.atomic64 = true;
     Check(RawSignedStorageFormat(image, format) == F::kInvalid &&
-              !MaterializeResources(plan, runtime, snapshot, specialization),
+              MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images[0] == DescriptorValue{.dword_count = 8u},
           "signed 16/32-bit image acquired a 64-bit atomic raw view");
     image.resource_class = ImageResourceClass::Sampled;
     image.written = image.atomic = image.atomic64 = false;
@@ -1345,7 +1536,7 @@ void TestSignedStorageSpecialization() {
 
 // One descriptor serves a store, an atomic that a user-data condition guards, and an image no
 // block lists. Unreached, the atomic reads a zero descriptor instead of the RGBA8 format the
-// others use; reached, it rejects that format.
+// others use; reached, that format is not one its width accepts, so it binds as null too.
 void TestUnreachedImageIgnoresSharedDescriptor(bool atomic64) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   using Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
@@ -1395,8 +1586,73 @@ void TestUnreachedImageIgnoresSharedDescriptor(bool atomic64) {
             snapshot.images[1] == DescriptorValue{.dword_count = 8u},
         "unreached atomic image kept the shared descriptor or an unlisted image lost it");
   data[1] = 1u;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "reached atomic image accepted a format its width rejects");
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images[0].dwords[1] == data[0] && snapshot.images[2].dwords[1] == data[0] &&
+            snapshot.images[1] == DescriptorValue{.dword_count = 8u},
+        "reached atomic image kept a format its width rejects");
+}
+
+// Image atomics act on one 32-bit (X2: 64-bit) element whatever the T# numeric format; other
+// element sizes bind as null and keep the declared dimension instead of aborting.
+void TestImageAtomicFormats() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  using Libs::Graphics::Prospero::TextureNumericClass;
+  for (const bool atomic64 : {false, true}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Pixel;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    program.user_data_count = 1u;
+    auto &entry = AddValueBlock(program);
+    DescriptorSource source;
+    source.dword_count = 8u;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(0x100u);
+    source.dwords[1] = Value(&entry.AppendNewInst(ValueOpcode::GetUserData, {Value(ScalarReg(0u))}));
+    source.dwords[3] = Value(uint32_t(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    program.descriptor_sources.push_back(source);
+    program.info.images.push_back({.source = 0u, .resource_class = ImageResourceClass::Storage,
+        .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D,
+        .read = true, .written = true, .atomic = true, .atomic64 = atomic64});
+    program.memory_info.push_back({.kind = ResourceKind::Image, .resource = 0u});
+    entry.AppendNewInst(atomic64 ? ValueOpcode::ImageAtomicUMax64 : ValueOpcode::ImageAtomicOr32,
+                        {Value(0u), Value(0u), Value(0u), Value(true)})
+        .SetFlags(MemoryFlags{.index = 0});
+    entry.terminator.kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+    auto plan = Extract(program);
+    const std::array accepted = atomic64
+        ? std::array{BufferFormat::k32_32UInt, BufferFormat::k32_32SInt, BufferFormat::k32_32Float}
+        : std::array{BufferFormat::k32UInt, BufferFormat::k32SInt, BufferFormat::k32Float};
+    for (const auto format : {BufferFormat::k8UInt, BufferFormat::k16UInt, BufferFormat::k32UInt,
+                              BufferFormat::k32Float, BufferFormat::k32_32UInt,
+                              BufferFormat::k32_32Float, BufferFormat::k8_8_8_8UNorm}) {
+      std::array<uint32_t, 1> data{uint32_t(format) << 20u};
+      const SrtRuntime runtime{.user_data = data};
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      // A direct k8UInt T# keeps its descriptor for the emulated byte atomics.
+      const bool emulated = !atomic64 && format == BufferFormat::k8UInt;
+      const bool bound = emulated || std::ranges::find(accepted, format) != accepted.end();
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                specialization.images[0].numeric_class == TextureNumericClass::Uint &&
+                specialization.images[0].dimension ==
+                    Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
+                (snapshot.images[0].dwords[1] == data[0]) == bound &&
+                (bound || snapshot.images[0] == DescriptorValue{.dword_count = 8u}) &&
+                (specialization.images[0].conversion_format == BufferFormat::k8UInt) == emulated,
+            "image atomic format width was not applied");
+      if (!emulated) continue;
+      // The applied image binds as plain UInt storage that the emitter updates under a lock.
+      // The plan owns its values, so the program can take the specialization.
+      ApplyResourceSpecialization(program, specialization);
+      const auto &image = program.info.images[0];
+      Check(!image.atomic && image.read && image.written && EmulatesImageAtomics(image) &&
+                DescriptorBindingForImage(image).has_value() &&
+                ImageBindingResourceClass(*DescriptorBindingForImage(image)) ==
+                    ImageResourceClass::Storage,
+            "emulated 8-bit image atomics did not bind a plain storage view");
+    }
+  }
 }
 
 void TestIndirectImageSamplerClasses(bool mixed) {
@@ -1510,6 +1766,7 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 int main() {
   TestWalkerLoadsBypassSpecializationReader();
+  TestWalkerGuardServesWatchedLoads();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();
@@ -1528,11 +1785,14 @@ int main() {
   TestCyclicControlPredicatesRemainUnknown();
   TestBackEdgeReachesPhiPredecessor();
   TestEmptyScalarBufferSpecialization();
+  TestRuntimeStrideSharesEmptyBufferModule();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestIndirectStorageSwizzles();
+  TestIndexedAddTidIndirectBuffers();
   TestStorageFillSwizzle();
   TestSignedStorageSpecialization();
   for (const bool atomic64 : {false, true}) TestUnreachedImageIgnoresSharedDescriptor(atomic64);
+  TestImageAtomicFormats();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
   TestShaderCacheRecords();
   std::puts("ResourceMaterializationTests: all cases passed");

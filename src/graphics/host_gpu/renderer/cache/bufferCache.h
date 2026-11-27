@@ -12,9 +12,11 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -34,6 +36,20 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// The fault buffer holds the fault bitmap (pages, then heap rows) and then the lock words of
+	// emulated image atomics (IR::EmulatedImageAtomicBits), which the bitmap scan never touches.
+	static constexpr uint64_t FAULT_BITMAP_BYTES =
+	    (CACHING_NUMPAGES + ShaderRecompiler::IR::HeapRowBits) / 8;
+	static constexpr uint64_t IMAGE_ATOMIC_LOCK_DWORD = FAULT_BITMAP_BYTES / 4;
+	// After them, at a storage-offset-aligned position, the write bitmap: one bit per caching
+	// page that a device-address store (indirect buffer store or atomic) wrote. (Port of TheCruZ's
+	// write bitmap, KytyPS5 PR #2469 line 427a75fc.)
+	static constexpr uint64_t WRITE_BITMAP_OFFSET =
+	    (FAULT_BITMAP_BYTES + ShaderRecompiler::IR::ImageAtomicLockWords * 4 + 255) & ~uint64_t {255};
+	static constexpr uint64_t WRITE_BITMAP_BYTES = ((CACHING_NUMPAGES + 127) / 128) * 16;
+	static constexpr uint64_t FAULT_BUFFER_BYTES  = WRITE_BITMAP_OFFSET + WRITE_BITMAP_BYTES;
+	static_assert(FAULT_BITMAP_BYTES % 16 == 0 && IMAGE_ATOMIC_LOCK_DWORD < UINT32_MAX);
+	static_assert(WRITE_BITMAP_OFFSET / 4 + WRITE_BITMAP_BYTES / 4 < UINT32_MAX);
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -53,6 +69,9 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// After a guest write fault: the clean pages of the window become CPU-modified too, so the
+	// guest's next writes there do not fault one page at a time.
+	void                   InvalidateWriteWindow(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	// Ends the draw window, whose draws share the stream copies of CPU-written ranges.
 	void                   EndDrawWindow() noexcept { m_draw_window++; }
@@ -75,6 +94,7 @@ public:
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	[[nodiscard]] HeapRows& GetHeapRows() noexcept { return m_fault_manager.GetHeapRows(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -82,6 +102,26 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Guest memory that GPU work recorded on a guest queue since that queue's last synchronisation
+	// point (a partial flush, ACQUIRE_MEM, WAIT_REG_MEM, a memory semaphore, RELEASE_MEM, a flip,
+	// the end of a submission) may write. On the console that work can still be running when the
+	// queue's command processor reads its next packet's indirect arguments, so those reads see
+	// memory as it was before it. Other queues' packets do not stall this one.
+	void SetGuestQueue(uint32_t queue) noexcept { m_guest_queue = queue; }
+	void NoteGuestSync() noexcept {
+		auto& window = m_sync_windows[m_guest_queue];
+		window.writes.Clear();
+		window.generation++;
+	}
+	[[nodiscard]] bool WrittenSinceGuestSync(uint64_t vaddr, uint64_t size) const {
+		const auto it = m_sync_windows.find(m_guest_queue);
+		return it != m_sync_windows.end() && it->second.writes.Intersects(vaddr, size);
+	}
+	[[nodiscard]] uint32_t GuestQueue() const noexcept { return m_guest_queue; }
+	[[nodiscard]] uint64_t SyncGeneration() const {
+		const auto it = m_sync_windows.find(m_guest_queue);
+		return it != m_sync_windows.end() ? it->second.generation : 0;
+	}
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -90,11 +130,26 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
+	// Records stores a shader made through device addresses, known once it completed: the bytes
+	// of [vaddr, vaddr + size) a cached buffer holds become GPU modified, except on pages the CPU
+	// dirtied since, whose upload replaces them.
+	void               NoteGpuWrites(uint64_t vaddr, uint64_t size);
 	// Uploads the CPU-dirty bytes of the queued ranges `mapped` covers behind one barrier pair.
 	void SynchronizeBda(const RangeSet& mapped);
+	// Zero-copy buffers over an unmapped range are dropped before their backing is reused.
+	void               UnmapZeroCopy(uint64_t vaddr, uint64_t size);
 	// Queue after the range's state change becomes visible, or a drain could consume it first.
 	void               QueueBdaSync(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
+	// After a draw, dispatch, fill or copy is recorded: the ranges bound for writing since the last
+	// call, and address writes noted since, belong to the current command buffer.
+	void RecordPendingWrites();
+	// A program with address writes is bound; its writes can reach any range.
+	void NoteAddressWrites() noexcept { m_address_writes_pending = true; }
+	// Called on the GPU thread when a guest CPU write faults into GPU-written memory.
+	void SetCpuWriteListener(std::function<void(uint64_t, uint64_t)> listener) {
+		m_cpu_write_listener = std::move(listener);
+	}
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -140,14 +195,40 @@ private:
 	void ChangeRegister(BufferId id);
 	void DeleteBuffer(BufferId id);
 	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	                                     bool is_written, Common::SlotId image);
 	void UploadCopies(std::span<const BufferUpload> uploads, std::span<vk::BufferCopy> copies,
 	                  uint64_t total_size);
-	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void RecordUploadStats(uint64_t address, const uint8_t* data, uint64_t size);
+	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, Common::SlotId id);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// GPU writes recorded in the current command buffer, or bound and not recorded yet. A
+	// synchronous download of ranges without such writes reads them in a detached submission
+	// behind the submitted work, without flushing the current command buffer.
+	void               MarkUnsubmittedWrite(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasUnsubmittedWrite(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool CanDownloadDetached(uint64_t                        buffer_address,
+	                                       std::span<const vk::BufferCopy> copies);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+
+	// Zero-copy guest memory (KYTY_ZERO_COPY=1, VK_EXT_external_memory_host). A buffer the CPU
+	// keeps faulting on is rebuilt over guest memory itself, so GPU writes land there. Its pages
+	// still count as GPU-modified while a write is pending (labels reach the guest before the
+	// host GPU finishes), but a fault on them only waits for the buffer's last write instead of
+	// flushing all recorded work and copying bytes back.
+	[[nodiscard]] bool ZeroCopyEnabled() const;
+	// Settles the pending GPU writes of a zero-copy buffer: false when none are tracked. With
+	// `wait`, waits for its last write and returns its pages to the CPU.
+	[[nodiscard]] bool ResolveZeroCopy(Buffer& buffer, bool wait);
+	// When `tick` completes and it was the buffer's last write, returns its pages to the CPU, so
+	// a later CPU access does not fault (KYTY_ZERO_COPY_RELEASE=0 waits for the fault instead).
+	void               ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick);
+	void               JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
+	void               MaybeMigrateToZeroCopy(BufferId id);
+	// False (and the buffer dropped) when the guest range moved to other backing.
+	[[nodiscard]] bool ZeroCopyBackingValid(BufferId id);
+	void               DropZeroCopyBuffer(BufferId id);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -159,11 +240,31 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                          m_pending_writes;
+	struct SyncWindow {
+		RangeSet writes;
+		uint64_t generation = 0;
+	};
+	std::map<uint32_t, SyncWindow>                    m_sync_windows;
+	uint32_t                                          m_guest_queue = 0;
+	std::function<void(uint64_t, uint64_t)>           m_cpu_write_listener;
+	RangeSet                                          m_unsubmitted_writes;
+	uint64_t                                          m_unsubmitted_tick       = 0;
+	uint64_t                                          m_address_write_tick     = 0;
+	bool                                              m_address_writes_pending = false;
+	enum class DetachedReadback { Off, Submit, NoSubmit };
+	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;
+	// Statistics only (KYTY_SYNC_STATS): bytes last downloaded, and hashes of uploaded pages.
+	RangeSet                                          m_stats_downloaded;
+	std::unordered_map<uint64_t, uint64_t>            m_stats_upload_hashes;
 	// One per TileManager::ColorClearSlots key slot.
 	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
 	std::mutex                                        m_bda_sync_mutex;
 	RangeSet                                          m_bda_sync;
+	// Guest ranges whose buffers are zero-copy; a buffer created over them imports guest memory.
+	RangeSet                                          m_zero_copy;
+	uint64_t                                          m_zero_copy_created = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

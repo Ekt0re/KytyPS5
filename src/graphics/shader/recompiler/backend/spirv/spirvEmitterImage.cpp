@@ -1,8 +1,10 @@
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -382,7 +384,7 @@ Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
                                                const IR::MemoryInfo& mem) {
 	const auto& image = state.program.info.images[mem.resource];
 	const auto format = image.conversion_format;
-	if (format == Prospero::BufferFormat::kInvalid) return {};
+	if (format == Prospero::BufferFormat::kInvalid || IR::EmulatesImageAtomics(image)) return {};
 	const auto info = Format::GetFormatInfo(format);
 	if (IR::ReadsDepthBits(image)) return info;
 	const bool raw_signed = IR::RawSignedStorageFormat(image, format) != Prospero::BufferFormat::kInvalid;
@@ -647,6 +649,11 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 			    : Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state), packed_value, value);
 			continue;
 		}
+		if (!integer && mem.data_bits != 16u &&
+		    ctx.state.program.info.images[mem.resource].clamp_half_float) {
+			// KYTY_F16_STORE_CLAMP: a 16-bit float storage image keeps the guest's range.
+			raw = EmitClampToHalfRangeBits(ctx.state, raw);
+		}
 		values[component] = integer ? raw
 		                    : mem.data_bits == 16u
 		                        ? EmitF16BitsToF32(ctx.state, raw)
@@ -855,6 +862,179 @@ std::array<ImageSampler, 2> LoadImageSamplers(ValueEmitContext& ctx, const IR::I
 	return result;
 }
 
+
+// See IR::EmulatedImageAtomicBits: a 32-bit atomic on a k8UInt image updates its byte through
+// the plain R8 UInt storage view. Each lane takes a lock word of the fault buffer chosen by its
+// texel, reads, combines and writes the texel, and releases the word; lanes of one wave that
+// pick the same word take turns over the iterations. After MaxSpins failed attempts a lane
+// updates without the lock rather than risk a GPU timeout. Returns the old texel.
+uint32_t EmitEmulatedImageAtomic(ValueEmitContext& ctx, const IR::Inst& inst,
+                                 const IR::MemoryInfo& mem, const IR::Inst& address) {
+	constexpr uint32_t MaxSpins = 1024u;
+	auto&       state = ctx.state;
+	const auto& image = state.program.info.images.at(mem.resource);
+	const auto  bits  = IR::EmulatedImageAtomicBits(image.conversion_format);
+	const auto  op    = inst.GetOpcode();
+	EXIT_IF(bits == 0u || bits >= 32u || state.fault_buffer_variable == 0u);
+	if (op == IR::ValueOpcode::ImageAtomicFMin32 || op == IR::ValueOpcode::ImageAtomicFMax32 ||
+	    inst.GetType() != IR::Type::U32) {
+		ctx.Fail(inst, "has no emulation on a sub-dword atomic image");
+	}
+	state.builder.RequireCapability(spv::CapabilityStorageImageReadWithoutFormat);
+	state.builder.RequireCapability(spv::CapabilityStorageImageWriteWithoutFormat);
+	const auto u32   = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto mask  = ConstantU32(state, (1u << bits) - 1u);
+	const auto coord = CoordU32(ctx, mem, address, image.dimension);
+	const auto cmpswap = op == IR::ValueOpcode::ImageAtomicCompareSwap32;
+	const auto data    = ctx.Arg(inst, inst.NumArgs() - (cmpswap ? 3u : 2u));
+	const auto compare = cmpswap ? ctx.Arg(inst, inst.NumArgs() - 2u) : 0u;
+
+	// Texels of all images share the words; a collision only serializes two updates.
+	const auto& dimension_info = ImageDimensionInfoFor(image.dimension);
+	auto hash = Binary(state, spv::OpIMul, u32, AddressU32(ctx, mem, address, 0),
+	                   ConstantU32(state, 0x9e3779b1u));
+	constexpr std::array<uint32_t, 2> factors {0x85ebca77u, 0xc2b2ae3du};
+	for (uint32_t component = 1; component < dimension_info.coordinate_components; ++component) {
+		if (mem.image_address_components <= component) break;
+		hash = Binary(state, spv::OpBitwiseXor, u32, hash,
+		              Binary(state, spv::OpIMul, u32, AddressU32(ctx, mem, address, component),
+		                     ConstantU32(state, factors[component - 1u])));
+	}
+	static_assert(std::has_single_bit(IR::ImageAtomicLockWords));
+	const auto word = Binary(
+	    state, spv::OpIAdd, u32,
+	    Binary(state, spv::OpShiftRightLogical, u32, hash,
+	           ConstantU32(state, 32u - std::countr_zero(IR::ImageAtomicLockWords))),
+	    ConstantU32(state, static_cast<uint32_t>(BufferCache::IMAGE_ATOMIC_LOCK_DWORD)));
+	const auto lock = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), lock,
+	                          state.fault_buffer_variable, ConstantU32(state, 0), word);
+
+	const auto device  = ConstantU32(state, spv::ScopeDevice);
+	const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+	const auto fence   = [&] {
+		state.builder.AddFunction(
+		    spv::OpMemoryBarrier, device,
+		    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
+		                           spv::MemorySemanticsUniformMemoryMask |
+		                           spv::MemorySemanticsImageMemoryMask));
+	};
+	const auto one = ConstantU32(state, 1);
+	const auto zero = ConstantU32(state, 0);
+	// Reads the texel, writes the combined value and returns the old one.
+	const auto update = [&] {
+		const auto descriptor = LoadImageDescriptor(state, mem.resource, 0u, 0u);
+		const auto texel      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpImageRead, TypeU32Vector(state, 4), texel, descriptor,
+		                          coord);
+		const auto first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, u32, first, texel, 0u);
+		const auto old = Binary(state, spv::OpBitwiseAnd, u32, first, mask);
+		const auto pick = [&](spv::Op compare_op, uint32_t lhs, uint32_t rhs) {
+			return Select(state, u32, Binary(state, compare_op, boolean, lhs, rhs), lhs, rhs);
+		};
+		const auto sign_shift = ConstantU32(state, 32u - bits);
+		const auto signed_old = Binary(state, spv::OpShiftRightArithmetic, u32,
+		                               Binary(state, spv::OpShiftLeftLogical, u32, old, sign_shift),
+		                               sign_shift);
+		uint32_t next = 0;
+		switch (op) {
+			case IR::ValueOpcode::ImageAtomicSwap32: next = data; break;
+			case IR::ValueOpcode::ImageAtomicCompareSwap32:
+				next = Select(state, u32,
+				              Binary(state, spv::OpIEqual, boolean, old,
+				                     Binary(state, spv::OpBitwiseAnd, u32, compare, mask)),
+				              data, old);
+				break;
+			case IR::ValueOpcode::ImageAtomicIAdd32:
+				next = Binary(state, spv::OpIAdd, u32, old, data);
+				break;
+			case IR::ValueOpcode::ImageAtomicSMin32:
+				next = pick(spv::OpSLessThan, signed_old, data);
+				break;
+			case IR::ValueOpcode::ImageAtomicSMax32:
+				next = pick(spv::OpSGreaterThan, signed_old, data);
+				break;
+			case IR::ValueOpcode::ImageAtomicUMin32: next = pick(spv::OpULessThan, old, data); break;
+			case IR::ValueOpcode::ImageAtomicUMax32:
+				next = pick(spv::OpUGreaterThan, old, data);
+				break;
+			case IR::ValueOpcode::ImageAtomicAnd32:
+				next = Binary(state, spv::OpBitwiseAnd, u32, old, data);
+				break;
+			case IR::ValueOpcode::ImageAtomicOr32:
+				next = Binary(state, spv::OpBitwiseOr, u32, old, data);
+				break;
+			case IR::ValueOpcode::ImageAtomicXor32:
+				next = Binary(state, spv::OpBitwiseXor, u32, old, data);
+				break;
+			default: ctx.Fail(inst, "has no emulation on a sub-dword atomic image");
+		}
+		const auto stored = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), stored,
+		                          Binary(state, spv::OpBitwiseAnd, u32, next, mask), zero, zero,
+		                          zero);
+		state.builder.AddFunction(spv::OpImageWrite,
+		                          LoadImageDescriptor(state, mem.resource, 0u, 0u), coord, stored);
+		return old;
+	};
+
+	const auto entry_label = state.current_label;
+	const auto header   = state.builder.AllocateId();
+	const auto body     = state.builder.AllocateId();
+	const auto locked   = state.builder.AllocateId();
+	const auto join     = state.builder.AllocateId();
+	const auto cont     = state.builder.AllocateId();
+	const auto merge    = state.builder.AllocateId();
+	const auto fallback = state.builder.AllocateId();
+	const auto done     = state.builder.AllocateId();
+	const auto iter     = state.builder.AllocateId();
+	const auto iter_next = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, header);
+	state.builder.AddFunction(spv::OpPhi, u32, iter, zero, entry_label, iter_next, cont);
+	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranch, body);
+	EmitLabel(state, body);
+	const auto previous = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicCompareExchange, u32, previous, lock, device, relaxed,
+	                          relaxed, one, zero);
+	const auto acquired = Binary(state, spv::OpIEqual, boolean, previous, zero);
+	state.builder.AddFunction(spv::OpSelectionMerge, join, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, acquired, locked, join);
+	EmitLabel(state, locked);
+	fence();
+	const auto locked_old = update();
+	fence();
+	state.builder.AddFunction(spv::OpAtomicStore, lock, device, relaxed, zero);
+	const auto locked_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, join);
+	EmitLabel(state, join);
+	const auto joined_old = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, u32, joined_old, locked_old, locked_exit, zero, body);
+	state.builder.AddFunction(spv::OpBranch, cont);
+	EmitLabel(state, cont);
+	state.builder.AddFunction(spv::OpIAdd, u32, iter_next, iter, one);
+	const auto retry = Binary(state, spv::OpLogicalAnd, boolean,
+	                          Unary(state, spv::OpLogicalNot, boolean, acquired),
+	                          Binary(state, spv::OpULessThan, boolean, iter_next,
+	                                 ConstantU32(state, MaxSpins)));
+	state.builder.AddFunction(spv::OpBranchConditional, retry, header, merge);
+	EmitLabel(state, merge);
+	state.builder.AddFunction(spv::OpSelectionMerge, done, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, acquired, done, fallback);
+	EmitLabel(state, fallback);
+	const auto fallback_old = update();
+	const auto fallback_exit = state.current_label;
+	state.builder.AddFunction(spv::OpBranch, done);
+	EmitLabel(state, done);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, u32, result, joined_old, merge, fallback_old,
+	                          fallback_exit);
+	return result;
+}
+
 } // namespace
 
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -983,6 +1163,30 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a converted image");
+			return;
+		}
+		// Vulkan has no sampling of multisampled images, no depth comparison with a 3D image and no
+		// 3D gather: refuse them instead of emitting invalid SPIR-V (AnyPS5 ae707637, 0eabf7ec,
+		// 007a98c1).
+		const auto multisampled = [&state](uint32_t resource) {
+			const auto dimension = state.program.info.images[resource].dimension;
+			return dimension == ImageDimension::Dim2DMsaa || dimension == ImageDimension::Dim2DMsaaArray;
+		};
+		const auto volume = [&state](uint32_t resource) {
+			return state.program.info.images[resource].dimension == ImageDimension::Dim3D;
+		};
+		const auto& indirect_images = state.program.info.images[mem.resource].indirect_resources;
+		if (multisampled(mem.resource) || std::ranges::any_of(indirect_images, multisampled)) {
+			ctx.Fail(inst, "samples a multisampled image");
+			return;
+		}
+		if (dref && (volume(mem.resource) || std::ranges::any_of(indirect_images, volume))) {
+			ctx.Fail(inst, "uses depth comparison with a 3D image");
+			return;
+		}
+		if (op == IR::ValueOpcode::ImageGatherRaw &&
+		    (volume(mem.resource) || std::ranges::any_of(indirect_images, volume))) {
+			ctx.Fail(inst, "gathers from a 3D image");
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
@@ -1128,6 +1332,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return sample;
 		};
 		ctx.Define(inst, EmitImageResult(ctx, inst, EmitSample));
+		return;
+	}
+	if (image_info.access == IR::ImageAccess::Atomic && IR::EmulatesImageAtomics(image)) {
+		ctx.Define(inst, EmitValueOrDefaultIfCondition(
+		                     state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32(state),
+		                     ConstantU32(state, 0),
+		                     [&]() { return EmitEmulatedImageAtomic(ctx, inst, mem, *address); }));
 		return;
 	}
 	if (image_info.access == IR::ImageAccess::Atomic) {

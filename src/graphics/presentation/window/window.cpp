@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/shaderCompileStatus.h"
 #include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
@@ -317,7 +318,13 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	// A new mapping changes how SDL translates the device. SDL sends no release or neutral axis
+	// events for the old mapping, so held input would stay stuck: reset it on every player.
+	if (f.remapped) {
+		HostInputResetGamepadTouchPad(f.id);
+		Controller::ResetInputState();
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -766,7 +773,7 @@ void WindowContext::Run() {
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
-			if (frames != 0) {
+			if (frames != 0 || Common::ShaderCompileStatus::BannerVisible()) {
 				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
 				                        static_cast<double>(elapsed));
 			}
@@ -802,6 +809,10 @@ static void WindowCreate(WindowContext& context) {
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
 	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
+	// A shader precompile needs the device a game run picks (by its surface), but shows nothing.
+	if (Config::PrecompileShadersEnabled()) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
 #if defined(__APPLE__)
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
@@ -981,6 +992,13 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
+	if (Common::ShaderCompileStatus::BannerVisible()) {
+		const auto counts = Common::ShaderCompileStatus::Read();
+		if (counts.queued + counts.active > 0) {
+			text += fmt::format(" | COMPILING SHADERS ({} queued, {} active)", counts.queued,
+			                    counts.active);
+		}
+	}
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

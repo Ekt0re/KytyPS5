@@ -19,8 +19,11 @@
 #include "graphics/host_gpu/renderer/resolveCache.h"
 #include "kernel/eventQueue.h"
 
+#include <array>
+#include <atomic>
 #include <memory>
 #include <shared_mutex>
+#include <utility>
 #include <vector>
 
 namespace Libs::VideoOut {
@@ -60,9 +63,29 @@ public:
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
+	// Changes whenever a range is mapped or unmapped.
+	[[nodiscard]] uint64_t MappingGeneration() const noexcept {
+		return m_mapping_generation.load(std::memory_order_acquire);
+	}
+	// Whether a range that overlaps the given one was mapped or unmapped after `generation`. True
+	// as well once the changes since then are no longer on record.
+	[[nodiscard]] bool MappingChangedSince(uint64_t generation, uint64_t vaddr,
+	                                       uint64_t size) const noexcept;
+	[[nodiscard]] bool IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// Maps a range that was free or reserved, without waiting for the GPU thread.
+	void               MapFreshMemory(uint64_t vaddr, uint64_t size);
+	// Drops what the caches hold for a range (cached buffers' contents, images, image heap
+	// tables) on the GPU thread without waiting for it. The GPU thread runs its commands in the
+	// order they were sent and before the next packet of any submission, so the drop comes
+	// before every draw, dispatch and upload of GPU work the guest submits after this call, and
+	// after every command sent before it. Only for a range whose memory stays valid: before
+	// memory goes away, UnmapMemory has to wait for the GPU work and write-backs that use it.
+	void               PostDropCachedMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	// Scans the fault bitmap once the current work has run.
+	void               RequestFaultScan() { m_fault_process_pending = true; }
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -70,6 +93,11 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	// With m_mapped_ranges_mutex held for writing.
+	void NoteMappingChange(uint64_t vaddr, uint64_t size) noexcept;
+	// On the GPU thread: drops what the caches hold for the range.
+	void DropCachedMemory(uint64_t vaddr, uint64_t size);
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;
@@ -93,6 +121,10 @@ private:
 	OcclusionQueries          m_occlusion_queries;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
+	std::atomic<uint64_t>     m_mapping_generation {0};
+	// m_mapping_changes[generation % size] is the range whose change started `generation`, for
+	// the last `size` generations. Guarded by m_mapped_ranges_mutex.
+	std::array<std::pair<uint64_t, uint64_t>, 64> m_mapping_changes {};
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;

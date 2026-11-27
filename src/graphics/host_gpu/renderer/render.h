@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <map>
 #include <span>
 #include <vector>
 
@@ -145,6 +146,8 @@ public:
 	                    uint32_t thread_group_z, uint32_t mode, bool async_compute);
 	void DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                      bool async_compute);
+	// The command processor wrote guest memory: indirect arguments there are read again.
+	void ForgetIndirectArgs(uint64_t vaddr, uint64_t size);
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
@@ -156,8 +159,33 @@ public:
 	                    std::span<PreparedBindings* const> bindings);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	// ResolveTexture in two steps, so a caller can keep the first for unchanged descriptors.
+	[[nodiscard]] PreparedTexture PrepareTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                             const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding  FinishTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            PreparedTexture                            prepared);
 
 private:
+	// The newest read of each indirect-argument address since the guest queue's last sync point,
+	// from before that window's writes reached it: the counts when the CPU wrote them, or the
+	// dispatch guard's slot the dispatch read them from.
+	struct IndirectArgsRead {
+		bool                        known = false;
+		vk::DispatchIndirectCommand counts {};
+		vk::Buffer                  buffer;
+		uint64_t                    offset = 0;
+		// Guest memory at the arguments then: a CPU write since makes a CPU read stale.
+		vk::DispatchIndirectCommand guest {};
+		uint64_t                    sequence = 0; // m_indirect_sequence of the read
+	};
+	struct IndirectArgsWindow {
+		std::map<uint64_t, IndirectArgsRead> reads;
+		uint64_t                             generation = 0;
+	};
+	// Per guest queue (BufferCache::GuestQueue).
+	std::map<uint32_t, IndirectArgsWindow> m_indirect_args;
+	uint64_t                               m_indirect_sequence = 0; // indirect dispatches so far
+
 	// False, with nothing drawn, when the draw's indirect records need CPU counts.
 	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);

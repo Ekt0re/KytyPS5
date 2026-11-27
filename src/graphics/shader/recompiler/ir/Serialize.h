@@ -149,15 +149,15 @@ template <class S, class T> void Io(S& io, T& value) {
 	}
 KYTY_IO_FIELDS(MemoryInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x,
                y, z)
-KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
+KYTY_IO_FIELDS(BufferResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
 KYTY_IO_FIELDS(ImageResource, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w,
-               x, y, z)
+               x, y, z, A)
 KYTY_IO_FIELDS(SamplerResource, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(SampledResourcePair, a, b, c)
 KYTY_IO_FIELDS(StageInput, a, b, c, d, e)
 KYTY_IO_FIELDS(StageOutput, a, b, c, d)
 KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, U)
+               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, U, V)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,
@@ -170,13 +170,13 @@ KYTY_IO_FIELDS(SrtRead, a, b)
 KYTY_IO_FIELDS(ResourceBlock, a, b, c, d, e)
 KYTY_IO_FIELDS(UniformFill, a, b, c, d, e, f)
 KYTY_IO_FIELDS(UniformFillPlan, a, b, c, d)
-KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h)
-KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m)
+KYTY_IO_FIELDS(ResourceSpecialization::Buffer, a, b, c, d, e, f, g, h, i)
+KYTY_IO_FIELDS(ResourceSpecialization::Image, a, b, c, d, e, f, g, h, i, j, k, l, m, n)
 KYTY_IO_FIELDS(ResourceSpecialization::Sampler, a, b, c)
 KYTY_IO_FIELDS(ResourceSpecialization, a, b, c)
 KYTY_IO_FIELDS(Bindings, a, b, c, d, e, f)
 KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h)
-KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f, g, h)
+KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f, g, h, i, j, k, l)
 KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i)
 KYTY_IO_FIELDS(RectListParameter, a, b, c)
 #undef KYTY_IO_FIELDS

@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -772,6 +773,11 @@ static uint64_t WriteAddressRecordSize(uint64_t value) {
 	return value <= 3 ? 8 : value < (uint64_t {1} << 34) ? 12 : 16;
 }
 
+// Titles size command buffers with the console's record sizes, so records must not exceed them.
+static uint64_t WaitAddressRecordSize(uint64_t value) {
+	return value == 0 ? 8 : value < (uint64_t {1} << 32) ? 12 : 16;
+}
+
 static uint64_t AprReadGatherRecordSize(uint64_t file_offset) {
 	return file_offset > 0x3ffffu ? READ_GATHER_RECORD_SIZE_EXT : READ_GATHER_RECORD_SIZE;
 }
@@ -1066,8 +1072,10 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		const auto& command = *payload;
 		int         result  = OK;
 		if (command.kind == AmmCommandKind::Unmap) {
+			Common::PerfSummary::Add(Common::PerfSummary::Counter::AmmUnmaps);
 			result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
 		} else {
+			Common::PerfSummary::Add(Common::PerfSummary::Counter::AmmMaps);
 			result = ExecuteAmmMapCommand(command);
 		}
 
@@ -1804,7 +1812,7 @@ static int KYTY_SYSV_ABI CommandBufferWaitOnAddress(void*              command_b
 	return AppendCommandRecord(reinterpret_cast<uint64_t>(command_buffer),
 	                           CommandBufferState::WaitCommand {
 	                               reinterpret_cast<uint64_t>(address), value, compare, false},
-	                           0x20);
+	                           WaitAddressRecordSize(value));
 }
 
 static int AppendCounterRecord(void* command_buffer, CommandBufferState::CommandData command,

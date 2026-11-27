@@ -4,13 +4,18 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/parallelFor.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "graphics/frameCapture.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
@@ -26,6 +31,8 @@
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <thread>

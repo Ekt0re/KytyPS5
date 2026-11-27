@@ -1,10 +1,15 @@
+#include "common/shaderCompileStatus.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "common/logging/log.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -12,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -19,10 +25,57 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
+
+bool RetainModuleSpirv() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAILED_SPIRV_DUMP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void RetainModuleSpirv(ShaderModule& module, const std::vector<uint32_t>& spirv) {
+	module.spirv_words = spirv.size();
+	if (RetainModuleSpirv()) {
+		module.spirv = spirv;
+	}
+}
+
+// The driver's result and the modules of a pipeline it fails to create: a driver given an invalid
+// or oversized module may only answer ErrorUnknown (Axellito/VIKyng bcee3021 found a 1 GB module).
+[[noreturn]] static void ExitPipelineFailure(const char* kind, vk::Result result,
+                                             std::span<const ShaderModule* const> modules) {
+	for (const auto* module: modules) {
+		if (module == nullptr) {
+			continue;
+		}
+		std::printf("%s: module id=0x%016" PRIx64 " stage=%u spirv=%zu words\n", kind, module->id,
+		            static_cast<unsigned>(module->info.stage), module->spirv_words);
+		if (module->spirv.empty()) {
+			continue;
+		}
+		std::error_code error;
+		const auto      folder = Config::GetShaderLogFolder() / "failed";
+		std::filesystem::create_directories(folder, error);
+		const auto path = folder / fmt::format("{:016x}.spv", module->id);
+		if (std::FILE* file = std::fopen(path.string().c_str(), "wb"); file != nullptr) {
+			std::fwrite(module->spirv.data(), sizeof(uint32_t), module->spirv.size(), file);
+			std::fclose(file);
+			std::printf("%s: wrote %s\n", kind, path.string().c_str());
+		}
+	}
+	EXIT("%s failed: %s%s\n", kind, vk::to_string(result).c_str(),
+	     RetainModuleSpirv() ? "" : " (KYTY_FAILED_SPIRV_DUMP=1 writes the modules' SPIR-V)");
+}
 
 static vk::BlendFactor GetBlendFactor(uint32_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
@@ -115,6 +168,7 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	pipeline.descriptor_sizes      = DescriptorSetLayoutSizes(bindings);
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors
@@ -137,6 +191,37 @@ static void CreateLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pip
 	EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                          &pipeline.pipeline_layout) !=
 	                     vk::Result::eSuccess);
+}
+
+void CreatePipelineLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                           std::span<const ShaderModule* const> stages) {
+	std::vector<vk::DescriptorSetLayoutBinding> bindings;
+	for (const auto* stage: stages) {
+		if (stage != nullptr) {
+			const auto native_stage = NativeShaderStage(stage->info.stage);
+			AddLayoutBindings(bindings, stage->info, native_stage);
+			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
+			pipeline.push_stages |= native_stage;
+			if (stage->mesh_task) pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
+		}
+	}
+	if (!(pipeline.push_stages & vk::ShaderStageFlagBits::eCompute)) {
+		pipeline.push_stages |= vk::ShaderStageFlagBits::eFragment;
+	}
+	CreateLayouts(graphics, pipeline, bindings);
+	if (!pipeline.uses_push_descriptors && !FitsStandardDescriptorPool(pipeline.descriptor_sizes)) {
+		std::string shaders;
+		for (const auto* stage: stages) {
+			if (stage != nullptr) {
+				shaders += fmt::format(" {}:0x{:016x}", static_cast<int>(stage->info.stage),
+				                       stage->info.shader_hash);
+			}
+		}
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Descriptor set layout of shaders{} exceeds the standard descriptor pool ({}): its "
+		    "sets come from a dedicated pool\n",
+		    shaders, DescribeDescriptorSetSizes(pipeline.descriptor_sizes)));
+	}
 }
 
 // Formats with a narrower host variant drop the components the shader does not read.
@@ -196,11 +281,33 @@ static vk::Format InputFormat(uint8_t raw_format, uint32_t used_components) {
 	return NarrowInputFormat(format, used_components);
 }
 
+// Under RenderDoc (--rd), pipelines carry their guest shader hashes, so a captured draw or
+// dispatch maps back to the guest program.
+static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
+                         std::span<const ShaderModule* const> stages) {
+	if (!Config::RenderDocEnabled() || pipeline == nullptr ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
+		return;
+	}
+	std::string name;
+	for (const auto* stage: stages) {
+		if (stage == nullptr) continue;
+		if (!name.empty()) name += ' ';
+		name += fmt::format("{}_{:016x}", ShaderRecompiler::StageName(stage->info.stage),
+		                    stage->info.shader_hash);
+	}
+	vk::DebugUtilsObjectNameInfoEXT info {};
+	info.objectType   = vk::ObjectType::ePipeline;
+	info.objectHandle = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
+	info.pObjectName  = name.c_str();
+	(void)graphics.device.setDebugUtilsObjectNameEXT(&info);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
-                            const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache) {
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const GraphicsPipelineKey&                key,
+                                const std::array<const ShaderModule*, 4>& stages,
+                                vk::PipelineCache driver_cache, bool optimize) {
 	const auto& rendering     = key.rendering;
 	const auto& vertex_input  = key.vertex_input;
 	const auto& static_params = key.static_params;
@@ -227,11 +334,24 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	vk::PipelineShaderStageCreateInfo shader_stages[4] {};
 	uint32_t                          shader_stage_count = 0;
+	// The recompiled code treats the host subgroup as the guest wave. RADV runs fragment shaders
+	// in 64-lane waves by default, so a wave32 pixel shader's upper 32 lanes tested the EXEC and
+	// ballot bits of lanes 0-31; GTA VI's clustered-light shader (PS 0x02defa99cc8f3d1e) then took
+	// an empty cell's 0xffffffff into its slice range and looped until the GPU reset.
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo pixel_subgroup_size {};
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			shader_stages[shader_stage_count++] = {.stage  = NativeShaderStage(stage->info.stage),
-			                                       .module = stage->module,
-			                                       .pName  = "main"};
+			auto& info = shader_stages[shader_stage_count++];
+			info       = {.stage  = NativeShaderStage(stage->info.stage),
+			              .module = stage->Handle(),
+			              .pName  = "main"};
+			const auto wave_size = stage->info.wave_size;
+			if (info.stage == vk::ShaderStageFlagBits::eFragment &&
+			    graphics.fragment_subgroup_size_control_enabled &&
+			    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+				pixel_subgroup_size.requiredSubgroupSize = wave_size;
+				info.pNext                               = &pixel_subgroup_size;
+			}
 		}
 	}
 	if (task_module) {
@@ -342,21 +462,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
-	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	pipeline.push_stages = vk::ShaderStageFlagBits::eFragment;
-	if (task_module) {
-		pipeline.push_stages |= vk::ShaderStageFlagBits::eTaskEXT;
-	}
-	for (const auto* stage: stages) {
-		if (stage != nullptr) {
-			const auto native_stage = NativeShaderStage(stage->info.stage);
-			AddLayoutBindings(descriptor_bindings, stage->info, native_stage);
-			pipeline.uses_image_heap |= stage->info.info.uses_image_heap;
-			pipeline.push_stages |= native_stage;
-		}
-	}
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
-
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
 	std::vector<vk::DynamicState> dynamic_states {
@@ -410,23 +515,34 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	pipeline_info.pDepthStencilState  = (with_depth ? &depth_stencil_info : nullptr);
 	pipeline_info.pColorBlendState    = &color_blending;
 	pipeline_info.pDynamicState       = &dynamic_state;
-	pipeline_info.layout              = pipeline.pipeline_layout;
+	pipeline_info.layout              = layout;
+	if (!optimize) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
-	const auto result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	vk::Pipeline pipeline;
+	Common::ShaderCompileStatus::Work compile_work;
+	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
+	const auto result =
+	    PipelineBinaryStore::Get().CreateGraphics(graphics, driver_cache, pipeline_info, &pipeline);
+	if (result != vk::Result::eSuccess) {
+		ExitPipelineFailure("vkCreateGraphicsPipelines", result, stages);
+	}
+	NamePipeline(graphics, pipeline, stages);
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
 	graphics.device.destroyShaderModule(task_module, nullptr);
+	return pipeline;
 }
 
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const ShaderModule& module, vk::PipelineCache driver_cache,
+                                bool optimize) {
 	vk::PipelineShaderStageCreateInfo                     comp_shader_stage_info {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo comp_subgroup_size {};
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
-	comp_shader_stage_info.module = module.module;
+	comp_shader_stage_info.module = module.Handle();
 	comp_shader_stage_info.pName  = "main";
 	const auto wave_size = module.info.wave_size;
 	if (graphics.compute_subgroup_size_control_enabled &&
@@ -435,22 +551,45 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 
-	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
-	AddLayoutBindings(descriptor_bindings, module.info, vk::ShaderStageFlagBits::eCompute);
-	pipeline.uses_image_heap = module.info.info.uses_image_heap;
-	pipeline.push_stages     = vk::ShaderStageFlagBits::eCompute;
-	CreateLayouts(graphics, pipeline, descriptor_bindings);
-
 	vk::ComputePipelineCreateInfo info {};
 	if (module.info.info.uses_gds) {
 		info.flags = vk::PipelineCreateFlagBits::eDispatchBase;
 	}
+	if (!optimize) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 	info.stage  = comp_shader_stage_info;
-	info.layout = pipeline.pipeline_layout;
+	info.layout = layout;
 
+	vk::Pipeline pipeline;
+	Common::ShaderCompileStatus::Work compile_work;
+	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
 	const auto result =
-	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	    PipelineBinaryStore::Get().CreateCompute(graphics, driver_cache, info, &pipeline);
+	if (result != vk::Result::eSuccess) {
+		const ShaderModule* modules[] = {&module};
+		ExitPipelineFailure("vkCreateComputePipelines", result, modules);
+	}
+	const auto* stage = &module;
+	NamePipeline(graphics, pipeline, {&stage, 1});
+	return pipeline;
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const GraphicsPipelineKey&                 key,
+                            const std::array<const ShaderModule*, 4>& stages,
+                            vk::PipelineCache                          driver_cache) {
+	CreatePipelineLayouts(graphics, pipeline, stages);
+	pipeline.pipeline =
+	    CreateHostPipeline(graphics, pipeline.pipeline_layout, key, stages, driver_cache);
+}
+
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderModule& module, vk::PipelineCache driver_cache) {
+	const auto* stage = &module;
+	CreatePipelineLayouts(graphics, pipeline, {&stage, 1});
+	pipeline.pipeline =
+	    CreateHostPipeline(graphics, pipeline.pipeline_layout, module, driver_cache);
 }
 
 } // namespace Libs::Graphics

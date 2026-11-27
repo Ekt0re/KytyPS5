@@ -5,6 +5,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
@@ -1404,6 +1405,68 @@ void TestRebasedTextureMipViews() {
         "sparse view accepted a different mip-tail origin");
 }
 
+void TestMipViewPastMaxMip() {
+  const auto make = [](Prospero::BufferFormat format, Prospero::TileMode tile, uint32_t width,
+                       uint32_t height, uint32_t levels) {
+    ImageInfo info {};
+    info.data.address  = 0x100000000ull;
+    info.guest_format  = format;
+    info.type          = Prospero::ImageType::kColor2D;
+    info.extent        = {width, height, 1};
+    info.resources     = {levels, 1};
+    info.tile_mode     = tile;
+    info.samples       = 1;
+    return info;
+  };
+
+  {
+    // No Man's Sky compresses mip 1 through a T# that declares one level (256x256 -> 128x128).
+    auto     info = make(Prospero::BufferFormat::k32_32UInt, Prospero::TileMode::kStandard4KB, 256,
+                         256, 2);
+    uint32_t base = 1;
+    const bool ok = ResolveTextureMipView(info, 1, false, 1, base);
+    Check(ok && info.extent.width == 128 && info.extent.height == 128 &&
+              info.resources.levels == 1 && info.data.size == 0x20000 && base == 0,
+          "a view past MAX_MIP did not rebase to its own 128x128 chain");
+  }
+  {
+    // The same chain's mip 4 sits in the tail and is not an independent 16x16 image.
+    auto     info = make(Prospero::BufferFormat::k32_32UInt, Prospero::TileMode::kStandard4KB, 256,
+                         256, 5);
+    uint32_t base = 4;
+    Check(!ResolveTextureMipView(info, 1, false, 1, base),
+          "a tail mip past MAX_MIP was accepted as its own chain");
+  }
+
+  const Prospero::BufferFormat formats[] = {
+      Prospero::BufferFormat::k8_8_8_8UNorm,
+      Prospero::BufferFormat::k10_10_10_2UNorm,
+      Prospero::BufferFormat::k16_16_16_16Float,
+  };
+  for (const auto format : formats) {
+    for (const bool metadata : {false, true}) {
+      auto chain = make(format, Prospero::TileMode::kRenderTarget, 1920, 1080, 6);
+      chain.UpdateSize();
+      auto     info = make(format, Prospero::TileMode::kRenderTarget, 1920, 1080, 7);
+      uint32_t base = 6;
+      const bool ok = ResolveTextureMipView(info, 6, metadata, 1, base);
+      char       msg[320];
+      std::snprintf(msg, sizeof(msg),
+                    "1920x1080 render target mip 6 past MAX_MIP format=%u meta=%d ok=%d "
+                    "extent=%ux%u levels=%u base=%u size=%llu chain=%llu",
+                    static_cast<unsigned>(format), metadata ? 1 : 0, ok ? 1 : 0, info.extent.width,
+                    info.extent.height, info.resources.levels, base,
+                    static_cast<unsigned long long>(info.data.size),
+                    static_cast<unsigned long long>(chain.data.size));
+      // The standalone mip is not this chain's mip 6, so the view stays on the 1920x1080
+      // image and must not grow past the six stored levels (Astro Bot's PS logo).
+      Check(ok && info.extent.width == 1920 && info.extent.height == 1080 &&
+                info.data.size == chain.data.size,
+            msg);
+    }
+  }
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -1491,6 +1554,30 @@ void TestShaderFeatureCollection() {
             !add_tid_requirements.subgroup_ballot &&
             !add_tid_requirements.subgroup_shuffle,
         "buffer ADD_TID requested the wrong subgroup contract");
+  {
+    // A GPU-selected child V# with ADD_TID needs the lane too, though its root has none.
+    Program child;
+    child.resource_tracking_complete = true;
+    child.stage = ShaderType::Compute;
+    child.info.buffers.resize(2);
+    child.info.buffers[0].indirect_root = 0;
+    child.info.buffers[0].indirect_resources = {0, 1};
+    child.info.buffers[1].indirect_root = 0;
+    child.info.buffers[1].packed_stride = 1u << 20u;
+    child.block_storage.push_back(std::make_unique<Block>());
+    auto *child_block = child.block_storage.back().get();
+    child.blocks.push_back(child_block);
+    child.memory_info.push_back({.kind = ResourceKind::Buffer, .resource = 0});
+    auto &child_buffer = child_block->AppendNewInst(
+        ValueOpcode::GetBufferResource, {Value(0u), Value(0u), Value(0u), Value(0u)});
+    auto &child_load = child_block->AppendNewInst(
+        ValueOpcode::LoadBufferU32,
+        {Value(&child_buffer), Value(0u), Value(0u), Value(0u), Value(true)});
+    child_load.SetFlags(MemoryFlags{.index = 0});
+    CollectShaderInfo(child, {.compute = &compute_info});
+    Check(child.info.subgroup_local_invocation_id,
+          "a selected ADD_TID buffer did not request the subgroup lane");
+  }
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   ExpectFatal(
@@ -1577,6 +1664,12 @@ constexpr uint32_t EncodeVop2Dpp(uint32_t src0, uint32_t dpp_ctrl = 0,
 constexpr uint32_t EncodeVopc(uint32_t opcode, uint32_t src0, uint32_t src1) {
   return (0x3eu << 25u) | ((opcode & 0xffu) << 17u) | ((src1 & 0xffu) << 9u) |
          (src0 & 0x1ffu);
+}
+
+constexpr uint32_t EncodeVop1Sdwa(uint32_t src0, uint32_t dst_sel,
+                                  uint32_t dst_unused, uint32_t src0_sel = 6) {
+  return (src0 & 0xffu) | ((dst_sel & 0x7u) << 8u) |
+         ((dst_unused & 0x3u) << 11u) | ((src0_sel & 0x7u) << 16u);
 }
 
 constexpr uint32_t EncodeVopcSdwa(uint32_t src0, uint32_t sdst = 0,
@@ -3217,6 +3310,33 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// The F16 compares RDNA2 has besides the common ones (F, O, NLG, TRU and their CMPX forms, CMPX
+// U and LG) decode in compact and VOP3 encodings and translate into valid SPIR-V.
+void TestVopcRemainingF16Compares() {
+  using namespace ShaderRecompiler::Decoder;
+  const std::pair<uint32_t, Opcode> compares[] = {
+      {0xc8u, Opcode::V_CMP_F_F16},    {0xcfu, Opcode::V_CMP_O_F16},
+      {0xeau, Opcode::V_CMP_NLG_F16},  {0xefu, Opcode::V_CMP_TRU_F16},
+      {0xd8u, Opcode::V_CMPX_F_F16},   {0xddu, Opcode::V_CMPX_LG_F16},
+      {0xdfu, Opcode::V_CMPX_O_F16},   {0xf8u, Opcode::V_CMPX_U_F16},
+      {0xfau, Opcode::V_CMPX_NLG_F16}, {0xffu, Opcode::V_CMPX_TRU_F16}};
+  for (const auto& [id, opcode] : compares) {
+    const bool exec = (id >= 0xd8u && id <= 0xdfu) || id >= 0xf8u;
+    const uint32_t compact[] = {EncodeVopc(id, 256, 1), EncodeSopp(0x01)};
+    const uint32_t vop3[] = {EncodeVop3Word0(id, exec ? 126u : 106u), EncodeVop3Word1(256, 257, 0),
+                             EncodeSopp(0x01)};
+    for (auto words : {std::span<const uint32_t>(compact), std::span<const uint32_t>(vop3)}) {
+      Instruction decoded;
+      DecodeInstruction(words, 0, decoded);
+      Check(decoded.opcode == opcode &&
+                (decoded.dst.kind == OperandKind::ExecLo) == exec,
+            "a remaining F16 compare did not decode");
+      auto result = RecompileForTest(words, MakeCompileOptions(ShaderType::Pixel));
+      CheckSpirvBinaryValidates(result.spirv);
+    }
+  }
+}
+
 void TestVopcCmpxClassF16Decoder() {
   using namespace ShaderRecompiler::Decoder;
   for (const uint32_t modifier : {0x86360000u, 0x86350002u}) {
@@ -4029,6 +4149,29 @@ void TestPixelAncillaryLayerInput() {
         "DPP write retained the old ancillary register value");
   CheckSpirvBinaryValidates(dpp_result.spirv);
 
+  constexpr uint32_t cvt_f16_f32 = 0x0a;
+  constexpr uint32_t sdwa_source = 249;
+  constexpr uint32_t sdwa_word1 = 5;
+  constexpr uint32_t sdwa_preserve = 2;
+  uint32_t high_word[] = {
+      EncodeSop1(0x04, 8, 126),
+      EncodeSop1(0x0a, 10, 126),
+      EncodeSop1(0x04, 126, 10),
+      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 8, 128 + 4),
+      EncodeVop1(cvt_f16_f32, 5, sdwa_source),
+      EncodeVop1Sdwa(2, sdwa_word1, sdwa_preserve),
+      EncodeVop3Word0(0x148, 7), EncodeVop3Word1(5 + 256, 128 + 16, 128 + 16),
+      EncodeVop1(0x01, 5, 3 + 256),
+      EncodeSop1(0x04, 126, 8),
+      EncodeExp0(0x00, 0x7), EncodeExp1(5, 6, 7, 0), EncodeSopp(0x01),
+  };
+  auto high_word_result = RecompileForTest(high_word, options);
+  Check(ProgramHasInput(high_word_result.program, StageInputKind::SampleId) &&
+            !ProgramHasInput(high_word_result.program,
+                             StageInputKind::PackedAncillary),
+        "high-word write kept ancillary bits that are never read");
+  CheckSpirvBinaryValidates(high_word_result.spirv);
+
   const uint32_t loop[] = {
       EncodeSop1(0x04, 8, 126),  // Save the original EXEC mask.
       EncodeSop1(0x0a, 126, 8),   // Widen for helper lanes.
@@ -4052,6 +4195,27 @@ void TestPixelAncillaryLayerInput() {
   Check(SpirvContainsOpcode(loop_result.spirv, 246u),
         "ancillary regression did not retain its scalar loop");
   CheckSpirvBinaryValidates(loop_result.spirv);
+
+  uint32_t nested_loops[] = {
+      EncodeSMovB32(2, 128),
+      EncodeSMovB32(3, 128),
+      EncodeSop2(0x00, 3, 3, 129),
+      EncodeSopc(0x0a, 3, 131),
+      EncodeSopp(0x05, 0xfffdu),
+      EncodeSop2(0x00, 2, 2, 129),
+      EncodeSopc(0x0a, 2, 131),
+      EncodeSopp(0x05, 0xfff9u),
+      EncodeVop3Word0(0x148, 6), EncodeVop3Word1(5 + 256, 128 + 8, 128 + 4),
+      EncodeVopc(0x01, 128, 2),
+      EncodeSop1(0x24, 8, 106),
+      EncodeVop1(0x01, 5, 6 + 256),
+      EncodeExp0(0x00, 0x3), EncodeExp1(5, 6, 0, 0), EncodeSopp(0x01),
+  };
+  auto nested_result = RecompileForTest(nested_loops, options);
+  Check(ProgramHasInput(nested_result.program, StageInputKind::SampleId) &&
+            !ProgramHasInput(nested_result.program, StageInputKind::PackedAncillary),
+        "overwrite after nested loops retained the ancillary register value");
+  CheckSpirvBinaryValidates(nested_result.spirv);
 
   const uint32_t unused[] = {EncodeSopp(0x01)};
   auto unused_result = RecompileForTest(unused, options);
@@ -4085,6 +4249,16 @@ void TestPixelAncillaryLayerInput() {
   dpp[3] = EncodeVop1Dpp(6); // Without BOUND_CTRL, lanes with inactive sources keep the value.
   ExpectFatal([&] { (void)RecompileForTest(dpp, options); },
               "DPP write without BOUND_CTRL silently replaced the ancillary value");
+  high_word[8] = EncodeVop3Word1(5 + 256, 128, 128 + 16);
+  ExpectFatal([&] { (void)RecompileForTest(high_word, options); },
+              "low ancillary word kept by a high-word write was silently replaced");
+  nested_loops[12] = EncodeSopp(0x00);
+  ExpectFatal([&] { (void)RecompileForTest(nested_loops, options); },
+              "raw ancillary export after nested loops was silently replaced");
+  high_word[8] = EncodeVop3Word1(5 + 256, 128 + 16, 128 + 16);
+  high_word[9] = EncodeSopp(0x00);
+  ExpectFatal([&] { (void)RecompileForTest(high_word, options); },
+              "ancillary word with a written high half was exported whole");
 #endif
 }
 
@@ -4480,6 +4654,98 @@ void TestNewShaderRecompilerUnbasedFlatUsesBda() {
             result.program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer)] != 0,
         "unbased FLAT did not compile through BDA");
   CheckSpirvBinaryValidates(result.spirv);
+
+  // A guest page past the BDA table is a missing page: get_bda_pointer compares the 64-bit page
+  // with the table size before it indexes the table or records a fault.
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  const auto begin  = source.find("%get_bda_pointer = OpFunction");
+  const auto end    = source.find("OpFunctionEnd", begin);
+  const auto body   = begin == std::string::npos ? std::string {} : source.substr(begin, end - begin);
+  const auto pages  = std::to_string(Libs::Graphics::BufferCache::CACHING_NUMPAGES);
+  std::string pages_id;
+  std::string page_type;
+  for (size_t line = 0; line < source.size();) {
+    const auto next = std::min(source.find('\n', line), source.size());
+    const auto text = source.substr(line, next - line);
+    if (text.find("OpConstant %ulong " + pages) != std::string::npos ||
+        text.find("OpConstant %uint64 " + pages) != std::string::npos) {
+      pages_id = text.substr(text.find('%'), text.find(' ', text.find('%')) - text.find('%'));
+      page_type = text.find("OpConstant %ulong ") != std::string::npos ? "%ulong" : "%uint64";
+    }
+    line = next + 1;
+  }
+  Check(!pages_id.empty(), "BDA page lookup has no page table size constant");
+
+  // Follow the comparison: it must pick the table index and guard the fault record.
+  std::vector<std::vector<std::string>> instructions;
+  {
+    std::istringstream lines(body);
+    for (std::string line; std::getline(lines, line);) {
+      std::istringstream words(line);
+      std::vector<std::string> tokens;
+      for (std::string word; words >> word;) {
+        tokens.push_back(word);
+      }
+      instructions.push_back(std::move(tokens));
+    }
+  }
+  // Empty pattern entries match any operand.
+  const auto find_line = [&](std::initializer_list<std::string> pattern) -> std::vector<std::string> {
+    for (const auto &tokens: instructions) {
+      if (tokens.size() == pattern.size() &&
+          std::equal(pattern.begin(), pattern.end(), tokens.begin(),
+                     [](const std::string &p, const std::string &t) { return p.empty() || p == t; })) {
+        return tokens;
+      }
+    }
+    return {};
+  };
+  const auto find = [&](std::initializer_list<std::string> pattern) -> std::string {
+    const auto tokens = find_line(pattern);
+    return tokens.empty() ? std::string {} : tokens[0];
+  };
+  // The comparison reads the original 64-bit page, the right shift of the packed address, and the
+  // table index narrows that same result. Narrowing before the comparison would alias page 2^32
+  // onto page zero.
+  const auto compare  = find_line({"", "=", "OpULessThan", "%bool", "", pages_id});
+  const auto in_range = compare.empty() ? std::string {} : compare[0];
+  const auto page64   = compare.empty() ? std::string {} : compare[4];
+  const auto shifted  = find_line({page64, "=", "OpShiftRightLogical", page_type, "", ""});
+  const auto narrowed = find({"", "=", "OpUConvert", "%uint", page64});
+  const auto index    = find({"", "=", "OpSelect", "%uint", in_range, narrowed, "%uint_0"});
+  const auto missing  = find({"", "=", "OpLogicalNot", "%bool", in_range});
+  auto       unbacked = find({"", "=", "OpLogicalOr", "%bool", "", missing});
+  if (unbacked.empty()) {
+    unbacked = find({"", "=", "OpLogicalOr", "%bool", missing, ""});
+  }
+  Check(!in_range.empty() && shifted.size() == 6 && !narrowed.empty() && !index.empty() &&
+            !missing.empty() && !unbacked.empty() &&
+            !find({"", "=", "OpAccessChain", "", "%bda_pagetable", "%uint_0", index}).empty() &&
+            !find({"OpBranchConditional", unbacked, "", ""}).empty(),
+        "BDA page lookup did not select the table index with the bounds check");
+
+  // The fault bitmap is only touched in the block the bounds check branches into.
+  std::string record_label;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 4 && tokens[0] == "OpBranchConditional" && tokens[1] == in_range) {
+      record_label = tokens[2];
+    }
+  }
+  bool     in_record    = false;
+  bool     record_index = false;
+  uint32_t record_uses  = 0;
+  uint32_t total_uses   = 0;
+  for (const auto &tokens: instructions) {
+    if (tokens.size() == 3 && tokens[1] == "=" && tokens[2] == "OpLabel") {
+      in_record = !record_label.empty() && tokens[0] == record_label;
+    }
+    const auto uses = static_cast<uint32_t>(std::count(tokens.begin(), tokens.end(), "%fault_buffer"));
+    total_uses += uses;
+    record_uses += in_record ? uses : 0;
+    record_index |= in_record && std::find(tokens.begin(), tokens.end(), index) != tokens.end();
+  }
+  Check(!record_label.empty() && record_uses != 0 && record_uses == total_uses && record_index,
+        "BDA fault record is not guarded by the page bounds check");
 }
 
 void TestNewShaderRecompilerDsReadWrite2Translation() {
@@ -5933,6 +6199,76 @@ void TestNativeGuardedSamplerSource(bool inline_constants) {
   }
 }
 
+// A loop spills its constant sampler to VGPR lanes, reuses the SGPRs for data and restores them
+// on every native path before the sample and the backedge. The structurizer's dispatch of the
+// two forward gotos merges the clobbered words into the backedge Phi; the native lane spill
+// still proves the constant words. Variant 1 leaves s16 clobbered on the P3 path to the backedge
+// and variant 2 overwrites the spill VGPR; both must stay unproven.
+void TestNativeSpilledSamplerLanes(uint32_t variant) {
+  constexpr uint32_t loop = 5, p2 = 22, p3 = 28, join = 33;
+  const auto readlane = [](uint32_t sgpr, uint32_t lane) {
+    return std::array<uint32_t, 2>{EncodeVop3Word0(0x360, sgpr), EncodeVop3Word1(256 + 1, 128 + lane, 0)};
+  };
+  std::vector<uint32_t> code = {
+      EncodeSopk(0x00, 16, 146), EncodeSop2(0x24, 17, 140, 140),
+      EncodeSMovB32(18, 255), 0x05000000u, EncodeSMovB32(19, 128),
+      // loop: v_writelane_b32 v1, s16, 0; v_writelane_b32 v1, s17, 1
+      EncodeVop3Word0(0x361, 1), EncodeVop3Word1(16, 128, 0),
+      EncodeVop3Word0(0x361, 1), EncodeVop3Word1(17, 129, 0),
+      EncodeVop1(0x02, 16, 256), EncodeVop1(0x02, 17, 256), // v_readfirstlane_b32 s16/s17, v0
+      EncodeSopc(0x07, 20, 130), EncodeSopp(0x04, p3 - 12 - 1),
+      EncodeSopc(0x07, 20, 129), EncodeSopp(0x04, p2 - 14 - 1),
+  };
+  const auto append = [&](std::initializer_list<uint32_t> words) {
+    code.insert(code.end(), words.begin(), words.end());
+  };
+  const auto restore = [&] {
+    for (uint32_t word = 0; word < 2; ++word) {
+      const auto read = readlane(16 + word, word);
+      append({read[0], read[1]});
+    }
+  };
+  restore();                                                // 15
+  append({EncodeMimg0(0x20, 0x1), EncodeMimg1(4, 2, 4, 2)}); // 19: sample s[16:19]
+  append({EncodeSopp(0x02, join - 21 - 1)});
+  Check(code.size() == p2, "spilled sampler test layout");
+  append({EncodeVop1(0x01, 4, 242)});
+  restore();
+  append({EncodeSopp(0x02, join - 27 - 1)});
+  Check(code.size() == p3, "spilled sampler test layout");
+  append({EncodeVop1(0x01, 5, 16)}); // The clobbered SGPR is data here.
+  restore();
+  Check(code.size() == join, "spilled sampler test layout");
+  if (variant == 1u) code[p3 + 1u] = code[p3 + 2u] = EncodeSopp(0x00);
+  if (variant == 2u) code[10] = EncodeVop1(0x01, 1, 256); // v_mov_b32 v1, v0
+  append({EncodeSop2(0x02, 21, 21, 193), EncodeSopc(0x07, 21, 128),
+          EncodeSopp(0x05, static_cast<uint16_t>(static_cast<int32_t>(loop) - 35 - 1)),
+          EncodeExp0(0x00, 0x1), EncodeExp1(4, 0, 0, 0), EncodeSopp(0x01)});
+  auto user_data = ImageTestUserData();
+  user_data[13] = 2u;
+  const std::array<uint32_t, 4> sampler{0x92u, 0x00fff000u, 0x05000000u, 0u};
+  for (uint32_t mode = 0; mode != 3; ++mode) {
+    user_data[12] = mode;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data_base = 8;
+    options.user_data = user_data;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+    if (variant != 0u) {
+      ExpectFatal([&] { (void)RecompileForTest(code, options); },
+                  "a clobbered lane spill proved a constant sampler");
+      return;
+    }
+#endif
+    const auto result = RecompileForTest(code, options);
+    // Only mode 0 reaches the sample; the others materialize a null sampler.
+    const auto expected = mode == 0u ? sampler : std::array<uint32_t, 4>{};
+    Check(!result.program.dispatcher_fallback && result.resources.samplers.size() == 1u &&
+              std::equal(expected.begin(), expected.end(), result.resources.samplers[0].dwords.begin()),
+          "a sampler restored from its lane spill lost its constant words");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestNativeConstantSamplerSelection() {
   const uint32_t shader[] = {
       EncodeSopk(0x00, 16, 146), EncodeSop2(0x24, 17, 140, 140),
@@ -6118,12 +6454,19 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
   Check(materialize(), "restored material batch failed to materialize");
   auto result = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
   CheckSpirvBinaryValidates(result.spirv);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  // Wraparound leaves no key bound, so the bounded table V# supplies every row instead.
   auto unbounded = code;
   unbounded[0x3cu / 4u] = EncodeSopc(0x0bu, 14u, 13u); // s_cmp_le_u32 admits wraparound.
-  ExpectFatal([&] { ShaderRecompiler::TranslateProgram(unbounded, options); },
-              "material selection accepted an inclusive induction bound");
-#endif
+  const auto scanned = ShaderRecompiler::TranslateProgram(unbounded, options);
+  uint32_t whole_tables = 0;
+  for (const auto& source: scanned.program.descriptor_sources) {
+    if (!source.indirect_descriptor) continue;
+    Check(source.indirect_descriptor->table_scalar && !source.indirect_descriptor->selector &&
+              source.indirect_descriptor->key_count.IsEmpty(),
+          "material selection accepted an inclusive induction bound");
+    ++whole_tables;
+  }
+  Check(whole_tables == 1u, "unbounded material selection lost its table scan");
 }
 
 void TestNativeDescriptorProvenanceKeepsGpuSelection() {
@@ -12018,6 +12361,55 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   auto result = RecompileForTest(inline_sampler_shader, options);
 }
 
+// GTA VI ORs a quad mask (reserved sampler bits) into sampler dword 3 before image_sample_*_a.
+// The two crossing branches make structurization merge that SGPR with its earlier user-data
+// value, although only the quad mask reaches the sample on native paths.
+void TestSampleAdjustNativeQuadMaskSampler() {
+  const uint32_t shader[] = {
+      EncodeSmem0(0x02, 24, 1), 125u << 25u,  // s_load_dwordx4 s[24:27], s[2:3], 0
+      EncodeSMovB32(36, 12),                  // s_mov_b32 s36, s12
+      EncodeSopc(0x06, 13, 128),              // s_cmp_eq_u32 s13, 0
+      EncodeSopp(0x05, 12),                   // s_cbranch_scc1 F
+      EncodeVopc(0xc2, 129, 0),               // v_cmp_eq_u32 vcc, 1, v0
+      EncodeSop1(0x2d, 106, 106),             // s_quadmask_b64 vcc, vcc
+      EncodeSop2(0x1e, 36, 106, 128 + 12),    // s_lshl_b32 s36, vcc_lo, 12
+      EncodeSopc(0x06, 14, 128),              // s_cmp_eq_u32 s14, 0
+      EncodeSopp(0x05, 10),                   // s_cbranch_scc1 E
+      EncodeSmem0(0x0a, 20, 12), (125u << 25u) | 0x10u, // s_buffer_load_dwordx4 s[20:23], s[24:27], 0x10
+      EncodeSop2(0x10, 23, 23, 36),           // s_or_b32 s23, s23, s36
+      EncodeMimg0(0xa0, 0x1),
+      EncodeMimg1(1, 1, 5, 2),                // image_sample_a v1, v[2:3], s[4:11], s[20:23]
+      EncodeMubuf0(0x1c), EncodeMubuf1(1, 1, 0),
+      EncodeVop1(0x01, 3, 36),                // F: v_mov_b32 v3, s36
+      EncodeMubuf0(0x1c), EncodeMubuf1(3, 1, 0),
+      EncodeSopp(0x01),                       // E: s_endpgm
+  };
+  const auto user_data = ImageTestUserData();
+  const auto translate = [&](bool reserved_mask) {
+    auto code = std::vector<uint32_t>(std::begin(shader), std::end(shader));
+    // A shift by 4 leaves the quad mask's bits 4..19 partly outside the reserved bits 12..29.
+    if (!reserved_mask) code[7] = EncodeSop2(0x1e, 36, 106, 128 + 4);
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data = user_data;
+    return ShaderRecompiler::TranslateProgram(code, options);
+  };
+  const auto result = translate(true);
+  const auto &program = result.program;
+  Check(program.info.samplers.size() == 1u,
+        "quad-mask sampler was not tracked as one sampler");
+  const auto *source =
+      TypedDescriptorSource(program, program.info.samplers[0].source);
+  const auto *dword3 =
+      source == nullptr ? nullptr : source->dwords[3].ResolveInstruction();
+  Check(dword3 != nullptr &&
+            dword3->GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ReadConst,
+        "adjusted sample kept the quad mask in sampler dword 3");
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  ExpectFatal([&] { (void)translate(false); },
+              "a quad mask reaching non-reserved sampler bits was dropped");
+#endif
+}
+
 void TestSrtWalkerRealSmemTranslation() {
   const uint32_t shader[] = {
       EncodeSMovB32(124, 130), // m0 = 2
@@ -12516,6 +12908,39 @@ void TestNewShaderRecompilerPixelPipelineEntry() {
   ShaderPixelInputInfo vcc_input{};
   const auto vcc_params = PrepareProgram(vcc_regs, sh, mappings, vcc_input);
   CompilePixelRuntime(vcc_params, vcc_input);
+}
+
+// A wave64 program run as two halves on a 32-lane host orders each LDS access of its first half
+// with a subgroup barrier (Profile::lds_lane_sync); a native wave64 host or the profile switch
+// emits none.
+void TestLdsLaneSync() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeDs0(0x0d), EncodeDs1(0, 1, 0), // ds_write_b32 v0, v1
+      EncodeDs0(0x0d), EncodeDs1(0, 2, 3), // ds_write_b32 v3, v2
+      EncodeSopp(0x01),
+  };
+  for (const uint32_t host : {32u, 64u}) {
+    for (const bool sync : {true, false}) {
+      ShaderComputeInputInfo compute{};
+      compute.threads_num[0] = 64;
+      compute.threads_num[1] = compute.threads_num[2] = 1;
+      compute.lds_size_dwords = 64;
+      compute.host_subgroup_size = host;
+      auto options = MakeCompileOptions(ShaderType::Compute);
+      options.wave_size = 64;
+      options.input_info.compute = &compute;
+      Spirv::Profile profile{};
+      profile.lds_lane_sync = sync;
+      options.profile = &profile;
+      const auto result = RecompileForTest(shader, options);
+      CheckSpirvBinaryValidates(result.spirv);
+      const auto barriers =
+          CountSourceOccurrences(DisassembleSpirvBinary(result.spirv), "OpControlBarrier");
+      Check(barriers == (sync && host == 32u ? 2u : 0u),
+            "LDS accesses of a split wave64 were not ordered once per guest instruction");
+    }
+  }
 }
 
 void TestComputeLdsAllocationIdentity() {
@@ -13222,6 +13647,63 @@ void TestSpirvRepeatedEmission() {
         "split-wave re-emission retained native-wave definitions");
 }
 
+// A switch past one OpSwitch's 16-bit word count nests on the index's high bits; the module stays
+// valid, results keep the flat switch's default (case 0) and void switches skip out-of-range indices.
+void TestNestedIndexSwitch() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::Spirv;
+  using namespace ShaderRecompiler::Spirv::Emitter;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = compute.threads_num[2] = 1;
+  ShaderStageInputInfo input{.compute = &compute};
+  const Profile profile{};
+  for (const uint32_t count : {MaxSwitchCases, MaxSwitchCases + 1u, 2u * MaxSwitchCases + 7u}) {
+    for (const bool result : {true, false}) {
+      IR::Program program;
+      program.stage = ShaderType::Compute;
+      EmitterState state(program, input, profile);
+      state.builder.RequireCapability(spv::CapabilityShader);
+      state.builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+      const auto main = state.builder.AllocateId();
+      state.builder.AddFunction(spv::OpFunction, TypeVoid(state), main,
+                                spv::FunctionControlMaskNone, TypeFunction(state));
+      EmitLabel(state, state.builder.AllocateId());
+      // A runtime index: the function's variable, stored and loaded.
+      const auto pointer = TypePointer(state, spv::StorageClassFunction, TypeU32(state));
+      const auto variable = state.builder.AllocateId();
+      state.builder.AddFunction(spv::OpVariable, pointer, variable, spv::StorageClassFunction);
+      state.builder.AddFunction(spv::OpStore, variable, ConstantU32(state, count - 1u));
+      const auto index = state.builder.AllocateId();
+      state.builder.AddFunction(spv::OpLoad, TypeU32(state), index, variable);
+      uint32_t emitted = 0;
+      if (result) {
+        EmitIndexSwitch(state, index, count, TypeU32(state), [&](uint32_t item) {
+          emitted++;
+          return Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, item));
+        });
+      } else {
+        EmitIndexSwitch(state, index, count, 0u, [&](uint32_t item) {
+          emitted++;
+          state.builder.AddFunction(spv::OpStore, variable, ConstantU32(state, item));
+        });
+      }
+      state.builder.AddFunction(spv::OpReturn);
+      state.builder.AddFunction(spv::OpFunctionEnd);
+      state.builder.AddEntryPoint(spv::ExecutionModelGLCompute, main, "main", {});
+      state.builder.AddExecutionMode(main, spv::ExecutionModeLocalSize, 64u, 1u, 1u);
+      const auto binary = state.builder.Build();
+      CheckSpirvBinaryValidates(binary);
+      const auto source = DisassembleSpirvBinary(binary);
+      const auto switches = CountSourceOccurrences(source, "OpSwitch");
+      Check(emitted == count && switches == (count <= MaxSwitchCases
+                                                 ? 1u
+                                                 : 1u + (count + MaxSwitchCases - 1u) / MaxSwitchCases),
+            "a large index switch did not nest into valid groups of cases");
+    }
+  }
+}
+
 void TestSpirvConditionVotes() {
   using namespace ShaderRecompiler;
   using K = CFG::BranchCondition;
@@ -13255,12 +13737,22 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
+    // Ballot guards (KYTY_BALLOT_GUARDS=1; the device default is off here) emit each vote as one
+    // ballot compared with zero.
+    const bool ballot_guards = Spirv::Emitter::BallotGuardsEnabled();
+    const uint32_t votes = ballot_guards ? 0u : 3u;
+    // A 64-wide wave on 32-wide invocations already requires the ballot capability.
+    const bool ballot_capability = ballot_guards || wave != host;
     Check(compiled.program.info.subgroup_vote && !compiled.program.info.subgroup_ballot &&
-              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == 3 &&
-              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 0,
-          "condition votes used ballots, duplicated halves, or lost their capability");
+              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformVote) != ballot_guards &&
+              SpirvContainsCapability(binary, spv::CapabilityGroupNonUniformBallot) ==
+                  ballot_capability &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAll) == votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformAny) == votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpGroupNonUniformBallot) == 6u - 2u * votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpAll) == 3u - votes &&
+              SpirvInstructionOpcodeCount(binary, spv::OpAny) == 3u - votes,
+          "condition votes used the wrong form, duplicated halves, or lost their capability");
     Check(scalar.TryInstruction()->Definition(0) == predicate.TryInstruction()->Definition(0),
           "scalar instruction condition acquired a subgroup vote");
     if (wave != host) {
@@ -13605,6 +14097,43 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 #include "ShaderRayTracingTests.inc"
 
+// The loop guard (Spirv::LoopIterationLimit). The structural fixtures run without it, since it adds
+// a counter, a selection and a return to every loop header; here one loop is emitted both ways.
+void TestSpirvLoopIterationGuard() {
+  using namespace ShaderRecompiler;
+  if (std::getenv("KYTY_SHADER_LOOP_LIMIT") != nullptr) {
+    return; // The variable overrides the default this test switches.
+  }
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 128),       // s0 = 0
+      EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 2),         // break when scc == 0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopp(0x02, 0xfffcu),   // continue/backedge
+      EncodeSopp(0x01),
+  };
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto plain = RecompileForTest(shader, options).spirv;
+  Spirv::SetLoopIterationLimitDefault(1000);
+  const auto guarded = RecompileForTest(shader, options).spirv;
+  Spirv::SetLoopIterationLimitDefault(0);
+  CheckSpirvBinaryValidates(plain);
+  CheckSpirvBinaryValidates(guarded);
+  const auto count = [](const std::vector<uint32_t> &binary, spv::Op op) {
+    return SpirvInstructionOpcodeCount(binary, op);
+  };
+  Check(count(plain, spv::OpLoopMerge) == 1 && count(guarded, spv::OpLoopMerge) == 1 &&
+            MeasureSpirv(guarded).function_variables ==
+                MeasureSpirv(plain).function_variables + 1 &&
+            count(guarded, spv::OpUGreaterThan) == count(plain, spv::OpUGreaterThan) + 1 &&
+            count(guarded, spv::OpGroupNonUniformBallot) ==
+                count(plain, spv::OpGroupNonUniformBallot) + 1 &&
+            count(guarded, spv::OpSelectionMerge) == count(plain, spv::OpSelectionMerge) + 1 &&
+            count(guarded, spv::OpReturn) == count(plain, spv::OpReturn) + 1 &&
+            SpirvContainsCapability(guarded, spv::CapabilityGroupNonUniformBallot),
+        "loop guard: expected one counter, one ballot-guarded return per loop header");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -13612,17 +14141,23 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // The fixtures measure the translator's own control flow and size; the loop guard has its own
+  // test (TestSpirvLoopIterationGuard).
+  ShaderRecompiler::Spirv::SetLoopIterationLimitDefault(0);
+  TestSpirvLoopIterationGuard();
   TestVop3FloatConversionDecode();
   TestRayTracingInstructions();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestRebasedTextureMipViews();
+  TestMipViewPastMaxMip();
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
+  TestNestedIndexSwitch();
   TestSpirvConditionVotes();
   TestRepeatedExportsHaveOneInterface();
   TestNewShaderRecompilerSpirvSizeBaselines();
@@ -13665,6 +14200,7 @@ int main() {
   TestNativeStoreCompletion();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestVopcCmpxClassF16Decoder();
+  TestVopcRemainingF16Compares();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerInteger64CompareEncodings();
@@ -13710,6 +14246,11 @@ int main() {
   TestNativeGuardedSamplerSource(false);
   TestNativeGuardedSamplerSource(true);
   TestNativeConstantSamplerSelection();
+  TestNativeSpilledSamplerLanes(0);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  TestNativeSpilledSamplerLanes(1);
+  TestNativeSpilledSamplerLanes(2);
+#endif
   TestNullImageTakesDeclaredCube();
   TestPackedZeroHighSamplerTableKey();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
@@ -13793,6 +14334,7 @@ int main() {
   TestBoundedScalarMaterialImageKeys();
   TestImmutableDescriptorPredicate();
   TestTypedDescriptorRealCarryAndScalarLoads();
+  TestSampleAdjustNativeQuadMaskSampler();
   TestSrtWalkerRealSmemTranslation();
   TestSrtWalkerVccBaseTranslation();
   TestSrtWalkerRealSBufferTranslation();
@@ -13811,6 +14353,7 @@ int main() {
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();
+  TestLdsLaneSync();
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestCapturedBufferLoadUbyteD16Decode();
@@ -13829,3 +14372,4 @@ int main() {
 
   return 0;
 }
+

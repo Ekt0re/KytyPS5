@@ -1,11 +1,15 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include "graphics/host_gpu/renderer/bdaGuard.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include <bit>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
@@ -66,13 +70,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
-	buffer_info.size        = size;
-	buffer_info.usage       = flags;
+	buffer_info.size  = size;
+	buffer_info.usage = flags;
 
-	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	const bool              with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
+	allocation_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -80,13 +83,27 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
+	auto              result        = static_cast<vk::Result>(
+	    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+	                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	if (result == vk::Result::eErrorOutOfDeviceMemory) {
+		// These buffers are required for rendering. The reported budget is advisory;
+		// let the driver attempt the allocation before treating it as a fatal failure.
+		LOGF("Buffer allocation ran out of device memory with budget enforcement: size=%" PRIu64
+		     ", memory_usage=%u; retrying without the budget limit\n",
+		     size, static_cast<unsigned>(usage));
+		graphics.LogMemoryBudget();
+		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		result = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
+		EXIT("Buffer allocation failed: %s, size=%" PRIu64 ", memory_usage=%u, flags=0x%x\n",
+		     vk::to_string(result).c_str(), size, static_cast<unsigned>(usage),
+		     static_cast<unsigned>(static_cast<VkBufferUsageFlags>(flags)));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -94,6 +111,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		BdaGuard::OnCreate(m_device_address, size, cpu_address);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -105,8 +123,77 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	}
 }
 
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               void* host_pointer, vk::BufferUsageFlags flags, uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size),
+      m_host_pointer(reinterpret_cast<uint64_t>(host_pointer)) {
+	EXIT_IF(!graphics.external_memory_host_enabled || size == 0);
+	constexpr auto handle_type = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
+	const auto     device      = graphics.device;
+
+	vk::MemoryHostPointerPropertiesEXT host_properties {};
+	if (device.getMemoryHostPointerPropertiesEXT(handle_type, host_pointer, &host_properties) !=
+	    vk::Result::eSuccess) {
+		return;
+	}
+	vk::ExternalMemoryBufferCreateInfo external_info {.handleTypes = handle_type};
+	vk::BufferCreateInfo buffer_info {.pNext = &external_info, .size = size, .usage = flags};
+	if (device.createBuffer(&buffer_info, nullptr, &m_buffer) != vk::Result::eSuccess) {
+		m_buffer = nullptr;
+		return;
+	}
+	const auto requirements = device.getBufferMemoryRequirements(m_buffer);
+	const auto types        = requirements.memoryTypeBits & host_properties.memoryTypeBits;
+	if (types == 0 || requirements.size > size) {
+		device.destroyBuffer(m_buffer);
+		m_buffer = nullptr;
+		return;
+	}
+	vk::ImportMemoryHostPointerInfoEXT import_info {.handleType   = handle_type,
+	                                                .pHostPointer = host_pointer};
+	vk::MemoryAllocateFlagsInfo        allocate_flags {.pNext = &import_info,
+	                                                   .flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
+	vk::MemoryAllocateInfo             allocate_info {.pNext           = &allocate_flags,
+	                                                  .allocationSize  = size,
+	                                                  .memoryTypeIndex = static_cast<uint32_t>(
+	                                                      std::countr_zero(types))};
+	if (device.allocateMemory(&allocate_info, nullptr, &m_imported) != vk::Result::eSuccess) {
+		m_imported = nullptr;
+		device.destroyBuffer(m_buffer);
+		m_buffer = nullptr;
+		return;
+	}
+	if (device.bindBufferMemory(m_buffer, m_imported, 0) != vk::Result::eSuccess) {
+		device.freeMemory(m_imported);
+		m_imported = nullptr;
+		device.destroyBuffer(m_buffer);
+		m_buffer = nullptr;
+		return;
+	}
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = device.getBufferAddress(address_info);
+	}
+	// The host's own pages, coherent with the CPU. Not exposed through Mapped(): guest code owns
+	// these bytes and the cache must not treat them as an upload or download staging area.
+	m_coherent = true;
+}
+
 Buffer::~Buffer() {
+	if (m_imported != nullptr) {
+		m_graphics->device.destroyBuffer(m_buffer);
+		m_graphics->device.freeMemory(m_imported);
+		return;
+	}
 	if (m_buffer != nullptr) {
+		// KYTY_BDA_GUARD=2 keeps the buffer until the GPU completed the work recorded so far.
+		if (m_device_address != 0 &&
+		    BdaGuard::OnDestroy(m_device_address, m_graphics->allocator,
+		                        static_cast<VkBuffer>(m_buffer), m_allocation)) {
+			return;
+		}
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }
@@ -114,8 +201,7 @@ Buffer::~Buffer() {
 void Buffer::Flush(uint64_t offset, uint64_t size) {
 	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
-		const auto result =
-		    vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
+		const auto result = vmaFlushAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
 }

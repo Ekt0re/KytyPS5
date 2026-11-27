@@ -1,4 +1,5 @@
 #include "kernel/syncOnAddress.h"
+#include "kernel/pthread.h"
 
 #include "common/threads.h"
 #include "libs/errno.h"
@@ -257,14 +258,20 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline) {
 } // namespace
 
 int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros) {
+	const GuestWaitScope wait("WaitOnAddress", reinterpret_cast<uint64_t>(address),
+	                          static_cast<int64_t>(expected));
 	return WaitImpl(address, expected, MakeDeadline(timeout_micros));
 }
 
 int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeout_micros) {
+	const GuestWaitScope wait("WaitOnAddress", reinterpret_cast<uint64_t>(address),
+	                          static_cast<int64_t>(expected));
 	return WaitImpl(address, expected, MakeDeadline(timeout_micros));
 }
 
 int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout) {
+	const GuestWaitScope wait("WaitOnAddress", reinterpret_cast<uint64_t>(address),
+	                          static_cast<int64_t>(expected));
 	return WaitImpl(address, expected, MakeDeadline(timeout));
 }
 

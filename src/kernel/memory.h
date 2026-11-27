@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/virtualMemory.h"
+#include <vector>
 
 namespace Libs::Graphics {
 class RenderContext;
@@ -137,6 +138,26 @@ int RemapIntoPrtMemory(uint64_t prt_vaddr, uint64_t old_vaddr, size_t size, int 
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// TryReadBacking for large reads of memory that may never have been written: does not commit it.
+bool                   TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size);
+// Host address of the backing alias for a guest range that one contiguous run of direct memory
+// holds (no gaps, no private mappings), 0 otherwise. The alias stays mapped for the whole run.
+uint64_t               ContiguousBackingAlias(uint64_t vaddr, uint64_t size);
+// Changes whenever guest pages are bound to or unbound from the backing.
+uint64_t               BackingGeneration();
+// Whether pages of [vaddr, vaddr + size) were bound or unbound after `generation` (true when
+// that is too long ago to tell).
+bool                   BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size);
+// The host address of the range in the backing alias when one contiguous run of backing holds
+// all of it, else nullptr. The GPU resource tracker never protects the alias, so reads through it
+// never fault: they see what the CPU (and every publication of GPU data) stored last, not GPU
+// writes that were not read back yet. Raw command-buffer decoding (KYTY_RAW_CMDBUF) uses it.
+[[nodiscard]] const void* TryGetBackingView(uint64_t vaddr, uint64_t size);
+// The backing as the emulator maps it (its writes to guest memory go through this alias), and
+// where a guest page lives in it (UINT64_MAX: nowhere). For frame capture's write tracking.
+[[nodiscard]] uint64_t BackingAliasBase();
+[[nodiscard]] uint64_t BackingAliasSize();
+[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.
@@ -145,10 +166,49 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 // Stops at the first hole, or with span_holes at the end of the last committed range.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
+// 0 when nothing is committed there.
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size, bool span_holes = false);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+// Part of the range is guest memory that is reserved or mapped without CPU or GPU write access,
+// so a host store into it faults and nothing recovers the fault. Memory the guest map does not
+// describe is not known to fail, nor is a program image that SetProgramMemoryProtection left
+// host-writable whatever its guest protection.
+[[nodiscard]] bool     IsKnownUnwritable(uint64_t vaddr, uint64_t size);
+// The guest has the whole range committed with CPU or GPU write access. A host store into it
+// faults only on pages the GPU resource tracker protects, which HandleGpuFault recovers.
+[[nodiscard]] bool     IsGuestWritable(uint64_t vaddr, uint64_t size);
+// For a fault in a guest range briefly unmapped while the emulator replaced its mapping (MAP_FIXED
+// over a mapping, or a Windows file view split by a partial unmap): waits until it is mapped again
+// and returns the range's id. 0 for any other fault.
+[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
+// Whether such a fault can be retried (false once the same page keeps faulting).
+[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+
+// Frame capture (graphics/frameCapture.cpp): the committed guest ranges and allocated physical
+// blocks, and their re-creation at the same addresses in a replay.
+struct CaptureRange {
+	enum Type : uint32_t { Direct, Flexible, Pooled, Stack, Code, Runtime };
+	uint64_t start;
+	uint64_t size;
+	uint64_t offset;
+	int32_t  protection;
+	int32_t  memory_type;
+	uint32_t type;
+	uint32_t reserved;
+};
+struct CapturePhysical {
+	uint64_t start;
+	uint64_t size;
+	int32_t  memory_type;
+	uint32_t kind;
+};
+[[nodiscard]] std::vector<CaptureRange>    CaptureRanges();
+[[nodiscard]] std::vector<CapturePhysical> CapturePhysicalBlocks();
+[[nodiscard]] bool                         ReplayAllocatePhysical(const CapturePhysical& block);
+[[nodiscard]] bool                         ReplayMapRange(const CaptureRange& range);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
@@ -228,6 +288,9 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
+// Called for a map the GPU thread is not waited for (the range was free or reserved); the range
+// callback then sees its unmap and map.
+void     TestSetGpuFreshMapCallback(void (*callback)(uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);

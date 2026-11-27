@@ -1,4 +1,5 @@
 #include "kernel/semaphore.h"
+#include "kernel/pthread.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -163,14 +164,22 @@ void KernelSemaPrivate::RemoveWaiter(WaitingThread* waiter) {
 	}
 }
 
+// Waiters are served in queue order (arrival order, or priority order without the FIFO attribute).
+// A signal stops at the first waiter that needs more counts than are left: later, smaller waiters
+// do not overtake it. Measured on a PS5 (AnyPS5 #21061): a waiter of 3 queued before a waiter of 1
+// leaves both waiting after a signal of 1, and the next signals wake them in queue order.
 void KernelSemaPrivate::WakeWaiters() {
 	for (auto* waiter: m_waiting_threads) {
-		if (!waiter->ready && waiter->need_count <= m_count) {
-			m_count -= waiter->need_count;
-			waiter->result = Result::Ok;
-			waiter->ready  = true;
-			waiter->cond_var.Signal();
+		if (waiter->ready) {
+			continue;
 		}
+		if (waiter->need_count > m_count) {
+			break;
+		}
+		m_count -= waiter->need_count;
+		waiter->result = Result::Ok;
+		waiter->ready  = true;
+		waiter->cond_var.Signal();
 	}
 }
 
@@ -273,6 +282,7 @@ int KYTY_SYSV_ABI KernelWaitSema(KernelSema sem, int need, KernelUseconds* time)
 		return KERNEL_ERROR_ESRCH;
 	}
 
+	const GuestWaitScope wait("sceKernelWaitSema", reinterpret_cast<uint64_t>(sem), need);
 	auto result = sem->Wait(need, time);
 
 	int ret = OK;

@@ -2,11 +2,24 @@
 
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
+#include "common/shaderCompileStatus.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
+#include "graphics/shader/shaderCompiler.h"
 
+#include <csetjmp>
+#include <csignal>
+#include <thread>
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
+
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -24,6 +37,10 @@
 
 // The shader store: a header, then zstd-compressed records of everything a run created first.
 // Records are only appended, so a store cut short by a crash keeps every complete record.
+namespace Common {
+extern thread_local std::jmp_buf* g_dbg_recover;
+}
+
 namespace Libs::Graphics {
 
 namespace {
@@ -44,6 +61,15 @@ struct Frame {
 // Changes with every build, so records never meet code that encodes them differently. Zero when
 // the executable cannot be found.
 uint64_t BuildStamp() {
+	// KYTY_SHADER_CACHE_STAMP=N replaces the executable's time: a rebuild that does not change how
+	// shaders are translated keeps the cache. Change N whenever the shader recompiler changes
+	// (a main update, a shader patch), or the stored programs no longer match the code.
+	if (const char* env = std::getenv("KYTY_SHADER_CACHE_STAMP"); env != nullptr && env[0] != 0) {
+		const auto value = std::strtoull(env, nullptr, 10);
+		if (value != 0) {
+			return value;
+		}
+	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::array<wchar_t, 32768> name {};
 	GetModuleFileNameW(nullptr, name.data(), static_cast<DWORD>(name.size()));
@@ -61,14 +87,79 @@ uint64_t BuildStamp() {
 	return error ? 0 : static_cast<uint64_t>(time);
 }
 
+// The store's own format: what this file and pipelineCache.cpp make of the translator's output.
+// KYTY_SHADER_CACHE_STAMP names the translator alone (the sources under graphics/shader and the
+// guest_gpu definitions they include), so it no longer changes when this code does. BUMP THIS
+// whenever any of these change:
+//   - the record framing or the fields of a record (Frame, Record, IoKey, IoModule, the store
+//     header);
+//   - GraphicsPipelineKey or a struct in it, which records hold as raw bytes (the asserts below
+//     fail when their layout changes);
+//   - the module id formula (PipelineCache::CompileModule, ReplayRecipe);
+//   - what a translation is given (the CompileOptions of PipelineCache::GetProgramImpl and of the
+//     translations ahead, SpirvProfile's meaning for the same bytes).
+// Version 1 leaves the header as it was before the constant existed.
+constexpr uint64_t StoreFormatVersion = 1;
+
+static_assert(sizeof(PipelineStaticParameters) == 118 && sizeof(PipelineRenderingState) == 44 &&
+                  sizeof(PipelineVertexInputState) == 354 && sizeof(GraphicsPipelineKey) == 548 &&
+                  offsetof(GraphicsPipelineKey, rendering) == 32 &&
+                  offsetof(GraphicsPipelineKey, vertex_input) == 76 &&
+                  offsetof(GraphicsPipelineKey, static_params) == 430 &&
+                  offsetof(PipelineStaticParameters, color_mask) == 17 &&
+                  offsetof(PipelineStaticParameters, color_srcblend) == 54 &&
+                  offsetof(PipelineStaticParameters, blend_enable) == 110,
+              "stored pipeline keys changed their layout: bump StoreFormatVersion, then update "
+              "these numbers");
+
+// The translator's code-generation switches read from the environment that Profile does not
+// hold: a store written with one of them changed must not serve a run without it. Each switch
+// away from its default changes the key; the defaults leave it as it was. A new switch of this
+// kind in the translator belongs here.
+uint64_t CodegenSwitches() {
+	const auto env = [](const char* name) {
+		const char* value = std::getenv(name);
+		return value != nullptr ? value : "";
+	};
+	uint64_t switches = 0;
+	// F16StoreClampEnabled.
+	if (ShaderRecompiler::IR::F16StoreClampEnabled()) switches |= 1u;
+	// PixelQuadDppEnabled (spirvEmitterFlow.cpp).
+	if (env("KYTY_PS_QUAD_DPP")[0] != 0 && env("KYTY_PS_QUAD_DPP")[0] != '0') switches |= 2u;
+	// MovrelLaneBoundsEnabled (ConstantPropagation.cpp).
+	if (env("KYTY_MOVREL_LANE_BOUNDS")[0] == '0') switches |= 4u;
+	// ExecSelectsEnabled (ShaderRecompiler.cpp).
+	if (env("KYTY_EXEC_SELECTS")[0] == '0' || env("KYTY_EXEC_SELECT_ELIM")[0] == '0') {
+		switches |= 8u;
+	}
+	return switches;
+}
+
+uint64_t CodegenSwitchKey() {
+	uint64_t key = CodegenSwitches() * 0x9e3779b97f4a7c15ull;
+	// Ballot guards change the SPIR-V of most modules but are not part of Profile (whose bytes
+	// stay those of stores written without them).
+	constexpr uint64_t BallotGuardsStamp = 0x62616c6c6f740001ull;
+	if (ShaderRecompiler::Spirv::BallotGuardsEnabled()) key ^= BallotGuardsStamp;
+	// The loop iteration limit is a constant in every module with a loop (0: no guard at all).
+	if (const auto limit = ShaderRecompiler::Spirv::LoopIterationLimit();
+	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
+		constexpr uint64_t LoopLimitStamp = 0x6c6f6f706c696d00ull;
+		key ^= LoopLimitStamp ^ (uint64_t {limit} * 0xff51afd7ed558ccdull);
+	}
+	return key;
+}
+
 // What every record depends on besides its own fields; empty when the build is unknown.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	const auto stamp = BuildStamp();
 	if (stamp == 0) {
 		return {};
 	}
+	const uint64_t keyed_stamp =
+	    stamp ^ CodegenSwitchKey() ^ ((StoreFormatVersion - 1) * 0xc2b2ae3d27d4eb4full);
 	Writer header;
-	IoAll(header, stamp, SpirvProfile(graphics),
+	IoAll(header, keyed_stamp, SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }
@@ -80,16 +171,34 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 }
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
-	// The handle comes from the SPIR-V; stored programs have no function code.
-	auto& [id, handle, info, specialization, function_code, rect_parameters, mesh_task] = stage;
+	// The handle and the SPIR-V report fields come from the SPIR-V; stored programs have no
+	// function code.
+	auto& [id, handle, info, specialization, function_code, rect_parameters, mesh_task, spirv_words,
+	       spirv, stored] = stage;
 	IoAll(io, id, info, specialization, rect_parameters, mesh_task);
 }
 
 } // namespace
 
-void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
+// A store per set of switches: with one file, runs with and without a switch would discard each
+// other's store at every start.
+std::string ShaderStoreVariant() {
+	const auto switches = CodegenSwitches();
+	auto variant = switches == 0 ? std::string {} : fmt::format("-sw{:x}", switches);
+	// A loop iteration limit away from the default (KYTY_SHADER_LOOP_LIMIT) gets its own file too.
+	if (const auto limit = ShaderRecompiler::Spirv::LoopIterationLimit();
+	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
+		variant += fmt::format("-loop{}", limit);
+	}
+	return variant;
+}
+
+bool ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
                              uint64_t kept) {
 	Common::File::CreateDirectories(path.parent_path());
+	if (!m_lock.Acquire(path)) {
+		return false;
+	}
 	if (kept == 0) {
 		if (m_file.Create(path)) {
 			m_file.Write(header.data(), static_cast<uint32_t>(header.size()));
@@ -98,6 +207,7 @@ void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 		m_file.Truncate(kept);
 		m_file.Seek(kept);
 	}
+	return true;
 }
 
 ShaderStoreWriter::ShaderStoreWriter() {
@@ -228,8 +338,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (header.empty()) {
 		return;
 	}
-	const auto           start = std::chrono::steady_clock::now();
-	std::vector<uint8_t> bytes;
+	const auto start      = std::chrono::steady_clock::now();
+	auto       store_data = std::make_shared<std::vector<uint8_t>>();
+	auto&      bytes      = *store_data;
 	if (Common::File file;
 	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
 		bytes.resize(file.Size());
@@ -237,12 +348,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
 		bytes.resize(read);
 	}
+	const auto read_ms = MillisecondsSince(start);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
 	    Common::ParallelThreads()));
-	auto       records = std::span<const uint8_t>(bytes);
-	const bool reusable =
+	auto records  = std::span<const uint8_t>(bytes);
+	bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (RestampMode()) {
 		// A store of another stamp that agrees in everything else (device profile, format) is
@@ -339,18 +451,30 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			StartStoreDecoders(std::move(stored));
 		}
 	}
+	const auto parse_ms = MillisecondsSince(start) - read_ms;
 	// A damaged record ends the store; the records before it stay.
-	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
+	if (!m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader cache: {} is being written by another process (a precompile or another game of "
+		    "this stamp); this run reads it but stores nothing\n",
+		    Common::PathToString(path)));
+	}
 
 	const auto modules = MapModules();
-	std::vector<Common::UniqueFunction<void>> jobs;
-	jobs.reserve(m_graphics_pipelines.size() + modules.size());
-	for (auto& node: m_graphics_pipelines) {
-		jobs.emplace_back([this, &modules, &node] {
-			CreateGraphicsPipeline(node.second, node.first, modules);
-		});
-	}
-	// A compute pipeline depends only on its module.
+	// A key with a stage missing from the store keeps no pipeline.
+	std::vector<std::pair<const GraphicsPipelineKey*, std::array<const ShaderModule*, 4>>> graphics;
+	graphics.reserve(m_graphics_pipelines.size());
+	std::erase_if(m_graphics_pipelines, [&](const auto& entry) {
+		std::array<const ShaderModule*, 4> stages {};
+		for (size_t i = 0; i < stages.size(); i++) {
+			const auto found = modules.find(entry.first.stage_ids[i]);
+			if (found == modules.end()) return true;
+			stages[i] = found->second;
+		}
+		graphics.emplace_back(&entry.first, stages);
+		return false;
+	});
+	std::vector<const ShaderModule*> compute;
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
 			compute.push_back(module);
@@ -374,98 +498,333 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
 			});
 		}
+		Common::ShaderCompileStatus::AddQueued(static_cast<int64_t>(jobs.size()));
+		Common::ParallelFor(jobs.size(), [&](size_t i) {
+			Common::ShaderCompileStatus::RemoveQueued();
+			jobs[i]();
+		});
+		if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
+			CheckpointDriverCache();
+		}
+	} else {
+		// The layouts here, the pipelines on the workers while the game starts: a draw that
+		// needs one not created yet has it created at once (Expedite, PendingPipeline::Get).
+		// Compute pipelines go first, since dispatches cannot be skipped.
+		auto remaining = std::make_shared<std::atomic<size_t>>(graphics.size() + compute.size());
+		const auto counted = [remaining, start](vk::Pipeline pipeline) {
+			if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Shader cache: background pipeline creation finished {:.0f} ms after the "
+				    "warm-up started\n",
+				    MillisecondsSince(start)));
+			}
+			return pipeline;
+		};
+		for (const auto* module: compute) {
+			auto& pipeline = m_compute_pipelines[module->id];
+			CreatePipelineLayouts(m_graphics, pipeline, {&module, 1});
+			StartDeferredCompile(pipeline, [this, counted, layout = pipeline.pipeline_layout, module] {
+				return counted(CreateHostPipeline(m_graphics, layout, *module, m_driver_cache));
+			});
+		}
+		for (const auto& [key, stages]: graphics) {
+			auto& pipeline = m_graphics_pipelines.at(*key);
+			CreatePipelineLayouts(m_graphics, pipeline, stages);
+			StartDeferredCompile(pipeline,
+			                     [this, counted, layout = pipeline.pipeline_layout, key, stages] {
+				                     return counted(CreateHostPipeline(m_graphics, layout, *key,
+				                                                       stages, m_driver_cache));
+			                     });
+		}
 	}
-	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
-	// A key with a stage missing from the store keeps no pipeline.
-	std::erase_if(m_graphics_pipelines,
-	              [](const auto& entry) { return entry.second.pipeline == nullptr; });
-	if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {
-		CheckpointDriverCache();
-	}
+	OpenRecipes(path);
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {} ms\n",
+	    "Shader cache: loaded {} programs, {} modules, {} pipelines in {:.0f} ms (read {:.0f} ms, "
+	    "records {:.0f} ms, pipelines {:.0f} ms{}{})\n",
 	    m_program_cache.size(), modules.size() - 1,
-	    m_graphics_pipelines.size() + m_compute_pipelines.size(),
-	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-	                                                          start)
-	        .count()));
+	    m_graphics_pipelines.size() + m_compute_pipelines.size(), MillisecondsSince(start),
+	    read_ms, parse_ms, MillisecondsSince(start) - read_ms - parse_ms,
+	    sync ? "" : ", creation continues in the background",
+	    m_store_decoders != nullptr ? ", records decode on first use and in the background" : ""));
 }
 
-bool PipelineCache::LoadRecord(std::span<const uint8_t>& records) {
+void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& loaded) {
 	Frame frame;
-	if (records.size() < sizeof(frame)) {
-		return false;
-	}
-	std::memcpy(&frame, records.data(), sizeof(frame));
-	if (records.size() - sizeof(frame) < frame.compressed_size) {
-		return false;
-	}
-	const auto compressed = records.subspan(sizeof(frame), frame.compressed_size);
+	std::memcpy(&frame, record.data(), sizeof(frame));
+	const auto compressed = record.subspan(sizeof(frame));
 	if (XXH3_64bits(compressed.data(), compressed.size()) != frame.checksum ||
 	    ZSTD_getFrameContentSize(compressed.data(), compressed.size()) != frame.raw_size) {
-		return false;
+		return;
 	}
+	const auto           part = std::chrono::steady_clock::now();
 	std::vector<uint8_t> raw(frame.raw_size);
 	if (ZSTD_decompress(raw.data(), raw.size(), compressed.data(), compressed.size()) != raw.size()) {
-		return false;
+		return;
 	}
+	g_index_zstd_ns += NanosecondsSince(part);
 	Reader     reader {raw};
-	auto       type     = Record::Module;
 	const auto complete = [&] { return reader.ok && reader.bytes.empty(); };
+	const auto offset   = [&] { return static_cast<uint32_t>(raw.size() - reader.bytes.size()); };
+	// Skips a stored vector of `element` bytes each, returning its count and offset.
+	const auto skip = [&](size_t element, uint32_t& count) {
+		IoAll(reader, count);
+		const auto at = offset();
+		reader.ok     = reader.ok && uint64_t {count} * element <= reader.bytes.size();
+		if (reader.ok) reader.bytes = reader.bytes.subspan(count * element);
+		return at;
+	};
+	auto type = Record::Module;
 	IoAll(reader, type);
+	loaded.type = static_cast<uint8_t>(type);
 	switch (type) {
 		case Record::Module: {
-			ProgramKey            key;
-			std::vector<uint8_t>  plan;
-			ShaderModule          module;
-			std::vector<uint32_t> spirv;
-			IoKey(reader, key);
-			IoAll(reader, plan);
-			IoModule(reader, module);
-			IoAll(reader, spirv);
-			if (!complete()) {
-				return false;
+			auto stored = std::make_shared<StoredModule>();
+			IoKey(reader, loaded.key);
+			stored->plan_offset = skip(1, stored->plan_size);
+			IoModule(reader, loaded.module);
+			stored->spirv_offset = skip(sizeof(uint32_t), stored->spirv_words);
+			if (!complete() || stored->spirv_words == 0) {
+				return;
 			}
-			const auto [program, inserted] = m_program_cache.try_emplace(std::move(key));
-			if (inserted &&
-			    !ShaderRecompiler::IR::LoadResourcePlan(plan, program->second.resource_plan)) {
-				m_program_cache.erase(program);
-				return false;
-			}
-			module.module = CompileSPV(spirv, m_graphics.device);
-			program->second.modules.push_back(std::move(module));
+			stored->frame               = record;
+			stored->device              = m_graphics.device;
+			loaded.module.spirv_words   = stored->spirv_words;
+			loaded.module.stored        = std::move(stored);
 			break;
 		}
 		case Record::GraphicsPipeline: {
-			GraphicsPipelineKey key;
-			reader.Raw(&key, sizeof(key));
+			reader.Raw(&loaded.pipeline_key, sizeof(loaded.pipeline_key));
 			if (!complete()) {
-				return false;
+				return;
 			}
-			// WarmUp creates the pipeline once every record is loaded.
-			m_graphics_pipelines.try_emplace(key);
 			break;
 		}
 		case Record::TessellationLayout: {
-			uint64_t                    key = 0;
-			ShaderTessellationInputInfo layout;
-			IoAll(reader, key, layout);
+			IoAll(reader, loaded.layout_key, loaded.layout);
 			if (!complete()) {
-				return false;
+				return;
 			}
-			m_tess_layouts.try_emplace(key, layout);
 			break;
 		}
-		default: return false;
+		default: return;
 	}
-	records = records.subspan(sizeof(frame) + compressed.size());
+	loaded.ok = true;
+}
+
+namespace {
+
+// The record's decompressed bytes; the frame was checked and decompressed once at start, so this
+// cannot fail.
+std::vector<uint8_t> DecompressStored(const StoredModule& stored) {
+	Frame frame;
+	std::memcpy(&frame, stored.frame.data(), sizeof(frame));
+	const auto compressed = stored.frame.subspan(sizeof(frame));
+	const auto part       = std::chrono::steady_clock::now();
+	std::vector<uint8_t> raw(frame.raw_size);
+	EXIT_IF(ZSTD_decompress(raw.data(), raw.size(), compressed.data(), compressed.size()) !=
+	        raw.size());
+	g_decode_zstd_ns += NanosecondsSince(part);
+	return raw;
+}
+
+void FinishStoredPart(StoredModule& stored) {
+	if (stored.parts_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+		stored.store.reset();
+	}
+}
+
+} // namespace
+
+vk::ShaderModule ResolveStoredModule(StoredModule& stored) {
+	std::call_once(stored.module_once, [&] {
+		auto                  raw = DecompressStored(stored);
+		std::vector<uint32_t> spirv(stored.spirv_words);
+		std::memcpy(spirv.data(), raw.data() + stored.spirv_offset, spirv.size() * sizeof(uint32_t));
+		raw             = {};
+		const auto part = std::chrono::steady_clock::now();
+		stored.handle   = CompileSPV(spirv, stored.device);
+		g_decode_spirv_ns += NanosecondsSince(part);
+		if (RetainModuleSpirv()) {
+			stored.spirv = std::move(spirv);
+		}
+		stored.decoded.store(true, std::memory_order_release);
+		FinishStoredPart(stored);
+	});
+	return stored.handle;
+}
+
+bool ResolveStoredPlan(StoredModule& stored) {
+	std::call_once(stored.plan_once, [&] {
+		const auto raw  = DecompressStored(stored);
+		const auto part = std::chrono::steady_clock::now();
+		stored.plan_ok  = ShaderRecompiler::IR::LoadResourcePlan(
+            std::span(raw).subspan(stored.plan_offset, stored.plan_size), stored.plan);
+		g_decode_plan_ns += NanosecondsSince(part);
+		stored.plan_decoded.store(true, std::memory_order_release);
+		FinishStoredPart(stored);
+	});
+	return stored.plan_ok;
+}
+
+bool PipelineCache::LazyShaderStore() {
+	static const bool lazy = [] {
+		const char* env = std::getenv("KYTY_LAZY_SHADER_STORE");
+		return env != nullptr && env[0] == '1';
+	}();
+	return lazy;
+}
+
+bool PipelineCache::OnDemandShaderStore() {
+	static const bool on_demand = [] {
+		const char* env = std::getenv("KYTY_ON_DEMAND_SHADER_STORE");
+		return (env != nullptr && env[0] == '1') || LazyShaderStore();
+	}();
+	return on_demand;
+}
+
+bool PipelineCache::TakeStoredPlan(Program& program) {
+	const auto stored = std::move(program.stored_plan);
+	// How much of the store a run uses: its programs are looked up here once each.
+	{
+		static const auto start = std::chrono::steady_clock::now();
+		static uint32_t   used  = 0;
+		if (++used % 100u == 0u) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader cache: {} stored programs used, {} of them not decoded yet, {:.0f} s after "
+			    "the first ({} programs known)\n",
+			    used, g_demand_plans.load(), MillisecondsSince(start) / 1000.0,
+			    m_program_cache.size()));
+		}
+	}
+	if (!stored->plan_decoded.load(std::memory_order_acquire)) {
+		const auto start = std::chrono::steady_clock::now();
+		ResolveStoredPlan(*stored);
+		g_demand_plans++;
+		g_demand_plan_ns += NanosecondsSince(start);
+	}
+	if (!ResolveStoredPlan(*stored)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader cache: a stored resource plan could not be decoded; translating the program "
+		    "again\n"));
+		return false;
+	}
+	// Decoded once; no other thread touches the plan any more.
+	program.resource_plan = std::move(stored->plan);
 	return true;
+}
+
+void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
+	switch (static_cast<Record>(loaded.type)) {
+		case Record::Module: {
+			const auto [program, inserted] = m_program_cache.try_emplace(std::move(loaded.key));
+			if (inserted) {
+				loaded.module.stored->want_plan  = true;
+				loaded.module.stored->parts_left = 2;
+				program->second.stored_plan     = loaded.module.stored;
+			}
+			// KYTY_RT_OFF: stored BVH modules walk the scene; they are dropped (their records give
+			// only the plan), and their programs translate again with the miss.
+			if (loaded.module.info.info.bvh && ShaderRecompiler::Spirv::BvhIntersectAlwaysMisses()) {
+				auto& stored          = *loaded.module.stored;
+				stored.module_dropped = true;
+				if (stored.parts_left.fetch_sub(1) == 1) stored.store.reset();
+				break;
+			}
+			program->second.modules.push_back(std::move(loaded.module));
+			break;
+		}
+		// WarmUp creates the pipeline once every record is loaded.
+		case Record::GraphicsPipeline: m_graphics_pipelines.try_emplace(loaded.pipeline_key); break;
+		case Record::TessellationLayout:
+			m_tess_layouts.try_emplace(loaded.layout_key, loaded.layout);
+			break;
+	}
+}
+
+// Background decoders: a few low-priority threads decode, in store order (the order a run first
+// needed the records in), every record no lookup or pipeline creation decoded first.
+struct PipelineCache::StoreDecoders {
+	std::vector<std::shared_ptr<StoredModule>> records;
+	std::atomic<size_t>                        next = 0;
+	std::atomic<bool>                          stop = false;
+	std::vector<std::jthread>                  threads;
+};
+
+namespace {
+
+void LowerThreadPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#elif !defined(__APPLE__)
+	// Linux: a nice value of one thread.
+	setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), 19);
+#endif
+}
+
+size_t StoreDecoderThreads() {
+	if (const char* env = std::getenv("KYTY_STORE_DECODE_THREADS"); env != nullptr && env[0] != 0) {
+		return std::strtoull(env, nullptr, 10);
+	}
+	return Common::ParallelThreads();
+}
+
+} // namespace
+
+void PipelineCache::StartStoreDecoders(std::vector<std::shared_ptr<StoredModule>>&& records) {
+	auto decoders     = std::make_shared<StoreDecoders>();
+	decoders->records = std::move(records);
+	const auto count  = StoreDecoderThreads();
+	auto       left   = std::make_shared<std::atomic<size_t>>(count);
+	const auto start  = std::chrono::steady_clock::now();
+	// Shown in the shader banner like other shader work.
+	Common::ShaderCompileStatus::AddQueued(static_cast<int64_t>(decoders->records.size()));
+	for (size_t i = 0; i < count; i++) {
+		decoders->threads.emplace_back([state = decoders.get(), left, start] {
+			LowerThreadPriority();
+			while (true) {
+				const auto index = state->next++;
+				if (index >= state->records.size()) break;
+				Common::ShaderCompileStatus::RemoveQueued();
+				if (state->stop) continue;
+				const Common::ShaderCompileStatus::Work work;
+				auto& record = *state->records[index];
+				if (record.want_plan && !record.plan_decoded.load(std::memory_order_acquire)) {
+					ResolveStoredPlan(record);
+				}
+				if (!record.module_dropped && !record.decoded.load(std::memory_order_acquire)) {
+					ResolveStoredModule(record);
+				}
+			}
+			if (left->fetch_sub(1) == 1 && !state->stop) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "Shader cache: all {} stored modules decoded {:.1f} s after decoding "
+				    "started (over all threads: zstd {:.0f} ms at start and {:.0f} ms since, "
+				    "resource plans {:.0f} ms, shader modules {:.0f} ms); {} plans were decoded "
+				    "on first use ({:.0f} ms on the command thread)\n",
+				    state->records.size(), MillisecondsSince(start) / 1000.0,
+				    static_cast<double>(g_index_zstd_ns) / 1e6,
+				    static_cast<double>(g_decode_zstd_ns) / 1e6,
+				    static_cast<double>(g_decode_plan_ns) / 1e6,
+				    static_cast<double>(g_decode_spirv_ns) / 1e6, g_demand_plans.load(),
+				    static_cast<double>(g_demand_plan_ns) / 1e6));
+			}
+		});
+	}
+	m_store_decoders = std::move(decoders);
+}
+
+void PipelineCache::StopStoreDecoders() {
+	if (m_store_decoders != nullptr) {
+		m_store_decoders->stop = true;
+		m_store_decoders->threads.clear(); // Joins.
+	}
 }
 
 // Records are encoded here, since programs and modules change later.
 void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
                                 const ShaderModule& module, const std::vector<uint32_t>& spirv) {
-	if (!m_store) {
+	// KYTY_RT_OFF modules never enter the store, so runs without it keep the real ones.
+	if (!m_store || (module.info.info.bvh && ShaderRecompiler::Spirv::BvhIntersectAlwaysMisses())) {
 		return;
 	}
 	Writer record;
@@ -478,6 +837,7 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 }
 
 void PipelineCache::StorePipeline(const GraphicsPipelineKey& key) {
+	RecordRecipePipeline(key);
 	if (!m_store) {
 		return;
 	}

@@ -6,9 +6,11 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/frameCapture.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -27,10 +29,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <fmt/format.h>
 #include <list>
 #include <thread>
+#include <cstring>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -201,7 +207,25 @@ struct VideoOutConfig {
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
 	// The flip and wait packets name a buffer by its label.
 	std::array<uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> labels {};
+	// KYTY_FLIP_TRACE: the last request shown on this port.
+	uint64_t trace_last_id  = 0;
+	int64_t  trace_last_arg = 0;
 };
+
+// KYTY_FLIP_TRACE=1 logs each flip request and each presentation with the request sequence, and
+// counts presentations out of request order and waits on a buffer that last a second or more.
+static bool FlipTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FLIP_TRACE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+static std::atomic<uint64_t> g_flip_trace_presented {0};
+static std::atomic<uint64_t> g_flip_trace_out_of_order {0};
+static std::atomic<uint64_t> g_flip_trace_arg_backward {0};
+static std::atomic<uint64_t> g_flip_trace_held {0};
 
 class FlipQueue {
 public:
@@ -218,6 +242,8 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip();
 	void Wait(VideoOutConfig& cfg, int index);
+	// Every request of every port is done.
+	void WaitAll();
 
 private:
 	enum class RequestState { Reserved, Ready, Presenting };
@@ -901,7 +927,16 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	if (FlipTraceEnabled()) {
+		std::fprintf(stderr,
+		             "FLIPTRACE req id=%" PRIu64 " bus=%d idx=%d arg=%" PRId64
+		             " src=%s pending=%d ptc=%" PRIu64 "\n",
+		             r.id, cfg.bus, index, flip_arg,
+		             source == FlipRequestSource::GpuEop ? "eop" : "cpu",
+		             cfg.flip_status.flipPendingNum + 1, r.submit_ptc);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::Flips);
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1070,6 +1105,13 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
+void FlipQueue::WaitAll() {
+	Common::LockGuard lock(m_mutex);
+	while (!m_requests.empty() || !m_cpu_requests.empty()) {
+		m_done_cond_var.Wait(&m_mutex);
+	}
+}
+
 void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	Common::LockGuard lock(m_mutex);
 
@@ -1078,8 +1120,38 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
+	if (!FlipTraceEnabled()) {
+		while (has_request()) {
+			m_done_cond_var.Wait(&m_mutex);
+		}
+		return;
+	}
+	const auto begin  = std::chrono::steady_clock::now();
+	auto       waited = [begin] {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+		    .count();
+	};
+	double reported = 0;
 	while (has_request()) {
-		m_done_cond_var.Wait(&m_mutex);
+		m_done_cond_var.WaitFor(&m_mutex, 100000);
+		if (waited() - reported < 1000.0 || !has_request()) {
+			continue;
+		}
+		reported = waited();
+		g_flip_trace_held++;
+		const auto head = m_requests.begin();
+		std::fprintf(stderr,
+		             "FLIPTRACE held bus=%d idx=%d waited_ms=%.0f eop_queue=%zu cpu_queue=%zu "
+		             "head_id=%" PRIu64 " head_idx=%d head_state=%d held_total=%" PRIu64 "\n",
+		             cfg.bus, index, reported, m_requests.size(), m_cpu_requests.size(),
+		             head != m_requests.end() ? head->id : 0,
+		             head != m_requests.end() ? head->index : -9,
+		             head != m_requests.end() ? static_cast<int>(head->state) : -1,
+		             g_flip_trace_held.load());
+	}
+	if (waited() >= 1.0) {
+		std::fprintf(stderr, "FLIPTRACE wait bus=%d idx=%d waited_ms=%.1f\n", cfg.bus, index,
+		             waited());
 	}
 }
 
@@ -1164,6 +1236,27 @@ bool FlipQueue::Flip() {
 			continue;
 		}
 		auto& r = *it;
+		if (FlipTraceEnabled()) {
+			const bool out_of_order = r.id < r.cfg->trace_last_id;
+			const bool arg_backward = r.flip_arg < r.cfg->trace_last_arg;
+			g_flip_trace_presented++;
+			g_flip_trace_out_of_order += out_of_order;
+			g_flip_trace_arg_backward += arg_backward;
+			std::fprintf(stderr,
+			             "FLIPTRACE present id=%" PRIu64 " bus=%d idx=%d arg=%" PRId64
+			             " src=%s prev_id=%" PRIu64 " prev_arg=%" PRId64
+			             " ooo=%d argback=%d vblank=%" PRIu64 " pending=%d totals: presented=%" PRIu64
+			             " ooo=%" PRIu64 " argback=%" PRIu64 " held=%" PRIu64 "\n",
+			             r.id, r.cfg->bus, r.index, r.flip_arg,
+			             r.source == FlipRequestSource::GpuEop ? "eop" : "cpu", r.cfg->trace_last_id,
+			             r.cfg->trace_last_arg, out_of_order, arg_backward,
+			             static_cast<uint64_t>(r.cfg->vblank_status.count),
+			             r.cfg->flip_status.flipPendingNum - 1, g_flip_trace_presented.load(),
+			             g_flip_trace_out_of_order.load(), g_flip_trace_arg_backward.load(),
+			             g_flip_trace_held.load());
+			r.cfg->trace_last_id  = r.id;
+			r.cfg->trace_last_arg = r.flip_arg;
+		}
 		r.cfg->flip_vblank = r.cfg->vblank_status.count;
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
@@ -1192,8 +1285,12 @@ bool FlipQueue::Flip() {
 	return due;
 }
 
+namespace Capture = Graphics::FrameCapture;
+
 KYTY_SYSV_ABI int VideoOutSetFlipMaster(int slave_handle, int master_handle) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::SetFlipMaster,
+	                      std::array<int64_t, 2> {slave_handle, master_handle});
 	return DriverState().SetFlipMaster(slave_handle, master_handle);
 }
 
@@ -1210,11 +1307,15 @@ KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void*
 	EXIT_NOT_IMPLEMENTED(user_id != 255 && user_id != 0);
 	LOGF("\t param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
 
-	return DriverState().Open(bus_type, index);
+	const int handle = DriverState().Open(bus_type, index);
+	Capture::VideoOutCall(Capture::VideoOutCallKind::Open,
+	                      std::array<int64_t, 3> {bus_type, index, handle});
+	return handle;
 }
 
 KYTY_SYSV_ABI int VideoOutClose(int handle) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::Close, std::array<int64_t, 1> {handle});
 
 	return DriverState().Close(handle) ? OK : VIDEO_OUT_ERROR_INVALID_HANDLE;
 }
@@ -1253,6 +1354,8 @@ KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribu
 
 KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::SetFlipRate,
+	                      std::array<int64_t, 2> {handle, rate});
 
 	LOGF("\trate = %d\n", rate);
 
@@ -1269,6 +1372,15 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	ctx->flip_rate = rate;
 
 	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutSetGlobalBlendSpace(int handle, uint32_t space, uint32_t option) {
+	PRINT_NAME();
+
+	LOGF("\tspace = %u, option = %u\n", space, option);
+
+	// The host composes no system overlay, so the blend space has no effect.
+	return DriverState().Get(handle) == nullptr ? VIDEO_OUT_ERROR_INVALID_HANDLE : OK;
 }
 
 KYTY_SYSV_ABI int VideoOutDeleteFlipEvent(EventQueue::KernelEqueue eq, int handle) {
@@ -1315,6 +1427,19 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
                                            void* option) {
 	PRINT_NAME();
 
+	if (Capture::Enabled() && buffers != nullptr && attribute != nullptr && buffer_num > 0) {
+		std::vector<uint8_t> blob(sizeof(VideoOutBufferAttribute2) +
+		                          sizeof(VideoOutBuffers) * static_cast<size_t>(buffer_num));
+		static_assert(sizeof(VideoOutBuffers) == 32);
+		const auto buffer_bytes = sizeof(VideoOutBuffers) * static_cast<size_t>(buffer_num);
+		std::memcpy(blob.data(), buffers, buffer_bytes);
+		std::memcpy(blob.data() + buffer_bytes, attribute, sizeof(VideoOutBufferAttribute2));
+		Capture::VideoOutCall(
+		    Capture::VideoOutCallKind::RegisterBuffers2,
+		    std::array<int64_t, 5> {handle, set_index, buffer_index_start, buffer_num, category},
+		    blob);
+	}
+
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
@@ -1353,6 +1478,9 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
+	Log::WriteToConsoleAndLog(fmt::format("VideoOut: {} buffers of {}x{} registered (set {})\n",
+	                                      buffer_num, attribute->width, attribute->height,
+	                                      set_index));
 	// The headset port takes reprojection buffers with a zeroed attribute. Each names its eye
 	// texture, which is registered and flipped like a regular surface.
 	const bool headset = ctx->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
@@ -1438,6 +1566,12 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
                                                        const VideoOutBufferAttribute2* attribute,
                                                        void*                           option) {
 	PRINT_NAME();
+	if (attribute != nullptr) {
+		Capture::VideoOutCall(Capture::VideoOutCallKind::SubmitChangeBufferAttribute2,
+		                      std::array<int64_t, 2> {handle, set_index},
+		                      {reinterpret_cast<const uint8_t*>(attribute),
+		                       sizeof(VideoOutBufferAttribute2)});
+	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1478,6 +1612,8 @@ KYTY_SYSV_ABI int VideoOutSubmitChangeBufferAttribute2(int handle, int set_index
 
 KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::UnregisterBuffers,
+	                      std::array<int64_t, 2> {handle, set_index});
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1506,6 +1642,8 @@ KYTY_SYSV_ABI int VideoOutUnregisterBuffers(int handle, int set_index) {
 
 KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64_t flip_arg) {
 	PRINT_NAME();
+	Capture::VideoOutCall(Capture::VideoOutCallKind::SubmitFlip,
+	                      std::array<int64_t, 4> {handle, index, flip_mode, flip_arg});
 
 	auto&     driver     = DriverState();
 	uint64_t  request_id = 0;
@@ -1517,6 +1655,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	if (result != OK) {
 		return result;
 	}
+	Capture::NoteFlip();
 	driver.Renderer().GetGpu().SubmitFlipPreparation(request_id);
 
 	return OK;
@@ -1531,9 +1670,24 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
 	if (result != OK) {
 		return result;
 	}
+	Capture::NoteFlip();
 	m_impl->GetFlipQueue().Prepare(request_id, buffer);
 
 	return OK;
+}
+
+bool VideoOutCurrentImage(int handle, Graphics::ImageInfo* info) {
+	auto* cfg = DriverState().Get(handle);
+	if (cfg == nullptr || info == nullptr) return false;
+	Common::LockGuard lock(cfg->mutex);
+	const int         index = cfg->flip_status.currentBuffer;
+	if (index < 0 || IsSpecialBufferIndex(index) ||
+	    static_cast<size_t>(index) >= std::size(cfg->buffers) || !cfg->buffers[index].Occupied()) {
+		return false;
+	}
+	const auto& surface = cfg->buffers[index];
+	*info               = cfg->groups[surface.group_index].ImageInfo(surface);
+	return true;
 }
 
 void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer) {
@@ -1552,6 +1706,12 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 
 void VideoOutDriver::WaitFlipDone(const uint64_t* label) {
 	auto* ctx = m_impl->GetByLabel(label);
+	if (ctx == nullptr && Graphics::FrameCapture::Replaying()) {
+		// The labels the recorded commands name were in the recorded process: wait for every
+		// flip instead, which includes the one the packet waits for.
+		m_impl->GetFlipQueue().WaitAll();
+		return;
+	}
 	EXIT_IF(ctx == nullptr);
 
 	m_impl->GetFlipQueue().Wait(*ctx, static_cast<int>(label - ctx->labels.data()));
@@ -1715,9 +1875,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute);
 	Loader::SystemContentParamSfoGetInt("ATTRIBUTE3", &attribute3);
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
+	// Primary output reports 4K unless param.json Video-out Info enables resolution detection,
+	// or --output-1080p asks for 1080p: titles size their output buffers by it.
 	status->resolution =
-	    ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160 ? 1u : 2u);
+	    (Config::Output1080pEnabled() ||
+	             ((attribute3 & 4) != 0 && driver.width < 3840 && driver.height < 2160)
+	         ? 1u
+	         : 2u);
 	status->dynamicRange = (attribute & 0x20000000) != 0 && driver.IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
@@ -1727,7 +1891,14 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[0] = 0;
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
+	const auto resolution = status->resolution;
 	ctx->mutex.Unlock();
+
+	static std::atomic_uint32_t reported {0};
+	if (reported.exchange(resolution, std::memory_order_relaxed) != resolution) {
+		Log::WriteToConsoleAndLog(fmt::format("VideoOut: output status reports {}\n",
+		                                      resolution == 1u ? "1080p" : "4K"));
+	}
 
 	return OK;
 }

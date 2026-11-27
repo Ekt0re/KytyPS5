@@ -13,6 +13,7 @@
 
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <list>
 #include <memory>
 #include <optional>
@@ -28,6 +29,11 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Finite descriptor domains also bound the arithmetic used to prove their indices.
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
+// Whole-table scans visit each row once; GTA VI keeps a 196608-row buffer heap.
+constexpr uint32_t MaxIndirectScalarTableRows = 262144u;
+// Rows a shader can report selecting unbound, over all roots, and the rows one root binds.
+constexpr uint32_t HeapRowBits = 1u << 24u;
+constexpr uint32_t MaxHeapRows = 512u;
 
 enum class ResourceKind {
 	None,
@@ -85,11 +91,52 @@ struct MemoryInfo {
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		if (typed) {
+			return formatted && data_bits == 32u &&
+			       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
+			        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
+		}
 		if (data_bits == 8u) return !formatted && opcode == ValueOpcode::LoadBufferU8;
 		if (data_bits == 16u) return !formatted && opcode == ValueOpcode::LoadBufferU16;
-		return data_bits == 32u && ((!formatted && opcode == ValueOpcode::ReadConstBuffer) ||
-		       opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
-		       opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
+		return data_bits == 32u &&
+		       (formatted ? opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4
+		                  : opcode == ValueOpcode::ReadConstBuffer ||
+		                        opcode == ValueOpcode::LoadBufferU32 ||
+		                        opcode == ValueOpcode::LoadBufferU32x2 ||
+		                        opcode == ValueOpcode::LoadBufferU32x3 ||
+		                        opcode == ValueOpcode::LoadBufferU32x4);
+	}
+
+	// Raw DWORD stores through a V# the GPU computes; they write guest memory by device address.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+	// Raw 32-bit integer atomics through a V# the GPU computes: they run on guest memory by
+	// device address, as the stores write it.
+	[[nodiscard]] bool SupportsIndirectBufferAtomic(ValueOpcode opcode) const {
+		if (formatted || typed || data_bits != 32u) return false;
+		switch (opcode) {
+			case ValueOpcode::BufferAtomicSwap32:
+			case ValueOpcode::BufferAtomicCmpSwap32:
+			case ValueOpcode::BufferAtomicIAdd32:
+			case ValueOpcode::BufferAtomicISub32:
+			case ValueOpcode::BufferAtomicSMin32:
+			case ValueOpcode::BufferAtomicUMin32:
+			case ValueOpcode::BufferAtomicSMax32:
+			case ValueOpcode::BufferAtomicUMax32:
+			case ValueOpcode::BufferAtomicAnd32:
+			case ValueOpcode::BufferAtomicOr32:
+			case ValueOpcode::BufferAtomicXor32: return true;
+			default: return false;
+		}
+	}
+	[[nodiscard]] bool SupportsIndirectBufferWrite(ValueOpcode opcode) const {
+		return SupportsIndirectBufferStore(opcode) || SupportsIndirectBufferAtomic(opcode);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -109,6 +156,10 @@ struct ExportInfo {
 
 struct BufferResource {
 	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
+	// packed_stride flag of a direct V#: its stride is not part of the module and the shader reads
+	// it from shader data (Bindings::BufferStrideDword), so binding an empty buffer (stride 0) or
+	// another stride does not need another translation. The static stride bits are then 0.
+	static constexpr uint32_t RuntimeStride = 1u << 31u;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
@@ -123,6 +174,8 @@ struct BufferResource {
 	bool                   formatted          = false;
 	bool                   scalar             = false;
 	bool                   live               = false;
+	bool                   raw                = false; // Some access is not formatted.
+	bool                   heap_rows          = false; // Reports rows it selects unbound.
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
@@ -160,6 +213,9 @@ struct ImageResource {
 	bool                          cube              = false;
 	bool                          r128              = false;
 	bool                          heap              = false; // Resident image heap root or kind.
+	// A storage image of a 16-bit float format: float stores keep the guest's range
+	// (KYTY_F16_STORE_CLAMP, F16StoreClampEnabled).
+	bool                          clamp_half_float  = false;
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
@@ -168,12 +224,48 @@ struct ImageResource {
 	bool operator==(const ImageResource& other) const = default;
 };
 
-[[nodiscard]] constexpr bool IsSupportedAtomicImageFormat(Prospero::BufferFormat format, bool wide) {
-	using F = Prospero::BufferFormat;
-	// An atomic treats one or two 32-bit channels as a single word regardless of their numeric type.
-	return wide ? format >= F::k32_32UInt && format <= F::k32_32Float
-	            : format >= F::k32UInt && format <= F::k32Float;
+// KYTY_F16_STORE_CLAMP=1: 32-bit float values stored to a 16-bit float format keep the guest
+// GPU's range. The guest converts rounding toward zero, so a finite value beyond the half range
+// stores the largest half (65504) of its sign; the host's conversion gives infinity, which bloom
+// and exposure passes then spread over the frame. Covers storage images of 16-bit float formats
+// and formatted 16-bit float buffer stores (packed RTZ exports and 11/10-bit float stores already
+// saturate). Adapted from Jetsku/KytyPS5 e0f28907 (from usa-ratt/KytyPS5-GT7 cfa8a479e), GPL-2.0.
+// Read once; part of the generated code, so A/B runs need separate shader caches.
+[[nodiscard]] inline bool F16StoreClampEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F16_STORE_CLAMP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
 }
+
+// "Image atomic operations are supported only on 32- and 64-bit-per pixel surfaces ... Atomic
+// operations treat the element as a single component of 32- or 64-bits" (RDNA ISA, Image
+// Instructions). The opcode types the operation, so any single-component 32-bit T# (64-bit for
+// the X2 forms) works through an R32 (R64) UInt view of the same bits; the 64-bit set
+// k32_32{UInt,SInt,Float} matches AnyPS5's ResourceMaterializer (GPL-2.0). Atomics on other
+// element sizes are undefined and have no Vulkan view.
+[[nodiscard]] constexpr bool IsImageAtomicFormat(Prospero::BufferFormat format, bool atomic64) {
+	using F = Prospero::BufferFormat;
+	return atomic64 ? format == F::k32_32UInt || format == F::k32_32SInt || format == F::k32_32Float
+	                : format == F::k32UInt || format == F::k32SInt || format == F::k32Float;
+}
+
+// A 32-bit image atomic on a k8UInt T#. The ISA defines image atomics only on 32- and 64-bit
+// elements, but GTA VI ORs small values into a k8UInt map whose allocation holds only 8-bit
+// texels (its DCC metadata starts right after the 8-bit surface), so the operation updates the
+// addressed byte. Vulkan has no 8-bit image atomics, and an atomic on such a view can reset the
+// GPU, so the image binds its plain R8 UInt storage view instead: ResourceMaterialization keeps
+// the format as its conversion_format, ApplyResourceSpecialization clears its atomic flag, and the
+// SPIR-V emitter runs each atomic as a read-modify-write of the texel under a lock word of the
+// fault buffer. Returns the element width, or 0 for formats that are not emulated. (k16UInt is
+// not: as a conversion format it marks depth-code reads.)
+[[nodiscard]] constexpr uint32_t EmulatedImageAtomicBits(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k8UInt ? 8u : 0u;
+}
+
+// Lock words for emulated image atomics follow the fault bitmap; any two texels may share one.
+inline constexpr uint32_t ImageAtomicLockWords = 4096u;
 
 [[nodiscard]] constexpr Prospero::BufferFormat
 RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format) {
@@ -190,6 +282,12 @@ RawSignedStorageFormat(const ImageResource& image, Prospero::BufferFormat format
 // R16Uint, so the host binds it as UNorm and the shader converts back.
 [[nodiscard]] constexpr bool ReadsDepthBits(const ImageResource& image) {
 	return image.conversion_format == Prospero::BufferFormat::k16UInt;
+}
+
+// An atomic image bound through its R8 UInt storage view (see EmulatedImageAtomicBits).
+[[nodiscard]] constexpr bool EmulatesImageAtomics(const ImageResource& image) {
+	return image.resource_class == ImageResourceClass::Storage && !image.atomic &&
+	       EmulatedImageAtomicBits(image.conversion_format) != 0u;
 }
 
 struct SamplerResource {
@@ -347,7 +445,9 @@ inline constexpr uint32_t ImageBindingCount           = 50u;
 // Resident image heaps share one sampled-image array at binding 0 of this set. A heap slot
 // word is kind << ImageHeapKindShift | element; element 0 is the null descriptor.
 inline constexpr uint32_t ImageHeapSet                = 1u;
-inline constexpr uint32_t ImageHeapCapacity           = 65536u;
+// The most resident images a heap holds; a device with lower descriptor limits gets the largest
+// power of two it allows (Spirv::Profile::image_heap_capacity).
+inline constexpr uint32_t ImageHeapCapacity           = 262144u;
 inline constexpr uint32_t ImageHeapKindShift          = 20u;
 
 enum class DescriptorBindingKind : uint32_t {
@@ -516,9 +616,14 @@ struct Bindings {
 		return memory_offset_dword +
 		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Then each binding's run-time V# stride, two 16-bit halves per dword.
+	[[nodiscard]] uint32_t BufferStrideDword() const {
 		return MemorySizeDword() +
 		       descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)];
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return BufferStrideDword() +
+		       (descriptor_counts[static_cast<size_t>(DescriptorBindingKind::Buffers)] + 1u) / 2u;
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -537,7 +642,7 @@ struct Bindings {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
-	static constexpr uint32_t MaxImages       = 64;
+	static constexpr uint32_t MaxImages       = 128;
 	static constexpr uint32_t MaxSamplers     = 32;
 
 	std::vector<BufferResource>      buffers;
@@ -555,6 +660,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	bool                            uses_heap_rows                = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
@@ -702,6 +808,36 @@ struct UniformFillPlan {
 
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
+// One scanned descriptor table: the inputs that determine the scan, and what it produced.
+struct ScanCacheEntry {
+	static constexpr size_t ChildWords = 9u; // Eight descriptor DWORDs and their count.
+	static constexpr size_t MaxEntries = 64u;
+
+	uint32_t                source_index     = 0;
+	uint32_t                resource_index   = 0;
+	uint64_t                table_base       = 0;
+	uint64_t                table_size       = 0;
+	uint64_t                first            = 0;
+	uint64_t                step             = 0;
+	uint64_t                count            = 0;
+	uint32_t                dword_count      = 0;
+	uint32_t                read_dwords      = 0;
+	std::array<uint32_t, 8> root             = {};
+	uint32_t                root_dword_count = 0;
+	uint64_t                content_hash     = 0;
+	std::vector<uint32_t>   children;
+	std::vector<uint32_t>   mapping;
+
+	// Everything except the table bytes; a match with other bytes is a stale entry to replace.
+	[[nodiscard]] bool SameInputs(const ScanCacheEntry& other) const {
+		return source_index == other.source_index && resource_index == other.resource_index &&
+		       table_base == other.table_base && table_size == other.table_size &&
+		       first == other.first && step == other.step && count == other.count &&
+		       dword_count == other.dword_count && read_dwords == other.read_dwords &&
+		       root == other.root && root_dword_count == other.root_dword_count;
+	}
+};
+
 struct ResourcePlan {
 	struct SelectorKeys {
 		std::vector<uint32_t> values;
@@ -741,6 +877,8 @@ struct ResourcePlan {
 	mutable std::vector<uint64_t>           srt_scratch;
 	mutable std::vector<uint32_t>           material_keys;
 	mutable std::vector<SelectorKeys>       selector_keys;
+	// Results of scanning large descriptor tables, reused while the table bytes are unchanged.
+	mutable std::vector<ScanCacheEntry> scan_cache;
 };
 
 struct Program: ResourcePlan {

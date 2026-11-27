@@ -162,9 +162,9 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		site.address = address;
 	}
 	const auto query_reads = reads.size();
-	if (source.linked) {
-		auto& linked = *source.linked;
-		bool unchanged = true;
+	// Whether a link's callees are the code now at the call addresses (by content: leaf code
+	// has no PC-relative instructions, so equal words translate equally at any address).
+	const auto matches = [&](ShaderSource::Linked& linked) {
 		for (size_t i = 0; i < source.calls.size(); ++i) {
 			const auto& function = linked.functions[i];
 			const auto expected = std::span(linked.code).subspan(function.offset, function.size);
@@ -173,18 +173,29 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 			if (previous != preceding.end()) {
 				const auto& observed = linked.functions[previous - preceding.begin()];
 				if (std::ranges::equal(expected, std::span(linked.code).subspan(observed.offset, observed.size))) continue;
-				unchanged = false;
-				break;
+				reads.resize(query_reads);
+				return false;
 			}
 			linked.observed_function.resize(function.size);
 			if (!read_code(source.calls[i].address, linked.observed_function) ||
 			    !std::ranges::equal(expected, linked.observed_function)) {
-				unchanged = false;
-				break;
+				reads.resize(query_reads);
+				return false;
 			}
 		}
-		if (unchanged) return linked.decoded;
-		reads.resize(query_reads);
+		return true;
+	};
+	if (source.linked && matches(*source.linked)) return source.linked->decoded;
+	// A callee set linked before: swap it back in (the current link becomes the most recent
+	// previous one).
+	for (auto it = source.previous_links.begin(); it != source.previous_links.end(); ++it) {
+		if (!matches(*it)) continue;
+		auto found = std::move(*it);
+		source.previous_links.erase(it);
+		if (source.linked) source.previous_links.insert(source.previous_links.begin(), std::move(*source.linked));
+		source.linked = std::move(found);
+		source.revision = source.linked->id;
+		return source.linked->decoded;
 	}
 	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
 	const auto& last = source.decoded.instructions.back();
@@ -261,8 +272,13 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	linked.observed_function.resize(std::ranges::max_element(linked.functions, {},
 	    &ShaderSource::Linked::Function::size)->size);
 
+	if (source.linked) {
+		source.previous_links.insert(source.previous_links.begin(), std::move(*source.linked));
+		if (source.previous_links.size() > ShaderSource::MaxPreviousLinks) source.previous_links.pop_back();
+	}
+	linked.id = ++source.links_made;
 	source.linked = std::move(linked);
-	++source.revision;
+	source.revision = source.linked->id;
 	return source.linked->decoded;
 }
 

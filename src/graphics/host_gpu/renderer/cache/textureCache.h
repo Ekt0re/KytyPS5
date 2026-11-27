@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <bitset>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <type_traits>
@@ -75,7 +76,10 @@ public:
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// full_write: the GPU write covers every byte of the range, so images inside it take the
+	// written data even when they hold GPU writes of their own.
+	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
+	                                           bool full_write = false);
 	// Writes a copy into whole levels of one layer of a GPU-written image straight into it, and
 	// returns false for any other copy.
 	[[nodiscard]] bool CopyToImage(uint64_t address, uint64_t source, uint64_t size);
@@ -211,6 +215,7 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
+	[[nodiscard]] bool        ReleaseIdleImages(GuestRange requested);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -227,12 +232,22 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	[[nodiscard]] static bool        ShareDepthStencilDefault() {
+		static const bool share = [] {
+			const char* value = std::getenv("KYTY_DEPTH_STENCIL_SHARE");
+			return value != nullptr && value[0] == '1';
+		}();
+		return share;
+	}
 
+	// single_view: the binding views one level and one layer, as a block view of a BC image must.
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged, bool exact_format);
+	                                           ImageId cached, ImageId merged, bool exact_format,
+	                                           bool single_view);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
+	[[nodiscard]] bool          RetireThroughGuestMemory(ImageId replacement, ImageId retired);
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
@@ -284,6 +299,10 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t m_critical_gc_memory      = 3ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick                 = 0;
+	// KYTY_DEPTH_STENCIL_SHARE=1 (off by default until verified in game): a depth-only target
+	// renders the depth aspect of the depth/stencil image at its address instead of replacing
+	// it with a depth-only image. With it on, the runtime toggle depth_split=1 turns it off again.
+	bool     m_share_depth_stencil     = ShareDepthStencilDefault();
 	bool     m_readback_linear_images  = false;
 	bool     m_readback_tiled_images   = false;
 	bool     m_readback_storage_images = false;

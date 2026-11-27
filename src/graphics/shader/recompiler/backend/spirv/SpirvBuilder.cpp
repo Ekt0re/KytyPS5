@@ -16,6 +16,8 @@ static void AppendInstructionWords(std::vector<uint32_t>& section, const uint32_
 		return;
 	}
 	const uint32_t opcode     = words[0];
+	// A longer instruction would wrap its 16-bit word count into a corrupt module.
+	EXIT_IF(words_num > 0xffffu);
 	const auto     word_count = static_cast<uint32_t>(words_num);
 	section.push_back((word_count << spv::WordCountShift) | opcode);
 	section.insert(section.end(), words + 1, words + words_num);
@@ -100,6 +102,13 @@ uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass 
 	return id;
 }
 
+uint32_t Builder::DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class,
+                                       uint32_t initializer) {
+	const auto id = AllocateId();
+	AppendInstruction(m_declarations, spv::OpVariable, pointer_type, id, storage_class, initializer);
+	return id;
+}
+
 void Builder::DefineGlobalVariable(uint32_t id, uint32_t pointer_type,
                                    spv::StorageClass storage_class) {
 	AppendInstruction(m_declarations, spv::OpVariable, pointer_type, id, storage_class);
@@ -169,6 +178,7 @@ void Builder::AddFunction(std::span<const uint32_t> words) {
 
 DeferredPhi Builder::AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count) {
 	const DeferredPhi phi {m_functions.size()};
+	EXIT_IF(incoming_count > (0xffffu - 3u) / 2u);
 	const auto word_count = static_cast<uint32_t>(3u + incoming_count * 2u);
 	m_functions.push_back((word_count << spv::WordCountShift) | spv::OpPhi);
 	m_functions.push_back(type);

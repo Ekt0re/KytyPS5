@@ -198,6 +198,13 @@ public:
 		return result;
 	}
 
+	BitArray& operator|=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) | other.Load(word));
+		}
+		return *this;
+	}
+
 private:
 	static constexpr uint64_t StartMask(size_t start) {
 		return ~uint64_t {0} << (start % BITS_PER_WORD);

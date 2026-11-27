@@ -41,6 +41,12 @@ class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	// Zero-copy: a buffer over guest memory itself, imported from `host_pointer` (the backing
+	// alias of [cpu_address, cpu_address + size)) with VK_EXT_external_memory_host. GPU writes land
+	// in guest memory and CPU writes are visible to the GPU without uploads. Handle() is null when
+	// the driver refuses the import.
+	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+	       void* host_pointer, vk::BufferUsageFlags flags, uint64_t size);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -48,6 +54,8 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	[[nodiscard]] bool               IsZeroCopy() const noexcept { return m_imported != nullptr; }
+	[[nodiscard]] uint64_t           HostPointer() const noexcept { return m_host_pointer; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
@@ -73,6 +81,16 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Zero-copy: CPU faults that needed a read-back from this buffer, and whether it qualifies
+	// for guest memory (0 not judged yet, 2 no).
+	uint32_t readback_faults    = 0;
+	uint8_t  zero_copy_judgment = 0;
+	// Zero-copy: the newest scheduler tick that records a GPU write to this buffer.
+	uint64_t last_write_tick    = 0;
+	// Zero-copy: the tick whose completion already returns this buffer's pages to the CPU.
+	uint64_t release_tick       = 0;
+	// Zero-copy: LibKernel::Memory::BackingGeneration() when the import was last known valid.
+	uint64_t backing_generation = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -93,6 +111,8 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	vk::DeviceMemory              m_imported     = nullptr;
+	uint64_t                      m_host_pointer = 0;
 };
 
 class StreamBuffer final: public Buffer {

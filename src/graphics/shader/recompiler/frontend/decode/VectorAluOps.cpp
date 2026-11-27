@@ -245,6 +245,12 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xdeu, Opcode::V_CMPX_GE_F16},        {0xf9u, Opcode::V_CMPX_NGE_F16},
     {0xfbu, Opcode::V_CMPX_NGT_F16},       {0xfcu, Opcode::V_CMPX_NLE_F16},
     {0xfdu, Opcode::V_CMPX_NEQ_F16},       {0xfeu, Opcode::V_CMPX_NLT_F16},
+    // The rest of the RDNA2 F16 compares (after Axellito/VIKyng bcee3021).
+    {0xc8u, Opcode::V_CMP_F_F16},          {0xcfu, Opcode::V_CMP_O_F16},
+    {0xeau, Opcode::V_CMP_NLG_F16},        {0xefu, Opcode::V_CMP_TRU_F16},
+    {0xd8u, Opcode::V_CMPX_F_F16},         {0xddu, Opcode::V_CMPX_LG_F16},
+    {0xdfu, Opcode::V_CMPX_O_F16},         {0xf8u, Opcode::V_CMPX_U_F16},
+    {0xfau, Opcode::V_CMPX_NLG_F16},       {0xffu, Opcode::V_CMPX_TRU_F16},
 };
 
 constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
@@ -1071,7 +1077,9 @@ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	}
 	if (!SupportsVopcSdwa(inst.opcode)) {
 		SetUnsupported(inst, Family::VOPC, opcode,
-		               "VOPC SDWA modifier is not supported for opcode");
+		               inst.opcode == Opcode::UNSUPPORTED
+		                   ? "VOPC opcode is not implemented"
+		                   : "VOPC SDWA modifier is not supported for opcode");
 		return;
 	}
 
@@ -1478,7 +1486,13 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NGT_F16:
 		case Opcode::V_CMPX_NLE_F16:
 		case Opcode::V_CMPX_NEQ_F16:
-		case Opcode::V_CMPX_NLT_F16: return true;
+		case Opcode::V_CMPX_NLT_F16:
+		case Opcode::V_CMPX_F_F16:
+		case Opcode::V_CMPX_U_F16:
+		case Opcode::V_CMPX_LG_F16:
+		case Opcode::V_CMPX_O_F16:
+		case Opcode::V_CMPX_NLG_F16:
+		case Opcode::V_CMPX_TRU_F16: return true;
 		default: return false;
 	}
 }

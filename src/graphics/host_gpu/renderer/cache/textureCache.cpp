@@ -5,7 +5,9 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
+#include "common/runtimeToggles.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -20,14 +22,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <span>
 #include <tuple>
 #include <utility>
+#include <vector>
+#include <fmt/format.h>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -45,7 +52,9 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
 	                           : desc.view_info.format;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
-	if (cmask ? code == 0 : code == 0x20) {
+	// PS5 DCC fast clears to the CB_COLOR_CLEAR_WORD value fill the keys with 0x10, not only the
+	// GFX10 0x20.
+	if (cmask ? code == 0 : (code == 0x20 || code == 0x10)) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
@@ -204,10 +213,85 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return BindingType::Texture;
 }
 
+// KYTY_LOG_IMAGE_SIZES lists the first sizes of large 2D images the title creates, which show
+// the resolution it renders at (for example with --output-1080p).
+static void LogLargeImageExtent(const ImageInfo& info) {
+	static const bool enabled = std::getenv("KYTY_LOG_IMAGE_SIZES") != nullptr;
+	if (!enabled || info.extent.width < 960 || info.extent.depth != 1) {
+		return;
+	}
+	static std::mutex                                 mutex;
+	static std::vector<std::pair<uint32_t, uint32_t>> seen;
+	std::lock_guard lock(mutex);
+	const std::pair size {info.extent.width, info.extent.height};
+	if (seen.size() >= 64 || std::ranges::find(seen, size) != seen.end()) {
+		return;
+	}
+	seen.push_back(size);
+	Log::WriteToConsoleAndLog(fmt::format("Image size: {}x{} format={} levels={}\n", size.first,
+	                                      size.second, static_cast<int>(info.pixel_format),
+	                                      info.resources.levels));
+}
+
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	while (info.pixel_format != vk::Format::eUndefined &&
+	       m_slot_images[id].backing.image == nullptr) {
+		m_slot_images.erase(id);
+		if (!ReleaseIdleImages(info.data)) {
+			EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
+			     info.extent.width, info.extent.height, info.extent.depth,
+			     static_cast<int>(info.pixel_format), info.IsVolume() ? 1u : info.resources.layers,
+			     info.resources.levels);
+		}
+		id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	}
 	RegisterImage(id);
+	LogLargeImageExtent(info);
 	return id;
+}
+
+bool TextureCache::ReleaseIdleImages(GuestRange requested) {
+	if (!m_scheduler.Active() || m_gc_tick == 0) {
+		return false;
+	}
+	std::vector<ImageId> candidates;
+	m_lru_cache.ForEachItemBelow(m_gc_tick - 1, [&](ImageId id) { candidates.push_back(id); });
+	std::vector<ImageId> released;
+	uint64_t             released_size = 0;
+	for (const auto id: candidates) {
+		if (released_size >= requested.size) {
+			break;
+		}
+		auto* image = m_slot_images.try_get(id);
+		if (image == nullptr || !image->registered || image->depth_id ||
+		    image->backing.image == nullptr || image->tick_accessed_last == m_gc_tick ||
+		    image->heap_refs.load(std::memory_order_relaxed) != 0u || image->binding.is_bound ||
+		    image->binding.is_target || image->usage.video_out ||
+		    image->Overlaps(requested.address, requested.size)) {
+			continue;
+		}
+		if (image->IsGpuModified() && image->IsMaybeCpuDirty()) {
+			TrackImage(id);
+			image->ResolveMaybeCpuHash(image->HashGuestEdges());
+		}
+		if (image->SafeToDownload() && (image->info.HasStencil() || !DownloadImageMemory(id))) {
+			continue;
+		}
+		released_size += image->AccountedSize();
+		released.push_back(id);
+		FreeImage(id);
+	}
+	if (released.empty()) {
+		return false;
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto id: released) {
+		m_slot_images[id].ReleaseBacking();
+	}
+	return true;
 }
 
 void TextureCache::RegisterImage(ImageId id) {
@@ -226,7 +310,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
-	m_resolve_cache.Invalidate();
+	m_resolve_cache.Invalidate(data.address, data.size);
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -249,7 +333,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
 	image.registered = false;
-	m_resolve_cache.Invalidate();
+	m_resolve_cache.Invalidate(image.info.data.address, image.info.data.size);
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -275,7 +359,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -650,7 +734,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    binding == BindingType::Texture && cached.info.IsDepth() && !cached.info.HasStencil() &&
 	    !requested.IsVolume() && requested.samples == cached.info.samples &&
 	    IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
-	bool recreate = cached.info.resources < requested.resources ||
+	// A depth-only target renders the depth aspect of a depth/stencil image of its depth format.
+	const bool share_depth = binding == BindingType::DepthTarget && m_share_depth_stencil &&
+	                         cached.info.IsDepth() && !stencil_match &&
+	                         CanRenderDepthAspectOf(cached.info, requested);
+	bool recreate = !cached.info.resources.Contains(requested.resources) ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -661,13 +749,23 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
 		case BindingType::DepthTarget:
 			recreate |= !cached.info.IsDepth();
-			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match) && !share_depth;
 			break;
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
 	if (!recreate) {
+		if (share_depth) {
+			static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+			if (!logged.test_and_set(std::memory_order_relaxed)) {
+				LOGF("TextureCache: depth-only %s target renders the depth aspect of the %s image "
+				     "at 0x%016" PRIx64 "\n",
+				     vk::to_string(requested.pixel_format).c_str(),
+				     vk::to_string(cached.info.pixel_format).c_str(), requested.data.address);
+			}
+		}
 		return cached_id;
 	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::DepthRecreates);
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -689,6 +787,16 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+	}
+	if (grow_depth) {
+		// The grown image keeps the pending HTile clears of every slice.
+		const auto metadata = m_surface_metas.find(info.metadata.range.address);
+		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
+			metadata->second.owner = replacement_id;
+		}
+	}
+	if (RetireThroughGuestMemory(replacement_id, cached_id)) {
+		return replacement_id;
 	}
 	// The copy below covers only the cached layers and levels; the rest start from guest memory.
 	if (info.resources.levels > cached.info.resources.levels ||
@@ -718,13 +826,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
-	}
-	if (grow_depth) {
-		// The grown image keeps the pending HTile clears of every slice.
-		const auto metadata = m_surface_metas.find(info.metadata.range.address);
-		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
-			metadata->second.owner = replacement_id;
-		}
 	}
 	FreeImage(cached_id);
 	return replacement_id;
@@ -780,7 +881,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
-                                                         ImageId merged_id, bool exact_format) {
+                                                         ImageId merged_id, bool exact_format,
+                                                         bool single_view) {
 	auto& cached = m_slot_images[cached_id];
 	if (!cached.registered) {
 		return {merged_id};
@@ -861,7 +963,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		                              requested.resources.levels == cached.info.resources.levels;
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
 		if ((requested.pixel_format == cached.info.pixel_format || compatible_array) &&
-		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    requested.type == cached.info.type &&
+		    !cached.info.resources.Contains(requested.resources) &&
 		    (requested.data.size > cached.info.data.size ||
 		     (requested.data.size == cached.info.data.size &&
 		      requested.extent == cached.info.extent &&
@@ -871,6 +974,24 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		if (requested.type != cached.info.type) {
 			return {merged_id};
+		}
+		// Guest shaders write BC images through uncompressed aliases with one texel per block.
+		// A storage view of the BC image needs storage usage, which RADV refuses for 3D images
+		// with 16-byte blocks, and Vulkan allows block views of one level and layer only. Other
+		// writes go to an image of the alias format; sampling it as BC copies it back.
+		if (binding == BindingType::Storage && !merged_id && cached.info.IsBlock() &&
+		    !requested.IsBlock() &&
+		    (!(cached.backing.usage & vk::ImageUsageFlagBits::eStorage) || !single_view) &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+			static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+			if (!logged.test_and_set(std::memory_order_relaxed)) {
+				LOGF("TextureCache: storage alias %s %ux%ux%u of %s image at 0x%016" PRIx64
+				     " writes a separate image\n",
+				     vk::to_string(requested.pixel_format).c_str(), requested.extent.width,
+				     requested.extent.height, requested.extent.depth,
+				     vk::to_string(cached.info.pixel_format).c_str(), requested.data.address);
+			}
+			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
@@ -919,6 +1040,9 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
+	if (RetireThroughGuestMemory(expanded_id, source_id)) {
+		return expanded_id;
+	}
 	InitializeImage(expanded_id);
 	if (const auto view = source.info.SubresourceOf(info); view.mip >= 0) {
 		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(view.mip),
@@ -928,6 +1052,21 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	}
 	FreeImage(source_id);
 	return expanded_id;
+}
+
+bool TextureCache::RetireThroughGuestMemory(ImageId replacement_id, ImageId retired_id) {
+	const auto& replacement = m_slot_images[replacement_id].info;
+	auto&       retired     = m_slot_images[retired_id];
+	if (replacement.type != retired.info.type ||
+	    replacement.resources.Contains(retired.info.resources) || replacement.samples != 1 ||
+	    replacement.metadata.compression != VideoOutCompression::Uncompressed ||
+	    (retired.IsGpuModified() &&
+	     (!retired.SafeToDownload() || !BcAlias::Publish(*this, retired)))) {
+		return false;
+	}
+	InitializeImage(replacement_id);
+	FreeImage(retired_id);
+	return true;
 }
 
 bool TextureCache::CanDownload(const Image& image) const {
@@ -1297,6 +1436,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		// A resident image heap may sample the adopted image, for example an R8 texture at
+		// the stencil range. Its references still belong to that image, so queue the change.
+		record.HeapChanged();
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1306,6 +1448,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::TextureLookups);
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
@@ -1351,7 +1494,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			// only a new view replaces the view's mip and layer.
 			for (const auto candidate: candidates) {
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto overlap = ResolveOverlap(merged_info, desc.type, candidate, result, exact_format);
+				const auto overlap =
+				    ResolveOverlap(merged_info, desc.type, candidate, result, exact_format,
+				                   desc.view_info.level_count == 1 &&
+				                       desc.view_info.layer_count == 1);
 				if (overlap.image) {
 					result = overlap.image;
 				}
@@ -1392,7 +1538,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			                             desc.info.guest_format;
 			if (needs_color || (exact_format && resolved.info.pixel_format != desc.info.pixel_format)) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (!resolved.info.resources.Contains(desc.info.resources)) {
+				if (CanDownload(resolved)) {
+					RefreshImage(result);
+					if (resolved.SafeToDownload()) {
+						(void)BcAlias::Publish(*this, resolved);
+					}
+				}
 				FreeImage(result);
 				result = {};
 			}
@@ -1417,6 +1569,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			desc.view_info.base_layer += image.stencil_subresources.base_layer;
 			result                = image.depth_id;
 			desc.view_info.format = m_slot_images[result].backing.format;
+		} else if (desc.type == BindingType::DepthTarget) {
+			// A depth-only target of a depth/stencil image renders its depth aspect.
+			desc.view_info.format =
+			    DepthTargetViewFormat(image.backing.format, desc.info.pixel_format);
 		}
 		image.tick_accessed_last = m_gc_tick;
 		TouchImage(image);
@@ -1841,14 +1997,9 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
-	if (!selected) {
-		return false;
-	}
-
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, ImageId id) {
 	std::scoped_lock lock {m_texture_cache.m_lock};
-	auto& image = m_texture_cache.m_slot_images[selected];
+	auto&            image = m_texture_cache.m_slot_images[id];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!image.SafeToDownload()) {
 		return false;
@@ -1885,6 +2036,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	}
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	MarkUnsubmittedWrite(image.info.data.address, copy_size);
 	return true;
 }
 
@@ -1907,6 +2059,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	DownloadImage(image, *download.buffer, download.offset, range.size,
 	              image.info.resources.levels);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::TextureReadbacks);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -1959,11 +2112,48 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 	return tick;
 }
 
-void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool full_write) {
+	// A GPU buffer write also refreshes the images it overlaps at other addresses (after
+	// middletooth-glitch/KytyPS5 96a411672e, 9757165f56, 98a6e4cd3e, 7f3bfa1bdb):
+	// - an image without GPU writes of its own takes the buffer's bytes on its next use, so it
+	//   does not keep the contents from before the write;
+	// - a write that covers every byte of the range (a fill or a copy) is newer than the GPU
+	//   writes of the images inside it, so they take the written data too.
+	// Compressed images cannot be refreshed from a buffer. KYTY_GPU_WRITE_IMAGES=exact limits
+	// the refresh to images starting at the write, as before.
+	static const bool overlap_default = [] {
+		const char* value = std::getenv("KYTY_GPU_WRITE_IMAGES");
+		return value == nullptr || std::strcmp(value, "exact") != 0;
+	}();
+	const bool overlap = overlap_default && !Common::RuntimeToggles::Get("exact");
+	static std::atomic<uint32_t> logged {0};
 	std::scoped_lock lock {m_lock};
 	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
-		if (image.info.data.address != address) {
+		if (image.info.data.address == address) {
+			image.ClearGpuModified();
+			image.MarkBufferModified();
 			return;
+		}
+		if (!overlap || image.info.metadata.compression != VideoOutCompression::Uncompressed) {
+			return;
+		}
+		const bool inside = image.info.data.address >= address &&
+		                    image.info.data.End() <= address + size;
+		const bool refresh = !image.IsGpuModified() || (full_write && inside);
+		if (!refresh) {
+			return;
+		}
+		const auto count = logged.fetch_add(1, std::memory_order_relaxed);
+		if (count < 32u || (count & (count - 1u)) == 0u) {
+			char message[256];
+			std::snprintf(message, sizeof(message),
+			              "GPU buffer write refreshes an overlapped image (#%u): write 0x%016" PRIx64
+			              "+0x%" PRIx64 " full=%d, image 0x%016" PRIx64 "+0x%" PRIx64
+			              " %ux%u gpu_modified=%d\n",
+			              count + 1u, address, size, full_write ? 1 : 0, image.info.data.address,
+			              image.info.data.size, image.info.extent.width, image.info.extent.height,
+			              image.IsGpuModified() ? 1 : 0);
+			Log::WriteToConsoleAndLog(message);
 		}
 		image.ClearGpuModified();
 		image.MarkBufferModified();
@@ -2126,6 +2316,7 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	m_share_depth_stencil = ShareDepthStencilDefault() && !Common::RuntimeToggles::Get("depth_split");
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

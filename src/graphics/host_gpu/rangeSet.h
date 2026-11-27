@@ -96,6 +96,7 @@ public:
 	}
 
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
+	void               Clear() noexcept { m_ranges.clear(); }
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {

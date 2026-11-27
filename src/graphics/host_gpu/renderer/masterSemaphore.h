@@ -28,6 +28,15 @@ public:
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
+	// Every tick up to `tick` was submitted to the queue. Submissions of the GPU thread run on the
+	// command recorder's thread after NextTick() handed out their tick (in tick order), and Wait()
+	// waits for the submission before it waits for the GPU, so it never waits on a timeline value
+	// whose signal operation was not submitted yet.
+	void MarkSubmitted(uint64_t tick) noexcept;
+	[[nodiscard]] uint64_t SubmittedTick() const noexcept {
+		return m_submitted_tick.load(std::memory_order_acquire);
+	}
+
 	void Refresh();
 	void Wait(uint64_t tick);
 
@@ -36,6 +45,7 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::atomic<uint64_t> m_submitted_tick {0};
 };
 
 } // namespace Libs::Graphics

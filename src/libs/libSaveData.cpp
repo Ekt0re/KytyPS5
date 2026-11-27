@@ -14,9 +14,12 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <vector>
 
@@ -30,6 +33,18 @@ namespace SaveData {
 static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
 static constexpr uint64_t SAVE_DATA_BLOCKS_MIN = 48;
 static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
+
+// KYTY_SAVE_DIR=<folder> keeps saves in another host folder than `_SaveData` (relative paths are
+// resolved against the working directory), so one run folder can switch between save sets.
+static const std::filesystem::path& save_data_root() {
+	static const std::filesystem::path root = [] {
+		const char* value = std::getenv("KYTY_SAVE_DIR");
+		auto path = std::filesystem::path(value != nullptr && value[0] != '\0' ? value : SAVE_DATA_DIR);
+		std::printf("Save data folder: %s\n", path.string().c_str());
+		return path;
+	}();
+	return root;
+}
 
 struct SceSaveDataDirName {
 	char data[32];
@@ -312,7 +327,7 @@ static std::string memory_dir_name(uint32_t slot_id) {
 }
 
 static std::filesystem::path save_user_directory(std::string_view title_id, int32_t user_id) {
-	auto directory = std::filesystem::path(SAVE_DATA_DIR);
+	auto directory = save_data_root();
 	if (Config::IsGuestUserId(user_id)) {
 		directory /= std::filesystem::path("[users]") / std::to_string(user_id);
 	}
@@ -331,7 +346,7 @@ static bool is_memory_dir_name(std::string_view dir_name) {
 static std::filesystem::path save_directory(std::string_view title_id, std::string_view dir_name,
                                             int32_t user_id) {
 	if (is_memory_dir_name(dir_name)) {
-		return std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name / std::to_string(user_id);
+		return save_data_root() / title_id / dir_name / std::to_string(user_id);
 	}
 	return save_user_directory(title_id, user_id) / dir_name;
 }

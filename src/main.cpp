@@ -25,6 +25,10 @@ static void PrintUsage() {
 	::printf("Options:\n");
 	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
+	::printf("  --replay <dir>                       Replay a frame capture (KYTY_FRAME_CAPTURE=<dir>)\n"
+	         "                                       without a game.\n");
+	::printf("  --replay-out <dir>                   Replay results (default <capture>/replay).\n");
+	::printf("  --replay-repeat <num>                Replay the captured frames this many times.\n");
 	::printf("  --addcont-dir <dir>                  Add-ons (DLC) folder (default: none).\n");
 	::printf(
 	    "  --addcont <label>[=<dir>]            Add-on (DLC) by entitlement label with its data in\n"
@@ -57,6 +61,8 @@ static void PrintUsage() {
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
 	::printf("  --trinity                            Enable experimental PS5 Pro mode for\n"
 	         "                                       supported titles. Default: off.\n");
+	::printf("  --output-1080p                       Report a 1080p video output to games instead of 4K.\n"
+	         "                                       Default: off.\n");
 	::printf("  --pssr-upscaler <value>              With --trinity, upscale PSSR with Linear,\n"
 	         "                                       DLSS, or FSR. Default: Linear.\n");
 	::printf("  --dlss-folder <folder>               DLSS model folder.\n");
@@ -217,6 +223,7 @@ static constexpr Flag FLAGS[] = {
     {"--no-splash", &ConfigOptions::splash_enabled, false},
     {"--vr", &ConfigOptions::vr_enabled},
     {"--trinity", &ConfigOptions::pro_enabled},
+    {"--output-1080p", &ConfigOptions::output_1080p},
     {"--amd-cpu", &ConfigOptions::amd_cpu_enabled},
     {"--guest-tsc", &ConfigOptions::guest_tsc_enabled},
     {"--network-connected", &ConfigOptions::network_connected},
@@ -275,6 +282,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		if (!NextArg(argc, argv, i, value)) {
 			::printf("missing value for %s\n", arg.c_str());
 			return false;
+		}
+
+		if (arg == "--replay") {
+			options.replay = Common::PathFromUtf8(value);
+			continue;
+		}
+		if (arg == "--replay-out") {
+			options.replay_out = Common::PathFromUtf8(value);
+			continue;
+		}
+		if (arg == "--replay-repeat") {
+			if (!ParseUint32(value, options.replay_repeat) || options.replay_repeat == 0) {
+				::printf("invalid replay repeat count: %s\n", value.c_str());
+				return false;
+			}
+			continue;
 		}
 
 		if (arg == "--game") {
@@ -434,6 +457,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid vblank frequency: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--precompile-threads") {
+			if (!ParseUint32(value, options.config.precompile_threads) ||
+			    options.config.precompile_threads > 1024) {
+				::printf("invalid precompile thread count: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--restamp-sample") {
+			if (!ParseUint32(value, options.config.restamp_sample)) {
+				::printf("invalid restamp sample: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--flush-draws") {
 			if (!ParseUint32(value, options.config.flush_draws)) {
 				::printf("invalid draw count: %s\n", value.c_str());
@@ -482,7 +516,7 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		options.config.vulkan_validation_enabled = true;
 	}
 
-	return show_help || (!options.app0_dir.empty() && !options.elf.empty());
+	return show_help || !options.replay.empty() || (!options.app0_dir.empty() && !options.elf.empty());
 }
 
 static int Main(int argc, char* argv[]) {
@@ -506,6 +540,13 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
+	if (!options.replay.empty()) {
+		RunReplay(options);
+		return 0;
+	}
+	if (options.config.precompile_shaders || options.config.restamp_shader_store) {
+		return RunPrecompile(options);
+	}
 	Run(options);
 
 	return 0;

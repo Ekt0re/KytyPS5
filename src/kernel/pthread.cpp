@@ -1,3 +1,4 @@
+#include "common/compilePause.h"
 #include "kernel/pthread.h"
 
 #include "common/assert.h"
@@ -176,12 +177,21 @@ uint64_t KernelGuestTscMultiplier() {
 	return multiplier;
 }
 
+// The host TSC on the guest clock: it stands still while a GPU queue waits for a compile.
+static uint64_t KernelHeldHostTsc() {
+#if defined(_M_X64) || defined(__x86_64__)
+	return Common::CompilePause::GuestTicks();
+#else
+	return Common::CompilePause::GuestNowNs();
+#endif
+}
+
 static uint64_t KernelReadTscNative() {
 	if (!Config::GuestTscEnabled()) {
-		return KernelHostTsc();
+		return KernelHeldHostTsc();
 	}
 	return static_cast<uint64_t>(
-	    (static_cast<unsigned __int128>(KernelHostTsc()) * KernelGuestTscMultiplier()) >> 32u);
+	    (static_cast<unsigned __int128>(KernelHeldHostTsc()) * KernelGuestTscMultiplier()) >> 32u);
 }
 
 static uint64_t KernelGetTscFrequencyNative() {
@@ -284,7 +294,7 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
 		case KERNEL_CLOCK_EXT_AD_NETWORK:
 		case KERNEL_CLOCK_EXT_RAW_NETWORK: {
-			const auto ns = Common::SteadyNs();
+			const auto ns = Common::CompilePause::GuestNowNs();
 			tp->tv_sec    = static_cast<int64_t>(ns / NANOS_PER_SEC);
 			tp->tv_nsec   = static_cast<int64_t>(ns % NANOS_PER_SEC);
 			return true;
@@ -327,7 +337,25 @@ static bool KernelClockGettimeSpecial(KernelClockid clock_id, KernelTimespec* tp
 		return true;
 	}
 
-	return false;
+	switch (clock_id) {
+		case KERNEL_CLOCK_MONOTONIC:
+		case KERNEL_CLOCK_UPTIME:
+		case KERNEL_CLOCK_UPTIME_PRECISE:
+		case KERNEL_CLOCK_UPTIME_FAST:
+		case KERNEL_CLOCK_MONOTONIC_PRECISE:
+		case KERNEL_CLOCK_MONOTONIC_FAST:
+		case KERNEL_CLOCK_EXT_NETWORK:
+		case KERNEL_CLOCK_EXT_DEBUG_NETWORK:
+		case KERNEL_CLOCK_EXT_AD_NETWORK:
+		case KERNEL_CLOCK_EXT_RAW_NETWORK: {
+			// CLOCK_MONOTONIC (steady_clock) on the guest clock.
+			const auto ns = Common::CompilePause::GuestNowNs();
+			tp->tv_sec    = static_cast<int64_t>(ns / NANOS_PER_SEC);
+			tp->tv_nsec   = static_cast<int64_t>(ns % NANOS_PER_SEC);
+			return true;
+		}
+		default: return false;
+	}
 }
 #endif
 
@@ -401,6 +429,7 @@ struct PthreadPrivate {
 	uint64_t              cond_sequence = 0;
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
+	GuestWaitState        wait;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -509,11 +538,14 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
-// A guest signal queued as a special user APC runs only when the sleep returns.
+// A guest signal queued as a special user APC runs only when the sleep returns. The sleep lasts
+// until that much guest time has passed, so it does not end while the guest clock is held.
 static void SleepNanoInSlices(uint64_t nanoseconds) {
+	const GuestWaitScope wait_scope("sleep", 0, static_cast<int64_t>(nanoseconds));
 	constexpr uint64_t slice_nanos = static_cast<uint64_t>(SIGNAL_APC_POLL_MICROS) * 1000ull;
-	const auto         start       = Common::SteadyNs();
-	for (uint64_t slept = 0; slept < nanoseconds; slept = Common::SteadyNs() - start) {
+	const auto         start       = Common::CompilePause::GuestNowNs();
+	for (uint64_t slept = 0; slept < nanoseconds;
+	     slept = Common::CompilePause::GuestNowNs() - start) {
 		Common::Thread::SleepNano(std::min(nanoseconds - slept, slice_nanos));
 	}
 }
@@ -567,6 +599,12 @@ public:
 	void    Retire(Pthread thread);
 
 	void FreeDetachedThreads();
+
+	template <typename Function>
+	void ForEach(Function&& function) {
+		Common::LockGuard lock(m_mutex);
+		for (auto* thread: m_threads) function(thread);
+	}
 
 private:
 	std::vector<Pthread> m_threads;
@@ -984,6 +1022,7 @@ void PthreadInitSelfForMainThread() {
 #endif
 
 	g_pthread_self = new PthreadPrivate {};
+	SetCurrentGuestWaitState(&g_pthread_self->wait);
 	PthreadAttrInit(&g_pthread_self->attr);
 	g_pthread_self->attr->affinity = 0x1fff;
 	UpdateCurrentThreadStackAttr(&g_pthread_self->attr);
@@ -1727,6 +1766,7 @@ int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexLock(PthreadMutex* mutex) {
+	const GuestWaitScope wait_scope("PthreadMutexLock", reinterpret_cast<uint64_t>(mutex), static_cast<int64_t>(0));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -1781,6 +1821,7 @@ int KYTY_SYSV_ABI PthreadMutexTrylock(PthreadMutex* mutex) {
 }
 
 int KYTY_SYSV_ABI PthreadMutexTimedlock(PthreadMutex* mutex, KernelUseconds usec) {
+	const GuestWaitScope wait_scope("PthreadMutexTimedlock", reinterpret_cast<uint64_t>(mutex), static_cast<int64_t>(usec));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2817,6 +2858,7 @@ int KYTY_SYSV_ABI PthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 
 int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
                                        KernelUseconds usec) {
+	const GuestWaitScope wait_scope("PthreadCondTimedwait", reinterpret_cast<uint64_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2895,6 +2937,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 
 int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex,
                                           const KernelTimespec* abstime) {
+	const GuestWaitScope wait_scope("PthreadCondTimedwaitAbs", reinterpret_cast<uint64_t>(cond));
 	// PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -2970,6 +3013,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 }
 
 int KYTY_SYSV_ABI PthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+	const GuestWaitScope wait_scope("PthreadCondWait", reinterpret_cast<uint64_t>(cond), static_cast<int64_t>(0));
 	PRINT_NAME();
 
 	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
@@ -3031,6 +3075,29 @@ Pthread KYTY_SYSV_ABI PthreadSelf() {
 	return g_pthread_self;
 }
 
+std::string DumpGuestThreads() {
+	std::string out = "--- Guest threads ---\n";
+	if (g_pthread_context == nullptr || g_pthread_context->GetPthreadPool() == nullptr) return out;
+	const auto now = Common::SteadyNs();
+	g_pthread_context->GetPthreadPool()->ForEach([&](Pthread thread) {
+		if (thread->state.load(std::memory_order_acquire) != PthreadState::Running) return;
+		const char* call = thread->wait.call.load(std::memory_order_acquire);
+		out += fmt::format("  [{}] {:<32} host={}", thread->unique_id, thread->name,
+		                   thread->host_thread_id);
+		if (call != nullptr) {
+			const auto since = thread->wait.since.load(std::memory_order_relaxed);
+			out += fmt::format(" waits in {} object=0x{:x} value={} for {:.1f} s", call,
+			                   thread->wait.object.load(std::memory_order_relaxed),
+			                   thread->wait.value.load(std::memory_order_relaxed),
+			                   since != 0 && now > since ? static_cast<double>(now - since) / 1e9 : 0.0);
+		} else {
+			out += " running";
+		}
+		out += "\n";
+	});
+	return out;
+}
+
 Pthread PthreadSelfOrNull() {
 	return g_pthread_self;
 }
@@ -3038,6 +3105,7 @@ Pthread PthreadSelfOrNull() {
 Pthread PthreadSwapSelfForSignal(Pthread thread) {
 	auto* previous = g_pthread_self;
 	g_pthread_self = thread;
+	SetCurrentGuestWaitState(thread != nullptr ? &thread->wait : nullptr);
 	return previous;
 }
 
@@ -3166,6 +3234,7 @@ static void* RunThread(void* arg) {
 
 	Loader::RuntimeLinker::CreateThreadTls();
 	g_pthread_self = thread;
+	SetCurrentGuestWaitState(&thread->wait);
 
 	uint64_t os_thread_id = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -3310,6 +3379,7 @@ int KYTY_SYSV_ABI PthreadDetach(Pthread thread) {
 }
 
 int KYTY_SYSV_ABI PthreadJoin(Pthread thread, void** value) {
+	const GuestWaitScope wait_scope("PthreadJoin", reinterpret_cast<uint64_t>(thread), static_cast<int64_t>(0));
 	PRINT_NAME();
 
 	if (thread == nullptr) {

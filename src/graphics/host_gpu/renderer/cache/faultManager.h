@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_FAULTMANAGER_H_
 
 #include "common/abi.h"
+#include "graphics/host_gpu/renderer/cache/heapRows.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
@@ -20,14 +21,17 @@ public:
 	KYTY_CLASS_NO_COPY(FaultManager);
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
+	[[nodiscard]] HeapRows& GetHeapRows() noexcept { return m_heap_rows; }
 	void                  ProcessFaultBuffer();
 
 private:
 	GraphicContext&                            m_graphics;
 	CommandScheduler&                          m_scheduler;
 	BufferCache&                               m_buffer_cache;
+	HeapRows                                   m_heap_rows;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
+	Buffer                                     m_write_download_buffer;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;

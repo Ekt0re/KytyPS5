@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -310,6 +312,12 @@ void DefineBvhIntersect(EmitterState& s) {
 	for (uint32_t i = 0; i < 4; ++i)
 		invalid_words[i] = Select(s, u, triangle, triangle_invalid[i], box_invalid[i]);
 	const auto invalid = Vector(s, vec4, invalid_words);
+	if (BvhIntersectAlwaysMisses()) {
+		// An empty scene: every node test reports no hit and reads no node memory.
+		s.builder.AddFunction(spv::OpReturnValue, invalid);
+		s.builder.AddFunction(spv::OpFunctionEnd);
+		return;
+	}
 	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
 		const auto first = GetBdaPointer(s, address);
 		const auto second  = EmitValueOrDefaultIfCondition(s, full, wide, ConstantU64(s, 0), [&] {
@@ -373,3 +381,19 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+// KYTY_RT_OFF=1, off by default: image_bvh*_intersect_ray reports a miss for every node, so the
+// title's ray walks end at their first node and shade as if the scene had no geometry yet (the
+// title's own path while its structures stream in). Idea from klbf-lab (Xbox GTA VI: an empty
+// BVH directory). It trades ray-traced shadows, reflections and indirect light for GPU time.
+bool BvhIntersectAlwaysMisses() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RT_OFF");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

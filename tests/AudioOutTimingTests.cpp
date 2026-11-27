@@ -36,6 +36,7 @@ bool                                 pad_connected = false, pad_bluetooth = fals
 uint64_t                             pad_queue_us = 0;
 const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
+float                                ratio  = 1.0f;
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -105,6 +106,11 @@ bool ClearAudioStream(SDL_AudioStream* stream) {
 	clears++;
 	return true;
 }
+
+bool SetAudioStreamFrequencyRatio(SDL_AudioStream*, float value) {
+	ratio = value;
+	return true;
+}
 } // namespace Fake
 
 namespace Common::TimingThread {
@@ -124,6 +130,7 @@ inline void SleepMicro(uint32_t micros) {
 #define SDL_GetAudioStreamQueued    Fake::GetAudioStreamQueued
 #define SDL_PutAudioStreamData      Fake::PutAudioStreamData
 #define SDL_ClearAudioStream        Fake::ClearAudioStream
+#define SDL_SetAudioStreamFrequencyRatio Fake::SetAudioStreamFrequencyRatio
 #include "libs/audio.cpp"
 #undef Thread
 #undef SDL_InitSubSystem
@@ -134,6 +141,7 @@ inline void SleepMicro(uint32_t micros) {
 #undef SDL_GetAudioStreamQueued
 #undef SDL_PutAudioStreamData
 #undef SDL_ClearAudioStream
+#undef SDL_SetAudioStreamFrequencyRatio
 
 namespace Libs::Controller {
 int GetActiveControllerId() {
@@ -178,8 +186,11 @@ struct Fixture {
 	Audio                   audio;
 	std::array<float, 2048> pcm {};
 
-	Fixture() {
+	// The tests of the SDL queue wait run with the sample clock pacing off.
+	explicit Fixture(bool clock_pacing = false) {
 		Check(streams.empty(), "stream leaked between tests");
+		Libs::Audio::g_audio_clock_pacing = clock_pacing ? 1 : 0;
+		ratio                             = 1.0f;
 		now        = 1000000;
 		processing = oversleep = 0;
 		clears                 = 0;
@@ -255,6 +266,46 @@ void TestUnderrunAndStalledQueueRecovery() {
 	f.Output(port);
 	Check(now - start >= 5333 && now - start <= 5334,
 	      "queue clear retained an old pacing deadline");
+}
+
+void TestClockPacingNeverWaitsForTheDevice() {
+	constexpr uint64_t block = uint64_t {256} * 1000000;
+	Fixture            f(true);
+	const auto         port  = f.Open();
+	const auto         start = now;
+	f.Output(port);
+	Check(now == start && streams.front()->frames == 8 * block,
+	      "silence did not fill the cushion ahead of the first block");
+	for (int i = 0; i < 3000; i++) {
+		f.Output(port);
+	}
+	Check(now - start >= 15999999 && now - start <= 16000001 && clears == 0,
+	      "sample clock pacing drifted against a device in step");
+	Drain(*streams.front());
+	Check(streams.front()->frames >= 7 * block && streams.front()->frames <= 8 * block,
+	      "queue level left the cushion with a device in step");
+
+	// A device that stops pulling must not slow the guest: the level only raises the resampling
+	// ratio, and the stale queue is dropped once it is several cushions long.
+	stalled = true;
+	sleeps.clear();
+	const auto stalled_start = now;
+	for (int i = 0; i < 300; i++) {
+		f.Output(port);
+	}
+	Check(now - stalled_start >= 1599999 && now - stalled_start <= 1600001 && sleeps.size() == 300,
+	      "a stalled device changed the guest's output cadence");
+	Check(ratio > 1.0f && ratio <= 1.02f && clears >= 1, "stalled queue was neither sped up nor dropped");
+	stalled = false;
+
+	// After a long gap the queue is primed again and nothing is caught up.
+	now += 1000000;
+	const auto resumed = now;
+	f.Output(port);
+	f.Output(port);
+	Check(now - resumed >= 5333 && now - resumed <= 5334, "a gap caused catch-up submissions");
+	Drain(*streams.front());
+	Check(streams.front()->frames <= 8 * block + 1000000, "a gap left more than the cushion queued");
 }
 
 void TestFallbackClockAndLongGap() {
@@ -535,6 +586,7 @@ int main() {
 	Config::Initialize();
 	TestPrimingAndSteadyCadence();
 	TestUnderrunAndStalledQueueRecovery();
+	TestClockPacingNeverWaitsForTheDevice();
 	TestFallbackClockAndLongGap();
 	TestAsyncDoesNotAccumulateDeadlines();
 	TestSynchronizedBatchAndInactivePorts();

@@ -40,9 +40,13 @@ struct ImageMetadataInfo {
 };
 
 struct ImageSubresources {
-	uint32_t levels                                      = 1;
-	uint32_t layers                                      = 1;
-	auto     operator<=>(const ImageSubresources&) const = default;
+	uint32_t levels = 1;
+	uint32_t layers = 1;
+
+	[[nodiscard]] bool           operator==(const ImageSubresources&) const noexcept = default;
+	[[nodiscard]] constexpr bool Contains(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 // The level and first layer of a container that a single-level image occupies, or -1.
@@ -178,6 +182,12 @@ struct ImageViewInfo {
 	[[nodiscard]] bool operator==(const ImageViewInfo&) const noexcept = default;
 };
 
+// A tiled T# whose LAST_LEVEL runs past the stored chain. A view that lies entirely past MAX_MIP
+// is rebased onto an image of its base mip's extent when that mip is tiled as such an image;
+// otherwise the view is matched against the mips the chain stores. False means neither fits.
+bool ResolveTextureMipView(ImageInfo& info, uint32_t physical_levels, bool metadata,
+                           uint32_t view_levels, uint32_t& base_level);
+
 struct DepthFormatPolicy {
 	Prospero::DepthFormat     depth_format;
 	Prospero::BufferFormat    guest_format;
@@ -268,6 +278,30 @@ SampledDepthCompareFormat(Prospero::BufferFormat format, bool depth_compare) noe
 
 inline bool ImageInfo::IsDepth() const noexcept {
 	return ImageAspectMask(pixel_format) != vk::ImageAspectFlagBits::eColor;
+}
+
+// PS5 titles bind one depth buffer both with and without its stencil plane in a frame. A
+// depth-only target can render into the depth aspect of the depth/stencil image already at its
+// address when both store the same depth format, so the image is not converted to a depth-only
+// image and back (every conversion copies it and makes the image heaps look their views up again).
+[[nodiscard]] inline bool CanRenderDepthAspectOf(const ImageInfo& image,
+                                                 const ImageInfo& target) noexcept {
+	const auto depth = DepthAspectTransferFormat(target.pixel_format);
+	return depth != vk::Format::eUndefined && !target.HasStencil() &&
+	       image.HasSeparateStencil() && DepthAspectTransferFormat(image.pixel_format) == depth &&
+	       image.samples == target.samples && image.bytes_per_block == target.bytes_per_block;
+}
+
+// The attachment format of a depth-only target view (depth aspect) of an image with the backing
+// format: the backing format itself when the view renders the depth aspect of a depth/stencil
+// image, since rendering formats and pipelines must name the view's format.
+[[nodiscard]] inline constexpr vk::Format DepthTargetViewFormat(vk::Format backing,
+                                                                vk::Format view) noexcept {
+	const auto depth = DepthAspectTransferFormat(view);
+	return view != backing && depth == view && backing != depth &&
+	               DepthAspectTransferFormat(backing) == depth
+	           ? backing
+	           : view;
 }
 
 [[nodiscard]] inline constexpr uint32_t DepthStencilTransferBytes(vk::Format format) noexcept {

@@ -5,6 +5,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
+#include "graphics/frameCapture.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -25,6 +26,8 @@
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
+#include <xxhash.h>
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -80,6 +83,10 @@ void Initialize() {
 	// Native driver module startup reserves its DMEM before the guest can allocate it.
 	EXIT_IF(AgcDriver::Initialize() != OK);
 	ShaderInit();
+}
+
+RenderContext* AgcRenderer() noexcept {
+	return g_renderer;
 }
 
 void Shutdown() {
@@ -645,6 +652,7 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	map.scratch_size_dwords = h->scratch_size_dw_per_thread;
 
 	ShaderMapUserData(base, map);
+	FrameCapture::ShaderMapped(base, map);
 
 	EXIT_NOT_IMPLEMENTED((base & 0xFFFF0000000000FFull) != 0);
 
@@ -657,6 +665,27 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	*dst = h;
 
 	dbg_dump_shader(h);
+
+	// Diagnostic only: input for tools/shaderCheck.
+	if (static const char* dir = std::getenv("KYTY_SHADER_REGISTRY"); dir != nullptr) {
+		const auto path = fmt::format("{}/{}_{:016x}.reg", dir, static_cast<uint32_t>(h->type),
+		                              XXH3_64bits(const_cast<const void*>(code), h->shader_size));
+		if (auto* file = std::fopen(path.c_str(), "wbx"); file != nullptr) {
+			const uint32_t header[] {0x4745524bu, static_cast<uint32_t>(h->type),
+			                         static_cast<uint32_t>(h->shader_size),
+			                         static_cast<uint32_t>(h->num_sh_registers)};
+			std::fwrite(header, sizeof(header), 1, file);
+			for (uint32_t i = 0; i < h->num_sh_registers; i++) {
+				const uint32_t reg[] {static_cast<uint32_t>(h->sh_registers[i].offset),
+				                      static_cast<uint32_t>(h->sh_registers[i].value)};
+				std::fwrite(reg, sizeof(reg), 1, file);
+			}
+			std::fwrite(const_cast<const void*>(code), 1, h->shader_size, file);
+			const uint32_t scratch_size = h->scratch_size_dw_per_thread;
+			std::fwrite(&scratch_size, sizeof(scratch_size), 1, file);
+			std::fclose(file);
+		}
+	}
 
 	return OK;
 }
@@ -1513,6 +1542,7 @@ int KYTY_SYSV_ABI AgcJumpPatchSetTarget(uint32_t* cmd, const volatile uint32_t* 
 int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
+	FrameCapture::SuspendPoint();
 	g_renderer->GetGpu().SuspendPoint();
 
 	return OK;
@@ -3546,7 +3576,12 @@ static int patch_packet_control_bit31(uint32_t* cmd, uint32_t opcode, uint8_t va
 }
 
 int KYTY_SYSV_ABI AgcRewindPatchSetRewindState(uint32_t* cmd, uint8_t state) {
-	return patch_packet_control_bit31(cmd, Pm4::IT_REWIND, state);
+	const int result = patch_packet_control_bit31(cmd, Pm4::IT_REWIND, state);
+	if (result == OK && state != 0 && g_renderer != nullptr) {
+		FrameCapture::ReleaseRewind(cmd);
+		g_renderer->GetGpu().ReleaseRewind(cmd);
+	}
+	return result;
 }
 
 int KYTY_SYSV_ABI AgcAcquireMemSetEngine(uint32_t* cmd, uint8_t engine) {
@@ -4200,6 +4235,7 @@ struct TessellationDriverState {
 static TessellationDriverState g_tessellation_driver_state {};
 
 static void submit_dcb(uint32_t* dcb, uint32_t size_in_dwords) {
+	FrameCapture::Submit(0, dcb, size_in_dwords);
 	GraphicsDbgDumpDcb("d", size_in_dwords, dcb);
 	g_renderer->GetGpu().Submit(std::span {dcb, size_in_dwords});
 }
@@ -4260,6 +4296,7 @@ static void submit_acb(uint32_t queue, uint32_t* acb, uint32_t size_in_dwords) {
 		return;
 	}
 
+	FrameCapture::Submit(queue, acb, size_in_dwords);
 	GraphicsDbgDumpDcb("a", size_in_dwords, acb);
 	g_renderer->GetGpu().SubmitCompute(queue, std::span {acb, size_in_dwords});
 }

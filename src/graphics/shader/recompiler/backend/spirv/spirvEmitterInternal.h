@@ -112,10 +112,13 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 
 	uint32_t                                         lane_count              = 1;
+	// A native 64-wide subgroup's same-address LDS stores keep the last active lane's value.
+	bool                                             lds_last_lane_stores    = false;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
 	std::vector<uint32_t>                           memory_byte_sizes;
+	std::vector<uint32_t>                           memory_strides; // Run-time V# strides.
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -154,6 +157,8 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// Counts loop iterations of one invocation; see LoopIterationLimit.
+	uint32_t                   loop_fuel_variable                    = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   helper_invocation_variable            = 0;
 	uint32_t                   per_vertex_variable                   = 0;
@@ -321,6 +326,9 @@ uint32_t MrtOutputType(EmitterState& state, uint32_t index);
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+// The lane number inside the guest wave, which can differ from the host subgroup lane when the
+// two sizes disagree.
+uint32_t EmitGuestLane(EmitterState& state);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,
@@ -365,6 +373,10 @@ uint32_t ConstantU64(EmitterState& state, uint64_t value);
 
 uint32_t ConstantU32CompositeZero(EmitterState& state, uint32_t components);
 
+// Whether scalar-branch guards are ballots compared with zero rather than OpGroupNonUniformAny/All
+// (Spirv::BallotGuardsEnabled).
+bool BallotGuardsEnabled();
+
 uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::StorageClass storage,
                                  const char* name);
 void     DefineModule(EmitterState& state);
@@ -398,12 +410,15 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
-uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index);
+uint32_t EmitPushDataLoad(EmitterState& state, uint32_t index, bool non_uniform = false);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
+// The V# stride of a BufferResource::RuntimeStride binding, read from shader data.
+uint32_t StorageBufferRuntimeStride(EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
+uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index);
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 
 void EmitMemoryBindings(EmitterState& state);
@@ -485,6 +500,11 @@ inline constexpr auto EmitSelectValueU32 =
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask);
 
+// KYTY_F16_STORE_CLAMP: the bits of a 32-bit float bound for a 16-bit float format, the guest
+// GPU's way: a finite value beyond the half range becomes the largest half (65504) of its sign;
+// infinity and NaN pass unchanged.
+uint32_t EmitClampToHalfRangeBits(EmitterState& state, uint32_t f32_bits);
+
 inline constexpr auto EmitOrU32 = EmitNative<spv::OpBitwiseOr, IR::Type::U32, uint32_t, uint32_t>;
 
 uint32_t EmitCompareU32Constant(EmitterState& state, spv::Op opcode, uint32_t value,
@@ -536,12 +556,20 @@ uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32
 void DefineTrinityFunctions(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 
+// One OpSwitch, and the OpPhi of its results, take two words per case under SPIR-V's 16-bit
+// instruction word count, and the validator's universal limit is 16383 switch cases, so a switch
+// holds at most this many cases; EmitIndexSwitch nests larger ones. (A GPU-selected heap can give thousands of distinct candidates: Axellito/VIKyng bcee3021
+// found a one-switch-per-access module past 1 GB and a corrupt OpSwitch, which they cap.)
+inline constexpr uint32_t MaxSwitchCases     = 8192u;
+inline constexpr uint32_t MaxSwitchCasesBits = 13u;
+static_assert(MaxSwitchCases == 1u << MaxSwitchCasesBits);
+
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
-auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
-                        uint32_t result_type, Fn&& emit) {
+auto EmitFlatIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
+                         uint32_t result_type, Fn&& emit) {
 	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
-	EXIT_IF(count == 0u);
+	EXIT_IF(count == 0u || count > MaxSwitchCases);
 	const auto merge_label = state.builder.AllocateId();
 	std::vector<uint32_t> labels(count);
 	std::vector<uint32_t> words {spv::OpSwitch, index, merge_label};
@@ -574,6 +602,36 @@ auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
 		state.builder.AddFunction(phi);
 		return phi[2];
 	}
+}
+
+// Calls emit(item) in the case of index for items [0, count); an index past them takes item 0 when
+// there is a result, and no case otherwise.
+template <typename Fn>
+auto EmitIndexSwitch(EmitterState& state, uint32_t index, uint32_t count,
+                        uint32_t result_type, Fn&& emit) {
+	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
+	if (count <= MaxSwitchCases) {
+		return EmitFlatIndexSwitch(state, index, count, result_type, emit);
+	}
+	const auto groups = (uint64_t {count} + MaxSwitchCases - 1u) >> MaxSwitchCasesBits;
+	EXIT_IF(groups > MaxSwitchCases);
+	if constexpr (has_result) {
+		// The flat switch's default: case 0.
+		index = Select(state, TypeU32(state),
+		               Binary(state, spv::OpULessThan, TypeBool(state), index, ConstantU32(state, count)),
+		               index, ConstantU32(state, 0u));
+	}
+	const auto low  = Binary(state, spv::OpBitwiseAnd, TypeU32(state), index,
+	                         ConstantU32(state, MaxSwitchCases - 1u));
+	const auto high = Binary(state, spv::OpShiftRightLogical, TypeU32(state), index,
+	                         ConstantU32(state, MaxSwitchCasesBits));
+	return EmitFlatIndexSwitch(state, high, static_cast<uint32_t>(groups), result_type,
+	                           [&](uint32_t group) {
+		                           const auto first = group << MaxSwitchCasesBits;
+		                           return EmitFlatIndexSwitch(
+		                               state, low, std::min(MaxSwitchCases, count - first),
+		                               result_type, [&](uint32_t item) { return emit(first + item); });
+	                           });
 }
 
 template <typename Fn>
@@ -620,6 +678,15 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
+	// LDS of a stage without workgroup storage lives in a Function variable, where Vulkan allows no
+	// atomics; it is per invocation, so a load and a store do (AnyPS5 bf7b51a7).
+	if (kind == IR::ResourceKind::Lds && state.lds_storage_class != spv::StorageClassWorkgroup &&
+	    state.lds_storage_class != spv::StorageClassStorageBuffer) {
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer);
+		state.builder.AddFunction(spv::OpStore, pointer, desired(old));
+		return old;
+	}
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();

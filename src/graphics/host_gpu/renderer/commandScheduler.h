@@ -28,17 +28,33 @@ public:
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Records a small command buffer, submits it behind all submitted work and waits for it. The
+	// current command buffer stays open and the tick timeline does not advance. Its pool is not
+	// shared: call it only from the thread that records the current command buffer.
+	template <typename Record>
+	void SubmitDetached(Record&& record) {
+		record(BeginDetached());
+		EndDetached();
+	}
+	// Moves recording to a new command buffer. `tail` records what is left of the current one when
+	// the commands are submitted, so a draw can wait there for its pipeline while this thread goes
+	// on. The tail ends the rendering if it is open.
+	void           Split(Common::UniqueFunction<void, vk::CommandBuffer>&& tail);
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
+	void                      StartOperation();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// True while an operation deferred at `tick` or later has not completed.
+	[[nodiscard]] bool        HasPriorityOperationsSince(uint64_t tick);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -80,19 +96,33 @@ private:
 		uint64_t                     tick = 0;
 	};
 
-	void BeginNext();
+	struct Segment {
+		vk::CommandBuffer                               buffer;
+		Common::UniqueFunction<void, vk::CommandBuffer> tail;
+	};
+
+	void              BeginNext();
+	vk::CommandBuffer BeginDetached();
+	void              EndDetached();
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
+	void SealReleasesLocked();
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
+	vk::CommandPool              m_detached_pool    = nullptr;
+	vk::CommandBuffer            m_detached_command = nullptr;
+	vk::Fence                    m_detached_fence   = nullptr;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	// Recorded before m_command and submitted with it.
+	std::vector<Segment>         m_segments;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
+	std::vector<Common::UniqueFunction<void>> m_unsealed_releases;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;

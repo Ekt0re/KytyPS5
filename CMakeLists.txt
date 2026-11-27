@@ -333,7 +333,7 @@ add_custom_command(
 	OUTPUT "${fault_buffer_shader_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
 	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
-	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=16384
 	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
 	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -341,6 +341,20 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+set(dispatch_guard_shader_source "${gpu_tiler_shader_dir}/dispatch_args_guard.comp")
+set(dispatch_guard_shader_spv "${gpu_tiler_generated_dir}/dispatch_args_guard.spv")
+set(dispatch_guard_shader_header "${gpu_tiler_generated_dir}/dispatch_args_guard_spv.h")
+add_custom_command(
+	OUTPUT "${dispatch_guard_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dispatch_guard_shader_spv}" "${dispatch_guard_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dispatch_guard_shader_spv} -DOUTPUT=${dispatch_guard_shader_header}
+	        -DSYMBOL=DISPATCH_ARGS_GUARD_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dispatch_guard_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dispatch_guard_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -450,6 +464,8 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(descriptor_heap_tests "${KYTY_TESTS_DIR}/DescriptorHeapTests.cpp")
+add_kyty_full_emulator_test(shader_check "${KYTY_TESTS_DIR}/shaderCheck.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -536,6 +552,13 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
+
+add_executable(recorder_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RecorderTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/recorder.cpp"
+)
+target_link_libraries(recorder_tests fmt::fmt common)
+target_include_directories(recorder_tests PRIVATE ${inc_headers})
 
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
@@ -686,6 +709,7 @@ add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/descriptors.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guestWait.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
 target_link_libraries(event_queue_lifetime_tests common fmt::fmt)
@@ -698,9 +722,15 @@ target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 add_kyty_full_emulator_test(kernel_module_info_tests "${KYTY_TESTS_DIR}/KernelModuleInfoTests.cpp")
 target_link_libraries(kernel_module_info_tests kyty_test_gtest)
 
+add_executable(win_read_efault_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WinReadEfaultTests.cpp")
+target_link_libraries(win_read_efault_tests common)
+target_include_directories(win_read_efault_tests PRIVATE ${inc_headers})
+
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
+	"${KYTY_SOURCE_DIR}/kernel/guestWait.cpp"
 )
 target_link_libraries(sync_on_address_tests common)
 target_include_directories(sync_on_address_tests PRIVATE ${inc_headers})
@@ -736,7 +766,8 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 add_library(kyty_test_gtest STATIC EXCLUDE_FROM_ALL
 	"${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest/gmock-gtest-all.cc")
 target_include_directories(kyty_test_gtest PUBLIC "${KYTY_THIRD_PARTY_DIR}/fmt/test/gtest")
-target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp")
+target_sources(virtual_memory_allocation_tests PRIVATE "${KYTY_TESTS_DIR}/TrinityTests.cpp"
+	"${KYTY_TESTS_DIR}/GuestClockHoldTests.cpp")
 target_link_libraries(virtual_memory_allocation_tests kyty_test_gtest)
 
 add_kyty_full_emulator_test(net_resolver_tests "${KYTY_TESTS_DIR}/NetResolverTests.cpp")
@@ -750,6 +781,9 @@ target_link_libraries(kernel_thread_tests kyty_test_gtest)
 
 add_kyty_full_emulator_test(kernel_event_flag_tests "${KYTY_TESTS_DIR}/KernelEventFlagTests.cpp")
 target_link_libraries(kernel_event_flag_tests kyty_test_gtest)
+
+add_kyty_full_emulator_test(kernel_semaphore_tests "${KYTY_TESTS_DIR}/KernelSemaphoreTests.cpp")
+target_link_libraries(kernel_semaphore_tests kyty_test_gtest)
 
 add_kyty_full_emulator_test(video_dec2_tests "${KYTY_TESTS_DIR}/VideoDec2Tests.cpp")
 target_link_libraries(video_dec2_tests kyty_test_gtest)
@@ -820,12 +854,14 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME win_read_efault COMMAND $<TARGET_FILE:win_read_efault_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
@@ -839,6 +875,7 @@ if(BUILD_TESTING)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
 	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
+	add_test(NAME descriptor_heap COMMAND $<TARGET_FILE:descriptor_heap_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -847,6 +884,7 @@ if(BUILD_TESTING)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
 	add_test(NAME user_service COMMAND $<TARGET_FILE:user_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME image_heap COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-heap-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
 	add_test(NAME shader_recompiler_float_min_max
@@ -855,6 +893,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --relaxed-float-only)
 	add_test(NAME shader_recompiler_vop3_conversions
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vop3-conversions-only)
+	add_test(NAME shader_recompiler_private_lds
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --private-lds-only)
 	add_test(NAME shader_recompiler_quadmask
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --quadmask-only)
 	add_test(NAME shader_recompiler_integer16_ternary
@@ -869,6 +909,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --draw-offset-only)
+	add_test(NAME graphics_small_formatted_image_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --small-formatted-image-sync-only)
 	add_test(NAME virtual_memory_allocation
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME trinity_mode
@@ -893,6 +935,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
 	add_test(NAME srgb_texture
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --srgb-texture-only)
+	add_test(NAME unmapped_texture
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --unmapped-texture-only)
 	add_test(NAME device_creation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --device-creation-only)
 	add_test(NAME msaa_storage
@@ -931,6 +975,7 @@ if(BUILD_TESTING)
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
+		descriptor_heap_tests
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
@@ -942,12 +987,14 @@ if(BUILD_TESTING)
 		vdecsw_tests
 		bit_array_tests
 		lru_cache_tests
+		shader_store_tests
 		common_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests
+		win_read_efault_tests
 		sync_on_address_tests
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests

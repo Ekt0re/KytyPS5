@@ -26,6 +26,17 @@ struct TextureBinding {
 	std::vector<vk::ImageView> mip_views;
 };
 
+// ResolveTexture's work before the texture cache lookup: a function of the resource, the
+// descriptor words and which guest ranges are mapped. Not resolved means a null binding.
+struct PreparedTexture {
+	bool                    resolved = false;
+	TextureCache::ImageDesc desc;
+	ShaderTextureResource   descriptor {};
+	Prospero::BufferFormat  format       = {};
+	vk::Format              pixel_format = vk::Format::eUndefined;
+	vk::Format              view_format  = vk::Format::eUndefined;
+};
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;

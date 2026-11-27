@@ -17,6 +17,7 @@ struct ResourceSpecialization {
 		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
 		uint32_t               indirect_mapping_offset         = 0;
 		uint32_t               indirect_search_iterations      = 0;
+		bool                   heap_rows                       = false;
 		bool                   operator==(const Buffer&) const = default;
 	};
 
@@ -34,6 +35,7 @@ struct ResourceSpecialization {
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
 		bool                          heap                       = false;
+		bool                          clamp_half_float           = false; // F16StoreClampEnabled
 		bool                          operator==(const Image&) const = default;
 	};
 
@@ -52,6 +54,12 @@ struct ResourceSpecialization {
 };
 
 uint64_t BufferBindingSize(const BufferResource& resource, const ShaderBufferResource& descriptor);
+// Whether resource (after ApplyResourceSpecialization) is a direct read-only V# whose bounds mode 0
+// and zero stride put every access out of bounds; BufferBindingSize binds it empty.
+bool BufferRuntimeOutOfBounds(const BufferResource& resource, const ShaderBufferResource& descriptor);
+// Writes the V# stride of each BufferResource::RuntimeStride binding into shader data.
+void PackBufferRuntimeStrides(std::span<const BufferResource> buffers, const Bindings& bindings,
+                              const ResourceSnapshot& snapshot, std::span<uint32_t> shader_data);
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
 // its values and is independent of the translated shader CFG.

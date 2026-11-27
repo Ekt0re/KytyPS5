@@ -73,6 +73,8 @@ struct ConfigOptions {
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
+	// Report a 1080p output to the game instead of 4K (VideoOutGetOutputStatus).
+	bool                   output_1080p                = false;
 	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
 	std::filesystem::path  dlss_folder;
 	uint32_t               dlss_preset                 = 0; // 0 is the model default
@@ -160,6 +162,7 @@ bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
+bool     Output1080pEnabled();
 PssrUpscaler GetPssrUpscaler();
 const std::filesystem::path& GetDlssFolder();
 uint32_t GetDlssPreset();
@@ -174,6 +177,7 @@ bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 bool                   ShaderCacheEnabled();
+bool                   PrecompileShadersEnabled();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 

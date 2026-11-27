@@ -6,6 +6,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/uniqueFunction.h"
+#include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
@@ -15,7 +16,11 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 
+#include <future>
+#include <deque>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -27,6 +32,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -43,6 +49,7 @@ struct TranslateResult;
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
+class HeapRowSource;
 } // namespace ShaderRecompiler::IR
 
 namespace ShaderRecompiler::Spirv {
@@ -115,6 +122,40 @@ struct alignas(4) GraphicsPipelineKey {
 // Keys are compared and hashed as bytes.
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
+// A module record of the shader store, decoded on first use or by the store's background decoders
+// (pipelineSerialization.cpp): the store keeps only its key and pipeline fields decoded at start.
+struct StoredModule {
+	// The store's bytes, released once decoded, and the record's frame and fields in them.
+	std::shared_ptr<const std::vector<uint8_t>> store;
+	std::span<const uint8_t>                    frame;
+	uint32_t                                    plan_offset  = 0;
+	uint32_t                                    plan_size    = 0;
+	uint32_t                                    spirv_offset = 0;
+	uint32_t                                    spirv_words  = 0;
+	vk::Device                                  device;
+	// The first record of a program also gives the program's resource plan. The module (cheap)
+	// and the plan (most of the time) decode separately: pipeline creation needs only the module.
+	bool                                        want_plan = false;
+	// A module the run does not use (KYTY_RT_OFF); its record may still give the plan.
+	bool                                        module_dropped = false;
+	std::once_flag                              module_once;
+	std::once_flag                              plan_once;
+	std::atomic<bool>                           decoded      = false; // The module.
+	std::atomic<bool>                           plan_decoded = false;
+	// Parts still to decode; the last one releases the store's bytes.
+	std::atomic<int>                            parts_left = 1;
+	vk::ShaderModule                            handle     = nullptr;
+	ShaderRecompiler::IR::ResourcePlan          plan;
+	bool                                        plan_ok = false;
+	// With RetainModuleSpirv().
+	std::vector<uint32_t>                       spirv;
+};
+// Safe on any thread: decodes the record's module once (a call during another thread's decode
+// waits for it) and returns its handle.
+vk::ShaderModule ResolveStoredModule(StoredModule& stored);
+// The same for the resource plan of a program's first record; false when it cannot be decoded.
+bool ResolveStoredPlan(StoredModule& stored);
+
 // A compiled stage with what pipeline creation needs from it besides the key.
 struct ShaderModule {
 	uint64_t                                     id     = 0;
@@ -126,7 +167,22 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	// The SPIR-V's size, and the SPIR-V itself with KYTY_FAILED_SPIRV_DUMP=1, for the report of a
+	// pipeline the driver fails to create (after Axellito/VIKyng bcee3021).
+	size_t                                       spirv_words = 0;
+	std::vector<uint32_t>                        spirv;
+	// A module loaded from the shader store has no handle until Handle() first asks for it.
+	std::shared_ptr<StoredModule>                stored;
+
+	[[nodiscard]] vk::ShaderModule Handle() const {
+		return stored != nullptr ? ResolveStoredModule(*stored) : module;
+	}
 };
+
+// KYTY_FAILED_SPIRV_DUMP=1: modules keep their SPIR-V, written to the shader log folder's failed/
+// when a pipeline that uses them cannot be created.
+bool RetainModuleSpirv();
+void RetainModuleSpirv(ShaderModule& module, const std::vector<uint32_t>& spirv);
 
 // A draw's depth target and its first color_count color targets.
 struct DrawTargets {
@@ -157,8 +213,10 @@ struct DrawRenderState {
 class ShaderStoreWriter {
 public:
 	ShaderStoreWriter();
-	// Keeps the first `kept` bytes of the store at `path`, or starts it over with `header`.
-	void Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
+	// Keeps the first `kept` bytes of the store at `path`, or starts it over with `header`. False,
+	// with the file left as it is and nothing opened, when another writer holds the store
+	// (ShaderStoreLock).
+	bool Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
 	// Whether the store is open.
 	explicit operator bool() const { return !m_file.IsInvalid(); }
 	// Compresses `record` and appends it on the store thread, in call order.
@@ -180,12 +238,68 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
+	// Declared first, so it is released after the thread and the file are done.
+	ShaderStoreLock                          m_lock;
 	Common::File                             m_file;
 	std::mutex                               m_mutex;
 	std::condition_variable_any              m_ready;
 	std::queue<Common::UniqueFunction<void>> m_jobs;
 	// Declared last, so it drains the queue and joins before the rest is destroyed.
 	std::jthread m_thread;
+};
+
+// Runs jobs in the order they were posted; background jobs only when no other job waits.
+class PipelineWorkers {
+public:
+	PipelineWorkers();
+	explicit PipelineWorkers(size_t threads);
+	~PipelineWorkers() { Finish(); }
+	KYTY_CLASS_NO_COPY(PipelineWorkers);
+	void Post(Common::UniqueFunction<void>&& job, bool background = false);
+	// Runs the queued jobs and stops the threads.
+	void Finish() { m_threads.clear(); }
+
+private:
+	std::mutex                               m_mutex;
+	std::condition_variable_any              m_ready;
+	std::queue<Common::UniqueFunction<void>> m_jobs;
+	std::queue<Common::UniqueFunction<void>> m_background;
+	std::vector<std::jthread>                m_threads;
+};
+
+// A pipeline creation queued in the background (the shader store's warm-up) that a draw needing
+// it runs at once, on whichever thread asks first.
+class DeferredPipeline {
+public:
+	explicit DeferredPipeline(Common::UniqueFunction<vk::Pipeline>&& create)
+	    : m_create(std::move(create)), m_result(m_promise.get_future().share()) {}
+	KYTY_CLASS_NO_COPY(DeferredPipeline);
+	// Creates the pipeline unless another thread did or does; with `skip` a null one instead.
+	void Run(bool skip = false);
+	[[nodiscard]] bool Claimed() const { return m_claimed.load(std::memory_order_acquire); }
+	// True the first time only.
+	bool MarkExpedited() { return !m_expedited.exchange(true, std::memory_order_relaxed); }
+	[[nodiscard]] const std::shared_future<vk::Pipeline>& Result() const { return m_result; }
+
+private:
+	std::atomic<bool>                    m_claimed   = false;
+	std::atomic<bool>                    m_expedited = false;
+	Common::UniqueFunction<vk::Pipeline> m_create;
+	std::promise<vk::Pipeline>           m_promise;
+	std::shared_future<vk::Pipeline>     m_result;
+};
+
+// A pipeline a recorded command waits for, from PipelineCache::Pipeline::Pending().
+struct PendingPipeline {
+	std::shared_future<vk::Pipeline>  compiling;
+	std::shared_ptr<DeferredPipeline> deferred;
+
+	[[nodiscard]] bool Ready() const {
+		return compiling.wait_for(std::chrono::seconds {0}) == std::future_status::ready;
+	}
+	// Runs a queued background creation here rather than waiting for its turn.
+	// Holds the guest clock while it waits or creates it.
+	vk::Pipeline Get() const;
 };
 
 // The owning renderer serializes access, including saves while the GPU is running.
@@ -195,6 +309,7 @@ public:
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
 	              const std::filesystem::path& shader_store = {});
 	~PipelineCache();
+	void SetHeapRows(ShaderRecompiler::IR::HeapRowSource* rows) { m_heap_rows = rows; }
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	// Finishes the queued writes and stops the store thread, then writes the driver cache if it
 	// changed.
@@ -223,12 +338,22 @@ public:
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
+		// Null while a worker still compiles it.
 		vk::Pipeline            pipeline              = nullptr;
+		std::shared_future<vk::Pipeline> compiling;
+		// Set while `compiling` is a background creation not started yet.
+		std::shared_ptr<DeferredPipeline> deferred;
+		// KYTY_FAST_PIPELINES: the optimized build that replaces an unoptimized `pipeline`.
+		std::shared_future<vk::Pipeline> optimized;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;
 		bool                    uses_push_descriptors = false;
 		bool                    uses_image_heap       = false;
+		// Per descriptor type, the descriptors one set of descriptor_set_layout holds.
+		std::vector<vk::DescriptorPoolSize> descriptor_sizes;
+
+		[[nodiscard]] PendingPipeline Pending() const { return {compiling, deferred}; }
 	};
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
@@ -237,9 +362,50 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
 
+	// `fast_first`: the draw waits for a new pipeline, so it may be created unoptimized first.
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
-	                              const DrawTargets& targets);
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
+	                              const DrawTargets& targets, bool wait = true,
+	                              bool fast_first = true);
+	// KYTY_FAST_PIPELINES=1: new pipelines a command waits for are created without driver
+	// optimizations first, and the optimized build replaces them when ready.
+	static bool FastPipelines();
+	// Takes a finished compile, or with `wait` the running one.
+	static Pipeline& Resolve(Pipeline& pipeline, bool wait);
+	// KYTY_ASYNC_PIPELINES: 0 (default) every draw waits for its pipeline; 1 ordinary geometry
+	// whose pipeline is not ready when its commands are submitted is skipped for that frame,
+	// while full-screen passes, depth or stencil writers, draws whose shaders write memory and
+	// all dispatches wait; 2 also skips depth and stencil writers.
+	static int AsyncPipelineMode();
+	// KYTY_LAZY_SHADER_STORE=1 (frame replays): the shader store decodes a record only when a
+	// lookup needs it and creates a stored pipeline only when a draw or dispatch needs it, with no
+	// background decoders, pipeline creation, recipes or Vulkan pipeline cache file. Keeps the
+	// memory a replay needs small.
+	static bool LazyShaderStore();
+	// KYTY_ON_DEMAND_SHADER_STORE=1 (game runs): like the lazy store, records are decoded when a
+	// lookup needs them and stored pipelines are created when a draw or dispatch needs them, so a
+	// start does not spend a minute of CPU on all of them; unlike it, the recipes and the Vulkan
+	// pipeline cache file stay on, so the first use of a pipeline is a driver cache hit. Also true
+	// with KYTY_LAZY_SHADER_STORE=1.
+	static bool OnDemandShaderStore();
+	// A draw skipped because its pipeline was not ready; reported every 5 s.
+	static void NoteSkippedDraw();
+	// Waits for a pipeline being built on a worker; the guest clock stands still while it waits.
+	static vk::Pipeline WaitForPipeline(const std::shared_future<vk::Pipeline>& compiling);
+	// Without `wait` the pipeline may still be compiling.
+	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info, bool wait = true);
+
+	// Safe on any thread. Starts translating, on a worker, the program of a compute dispatch with
+	// these registers and DISPATCH_INITIATOR, unless that program was asked for before. The
+	// dispatch adopts the translation if its program key is the same. Wrong registers only waste
+	// the work. The code is copied from guest memory on the calling thread, which should be a
+	// guest thread (it handles faults on GPU-written memory).
+	void TranslateComputeAhead(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator,
+	                           bool async_compute);
+	// The same for a draw's vertex (or mesh) and pixel programs, from the registers a scan of the
+	// submitted commands sees at the draw (KYTY_NO_GRAPHICS_AHEAD=1 turns it off). Tessellation
+	// draws are left to the command thread.
+	void TranslateGraphicsAhead(const HW::Context& context, const HW::UserConfig& user_config,
+	                            const HW::Shader& shaders, bool indirect);
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -249,8 +415,14 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// Compiling pipelines keep references.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
+		// A program from the shader store whose resource plan is still in its first record.
+		std::shared_ptr<StoredModule>                stored_plan;
+		// Programs with calls: the resource plans of the earlier links call_source keeps, by link
+		// id, so a callee set seen before needs no translation to find its module.
+		std::unordered_map<uint64_t, ShaderRecompiler::IR::ResourcePlan> call_plans;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
@@ -279,8 +451,38 @@ private:
 
 	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
 
+	// A translation started ahead, or a key whose program the command thread looked up first.
+	struct AheadJob;
+
+	// What a draw's programs are prepared from (PrepareGraphicsStages).
+	struct GraphicsStageInputs {
+		std::array<ShaderParams, 3>            vertex_params;
+		ShaderParams                           pixel_params;
+		ShaderRecompiler::IR::PushData::Window push_data;
+		uint32_t                               color_output_mask = 0;
+		bool                                   pixel_active      = false;
+		bool                                   tess_active       = false;
+	};
+	// Fills the draw's stage inputs from the registers, or returns false when it draws nothing.
+	// With `ahead` (any thread) it also returns false for what needs the command thread.
+	bool PrepareGraphicsStages(const HW::Context& context, const HW::UserConfig& user_config,
+	                           const HW::Shader& shaders, DrawRenderState& state,
+	                           GraphicsStageInputs& out, bool ahead);
+
+	// A module translated again from a recipe, merged on the command thread.
+	struct ReplayedModule {
+		ProgramKey                         key;
+		ShaderRecompiler::IR::ResourcePlan plan;
+		ShaderModule                       module;
+		std::vector<uint32_t>              spirv;
+		// Recorded ids the module's id stands for, and its recipe if no recipe has that id.
+		std::vector<uint64_t>              old_ids;
+		std::vector<uint8_t>               recipe;
+	};
+
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
+	ShaderRecompiler::IR::HeapRowSource*   m_heap_rows = nullptr;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
@@ -288,7 +490,7 @@ private:
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	bool                          m_driver_cache_dirty = false;
+	std::atomic<bool>             m_driver_cache_dirty = false;
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
@@ -390,6 +592,12 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               ShaderRecompiler::IR::PushData::Window& push_data);
+	template <typename InputInfo>
+	const ShaderModule* GetProgramImpl(const ShaderParams& params, InputInfo& input_info,
+	                               ShaderRecompiler::IR::PushData::Window& push_data);
+	std::string CompileReason(const ProgramKey& key, bool known_program,
+	                      const ShaderRecompiler::IR::ResourceSpecialization& spec,
+	                          ShaderRecompiler::IR::PushData::Window push_data, bool source_changed);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions       options,
 	                            ShaderRecompiler::TranslateResult      translated,
@@ -400,8 +608,16 @@ private:
 	void WriteDriverCache() const;
 
 	// pipelineSerialization.cpp
+	struct LoadedRecord;
 	void WarmUp(const std::filesystem::path& path);
-	bool LoadRecord(std::span<const uint8_t>& records);
+	// Safe on any thread: checks, decompresses and decodes one framed record.
+	void DecodeRecord(std::span<const uint8_t> record, LoadedRecord& loaded);
+	void InsertRecord(LoadedRecord&& loaded);
+	// On the command thread: moves a stored program's resource plan in, decoding its record if no
+	// decoder did yet; false when the plan cannot be decoded (the program is translated again).
+	bool TakeStoredPlan(Program& program);
+	void StartStoreDecoders(std::vector<std::shared_ptr<StoredModule>>&& records);
+	void StopStoreDecoders();
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);
@@ -437,10 +653,26 @@ private:
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();
+// "" by default, else a suffix naming the code-generation switches set in the environment
+// (KYTY_F16_STORE_CLAMP and the like), which the store's file name carries.
+std::string ShaderStoreVariant();
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 
-// Stages are indexed like GraphicsPipelineKey::stage_ids.
+// Creates the layouts a pipeline of these stages (null where absent) has, which
+// CreateHostPipeline reads.
+void CreatePipelineLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                           std::span<const ShaderModule* const> stages);
+// Safe on any thread. Stages are indexed like GraphicsPipelineKey::stage_ids.
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const GraphicsPipelineKey&                key,
+                                const std::array<const ShaderModule*, 4>& stages,
+                                vk::PipelineCache driver_cache, bool optimize = true);
+// Without `optimize` the driver skips its optimizations (VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION).
+vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
+                                const ShaderModule& module, vk::PipelineCache driver_cache,
+                                bool optimize = true);
+// Both of the above.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const GraphicsPipelineKey&                 key,
                             const std::array<const ShaderModule*, 4>& stages,

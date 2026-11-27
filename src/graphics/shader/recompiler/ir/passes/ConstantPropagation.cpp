@@ -4,8 +4,11 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -22,6 +25,86 @@ void Replace(Inst& inst, Value value) {
 	inst.ReplaceUsesWith(value.Resolve());
 }
 
+constexpr uint32_t AncillaryRetainDepth = 16;
+
+uint32_t FieldMask(uint32_t offset, uint32_t count) {
+	if (count == 0u) {
+		return 0u;
+	}
+	return count == 32u ? UINT32_MAX : ((uint32_t {1} << count) - 1u) << offset;
+}
+
+bool ReadImmediateField(const Inst& inst, size_t offset_arg, uint32_t& mask) {
+	const auto offset = Arg(inst, offset_arg);
+	const auto count  = Arg(inst, offset_arg + 1u);
+	if (!IsImmediate(offset, Type::U32) || !IsImmediate(count, Type::U32) || offset.U32() > 32u ||
+	    count.U32() > 32u - offset.U32()) {
+		return false;
+	}
+	mask = FieldMask(offset.U32(), count.U32());
+	return true;
+}
+
+bool AncillaryBitsUnread(const Inst& inst, uint32_t live_bits, const Inst* lanes, uint32_t depth) {
+	if (depth == 0u) {
+		return false;
+	}
+	return std::ranges::all_of(inst.Uses(), [&](const Use& use) {
+		const auto& user = *use.user;
+		if (!user.HasUses() && !user.MayHaveSideEffects()) {
+			return true;
+		}
+		uint32_t field = 0;
+		switch (user.GetOpcode()) {
+			case ValueOpcode::Identity:
+				return AncillaryBitsUnread(user, live_bits, lanes, depth - 1u);
+			case ValueOpcode::BitFieldUExtract:
+			case ValueOpcode::BitFieldSExtract:
+				return use.operand == 0u && ReadImmediateField(user, 1u, field) &&
+				       (field & live_bits) == 0u;
+			case ValueOpcode::BitFieldInsert:
+				return use.operand == 0u && ReadImmediateField(user, 2u, field) &&
+				       ((live_bits & ~field) == 0u ||
+				        AncillaryBitsUnread(user, live_bits & ~field, lanes, depth - 1u));
+			case ValueOpcode::SelectU32: {
+				const auto* condition = Arg(user, 0).TryInstruction();
+				if (use.operand == 2u && condition != nullptr && condition == lanes) {
+					return true;
+				}
+				return use.operand != 0u &&
+				       AncillaryBitsUnread(
+				           user, live_bits,
+				           use.operand == 1u && lanes == nullptr ? condition : lanes, depth - 1u);
+			}
+			default: return false;
+		}
+	});
+}
+
+// A lowered ancillary word is dead when every use only carries it unread: an unused value, a phi,
+// the retained operand of a masked write, a high-word write keeping only unread bits (PR #2539),
+// or an SSA alias whose uses qualify in turn (PR #2543, both by Nawid3333).
+bool AncillaryRetainedOnly(const Inst& inst, uint32_t depth) {
+	if (depth == 0u) {
+		return false;
+	}
+	return std::ranges::all_of(inst.Uses(), [&](const Use& use) {
+		const auto& user = *use.user;
+		if (!user.HasUses() && !user.MayHaveSideEffects()) {
+			return true;
+		}
+		uint32_t field = 0;
+		if (user.GetOpcode() == ValueOpcode::BitFieldInsert && use.operand == 0u &&
+		    ReadImmediateField(user, 2u, field)) {
+			return field == UINT32_MAX ||
+			       AncillaryBitsUnread(user, ~field, nullptr, AncillaryRetainDepth);
+		}
+		return user.GetOpcode() == ValueOpcode::Phi ||
+		       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u) ||
+		       (user.GetOpcode() == ValueOpcode::Identity && AncillaryRetainedOnly(user, depth - 1u));
+	});
+}
+
 bool HasOneUse(const Inst& inst) {
 	// Replacement aliases preserve external Values but emit no additional operation.
 	return std::ranges::count_if(inst.Uses(), [](const Use& use) {
@@ -34,12 +117,69 @@ public:
 	struct Location {
 		Block::iterator instruction;
 		uint32_t index_maximum = 0;
+		uint8_t  index_growths = 0; // Times a phi's bound grew (FoldRegisterIndexComparisons).
 		bool queued = false;
 		bool tracks_index = false;
 	};
 
+	// Instruction -> Location, the first Location registered for an address winning as with
+	// std::unordered_map::emplace. Open addressing on the pointer keeps the lookups of every
+	// visit cache-friendly; locations live in a deque so pending pointers stay valid.
+	class LocationMap {
+	public:
+		void Reserve(size_t count) {
+			size_t capacity = 64;
+			while (capacity < count * 2u) capacity *= 2u;
+			if (capacity > m_slots.size()) Rehash(capacity);
+		}
+		Location& Emplace(Inst* key, Block::iterator instruction) {
+			if ((m_storage.size() + 1u) * 2u > m_slots.size()) Rehash(std::max<size_t>(64, m_slots.size() * 2u));
+			auto& slot = Probe(key);
+			if (slot.key == nullptr) {
+				slot.key   = key;
+				slot.index = static_cast<uint32_t>(m_storage.size());
+				m_storage.push_back(Location {instruction});
+			}
+			return m_storage[slot.index];
+		}
+		Location* Find(const Inst* key) {
+			if (m_slots.empty()) return nullptr;
+			const auto& slot = Probe(key);
+			return slot.key == nullptr ? nullptr : &m_storage[slot.index];
+		}
+		Location& At(const Inst* key) {
+			auto* found = Find(key);
+			if (found == nullptr) std::abort(); // As std::unordered_map::at without exceptions.
+			return *found;
+		}
+		[[nodiscard]] size_t size() const { return m_storage.size(); }
+
+	private:
+		struct Slot {
+			const Inst* key   = nullptr;
+			uint32_t    index = 0;
+		};
+		[[nodiscard]] size_t Hash(const Inst* key) const {
+			// Nodes allocated together stay together, so walks in program order stay local.
+			return static_cast<size_t>(reinterpret_cast<uintptr_t>(key) >> 4u);
+		}
+		Slot& Probe(const Inst* key) {
+			const size_t mask = m_slots.size() - 1u;
+			for (size_t at = Hash(key) & mask;; at = (at + 1u) & mask)
+				if (m_slots[at].key == key || m_slots[at].key == nullptr) return m_slots[at];
+		}
+		void Rehash(size_t capacity) {
+			std::vector<Slot> old(capacity);
+			old.swap(m_slots);
+			for (const auto& slot: old)
+				if (slot.key != nullptr) Probe(slot.key) = slot;
+		}
+		std::vector<Slot>    m_slots;
+		std::deque<Location> m_storage;
+	};
+
 	void Register(Block::iterator instruction) {
-		Queue(locations.emplace(&*instruction, Location {instruction}).first->second);
+		Queue(locations.Emplace(&*instruction, instruction));
 		const auto op = instruction->GetOpcode();
 		if ((op == ValueOpcode::IEqual32 || op == ValueOpcode::ULessThan32) &&
 		    instruction->Flags<IntegerCompareFlags>().register_index) {
@@ -65,9 +205,9 @@ public:
 		// the drain left nothing queued, so a queued instruction was visited here.
 		for (size_t i = 0; i < affected.size(); ++i) {
 			auto* inst = affected[i];
-			const auto found = locations.find(inst);
-			if (found == locations.end() || found->second.queued) continue;
-			Queue(found->second);
+			auto* found = locations.Find(inst);
+			if (found == nullptr || found->queued) continue;
+			Queue(*found);
 			for (const auto& use: inst->Uses()) affected.push_back(use.user);
 		}
 		affected.clear();
@@ -80,7 +220,7 @@ public:
 		return result;
 	}
 
-	std::unordered_map<Inst*, Location> locations;
+	LocationMap locations;
 	std::vector<Inst*>                  register_index_comparisons;
 	std::vector<Location*>              pending; // Map nodes keep their addresses across rehashes.
 	std::unordered_set<Inst*> lowered_ancillary;
@@ -89,20 +229,178 @@ private:
 	std::vector<Inst*> affected;
 };
 
+// KYTY_MOVREL_LANE_BOUNDS=0: ReadFirstLane bounds its source over every lane again (an A/B
+// switch for the lane bounds below). The shader store is keyed to the executable, not to this
+// switch, so it keeps serving modules built with the other setting: move
+// _PipelineCache/<title>.shaders aside before comparing the two in a run.
+bool MovrelLaneBoundsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MOVREL_LANE_BOUNDS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Whether every lane where `lanes` holds also has `predicate`: `lanes` is the predicate, a
+// conjunction with a term that implies it, or a phi whose incoming values all do. A phi met again
+// through a loop is taken to imply it, which holds by induction once its other incoming values
+// do: a waterfall loop's EXEC starts as the EXEC before the loop and only loses lanes.
+// (Jetsku/KytyPS5 7709c942, after serbru20066666/brunoKytyPs5 1d9b1ff09.)
+bool LanesImply(Value lanes, Value predicate, std::vector<const Inst*>& phis, uint32_t& budget) {
+	lanes = lanes.Resolve();
+	if (lanes == predicate) {
+		return true;
+	}
+	const auto* inst = lanes.TryInstruction();
+	if (inst == nullptr || budget == 0) {
+		return false;
+	}
+	budget--;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::LogicalAnd:
+			return LanesImply(inst->Arg(0), predicate, phis, budget) ||
+			       LanesImply(inst->Arg(1), predicate, phis, budget);
+		case ValueOpcode::Phi: {
+			if (std::ranges::find(phis, inst) != phis.end()) {
+				return true;
+			}
+			phis.push_back(inst);
+			bool all = inst->NumArgs() != 0;
+			for (size_t index = 0; index < inst->NumArgs() && all; index++) {
+				all = LanesImply(inst->Arg(index), predicate, phis, budget);
+			}
+			phis.pop_back();
+			return all;
+		}
+		default: return false;
+	}
+}
+
+// Whether `lanes` implies the mask of the EXEC-masked merge Select(mask, written, old).
+bool LanesImplySelect(Value lanes, const Inst& select) {
+	std::vector<const Inst*> phis;
+	uint32_t                 budget = 256;
+	return LanesImply(lanes, select.Arg(0).Resolve(), phis, budget);
+}
+
 // M0 indexes VGPRs across lanes. Trace only the definitions feeding its register
 // comparisons; loop-carried writes can themselves depend on those comparisons.
 void FoldRegisterIndexComparisons(FoldWorklist& worklist) {
 	const auto maximum = [&](Value value) -> uint32_t {
 		if (IsImmediate(value, Type::U32)) return value.U32();
 		if (IsImmediate(value, Type::U1)) return value.U1();
-		const auto found = worklist.locations.find(value.TryInstruction());
-		if (found == worklist.locations.end()) return UINT32_MAX;
-		auto& location = found->second;
+		auto* const found = worklist.locations.Find(value.TryInstruction());
+		if (found == nullptr) return UINT32_MAX;
+		auto& location = *found;
 		if (!location.tracks_index) {
 			location.tracks_index = true;
 			worklist.Queue(location);
 		}
 		return location.index_maximum;
+	};
+	// The bound of `value` in the lanes where `lanes` holds. A register written under a mask
+	// those lanes imply holds the written value there, whatever the other lanes kept, so the
+	// EXEC-masked merges Select(mask, written, old) on the way are looked through, not only the
+	// outermost one: in GTA VI's waterfall loops M0 is ReadFirstLane(3 * BFE(x, 0, 24)) where x
+	// merges a 2-bit field written under the loop's EXEC with an unbounded value other lanes
+	// kept (compute 0x21214b48a86d7fd2: 832k SPIR-V words, 81% movrel select chains). Every node
+	// visited is tracked, so a later growth of any of them reaches the ReadFirstLane through its
+	// uses and the fixpoint stays sound. Each result is capped by the node's whole-wave bound.
+	// Phis being walked, with the number of value-changing operations passed when each was
+	// entered: meeting one again through selects and identities only (values passed through
+	// unchanged) adds nothing to the join, so it counts as 0; through arithmetic it is unknown,
+	// as the loop could grow it.
+	uint32_t                                     lane_budget     = 0;
+	uint32_t                                     lane_transforms = 0;
+	std::vector<std::pair<const Inst*, uint32_t>> lane_phis;
+	// The walk reads bounds of nodes that are not its ReadFirstLane's operands (it looks through
+	// merges), so their growth must re-evaluate that ReadFirstLane directly: a merge above a
+	// grown node may itself stay unchanged and pass nothing on through its uses.
+	FoldWorklist::Location*                                       lane_owner = nullptr;
+	std::unordered_map<const Inst*, std::vector<FoldWorklist::Location*>> lane_dependents;
+	const auto lane_max = [&](Value value) -> uint32_t {
+		const auto bound = maximum(value);
+		if (const auto* inst = value.Resolve().TryInstruction(); inst != nullptr && lane_owner != nullptr) {
+			auto& dependents = lane_dependents[inst];
+			if (std::ranges::find(dependents, lane_owner) == dependents.end()) {
+				dependents.push_back(lane_owner);
+			}
+		}
+		return bound;
+	};
+	const auto lane_bound  = [&](auto& self, Value value, Value lanes, int depth) -> uint32_t {
+		value            = value.Resolve();
+		const auto whole = lane_max(value);
+		// Pass-through values cost no depth: identities, merges whose mask the lanes imply (the
+		// written value), and merges whose condition is bounded to false (the old value; each
+		// loop's V_MOVRELD writes leave a chain of them per register). The implication is tested
+		// first: it does not depend on the fixpoint, so a condition that grows from its initial 0
+		// later only widens the old-value case to both values, and every step stays monotone.
+		for (const Inst* through = value.TryInstruction(); through != nullptr && lane_budget != 0;
+		     through = value.TryInstruction()) {
+			if (through->GetOpcode() == ValueOpcode::Identity) {
+				value = through->Arg(0).Resolve();
+			} else if (through->GetOpcode() == ValueOpcode::SelectU32 &&
+			           LanesImplySelect(lanes, *through)) {
+				value = through->Arg(1).Resolve();
+			} else if (through->GetOpcode() == ValueOpcode::SelectU32 &&
+			           lane_max(through->Arg(0)) == 0) {
+				value = through->Arg(2).Resolve();
+			} else {
+				break;
+			}
+			lane_budget--;
+			(void)lane_max(value); // Its growth re-evaluates this walk's ReadFirstLane.
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > 64 || lane_budget == 0) return whole;
+		lane_budget--;
+		const auto arg = [&](size_t index) { return self(self, inst->Arg(index), lanes, depth + 1); };
+		// Arguments of a value-changing operation.
+		const auto changed_arg = [&](size_t index) {
+			lane_transforms++;
+			const auto bound = arg(index);
+			lane_transforms--;
+			return bound;
+		};
+		uint32_t   result = whole;
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::Phi: {
+				const auto active = std::ranges::find(lane_phis, inst,
+				                                      &std::pair<const Inst*, uint32_t>::first);
+				if (active != lane_phis.end()) {
+					return active->second == lane_transforms ? 0u : whole;
+				}
+				if (inst->NumArgs() == 0) break;
+				lane_phis.emplace_back(inst, lane_transforms);
+				uint32_t joined = 0;
+				for (size_t index = 0; index < inst->NumArgs() && joined < whole; index++) {
+					joined = std::max(joined, arg(index));
+				}
+				lane_phis.pop_back();
+				result = joined;
+				break;
+			}
+			// Neither pass-through case held: the mask is not implied and the condition may hold.
+			case ValueOpcode::SelectU32: result = std::max(arg(1), arg(2)); break;
+			case ValueOpcode::Identity: result = arg(0); break;
+			case ValueOpcode::BitwiseAnd32: result = std::min(changed_arg(0), changed_arg(1)); break;
+			case ValueOpcode::IMul32:
+				result = static_cast<uint32_t>(
+				    std::min<uint64_t>(uint64_t {changed_arg(0)} * changed_arg(1), UINT32_MAX));
+				break;
+			case ValueOpcode::BitFieldUExtract: {
+				const auto offset = inst->Arg(1).Resolve(), width = inst->Arg(2).Resolve();
+				if (offset.IsImmediate() && width.IsImmediate() && offset.U32() < 32u &&
+				    width.U32() <= 32u - offset.U32()) {
+					const auto mask = width.U32() == 32u ? UINT32_MAX : (1u << width.U32()) - 1u;
+					result          = std::min(changed_arg(0) >> offset.U32(), mask);
+				}
+				break;
+			}
+			default: break;
+		}
+		return std::min(whole, result);
 	};
 	const auto evaluate = [&](const Inst& inst) -> uint32_t {
 		const auto bound = [&](size_t arg) { return maximum(inst.Arg(arg)); };
@@ -113,8 +411,21 @@ void FoldRegisterIndexComparisons(FoldWorklist& worklist) {
 				return inst.NumArgs() != 0 ? result : UINT32_MAX;
 			}
 			case ValueOpcode::SelectU32: return bound(0) == 0 ? bound(2) : std::max(bound(1), bound(2));
-			// ReadFirstLane takes lane zero for empty EXEC, so the source bound covers every lane.
-			case ValueOpcode::ReadFirstLane:
+			// ReadFirstLane reads the first lane its EXEC operand holds, so the bound in those lanes
+			// covers it (KYTY_MOVREL_LANE_BOUNDS). This assumes EXEC is not empty: an empty EXEC
+			// reads lane zero, whatever it holds. In the waterfall loops this targets, the read
+			// selects the lanes the following V_MOVRELS/V_MOVRELD run under (V_CMPX against the
+			// read value), so with no lanes their results and writes are discarded anyway.
+			// Jetsku/KytyPS5 7709c942 makes the same assumption for its value sets.
+			case ValueOpcode::ReadFirstLane: {
+				const auto lanes = inst.Arg(1);
+				if (lanes.IsEmpty() || !MovrelLaneBoundsEnabled()) return bound(0);
+				lane_budget = 4096;
+				lane_owner = worklist.locations.Find(const_cast<Inst*>(&inst));
+				const auto in_lanes = lane_bound(lane_bound, inst.Arg(0), lanes, 0);
+				lane_owner = nullptr;
+				return std::min(bound(0), in_lanes);
+			}
 			case ValueOpcode::Identity: return bound(0);
 			case ValueOpcode::LogicalAnd:
 			case ValueOpcode::BitwiseAnd32: return std::min(bound(0), bound(1));
@@ -151,11 +462,24 @@ void FoldRegisterIndexComparisons(FoldWorklist& worklist) {
 		const auto next = evaluate(inst);
 		auto& previous = location.index_maximum;
 		if (next <= previous) continue;
-		// Widen a growing loop-carried bound; only stable finite bounds can prune registers.
-		previous = inst.GetOpcode() == ValueOpcode::Phi && previous != 0 ? UINT32_MAX : next;
+		// Widen a growing loop-carried bound; only stable finite bounds can prune registers. A phi
+		// may grow a few times first (KYTY_MOVREL_LANE_BOUNDS): an index whose loop-carried value
+		// stays bounded only once the V_MOVRELD writes into it fold climbs over several rounds
+		// before it is stable. Termination: every cycle passes a phi, and a phi grows a bounded
+		// number of times before it becomes UINT32_MAX.
+		const uint8_t growth_limit = MovrelLaneBoundsEnabled() ? 8 : 1;
+		if (inst.GetOpcode() == ValueOpcode::Phi && previous != 0 &&
+		    ++location.index_growths >= growth_limit) {
+			previous = UINT32_MAX;
+		} else {
+			previous = next;
+		}
 		for (const auto& use: inst.Uses()) {
-			const auto user = worklist.locations.find(use.user);
-			if (user != worklist.locations.end() && user->second.tracks_index) worklist.Queue(user->second);
+			auto* const user = worklist.locations.Find(use.user);
+			if (user != nullptr && user->tracks_index) worklist.Queue(*user);
+		}
+		if (const auto found = lane_dependents.find(&inst); found != lane_dependents.end()) {
+			for (auto* dependent: found->second) worklist.Queue(*dependent);
 		}
 	}
 	worklist.pending.clear();
@@ -990,7 +1314,7 @@ private:
 		if (const auto found = m_values.find(source); found != m_values.end()) return found->second.Resolve();
 		if (const auto predicate = BallotPredicate(*source); !predicate.IsEmpty()) return predicate;
 		auto* block = source->Parent();
-		const auto where = m_worklist.locations.at(source).instruction;
+		const auto where = m_worklist.locations.At(source).instruction;
 		const auto op = source->GetOpcode() == ValueOpcode::BitwiseAnd32 ? ValueOpcode::LogicalAnd
 		              : source->GetOpcode() == ValueOpcode::BitwiseOr32 ? ValueOpcode::LogicalOr
 		              : source->GetOpcode() == ValueOpcode::BitwiseNot32 ? ValueOpcode::LogicalNot
@@ -1024,6 +1348,9 @@ private:
 void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 	FoldWorklist worklist;
 	LaneMaskProjection mask_projection(worklist);
+	size_t instructions = 0;
+	for (auto* block: blocks) instructions += block->Instructions().size();
+	worklist.locations.Reserve(instructions);
 	for (auto* block: blocks)
 		for (auto inst = block->begin(); inst != block->end(); ++inst) worklist.Register(inst);
 	std::vector<Use> users;
@@ -1065,14 +1392,7 @@ void ConstantPropagationPass(const BlockList& blocks, uint32_t wave_size) {
 		normalized = false;
 		for (auto* source: worklist.lowered_ancillary) {
 			if (source->GetOpcode() == ValueOpcode::Identity) continue;
-			const bool retained_only = std::ranges::all_of(source->Uses(), [](const Use& use) {
-				const auto& user = *use.user;
-				if (!user.HasUses() && !user.MayHaveSideEffects()) {
-					return true;
-				}
-				return user.GetOpcode() == ValueOpcode::Phi ||
-				       (user.GetOpcode() == ValueOpcode::SelectU32 && use.operand == 2u);
-			});
+			const bool retained_only = AncillaryRetainedOnly(*source, AncillaryRetainDepth);
 			if (retained_only) {
 				worklist.QueueUsers(source->Uses());
 				Replace(*source, Value(0u));

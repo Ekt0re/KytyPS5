@@ -623,6 +623,10 @@ void Translator::IMAGE_GET_RESINFO(const Decoder::Instruction& inst) {
 }
 
 void Translator::IMAGE_GET_LOD(const Decoder::Instruction& inst) {
+	// OpImageQueryLod exists only where there are derivatives (AnyPS5 9ceedb54).
+	if (program.stage != ShaderType::Pixel && program.stage != ShaderType::Compute) {
+		EXIT("image_get_lod requires a pixel or compute shader at pc 0x%08x", inst.pc);
+	}
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto sampler  = GetSamplerResource(memory);

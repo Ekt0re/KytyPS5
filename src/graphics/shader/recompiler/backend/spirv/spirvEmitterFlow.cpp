@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
@@ -488,6 +489,11 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+
+bool BallotGuardsEnabled() {
+	return Spirv::BallotGuardsEnabled();
+}
+
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();
@@ -736,7 +742,7 @@ void EmitBarrier(EmitterState& state) {
 uint32_t EmitLaneId(EmitterState& state) {
 	return state.program.stage == ShaderType::TessellationControl
 	           ? EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0)
-	           : EmitSubgroupLocalInvocationId(state);
+	           : EmitGuestLane(state);
 }
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -787,9 +793,75 @@ uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 	return result;
 }
 
+// KYTY_PS_QUAD_DPP=1: quad_perm DPP moves in pixel shaders are read with quad operations. In whole
+// quad mode the source lane is often a helper pixel; Vulkan may count helper invocations as inactive
+// for a subgroup shuffle (an undefined result) and for a ballot, but includes them in quad
+// operations. Needs subgroup quad operations in the fragment stage (RADV, AMD, NVIDIA, Intel have
+// them). Adapted from chenxiao07/KytyPS5 fc482f21 (GPL-2.0); the same defect family on AMD is
+// described by the victory-scarlett notes ("pixel shaders that read their quad's neighbours").
+static bool PixelQuadDppEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PS_QUAD_DPP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Each source lane the control names is broadcast once within the quad, with its EXEC bit unless
+// the move fetches inactive lanes, and every lane takes the one its 2-bit selector picks.
+static uint32_t EmitDppQuadPermPixel(ValueEmitContext& ctx, const IR::Inst& inst,
+                                     const IR::DppMoveFlags& flags) {
+	auto& state = ctx.state;
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformQuad);
+	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
+	const auto quad_lane =
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, EmitSubgroupLocalInvocationId(state), ConstantU32(state, 3));
+	// The selector of this lane: bits [2 * quad_lane, 2 * quad_lane + 1] of the control.
+	const auto selector = EmitBinaryU32(
+	    state, spv::OpBitwiseAnd,
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, ConstantU32(state, flags.control & 0xffu),
+	                  EmitBinaryU32(state, spv::OpShiftLeftLogical, quad_lane, ConstantU32(state, 1))),
+	    ConstantU32(state, 3));
+	uint32_t value  = 0;
+	uint32_t active = 0;
+	for (uint32_t source = 0; source < 4u; source++) {
+		bool used = false;
+		for (uint32_t lane = 0; lane < 4u; lane++) {
+			used = used || ((flags.control >> (2u * lane)) & 3u) == source;
+		}
+		if (!used) continue;
+		const auto index = ConstantU32(state, source);
+		const auto read  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpGroupNonUniformQuadBroadcast, TypeU32(state), read, scope,
+		                          ctx.Arg(inst, 0), index);
+		uint32_t read_active = 0;
+		if (!flags.fetch_inactive) {
+			read_active = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpGroupNonUniformQuadBroadcast, TypeBool(state),
+			                          read_active, scope, ctx.Arg(inst, 1), index);
+		}
+		if (value == 0) {
+			value  = read;
+			active = read_active;
+			continue;
+		}
+		const auto picked = Binary(state, spv::OpIEqual, TypeBool(state), selector, index);
+		value = EmitNative<spv::OpSelect, IR::Type::U32>(state, picked, read, value);
+		if (!flags.fetch_inactive) {
+			active = Select(state, TypeBool(state), picked, read_active, active);
+		}
+	}
+	if (flags.fetch_inactive) return value;
+	return EmitNative<spv::OpSelect, IR::Type::U32>(state, active, value, ConstantU32(state, 0));
+}
+
 uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state    = ctx.state;
 	const auto flags    = inst.Flags<IR::DppMoveFlags>();
+	if (state.program.stage == ShaderType::Pixel && !flags.dpp8 && flags.control <= 0xffu &&
+	    ctx.other_half == nullptr && PixelQuadDppEnabled()) {
+		return EmitDppQuadPermPixel(ctx, inst, flags);
+	}
 	const auto target   = EmitDppTargetLane(state, flags);
 	const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
 	if (flags.fetch_inactive) {
@@ -824,10 +896,26 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
-	                              TypeBool(ctx.state), result,
-	                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
+	if (!BallotGuardsEnabled()) {
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
+		                              TypeBool(ctx.state), result,
+		                              ConstantU32(ctx.state, spv::ScopeSubgroup), predicate);
+		return result;
+	}
+	// Any(p) is Ballot(p) != 0 and All(p) is Ballot(!p) == 0. NVIDIA's compiler spends ~45 ms on
+	// each OpGroupNonUniformAny/All and little on a ballot (KytyPS5 #2469). The ballot has bits only
+	// for active invocations, the same set the vote covers, and every word is compared, so this
+	// holds for any host subgroup size.
+	auto&      state  = ctx.state;
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup),
+	                          zero ? EmitLogicalNotBool(state, predicate) : predicate);
+	const auto words = Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual,
+	                          TypeBoolVector(state, 4), ballot, ConstantU32CompositeZero(state, 4));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(zero ? spv::OpAll : spv::OpAny, TypeBool(state), result, words);
 	return result;
 }
 
@@ -978,3 +1066,27 @@ void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+namespace {
+std::atomic<bool> g_ballot_guards_default {false};
+} // namespace
+
+void SetBallotGuardsDefault(bool enabled) {
+	g_ballot_guards_default.store(enabled, std::memory_order_relaxed);
+}
+
+bool BallotGuardsEnabled() {
+	// -1: no KYTY_BALLOT_GUARDS, the device default decides.
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_BALLOT_GUARDS");
+		if (value == nullptr || value[0] == 0) {
+			return -1;
+		}
+		return value[0] == '0' ? 0 : 1;
+	}();
+	return forced >= 0 ? forced == 1 : g_ballot_guards_default.load(std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

@@ -7,6 +7,8 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/recorder.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
@@ -18,6 +20,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -25,6 +28,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -403,13 +407,17 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
 	                   vk::PhysicalDeviceRayQueryFeaturesKHR,
 	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
-	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT>
+	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT,
+	                   vk::PhysicalDeviceMaintenance5FeaturesKHR,
+	                   vk::PhysicalDevicePipelineBinaryFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
-	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
+	       acceleration_structure, ray_query, cooperative_matrix, float8, maintenance5,
+	       pipeline_binary] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+	graphics.external_memory_host_enabled = add(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
 	if (!add(VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME)) {
@@ -461,6 +469,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		supported.unlink<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
 		supported.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
+	// Diagnostic GPU breadcrumbs (KYTY_GPU_BREADCRUMBS=1).
+	if (GpuBreadcrumbs::Requested()) {
+		graphics.buffer_marker_enabled = add(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+		graphics.device_fault_enabled  = add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		LOGF("Vulkan GPU breadcrumbs: buffer marker %s, device fault %s\n",
+		     graphics.buffer_marker_enabled ? "true" : "false",
+		     graphics.device_fault_enabled ? "true" : "false");
+	}
 	// FSR's ML upscalers run on cooperative matrices.
 	const bool fsr = Fsr::Enabled();
 	if (!fsr || !add(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
@@ -469,9 +485,23 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!fsr || !add(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
 	}
+	// Our own pipeline binaries (PipelineBinaryStore) need both; capture takes the flags2 struct.
+	const bool pipeline_binary_extensions =
+	    HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	if (pipeline_binary_extensions) {
+		add(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+		add(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	} else {
+		supported.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
+		supported.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
+	graphics.pipeline_binary_enabled = pipeline_binary_extensions && maintenance5.maintenance5 &&
+	                                   pipeline_binary.pipelineBinaries;
+	LOGF("Vulkan pipeline binaries: %s\n", graphics.pipeline_binary_enabled ? "true" : "false");
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	const bool ray_query_enabled =
 	    acceleration_structure.accelerationStructure && ray_query.rayQuery;
@@ -500,16 +530,28 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceProperties2, vk::PhysicalDeviceFloatControlsProperties,
 	    vk::PhysicalDeviceRobustness2PropertiesEXT, vk::PhysicalDeviceVulkan11Properties,
 	    vk::PhysicalDeviceSubgroupSizeControlProperties, vk::PhysicalDevicePushDescriptorProperties,
-	    vk::PhysicalDeviceMeshShaderPropertiesEXT>
+	    vk::PhysicalDeviceMeshShaderPropertiesEXT, vk::PhysicalDeviceDriverProperties>
 	    properties;
 	auto& [properties2, float_controls, robustness2_props, properties11, subgroup_control,
-	       push_descriptor, mesh_properties] = properties;
+	       push_descriptor, mesh_properties, driver_properties] = properties;
 	if (!graphics.mesh_shader_enabled) {
 		properties.unlink<vk::PhysicalDeviceMeshShaderPropertiesEXT>();
 	}
 	physical_device.getProperties2(&properties2);
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 	graphics.physical_device_properties = properties2.properties;
+	graphics.driver_id                  = driver_properties.driverID;
+	ShaderRecompiler::Spirv::SetBallotGuardsDefault(graphics.driver_id ==
+	                                                vk::DriverId::eNvidiaProprietary);
+	// RADV: the VkPipelineCache file already keeps every pipeline (no size cap), and capturing
+	// binaries bypasses it, so each store miss compiles from scratch. Opt-in there.
+	if (graphics.pipeline_binary_enabled && graphics.driver_id == vk::DriverId::eMesaRadv) {
+		const char* store = std::getenv("KYTY_PIPELINE_BINARIES");
+		if (!(store != nullptr && store[0] == '1')) {
+			graphics.pipeline_binary_enabled = false;
+			LOGF("Vulkan pipeline binaries: off on RADV (KYTY_PIPELINE_BINARIES=1 turns them on)\n");
+		}
+	}
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
@@ -522,6 +564,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    supported13.subgroupSizeControl == VK_TRUE &&
 	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_control.minSubgroupSize <= 64 && subgroup_control.maxSubgroupSize >= 64;
+	graphics.fragment_subgroup_size_control_enabled =
+	    graphics.compute_subgroup_size_control_enabled &&
+	    (subgroup_stages & vk::ShaderStageFlagBits::eFragment);
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
@@ -550,6 +595,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
+	graphics.compute_derivative_quads_enabled  = compute_derivatives.computeDerivativeGroupQuads == VK_TRUE;
+	graphics.compute_derivative_linear_enabled = compute_derivatives.computeDerivativeGroupLinear == VK_TRUE;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -574,6 +621,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+	// Emulated 8-bit image atomics read their texel through an unformatted storage view.
+	device_features.shaderStorageImageReadWithoutFormat =
+	    supported2.features.shaderStorageImageReadWithoutFormat;
 	device_features.shaderStorageImageMultisample =
 	    supported2.features.shaderStorageImageMultisample;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
@@ -656,7 +706,42 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
-	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
+	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
+	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE},
+	    vk::PhysicalDeviceMaintenance5FeaturesKHR {.maintenance5 = VK_TRUE},
+	    vk::PhysicalDevicePipelineBinaryFeaturesKHR {.pipelineBinaries = VK_TRUE},
+	    vk::DevicePipelineBinaryInternalCacheControlKHR {.disableInternalCache = VK_TRUE}};
+	// The driver's internal pipeline cache is turned off where it can be: NVIDIA's keeps it per
+	// executable and its captured binaries then depend on it, so a rebuilt or renamed emulator got
+	// VK_PIPELINE_COMPILE_REQUIRED for every stored pipeline. Without it the stored binaries are
+	// complete (PipelineBinaryStore). KYTY_PIPELINE_BINARY_INTERNAL_CACHE=1 keeps it.
+	bool disable_internal_cache = false;
+	if (graphics.pipeline_binary_enabled) {
+		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDevicePipelineBinaryPropertiesKHR>
+		    binary_properties;
+		physical_device.getProperties2(&binary_properties.get<vk::PhysicalDeviceProperties2>());
+		const auto& binary = binary_properties.get<vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
+		const char* keep   = std::getenv("KYTY_PIPELINE_BINARY_INTERNAL_CACHE");
+		// KYTY_PIPELINE_BINARIES=0 (no store) must keep the driver's cache, or nothing caches.
+		const char* store  = std::getenv("KYTY_PIPELINE_BINARIES");
+		disable_internal_cache = !(store != nullptr && store[0] == '0') &&
+		                         binary.pipelineBinaryInternalCache &&
+		                         binary.pipelineBinaryInternalCacheControl &&
+		                         !(keep != nullptr && keep[0] == '1');
+		graphics.pipeline_binary_internal_cache_disabled = disable_internal_cache;
+		LOGF("Vulkan pipeline binaries: internal cache %s, control %s -> %s\n",
+		     binary.pipelineBinaryInternalCache ? "true" : "false",
+		     binary.pipelineBinaryInternalCacheControl ? "true" : "false",
+		     disable_internal_cache ? "disabled" : "kept");
+	}
+	if (!graphics.pipeline_binary_enabled) {
+		create.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
+		create.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+	}
+	if (!disable_internal_cache) {
+		create.unlink<vk::DevicePipelineBinaryInternalCacheControlKHR>();
+	}
+	if (!graphics.device_fault_enabled) create.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}
@@ -687,7 +772,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!graphics.conditional_rendering_enabled) {
 		create.unlink<vk::PhysicalDeviceConditionalRenderingFeaturesEXT>();
 	}
-	if (!compute_derivatives.computeDerivativeGroupQuads) {
+	if (!graphics.compute_derivative_quads_enabled && !graphics.compute_derivative_linear_enabled) {
 		create.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
 	}
 	if (!extended_dynamic_state) {
@@ -1011,6 +1096,9 @@ void WindowContext::CreateVulkan() {
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+	// After the upscalers took the real device functions, before the allocator takes the
+	// recorder's waiting destroy and free functions.
+	Recorder::Install();
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

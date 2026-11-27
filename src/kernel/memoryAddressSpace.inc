@@ -25,6 +25,139 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+// Ranges whose guest mapping is briefly absent while the emulator replaces it: a guest mmap with
+// MAP_FIXED over an existing mapping (unmapped, then mapped again), and, on Windows, the parts of a
+// file view that stay mapped when part of it is unmapped (Windows splits a view only by unmapping
+// all of it). On the console these replacements are atomic, so guest threads keep using the
+// memory: GTA V's streamer decompresses into buffers whose 64 KiB pages are mapped again or
+// neighbour an unmap. A fault inside such a range waits until the mapping is back and is retried
+// instead of being reported as an access violation.
+struct TransientUnmapWindow {
+	std::atomic<uint64_t> id {0};
+	std::atomic<uint64_t> start {0};
+	std::atomic<uint64_t> end {0};
+	std::atomic<int64_t>  closed_ns {0}; // 0 while the range is being remapped
+	std::atomic<bool>     owned {false}; // an open Scope holds this entry
+};
+
+class TransientUnmapWindows {
+public:
+	using Window = TransientUnmapWindow;
+
+	class Scope {
+	public:
+		Scope(uint64_t start, uint64_t end) noexcept: m_window(Open(start, end)) {}
+		~Scope() {
+			m_window->closed_ns.store(Now(), std::memory_order_release);
+			m_window->owned.store(false, std::memory_order_release);
+		}
+		KYTY_CLASS_NO_COPY(Scope);
+
+	private:
+		Window* m_window;
+	};
+
+	// The newest range being remapped recently that holds vaddr (0: none). Waits while it still
+	// is being remapped.
+	static uint64_t Wait(uint64_t vaddr) noexcept {
+		constexpr int64_t Second  = 1000000000;
+		uint64_t          matched = 0;
+		for (auto& window: s_windows) {
+			// The id names one opening of this entry (Open's seqlock). Read it with the range until
+			// both belong to the same opening: the entry may be reopening for a range that holds
+			// vaddr. id 0 on an owned entry means Open is writing it.
+			uint64_t id    = 0;
+			uint64_t start = 0;
+			uint64_t end   = 0;
+			for (;;) {
+				id    = window.id.load(std::memory_order_acquire);
+				start = window.start.load(std::memory_order_relaxed);
+				end   = window.end.load(std::memory_order_relaxed);
+				std::atomic_thread_fence(std::memory_order_acquire);
+				const bool stable = window.id.load(std::memory_order_relaxed) == id;
+				if (stable && (id != 0 || !window.owned.load(std::memory_order_acquire))) {
+					break;
+				}
+#if defined(_M_X64) || defined(__x86_64__)
+				_mm_pause();
+#endif
+			}
+			if (id == 0 || vaddr < start || vaddr >= end) {
+				continue;
+			}
+			const auto begin  = Now();
+			int64_t    closed = 0;
+			for (uint32_t spins = 0;; spins++) {
+				closed = window.closed_ns.load(std::memory_order_acquire);
+				if (closed != 0) {
+					break;
+				}
+				// Reuse needs the original Scope to have closed first.
+				if (window.id.load(std::memory_order_acquire) != id) {
+					closed = Now();
+					break;
+				}
+				if (Now() - begin > Second * 10) {
+					return 0; // never closed: report the fault
+				}
+				if (spins < 4096) {
+#if defined(_M_X64) || defined(__x86_64__)
+					_mm_pause();
+#endif
+				} else {
+					std::this_thread::yield();
+				}
+			}
+			// The fault may be handled after the mapping is already back.
+			if (Now() - closed < Second) {
+				matched = std::max(matched, id);
+			}
+		}
+		return matched;
+	}
+
+private:
+	// Claims an entry no open Scope holds, so an open range is never overwritten. Scopes only
+	// span one remap, so when every entry is open one frees up shortly.
+	static Window* Claim() noexcept {
+		for (;;) {
+			for (size_t i = 0; i < s_windows.size(); i++) {
+				auto& window =
+				    s_windows[s_next.fetch_add(1, std::memory_order_relaxed) % s_windows.size()];
+				bool expected = false;
+				if (window.owned.compare_exchange_strong(expected, true,
+				                                         std::memory_order_acquire)) {
+					return &window;
+				}
+			}
+			std::this_thread::yield();
+		}
+	}
+
+	static Window* Open(uint64_t start, uint64_t end) noexcept {
+		auto& window = *Claim();
+		// Seqlock: id 0 while the range changes, then the new id publishes the range.
+		window.id.store(0, std::memory_order_relaxed);
+		std::atomic_thread_fence(std::memory_order_release);
+		window.closed_ns.store(0, std::memory_order_relaxed);
+		window.start.store(start, std::memory_order_relaxed);
+		window.end.store(end, std::memory_order_relaxed);
+		window.id.store(s_opened.fetch_add(1, std::memory_order_relaxed) + 1,
+		                std::memory_order_seq_cst);
+		return &window;
+	}
+
+	static int64_t Now() noexcept {
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		           std::chrono::steady_clock::now().time_since_epoch())
+		    .count();
+	}
+
+	inline static std::array<Window, 64> s_windows {};
+	inline static std::atomic<uint32_t>  s_next {0};
+	inline static std::atomic<uint64_t>  s_opened {0};
+};
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -78,8 +211,35 @@ public:
 			EXIT("direct-memory backing: writable alias failed: %d\n", errno);
 		}
 		m_backing_base = static_cast<uint8_t*>(backing);
+#if !defined(__APPLE__)
+		ExcludeFromCoreDumps();
+#endif
 #endif
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// A core dump reads every dumpable mapping, and reading shared memory that was never written
+	// allocates it: a crash with 12 GB of committed guest memory first grew by all of it (through
+	// the alias and the guest views), ran into the memory limit or the machine's memory, and
+	// wrote a core of several GB. Shared anonymous mappings (bit 1 of the filter) are left out of
+	// the dump; the emulator's own memory stays in. KYTY_COREDUMP_GUEST_MEMORY=1 keeps the default.
+	static void ExcludeFromCoreDumps() {
+		if (const char* keep = std::getenv("KYTY_COREDUMP_GUEST_MEMORY");
+		    keep != nullptr && *keep != '\0' && *keep != '0') {
+			return;
+		}
+		unsigned filter = 0;
+		FILE*    file   = std::fopen("/proc/self/coredump_filter", "r+");
+		if (file == nullptr) {
+			return;
+		}
+		if (std::fscanf(file, "%x", &filter) == 1 && (filter & 0x2u) != 0) {
+			std::rewind(file);
+			std::fprintf(file, "0x%x", filter & ~0x2u);
+		}
+		std::fclose(file);
+	}
+#endif
 
 	// Guest views outlive the alias and the handle; the address-space owner releases them.
 	~GuestBackingStore() {
@@ -146,6 +306,54 @@ public:
 		return true;
 	}
 
+	// Changes whenever a guest page is bound to or unbound from the backing, so holders of a
+	// backing address (zero-copy GPU buffers) know to check it again.
+	[[nodiscard]] uint64_t Generation() const noexcept {
+		return m_generation.load(std::memory_order_acquire);
+	}
+
+	// Whether a page change after `generation` touched [vaddr, vaddr + size). True when the
+	// history no longer reaches back that far.
+	[[nodiscard]] bool ChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) const {
+		std::lock_guard lock(m_changes_mutex);
+		const auto      now = m_generation.load(std::memory_order_acquire);
+		if (now - generation >= m_changes.size()) {
+			return true;
+		}
+		for (auto g = generation + 1; g <= now; ++g) {
+			const auto& change = m_changes[g % m_changes.size()];
+			if (change.generation != g ||
+			    (change.start < vaddr + size && vaddr < change.end)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// The alias address of [vaddr, vaddr + size) when one contiguous backing run holds all of it,
+	// 0 otherwise. Callers hold the state lock.
+	[[nodiscard]] uint64_t ContiguousAlias(uint64_t vaddr, uint64_t size) const {
+		uint64_t alias  = 0;
+		uint64_t runs   = 0;
+		bool     gapped = false;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
+			    runs++;
+			    if (start == vaddr && bytes == size) {
+				    alias = reinterpret_cast<uint64_t>(m_backing_base) + offset;
+			    }
+		    },
+		    [&](uint64_t, uint64_t) { gapped = true; });
+		return runs == 1 && !gapped ? alias : 0;
+	}
+
+	// Where a guest page lives in the backing, or UINT64_MAX for a page that has none.
+	[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr) const {
+		const auto entry = LoadPage(vaddr >> PageBits);
+		return entry != 0 ? (uint64_t {entry - 1u} << PageBits) + (vaddr & PageMask) : UINT64_MAX;
+	}
+
 	// Needs no lock either, as the alias stays mapped. A read racing an unmap copies the backing's
 	// current bytes, or zeros for a page unmapped between the check and the copy.
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) const {
@@ -155,6 +363,60 @@ public:
 		ReadSparseBacking(vaddr, data, size, [](uint64_t, uint8_t* destination, uint64_t bytes) {
 			std::memset(destination, 0, bytes);
 		});
+		return true;
+	}
+
+	// The alias address of a range that one contiguous run of backing holds, or nullptr. Needs
+	// no lock, like TryReadBacking; the alias stays mapped for the store's lifetime.
+	[[nodiscard]] const uint8_t* TryGetBackingView(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const auto first = LoadPage(vaddr >> PageBits);
+		if (first == 0) {
+			return nullptr;
+		}
+		auto expected = first;
+		for (auto page = (vaddr >> PageBits) + 1u; page <= (vaddr + size - 1u) >> PageBits; ++page) {
+			if (LoadPage(page) != ++expected) {
+				return nullptr;
+			}
+		}
+		return m_backing_base + ((uint64_t {first - 1u} << PageBits) + (vaddr & PageMask));
+	}
+
+	// The same bytes as TryReadBacking, read through the file where the host can: a file read
+	// of shared memory that was never written returns zeros without allocating it, where a copy
+	// from the mapping commits every page it touches. For readers of whole address spaces (frame
+	// capture); small hot reads keep TryReadBacking, which needs no system call.
+	bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) const {
+		if (data == nullptr || !IsBacked(vaddr, size)) {
+			return false;
+		}
+		auto* destination = static_cast<uint8_t*>(data);
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
+			    auto* out = destination + (start - vaddr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+			    while (bytes != 0) {
+				    const auto read = pread(m_fd, out, bytes, static_cast<off_t>(offset));
+				    if (read < 0 && errno == EINTR) {
+					    continue;
+				    }
+				    if (read <= 0) {
+					    break;
+				    }
+				    out += read;
+				    offset += static_cast<uint64_t>(read);
+				    bytes -= static_cast<uint64_t>(read);
+			    }
+#endif
+			    std::memcpy(out, m_backing_base + offset, bytes);
+		    },
+		    [&](uint64_t start, uint64_t bytes) {
+			    std::memset(destination + (start - vaddr), 0, bytes);
+		    });
 		return true;
 	}
 
@@ -257,7 +519,14 @@ private:
 		}
 	}
 
+	void NoteChange(uint64_t vaddr, uint64_t size) {
+		std::lock_guard lock(m_changes_mutex);
+		const auto      generation = m_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+		m_changes[generation % m_changes.size()] = {generation, vaddr, vaddr + size};
+	}
+
 	void StorePages(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
+		NoteChange(vaddr, size);
 		const auto end = vaddr + size;
 		EXIT_IF(((vaddr | size | backing_offset) & PageMask) != 0 ||
 		        (end >> PageBits) > BucketCount * BucketPages || backing_offset + size > m_size);
@@ -274,6 +543,7 @@ private:
 	}
 
 	void ClearPages(uint64_t vaddr, uint64_t size) {
+		NoteChange(vaddr, size);
 		for (auto page = vaddr >> PageBits; page < (vaddr + size) >> PageBits; ++page) {
 			m_pages[page / BucketPages].load(std::memory_order_relaxed)[page % BucketPages].store(
 			    0, std::memory_order_relaxed);
@@ -363,6 +633,16 @@ private:
 		QueryProtections(view.base, left_size, mode, &protections);
 		QueryProtections(right_addr, right_size, mode, &protections);
 
+		// The survivors are briefly unmapped too: their faults wait and are retried until they are
+		// back with their protections.
+		std::optional<TransientUnmapWindows::Scope> left_window;
+		std::optional<TransientUnmapWindows::Scope> right_window;
+		if (left_size != 0) {
+			left_window.emplace(view.base, vaddr);
+		}
+		if (right_size != 0) {
+			right_window.emplace(right_addr, right_addr + right_size);
+		}
 		EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(view.base), view.size));
 		ClearPages(vaddr, size);
 		EXIT_IF(left_size != 0 && !SplitPlaceholder(view.base, left_size));
@@ -441,6 +721,14 @@ private:
 	uint8_t*                                                     m_backing_base = nullptr;
 	uint64_t                                                     m_size         = 0;
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_pages {};
+	std::atomic<uint64_t>                                        m_generation {1};
+	struct PageChange {
+		uint64_t generation = 0;
+		uint64_t start      = 0;
+		uint64_t end        = 0;
+	};
+	mutable std::mutex                                           m_changes_mutex;
+	std::array<PageChange, 1024>                                 m_changes {};
 };
 
 // Callers change it with the state lock held exclusively and query it under the operation lock or
@@ -523,6 +811,24 @@ public:
 #endif
 
 	// Writes the backed bytes of a range that holds no private mappings.
+	[[nodiscard]] uint64_t BackingGeneration() const { return m_backing->Generation(); }
+	[[nodiscard]] bool     BackingChangedSince(uint64_t generation, uint64_t vaddr,
+	                                           uint64_t size) const {
+		return m_backing->ChangedSince(generation, vaddr, size);
+	}
+
+	// See GuestBackingStore::ContiguousAlias; 0 also when a private mapping overlaps the range.
+	[[nodiscard]] uint64_t ContiguousBackingAlias(uint64_t vaddr, uint64_t size) {
+		if (!Owns(vaddr, size)) {
+			return 0;
+		}
+		std::shared_lock state(g_memory_state_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			return 0;
+		}
+		return m_backing->ContiguousAlias(vaddr, size);
+	}
+
 	bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 		if (!Owns(vaddr, size)) {
 			return false;
@@ -537,6 +843,18 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryReadBackingUncommitted(vaddr, data, size);
+	}
+
+	[[nodiscard]] const void* TryGetBackingView(uint64_t vaddr, uint64_t size) const {
+		return m_backing->TryGetBackingView(vaddr, size);
+	}
+
+	[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr) const {
+		return m_backing->BackingOffset(vaddr);
 	}
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {

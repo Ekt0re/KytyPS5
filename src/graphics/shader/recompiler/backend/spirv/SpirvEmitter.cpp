@@ -44,6 +44,12 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	// The console keeps lane 63 when every lane of a wave stores to one LDS word; RADV keeps lane 0
+	// (AnyPS5 55fe6ebf).
+	state.lds_last_lane_stores =
+	    program.stage == ShaderType::Compute && workgroup != nullptr && state.lane_count == 1u &&
+	    program.wave_size == 64u && workgroup->host_subgroup_size == 64u && program.info.uses_lds &&
+	    state.lds_storage_class == spv::StorageClassWorkgroup;
 	DefineModule(state);
 	EmitProgram(state);
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,

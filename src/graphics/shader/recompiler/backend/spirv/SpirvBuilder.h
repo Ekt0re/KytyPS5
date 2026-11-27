@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVBUILDER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVBUILDER_H_
 
+#include "common/assert.h"
 #include "common/common.h"
 
 #include <initializer_list>
@@ -58,6 +59,9 @@ public:
 	}
 
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
+	// With a constant initializer (batatinhafcbatatinha-pixel/KytyPS5 1a036403d).
+	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class,
+	                              uint32_t initializer);
 	void DefineGlobalVariable(uint32_t id, uint32_t pointer_type, spv::StorageClass storage_class);
 
 	void AddMemoryModel(spv::AddressingModel addressing_model, spv::MemoryModel memory_model);
@@ -127,6 +131,8 @@ private:
 		const auto offset = section.size();
 		AppendOperands(section, opcode, operands...);
 		const auto word_count = static_cast<uint32_t>(section.size() - offset);
+		// A longer instruction would wrap its 16-bit word count into a corrupt module.
+		EXIT_IF(word_count > 0xffffu);
 		section[offset] |= word_count << spv::WordCountShift;
 	}
 

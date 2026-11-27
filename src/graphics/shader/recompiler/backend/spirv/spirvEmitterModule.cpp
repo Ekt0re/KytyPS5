@@ -242,7 +242,8 @@ void DefineDescriptors(EmitterState& state) {
 			// Heap kinds alias one array; the root itself is never accessed.
 			auto& definition = state.heap_images[IR::ImageBindingIndex(*kind)];
 			if (image.indirect_resources.empty() && definition.variable == 0) {
-				DefineImageArray(state, definition, image, IR::ImageHeapCapacity, IR::ImageHeapSet, 0u);
+				DefineImageArray(state, definition, image, state.profile.image_heap_capacity,
+				                 IR::ImageHeapSet, 0u);
 			}
 			continue;
 		}
@@ -256,7 +257,10 @@ void DefineDescriptors(EmitterState& state) {
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
 	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
+	// Emulated image atomics keep their lock words in the fault buffer.
+	const bool emulated_image_atomics = std::ranges::any_of(info.images, IR::EmulatesImageAtomics);
+	counts[static_cast<size_t>(Kind::FaultBuffer)] =
+	    info.uses_dma || info.uses_heap_rows || emulated_image_atomics;
 	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
 	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
 	if (info.uses_dispatch_threads) {
@@ -293,6 +297,13 @@ void DefineDescriptors(EmitterState& state) {
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
 		};
+		// The page table, shader data and flattened SRT are host-owned and never stored to by a
+		// shader: saying so lets the device compiler keep and reuse their loads across stores.
+		// Ported from batatinhafcbatatinha-pixel/KytyPS5 1a036403d (GPL-2.0).
+		const auto ReadOnly = [&](uint32_t variable) {
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationRestrict);
+		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
@@ -321,6 +332,7 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[3], 64), "bda_pagetable");
+				ReadOnly(state.bda_pagetable_variable);
 				break;
 			case IR::DescriptorBindingKind::FaultBuffer:
 				state.fault_buffer_variable =
@@ -329,10 +341,12 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::ShaderData:
 				state.shader_data_storage_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "shader_data");
+				ReadOnly(state.shader_data_storage_variable);
 				break;
 			case IR::DescriptorBindingKind::FlattenedSrt:
 				state.flattened_srt_variable =
 				    Define(StorageBufferType(state, state.storage_buffers[2]), "flattened_srt");
+				ReadOnly(state.flattened_srt_variable);
 				break;
 			case IR::DescriptorBindingKind::Samplers:
 				state.sampler_type = state.builder.Type(spv::OpTypeSampler);
@@ -364,6 +378,14 @@ void DefineDescriptors(EmitterState& state) {
 				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				// The texels an emulated atomic updates under its lock bypass incoherent caches.
+				if (std::ranges::any_of(info.images, [&](const auto& image) {
+					    return IR::EmulatesImageAtomics(image) && !image.heap &&
+					           IR::DescriptorBindingForImage(image) == kind;
+				    })) {
+					state.builder.AddAnnotation(spv::OpDecorate, definition.variable,
+					                            spv::DecorationCoherent);
+				}
 				break;
 			}
 		}
@@ -822,10 +844,12 @@ void DefineModule(EmitterState& state) {
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	// Scalar-branch guards (subgroup_vote) are ballots on NVIDIA or with KYTY_BALLOT_GUARDS=1.
+	const bool guard_ballots = state.program.info.subgroup_vote && BallotGuardsEnabled();
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot || guard_ballots) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
-	if (state.program.info.subgroup_vote) {
+	if (state.program.info.subgroup_vote && !guard_ballots) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	if (state.program.info.subgroup_shuffle) {
@@ -834,9 +858,11 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.subgroup_arithmetic) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
-	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
-		state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
+	if (state.lds_last_lane_stores) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
 	const bool fragment_barycentric =
 	    state.program.stage == ShaderType::Pixel &&
@@ -874,6 +900,13 @@ void DefineModule(EmitterState& state) {
 		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
 		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
 		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		const bool compute_derivatives =
+		    state.program.stage == ShaderType::Compute && state.program.info.compute_derivatives;
+		if (compute_derivatives && (uint64_t {local_x} * local_y * local_z) % 4u != 0u) {
+			EXIT("compute derivatives require four-lane workgroups (got %ux%ux%u) hash=0x%016" PRIx64
+			     "\n",
+			     local_x, local_y, local_z, state.program.shader_hash);
+		}
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;
@@ -884,6 +917,27 @@ void DefineModule(EmitterState& state) {
 		}
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
 		                               local_y, local_z);
+		// DerivativeGroupQuadsKHR is invalid when local size X or Y is odd
+		// (VUID-StandaloneSpirv-DerivativeGroupQuadsKHR-10151). Based on AnyKyty 688dbf145d
+		// (simnJS/AnyPS5, GPL-2.0).
+		if (compute_derivatives) {
+			const bool quads_layout  = (local_x & 1u) == 0u && (local_y & 1u) == 0u;
+			const bool linear_layout = (uint64_t {local_x} * local_y * local_z) % 4u == 0u;
+			if (quads_layout && state.profile.compute_derivative_quads) {
+				state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupQuadsKHR);
+				state.builder.AddExecutionMode(state.main_func,
+				                               spv::ExecutionModeDerivativeGroupQuadsKHR);
+			} else if (linear_layout && state.profile.compute_derivative_linear) {
+				state.builder.RequireCapability(spv::CapabilityComputeDerivativeGroupLinearKHR);
+				state.builder.AddExecutionMode(state.main_func,
+				                               spv::ExecutionModeDerivativeGroupLinearKHR);
+			} else {
+				EXIT("compute derivative group feature unavailable for local size %ux%ux%u "
+				     "hash=0x%016" PRIx64 "\n",
+				     local_x, local_y, local_z, state.program.shader_hash);
+			}
+			state.builder.RequireExtension("SPV_KHR_compute_shader_derivatives");
+		}
 	}
 	if (state.program.stage == ShaderType::Pixel) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOriginUpperLeft);
@@ -893,9 +947,6 @@ void DefineModule(EmitterState& state) {
 		if (state.input_info.pixel->ps_early_z) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
-	}
-	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
-		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}
 	state.builder.AddName(state.main_func, "main");
 	if (state.program.info.function_lds) {

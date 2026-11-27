@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "graphics/guest_gpu/command_processor/rawCommandBuffer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pssr.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -36,13 +37,24 @@ struct IndirectDrawRegisters {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// The packet the execution stands at (null when it has none), for diagnostics.
+	[[nodiscard]] const uint32_t* Position() const noexcept {
+		if (m_buffer_stack.empty()) return nullptr;
+		const auto& cursor = m_buffer_stack.back();
+		return cursor.offset_dw < cursor.commands.size() ? cursor.commands.data() + cursor.offset_dw
+		                                                 : nullptr;
+	}
 
 private:
 	friend class CommandProcessor;
 
 	struct BufferCursor {
-		std::span<const uint32_t> commands;
+		std::span<const uint32_t> commands; // Guest addresses.
 		uint32_t                  offset_dw = 0;
+		// KYTY_RAW_CMDBUF: the same DWORDs in the backing alias (nullptr: decode through
+		// commands). Resolved when the cursor is first decoded in a Process() call.
+		const uint32_t* view       = nullptr;
+		bool            view_ready = false;
 	};
 
 	std::vector<BufferCursor> m_buffer_stack;
@@ -89,6 +101,10 @@ public:
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
 	                uint32_t interrupt_context_id, bool gl2_writeback);
 	void WriteBackImages();
+	// A partial flush, ACQUIRE_MEM, WAIT_REG_MEM, memory semaphore, RELEASE_MEM, flip or the end of
+	// a submission: this queue's earlier GPU work is done as far as later indirect argument reads
+	// go.
+	void NoteGuestSync();
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
@@ -119,6 +135,9 @@ public:
 
 private:
 	void ProcessPm4(Pm4Execution& execution);
+	void ResolveCommandView(Pm4Execution::BufferCursor& cursor);
+	// A host GPU write into a live command span is published before the parser reads on.
+	void RefreshLiveCommands(uint64_t dst, uint64_t size);
 	void SuspendPm4();
 	void                CountDraw();
 	uint32_t            NumInstances();
@@ -146,6 +165,7 @@ private:
 	uint32_t       m_draws                       = 0; // Since the buffer start or CountDraw's flush
 	uint64_t       m_synthetic_occlusion_counter = 0;
 	bool           m_predicate_skip              = false;
+	RawCommandBuffer::Mode m_raw_mode            = RawCommandBuffer::Mode::Off;
 };
 
 } // namespace Libs::Graphics

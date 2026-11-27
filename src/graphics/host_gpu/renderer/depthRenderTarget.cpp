@@ -345,7 +345,28 @@ bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
 	cache.MarkGpuWritten(write_id);
 	auto& source      = cache.GetImage(read_id);
 	auto& destination = cache.GetImage(write_id);
-	EXIT_IF(read_id == write_id || source.backing.format != destination.backing.format);
+	EXIT_IF(read_id == write_id);
+	if (source.backing.format != destination.backing.format) {
+		// One side renders the depth aspect of a depth/stencil image: copy that aspect through a
+		// buffer, since a depth/stencil format copies only to its own format.
+		const auto bytes = DepthStencilTransferBytes(source.backing.format);
+		EXIT_IF(stencil_copy || source.backing.samples != 1 || destination.backing.samples != 1 ||
+		        DepthAspectTransferFormat(source.backing.format) !=
+		            DepthAspectTransferFormat(destination.backing.format) ||
+		        bytes == 0);
+		const auto& extent = write_desc.info.extent;
+		const uint64_t size = uint64_t {extent.width} * extent.height * bytes *
+		                      read_desc.view_info.layer_count;
+		const auto scratch = cache.m_tiler.GetScratchBuffer(size);
+		const vk::BufferImageCopy copy {
+		    scratch.offset, 0, 0,
+		    {vk::ImageAspectFlagBits::eDepth, read_desc.view_info.base_level,
+		     read_desc.view_info.base_layer, read_desc.view_info.layer_count},
+		    {0, 0, 0}, extent};
+		source.Download({&copy, 1}, scratch.buffer, scratch.offset, size);
+		destination.Upload({&copy, 1}, scratch.buffer, scratch.offset, size);
+		return true;
+	}
 
 	buffer.EndRendering();
 	const auto command = buffer.Handle();

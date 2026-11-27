@@ -1,4 +1,5 @@
 #include "kernel/eventFlag.h"
+#include "kernel/pthread.h"
 
 #include "common/logging/log.h"
 #include "common/threads.h"
@@ -242,6 +243,8 @@ int KYTY_SYSV_ABI KernelDeleteEventFlag(KernelEventFlag ef) {
 int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, uint32_t wait_mode,
                                       uint64_t* result_pat, KernelUseconds* timeout) {
 	PRINT_NAME();
+	const GuestWaitScope wait("sceKernelWaitEventFlag", reinterpret_cast<uint64_t>(ef),
+	                          static_cast<int64_t>(bit_pattern));
 
 	if (!ValidWait(bit_pattern, wait_mode)) {
 		return KERNEL_ERROR_EINVAL;

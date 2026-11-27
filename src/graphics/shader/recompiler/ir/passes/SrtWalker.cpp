@@ -7,10 +7,16 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <utility>
 #include <bit>
+#include <cstdio>
+#include <ranges>
 #include <cstring>
 #include <deque>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -169,6 +175,33 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+
+// The guard's page slots (ReadWatchFilter's). The walker reads the table through g_guard_counts,
+// which names an all-zero table while the guard is off, so compiled walkers follow the mode.
+constexpr uint64_t                  GuardSlots = uint64_t {1} << 20u;
+std::atomic<uint16_t>               g_guard_none[GuardSlots] {};
+const void*                         g_guard_table  = g_guard_none;
+std::atomic<const void*>            g_guard_counts = g_guard_none;
+std::atomic<SrtGuardedLoad>         g_guard_load   = nullptr;
+std::atomic<SrtWalkerGuardMode>     g_guard_mode   = SrtWalkerGuardMode::Off;
+std::atomic<bool>                   g_guard_count  = false;
+std::atomic<uint64_t>               g_guard_walks = 0, g_guard_served = 0, g_guard_declined = 0;
+std::atomic<uint64_t>               g_guard_verified = 0, g_guard_mismatches = 0;
+
+static_assert(sizeof(std::atomic<const void*>) == sizeof(void*));
+
+// Called by walker code with the load's address; bit 32 of the result says eax holds the value.
+uint64_t KYTY_SYSV_ABI GuardedLoad(uint64_t address) {
+	uint32_t   value = 0;
+	const auto load  = g_guard_load.load(std::memory_order_relaxed);
+	const bool counting = g_guard_count.load(std::memory_order_relaxed);
+	if (load != nullptr && load(address, value)) {
+		if (counting) g_guard_served.fetch_add(1, std::memory_order_relaxed);
+		return (uint64_t {1} << 32u) | value;
+	}
+	if (counting) g_guard_declined.fetch_add(1, std::memory_order_relaxed);
+	return 0;
+}
 
 class RuntimeValidator {
 public:
@@ -452,13 +485,77 @@ private:
 	Xbyak::CodeGenerator&                             m_code;
 	std::vector<Value>                                m_masks {Value {}};
 	std::deque<Node>                                  m_nodes;
-	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
+	// The node of an instruction in a context. A plan load evaluates every read through it: the
+	// ordered map was 9% of a warm start, and the node-based hash map that replaced it was still
+	// the largest single cost of loading a shader store (13% of the samples, a cache miss or two
+	// per lookup). One flat table with linear probing instead; entries are never removed.
+	class Memo {
+	public:
+		// The index stored for the key, and whether `index` was stored now.
+		std::pair<uint32_t, bool> TryEmplace(const Inst* inst, uint32_t context, uint32_t index) {
+			if ((m_count + 1u) * 2u > m_slots.size()) Grow();
+			const auto [slot, found] = Find(inst, context);
+			if (!found) {
+				m_slots[slot] = {inst, context, index};
+				m_count++;
+			}
+			const auto result = std::pair {m_slots[slot].index, !found};
+			if (VerifyMemo()) {
+				const auto [checked, inserted] = m_checked.try_emplace({inst, context}, index);
+				EXIT_IF(checked->second != result.first || inserted != result.second);
+			}
+			return result;
+		}
+
+	private:
+		struct Slot {
+			const Inst* inst    = nullptr;
+			uint32_t    context = 0;
+			uint32_t    index   = 0;
+		};
+		// KYTY_VERIFY_WALKER_MEMO=1: every lookup is checked against the hash map used before.
+		static bool VerifyMemo() {
+			static const bool verify = [] {
+				const char* value = std::getenv("KYTY_VERIFY_WALKER_MEMO");
+				return value != nullptr && value[0] == '1';
+			}();
+			return verify;
+		}
+		[[nodiscard]] std::pair<size_t, bool> Find(const Inst* inst, uint32_t context) const {
+			const auto mask = m_slots.size() - 1u;
+			// Instructions are heap objects: their low address bits carry nothing.
+			auto hash = (reinterpret_cast<uintptr_t>(inst) >> 4u) * 0x9e3779b97f4a7c15ull;
+			hash      = (hash ^ (hash >> 32u)) + uint64_t {context} * 0xc2b2ae3d27d4eb4full;
+			for (auto slot = static_cast<size_t>(hash) & mask;; slot = (slot + 1u) & mask) {
+				const auto& entry = m_slots[slot];
+				if (entry.inst == nullptr) return {slot, false};
+				if (entry.inst == inst && entry.context == context) return {slot, true};
+			}
+		}
+		void Grow() {
+			auto old = std::exchange(m_slots, std::vector<Slot>(std::max<size_t>(256u, m_slots.size() * 2u)));
+			for (const auto& entry: old) {
+				if (entry.inst != nullptr) m_slots[Find(entry.inst, entry.context).first] = entry;
+			}
+		}
+		struct CheckedHash {
+			size_t operator()(const std::pair<const Inst*, uint32_t>& key) const {
+				return std::hash<const void*> {}(key.first) ^ (size_t {key.second} * 0x9e3779b97f4a7c15ull);
+			}
+		};
+
+		std::vector<Slot> m_slots;
+		size_t            m_count = 0;
+		std::unordered_map<std::pair<const Inst*, uint32_t>, uint32_t, CheckedHash> m_checked;
+	};
+	Memo                                              m_memo;
 	std::vector<Value>                                m_outputs;
 	std::vector<std::vector<uint32_t>>                m_output_gates;
 	// Per user-data base pair of a read, the scratch slot holding the base for the walk.
 	std::map<std::pair<uint64_t, uint64_t>, uint32_t> m_bases;
 	std::deque<Stub>                                  m_stubs;
 	Xbyak::Label                                      m_ret;
+	Xbyak::Label                                      m_guard; // The guarded load's stub.
 	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0, m_bias = 0;
 	uint32_t m_user_data = 0, m_captures = 0;
 	bool     m_body = true;
@@ -565,8 +662,7 @@ WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
 			break;
 		default: break;
 	}
-	const auto [found, inserted] = m_memo.try_emplace({inst, context}, static_cast<uint32_t>(m_nodes.size()));
-	const auto index = found->second;
+	const auto [index, inserted] = m_memo.TryEmplace(inst, context, static_cast<uint32_t>(m_nodes.size()));
 	if (!inserted) {
 		auto& node = m_nodes[index];
 		if (!node.pending) return {node.result, node.masked};
@@ -1023,8 +1119,22 @@ void WalkerCompiler::EmitRead(const Node& node) {
 			c.cmp(c.r11, c.rcx);
 			c.ja(zero, Near);
 		}
+		// A page the host made inaccessible would fault on every load of every walk: the guard
+		// serves those loads. rcx = the page's slot.
+		Xbyak::Label plain, loaded;
+		c.mov(c.rcx, c.r10);
+		c.shr(c.rcx, 12);
+		c.and_(c.ecx, static_cast<uint32_t>(GuardSlots - 1));
+		c.mov(c.rax, reinterpret_cast<uint64_t>(&g_guard_counts));
+		c.mov(c.rax, c.qword[c.rax]);
+		c.cmp(c.word[c.rax + c.rcx * 2], 0);
+		c.je(plain);
+		c.call(m_guard);
+		c.jc(loaded);
+		c.L(plain);
 		// Every guest load is mov eax, [r10] (41 8b 02), which the fault handler completes.
 		c.mov(c.eax, c.dword[c.r10]);
+		c.L(loaded);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
 		c.add(c.r8, 8);
@@ -1444,6 +1554,23 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		Branch(stub.operand, *stub.unknown);
 		c.jmp(stub.back, Near);
 	}
+	// The guarded load: r10 = the address. Carry set and eax = the value, or carry clear. Keeps
+	// every register the walker holds across a load; the stack is aligned for the call.
+	c.L(m_guard);
+	const Xbyak::Reg64 saved[] = {c.rdi, c.rsi, c.rdx, c.r8, c.r9, c.r10, c.r11};
+	for (const auto& reg: saved) c.push(reg);
+	c.mov(c.rdi, c.r10);
+	c.mov(c.rcx, c.rsp);
+	c.and_(c.rsp, ~uint32_t {15});
+	c.sub(c.rsp, 16);
+	c.mov(c.qword[c.rsp], c.rcx);
+	c.mov(c.rax, reinterpret_cast<uint64_t>(&GuardedLoad));
+	c.call(c.rax);
+	c.mov(c.rsp, c.qword[c.rsp]);
+	for (const auto& reg: saved | std::views::reverse) c.pop(reg);
+	c.bt(c.rax, 32);
+	c.mov(c.eax, c.eax);
+	c.ret();
 	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
@@ -1457,15 +1584,70 @@ void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
 }
 
-bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
-	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
+void SetSrtWalkerGuard(const void* counts, uint64_t slot_count, SrtGuardedLoad load) {
+	EXIT_IF(counts == nullptr || slot_count != GuardSlots || load == nullptr);
+	g_guard_table = counts;
+	g_guard_load.store(load, std::memory_order_relaxed);
+	if (g_guard_mode.load(std::memory_order_relaxed) != SrtWalkerGuardMode::Off) {
+		g_guard_counts.store(counts, std::memory_order_relaxed);
+	}
+}
+
+void SetSrtWalkerGuardMode(SrtWalkerGuardMode mode) {
+	if (g_guard_mode.exchange(mode, std::memory_order_relaxed) == mode) return;
+	g_guard_counts.store(mode != SrtWalkerGuardMode::Off ? g_guard_table : g_guard_none,
+	                     std::memory_order_relaxed);
+}
+
+void SetSrtWalkerGuardCounting(bool counting) {
+	g_guard_count.store(counting, std::memory_order_relaxed);
+}
+
+SrtWalkerGuardStats GetSrtWalkerGuardStats() {
+	return {g_guard_walks.load(std::memory_order_relaxed),
+	        g_guard_served.load(std::memory_order_relaxed),
+	        g_guard_declined.load(std::memory_order_relaxed),
+	        g_guard_verified.load(std::memory_order_relaxed),
+	        g_guard_mismatches.load(std::memory_order_relaxed)};
+}
+
+static const uint64_t* RunWalker(const ResourcePlan& plan, const SrtRuntime& runtime,
+                                 std::vector<uint32_t>& flat) {
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
+	return end;
+}
+
+bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
+             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
+	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
+	if (g_guard_count.load(std::memory_order_relaxed)) g_guard_walks.fetch_add(1, std::memory_order_relaxed);
+	const auto* end = RunWalker(plan, runtime, flat);
+	if (g_guard_mode.load(std::memory_order_relaxed) == SrtWalkerGuardMode::Verify &&
+	    g_guard_counts.load(std::memory_order_relaxed) != g_guard_none) {
+		// The plain walk again: it must write the same flat SRT, scratch and captures. A guest
+		// write between the two walks can differ too; the count is an upper bound.
+		static thread_local std::vector<uint32_t> guarded_flat;
+		static thread_local std::vector<uint64_t> guarded_scratch;
+		guarded_flat    = flat;
+		guarded_scratch = plan.srt_scratch;
+		const auto* guarded_end = end;
+		g_guard_counts.store(g_guard_none, std::memory_order_relaxed);
+		end = RunWalker(plan, runtime, flat);
+		g_guard_counts.store(g_guard_table, std::memory_order_relaxed);
+		g_guard_verified.fetch_add(1, std::memory_order_relaxed);
+		if (end != guarded_end || flat != guarded_flat || plan.srt_scratch != guarded_scratch) {
+			if (g_guard_mismatches.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr, "[walker-guard] MISMATCH shader %016llx: end %d flat %d scratch %d\n",
+				             static_cast<unsigned long long>(plan.shader_hash), end != guarded_end,
+				             flat != guarded_flat, plan.srt_scratch != guarded_scratch);
+			}
+		}
+	}
 	if (end == nullptr) return false;
 	if (reads != nullptr) {
 		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
@@ -1516,6 +1698,25 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image) {
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
+}
+
+// Each Run starts from the same context (uniform, no EXEC mask), so the proofs one Run caches hold
+// for the next.
+struct RuntimeValueValidator::Impl {
+	explicit Impl(const ResourcePlan& program)
+	    : validators {RuntimeValidator(program, RuntimeValueType::Any),
+	                  RuntimeValidator(program, RuntimeValueType::Integer),
+	                  RuntimeValidator(program, RuntimeValueType::ImmutableInteger)} {}
+	std::array<RuntimeValidator, 3> validators;
+};
+
+RuntimeValueValidator::RuntimeValueValidator(const ResourcePlan& program)
+    : m_impl(std::make_unique<Impl>(program)) {}
+
+RuntimeValueValidator::~RuntimeValueValidator() = default;
+
+bool RuntimeValueValidator::Validate(Value value, RuntimeValueType type) {
+	return m_impl->validators[static_cast<size_t>(type)].Run(value);
 }
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {

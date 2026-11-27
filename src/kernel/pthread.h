@@ -3,6 +3,10 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "kernel/guestWait.h"
+
+#include <cstdint>
+#include <string>
 
 // IWYU pragma: no_include <pthread.h>
 
@@ -91,6 +95,8 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
+// One line per live guest thread: name, host thread id, the call it waits in and for how long.
+std::string DumpGuestThreads();
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);

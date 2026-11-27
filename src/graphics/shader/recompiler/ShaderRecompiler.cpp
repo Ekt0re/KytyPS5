@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ExecSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -21,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <span>
@@ -464,6 +466,22 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// KYTY_EXEC_SELECTS=0 (or KYTY_EXEC_SELECT_ELIM=0): keep every EXEC-masked merge
+// (IR::EliminateExecSelects off). The shader store is keyed to the executable, not to this
+// switch: move it aside before an A/B in a run.
+bool ExecSelectsEnabled() {
+	static const bool enabled = [] {
+		for (const char* name: {"KYTY_EXEC_SELECTS", "KYTY_EXEC_SELECT_ELIM"}) {
+			const char* value = std::getenv(name);
+			if (value != nullptr && value[0] == '0') {
+				return false;
+			}
+		}
+		return true;
+	}();
+	return enabled;
+}
+
 } // namespace
 
 const char* StageName(ShaderType stage) {
@@ -675,6 +693,12 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	ir.value_storage.clear();
 	IR::RemoveIdentities(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	// KYTY_EXEC_SELECTS=0 keeps every EXEC-masked merge. This emitter branches on the whole
+	// subgroup (EmitConditionRef: GroupNonUniformAny/All), so a block entered through a branch does
+	// not know its condition per lane: only the nested-merge and masked-use rules apply.
+	if (ExecSelectsEnabled()) {
+		(void)IR::EliminateExecSelects(ir);
+	}
 	if (options.profile->ray_query) {
 		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
 			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",

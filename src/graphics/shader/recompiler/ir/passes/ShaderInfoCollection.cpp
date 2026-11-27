@@ -350,7 +350,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
 					collect_element(child);
-				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+				// An indirect root's selected children carry their own ADD_TID.
+				const auto& children = info.buffers[memory.resource].indirect_resources;
+				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u ||
+				    std::ranges::any_of(children, [&](uint32_t child) {
+					    return (info.buffers[child].packed_stride & (1u << 20u)) != 0u;
+				    })) {
 					if (program.stage != ShaderType::Compute) {
 						return Fail("buffer ADD_TID is only valid for compute shaders");
 					}
@@ -608,6 +613,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	                           std::ranges::any_of(info.images, uses_mapping) ||
 	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
+	info.uses_heap_rows  = std::ranges::any_of(info.buffers, &BufferResource::heap_rows);
 	switch (program.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local: CollectVertexInputs(input_info.vertex, info, inputs.components); break;

@@ -3,14 +3,19 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
+#include "common/runtimeToggles.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
+#include "graphics/guest_gpu/command_processor/computePrescan.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
+#include "graphics/guest_gpu/command_processor/rawCommandBuffer.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -20,16 +25,26 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
+#include <csetjmp>
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <tuple>
 #include <vector>
+
+#include <fmt/format.h>
+
+namespace Common {
+extern thread_local std::jmp_buf* g_dbg_recover;
+}
 
 namespace Libs::Graphics {
 
@@ -39,6 +54,9 @@ static thread_local GuestGpu*     g_gpu_state         = nullptr;
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	for (auto& limit: m_packet_limit) {
+		limit.store(UINT64_MAX, std::memory_order_relaxed);
+	}
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -118,6 +136,7 @@ void GuestGpu::Submit(std::span<const uint32_t> commands) {
 	submission.queue_id = 0;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
+	Prescan(0, commands);
 }
 
 void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands) {
@@ -131,6 +150,56 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	submission.queue_id = 1 + compute_queue;
 	submission.commands = commands;
 	Enqueue(std::move(submission));
+	Prescan(1 + compute_queue, commands);
+}
+
+void GuestGpu::ReleaseRewind(const uint32_t* rewind) {
+	// The REWIND packet is two dwords; a chaining INDIRECT_BUFFER packet, four, follows it.
+	// Rewinds patched by queue are not told apart: the compute registers of queue 0 are used.
+	Prescan(0, {rewind + 2, 4});
+}
+
+void GuestGpu::Prescan(uint32_t queue_id, std::span<const uint32_t> commands) {
+	// Diagnostic switch for comparisons.
+	static const bool disabled = std::getenv("KYTY_NO_TRANSLATE_AHEAD") != nullptr;
+	if (disabled) {
+		return;
+	}
+	struct Sink final: ComputePrescanSink {
+		PipelineCache& cache;
+		bool           async_compute;
+		Sink(PipelineCache& c, bool async): cache(c), async_compute(async) {}
+		void Found(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator) override {
+			cache.TranslateComputeAhead(regs, dispatch_initiator, async_compute);
+		}
+		void FoundDraw(CommandProcessor& shadow, bool indirect) override {
+			cache.TranslateGraphicsAhead(shadow.GetCtx(), shadow.GetUcfg(), shadow.GetShCtx(),
+			                             indirect);
+		}
+	} sink(m_renderer.GetPipelineCache(), queue_id != 0);
+	std::scoped_lock lock(m_prescan_mutex);
+	// KYTY_NO_GRAPHICS_AHEAD=1: dispatches only. A register packet the shadow cannot apply
+	// stops this scan's graphics part only (and leaks what it held).
+	static const bool graphics = std::getenv("KYTY_NO_GRAPHICS_AHEAD") == nullptr;
+	CommandProcessor* shadow   = nullptr;
+	if (graphics && queue_id == 0) {
+		if (m_prescan_shadow == nullptr) {
+			m_prescan_shadow = std::make_unique<CommandProcessor>(m_renderer, 0);
+		}
+		shadow = m_prescan_shadow.get();
+	}
+	std::jmp_buf recover;
+	auto* const  previous = Common::g_dbg_recover;
+	if (shadow != nullptr && setjmp(recover) != 0) {
+		// Ran into an error: the compute scan is redone without the shadow.
+		Common::g_dbg_recover = previous;
+		m_prescan_shadow->Reset();
+		PrescanComputeDispatches(commands, m_prescan_regs[queue_id], sink);
+		return;
+	}
+	if (shadow != nullptr) Common::g_dbg_recover = &recover;
+	PrescanComputeDispatches(commands, m_prescan_regs[queue_id], sink, shadow);
+	Common::g_dbg_recover = previous;
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
@@ -262,6 +331,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
+	NoteGuestSync();
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -272,7 +342,12 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t);
 
+void CommandProcessor::NoteGuestSync() {
+	m_renderer.GetBufferCache().NoteGuestSync();
+}
+
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	NoteGuestSync();
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -304,6 +379,8 @@ void CommandProcessor::WriteData(uint64_t dst, const uint32_t* src, uint32_t dw_
 		return;
 	}
 
+	m_renderer.GetRenderExecutor().ForgetIndirectArgs(
+	    dst, write_one_address ? 4u : uint64_t {dw_num} * 4u);
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = reinterpret_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -374,10 +451,16 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
+	if (!dst_gds) {
+		m_renderer.GetRenderExecutor().ForgetIndirectArgs(dst_address_or_offset, num_bytes);
+	}
 	if (src_sel == 2) {
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
+		if (!dst_gds) {
+			RefreshLiveCommands(dst_address_or_offset, num_bytes);
+		}
 		return;
 	}
 	bool src_gds = false;
@@ -389,14 +472,47 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
+	if (!dst_gds) {
+		RefreshLiveCommands(dst_address_or_offset, num_bytes);
+	}
 }
 
 void GuestGpu::Enqueue(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.epoch = m_epoch.load(std::memory_order_acquire);
+	m_accepted[submission.queue_id].fetch_add(1, std::memory_order_acq_rel);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
+}
+
+std::string GuestGpu::DescribeUnfinished() {
+	std::string text;
+	SendCommandSync([&] {
+		Common::LockGuard lock(m_queue_mutex);
+		for (uint32_t queue = 0; queue < QueueCount; queue++) {
+			if (m_queues[queue].empty()) continue;
+			const auto& front    = m_queues[queue].front();
+			const auto* position = front.execution.Position();
+			text += fmt::format("queue {} ({} waiting): ", queue, m_queues[queue].size());
+			if (front.type != SubmissionType::Commands) {
+				text += front.type == SubmissionType::SuspendPoint ? "suspend point\n" : "flip\n";
+			} else if (position == nullptr) {
+				text += fmt::format("not started, {} dwords at 0x{:x}\n", front.commands.size(),
+				                    reinterpret_cast<uintptr_t>(front.commands.data()));
+			} else {
+				text += fmt::format("at 0x{:x} opcode 0x{:02x}:",
+				                    reinterpret_cast<uintptr_t>(position), (position[0] >> 8u) & 0xffu);
+				const auto dwords = std::min<uint32_t>(KYTY_PM4_LEN(position[0]), 10);
+				for (uint32_t index = 0; index < dwords; index++) {
+					text += fmt::format(" {:08x}", position[index]);
+				}
+				text += "\n";
+			}
+		}
+	});
+	return text;
 }
 
 void GuestGpu::WaitForIdle() {
@@ -411,6 +527,7 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::PerfSummary::RegisterGpuThread();
 	g_gpu_state = gpu;
 	if (const auto processor = Common::Thread::ReserveCoreForCurrentThread(); processor >= 0) {
 		Log::WriteToConsoleAndLog(fmt::format(
@@ -425,6 +542,7 @@ void GuestGpu::ThreadRun(void* data) {
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
+				gpu->m_parks.fetch_add(1, std::memory_order_acq_rel);
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
@@ -448,6 +566,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					gpu->m_parks.fetch_add(1, std::memory_order_acq_rel);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -497,6 +616,7 @@ void GuestGpu::ThreadRun(void* data) {
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
+			gpu->m_completed[submission.queue_id].fetch_add(1, std::memory_order_acq_rel);
 			for (auto& queue: gpu->m_queues) {
 				if (!queue.empty()) {
 					queue.front().blocked = false;
@@ -515,6 +635,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	m_counting    = submission.epoch == m_epoch.load(std::memory_order_acquire);
 
 	switch (submission.type) {
 		case SubmissionType::Commands:
@@ -551,6 +672,15 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	// Once per submission (the toggle takes a mutex). A resumed submission resolves its views
+	// again: the guest may have remapped or rewritten the rest of a span while it waited.
+	m_raw_mode = RawCommandBuffer::SubmissionMode();
+	for (auto& cursor: execution.m_buffer_stack) {
+		cursor.view_ready = false;
+	}
+	RawCommandBuffer::MaybeReport();
+	// GPU writes recorded from here on belong to this queue's indirect-argument window.
+	m_renderer.GetBufferCache().SetGuestQueue(static_cast<uint32_t>(m_interrupt_event_id));
 
 	struct ExecutionScope {
 		explicit ExecutionScope(Pm4Execution& execution) { g_current_execution = &execution; }
@@ -558,8 +688,12 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(execution);
 
 	ProcessPm4(execution);
-	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
-	                                        : Pm4ProcessResult::Blocked;
+	if (execution.m_buffer_stack.empty()) {
+		// The end of a submission closes the indirect-argument window.
+		NoteGuestSync();
+		return Pm4ProcessResult::Complete;
+	}
+	return Pm4ProcessResult::Blocked;
 }
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
@@ -569,6 +703,49 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 	g_current_execution->m_chain       = chain;
 }
 
+void CommandProcessor::ResolveCommandView(Pm4Execution::BufferCursor& cursor) {
+	cursor.view_ready = true;
+	cursor.view       = nullptr;
+	if (m_raw_mode == RawCommandBuffer::Mode::Off) {
+		return;
+	}
+	RawCommandBuffer::Add(RawCommandBuffer::Stat::Spans);
+	cursor.view = RawCommandBuffer::View(cursor.commands);
+	if (cursor.view == nullptr) {
+		RawCommandBuffer::Add(RawCommandBuffer::Stat::Fallback);
+		return;
+	}
+	RawCommandBuffer::Add(RawCommandBuffer::Stat::Raw);
+	if (m_raw_mode == RawCommandBuffer::Mode::Verify) {
+		(void)RawCommandBuffer::Verify(cursor.commands.subspan(cursor.offset_dw),
+		                               cursor.view + cursor.offset_dw);
+	}
+}
+
+void CommandProcessor::RefreshLiveCommands(uint64_t dst, uint64_t size) {
+	if (m_raw_mode == RawCommandBuffer::Mode::Off || g_current_execution == nullptr) {
+		return;
+	}
+	std::array<RawCommandBuffer::LiveRange, 16> live {};
+	size_t                                      count = 0;
+	for (const auto& cursor: g_current_execution->m_buffer_stack) {
+		if (cursor.view == nullptr || count == live.size()) {
+			continue;
+		}
+		const auto base = reinterpret_cast<uint64_t>(cursor.commands.data());
+		live[count++]   = {base + uint64_t {cursor.offset_dw} * 4u, base + cursor.commands.size_bytes()};
+	}
+	const auto overlaps = RawCommandBuffer::ForEachLiveOverlap(
+	    std::span(live.data(), count), dst, size, [](uint64_t begin, uint64_t bytes) {
+		    // Publishes the GPU-written bytes into guest memory, which the alias shows.
+		    std::vector<uint8_t> scratch(bytes);
+		    (void)LibKernel::Memory::TryReadBufferBacking(begin, scratch.data(), bytes);
+	    });
+	if (overlaps != 0) {
+		RawCommandBuffer::Add(RawCommandBuffer::Stat::LiveRefreshes, overlaps);
+	}
+}
+
 void CommandProcessor::SuspendPm4() {
 	EXIT_IF(g_current_execution == nullptr);
 	g_current_execution->m_suspended = true;
@@ -576,17 +753,34 @@ void CommandProcessor::SuspendPm4() {
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool debug_dump = graphics_debug_dump_enabled();
+	const auto queue_id   = m_interrupt_event_id == 0
+	                            ? 0u
+	                            : 1u + static_cast<uint32_t>(m_interrupt_event_id) -
+	                                  GuestGpu::ComputeQueueBase;
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+			// A replay holds the queue at the packet the recorded run had reached.
+			if (g_gpu_state->m_counting &&
+			    g_gpu_state->m_packets[queue_id].load(std::memory_order_relaxed) >=
+			        g_gpu_state->m_packet_limit[queue_id].load(std::memory_order_acquire)) {
+				execution.m_suspended = true;
+				return;
+			}
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		if (cursor.offset_dw == cursor.commands.size()) {
 			execution.m_buffer_stack.pop_back();
 			continue;
 		}
+		if (!cursor.view_ready) {
+			ResolveCommandView(cursor);
+		}
 
-		const auto* const packet        = cursor.commands.data() + cursor.offset_dw;
+		// Handlers read packet DWORDs only; addresses come from packet values, never from here.
+		const auto* const decode_base =
+		    cursor.view != nullptr ? cursor.view : cursor.commands.data();
+		const auto* const packet        = decode_base + cursor.offset_dw;
 		const auto        total_dw      = static_cast<uint32_t>(cursor.commands.size());
 		const auto        remaining_dw  = total_dw - cursor.offset_dw;
 		const auto        packet_header = packet[0];
@@ -620,8 +814,8 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			const auto offset = cursor.offset_dw;
 			LOGF("unknown PM4 packet: data=0x%016" PRIx64 ", num_dw=%" PRIu32
 			     ", offset=0x%05" PRIx32 ", current=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(packet - offset), total_dw, offset,
-			     reinterpret_cast<uint64_t>(packet));
+			     reinterpret_cast<uint64_t>(cursor.commands.data()), total_dw, offset,
+			     reinterpret_cast<uint64_t>(cursor.commands.data() + offset));
 			const auto  dump_begin = (offset > 8 ? offset - 8 : 0);
 			const auto  dump_end   = std::min<uint32_t>(total_dw, offset + 16);
 			auto* const base       = packet - offset;
@@ -642,6 +836,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (g_gpu_state != nullptr && g_gpu_state->m_counting) {
+			// Only this thread writes the counter.
+			auto& packets = g_gpu_state->m_packets[queue_id];
+			packets.store(packets.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+		}
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
@@ -696,6 +895,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
                                       const volatile void* address) {
 	uint64_t value = 0;
 
+	if (op != 0x00 && Common::RuntimeToggles::Get("pred_off")) {
+		m_predicate_skip = false;
+		return;
+	}
 	switch (op) {
 		case 0x00:
 			m_predicate_skip = false;
@@ -731,6 +934,15 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		case 0x00: m_predicate_skip = (value != 0); break;
 		case 0x01: m_predicate_skip = (value == 0); break;
 		default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+	}
+	if (Common::RuntimeToggles::Enabled()) {
+		// Diagnostic counts: which predication ops the title uses and how often they skip.
+		static std::array<std::atomic<uint32_t>, 8> counts {};
+		const auto n = counts[(op & 3u) * 2u + (m_predicate_skip ? 1u : 0u)].fetch_add(1) + 1u;
+		if ((n & (n - 1u)) == 0u) {
+			std::printf("Predication op %u skip=%d count %u (addr %p)\n", op,
+			            m_predicate_skip ? 1 : 0, n, const_cast<const void*>(address));
+		}
 	}
 }
 
@@ -808,6 +1020,62 @@ static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectO
 	return true;
 }
 
+// KYTY_READBACK_STATS: every 10 s, the indirect draws whose records or count the CPU read back
+// and the time those readbacks took.
+namespace {
+struct IndirectReadbackStats {
+	uint64_t packets = 0, records = 0, count_reads = 0, ns = 0;
+	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+
+	static IndirectReadbackStats* Get() {
+		static const bool enabled = std::getenv("KYTY_READBACK_STATS") != nullptr;
+		static IndirectReadbackStats stats;
+		return enabled ? &stats : nullptr;
+	}
+	void Add(std::chrono::steady_clock::time_point start, uint64_t record_count, bool count) {
+		const auto now = std::chrono::steady_clock::now();
+		packets += record_count != 0 ? 1 : 0;
+		records += record_count;
+		count_reads += count ? 1 : 0;
+		ns += std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count();
+		if (now - last >= std::chrono::seconds(10)) {
+			last = now;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Indirect readback stats: {} packets, {} records, {} count reads, {:.0f} ms\n",
+			    packets, records, count_reads, static_cast<double>(ns) / 1e6));
+		}
+	}
+};
+} // namespace
+
+// A record no real draw produces, such as one a writer the emulator dropped left as garbage
+// ("4 billion vertices"), would launch enough work to trip the GPU watchdog or a host launch
+// limit. Such records are clamped: at most 2^24 vertices or indices, 2^26 of them over all
+// instances, and a first vertex or index past 2^28 draws nothing.
+static void SanitizeIndirectRecord(uint32_t& count, uint32_t& instances, uint32_t first,
+                                   uint64_t addr) {
+	constexpr uint32_t MaxCount = 1u << 24u;
+	constexpr uint64_t MaxWork  = uint64_t {1} << 26u;
+	constexpr uint32_t MaxFirst = 1u << 28u;
+	const auto         original = std::tuple {count, instances, first};
+	if (first >= MaxFirst) {
+		count = 0;
+	}
+	count = std::min(count, MaxCount);
+	if (count != 0 && uint64_t {count} * instances > MaxWork) {
+		instances = static_cast<uint32_t>(MaxWork / count);
+	}
+	if (original != std::tuple {count, instances, first}) {
+		static std::atomic_uint32_t warned {0};
+		if (warned.fetch_add(1, std::memory_order_relaxed) < 8) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "GPU: clamped an implausible indirect draw record at 0x{:016x}: count={} "
+			    "instances={} first={}\n",
+			    addr, std::get<0>(original), std::get<1>(original), std::get<2>(original)));
+		}
+	}
+}
+
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
@@ -820,6 +1088,22 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 	                                                : sizeof(vk::DrawIndirectCommand)));
 
+	// A GPU-written count is brought back before the CPU reads it, like the records below. Bytes
+	// the GPU did not write need no readback (and no GPU-thread round trip, which a CP without a
+	// guest GPU, such as the test harness's, cannot make).
+	auto&      buffer_cache  = m_renderer.GetBufferCache();
+	const auto read_gpu_data = [&](uint64_t address, uint64_t size) {
+		if (GuestRange {address, size}.Valid() && buffer_cache.IsRegionGpuModified(address, size)) {
+			buffer_cache.ReadMemory(address, size);
+		}
+	};
+	if (count_addr != nullptr) {
+		const auto start = std::chrono::steady_clock::now();
+		read_gpu_data(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
+		if (auto* stats = IndirectReadbackStats::Get()) {
+			stats->Add(start, 0, true);
+		}
+	}
 	const auto draw_count = count_addr == nullptr
 	                            ? max_count_or_count
 	                            : std::min(uint32_t {*count_addr}, max_count_or_count);
@@ -849,11 +1133,21 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// The records may have been written by the GPU: bring them back before the CPU reads them,
+	// as DispatchIndirect does (ported from KytyPS5 PR #2302, de49ee9186).
+	const auto readback_start = std::chrono::steady_clock::now();
+	read_gpu_data(args_addr, static_cast<uint64_t>(draw_count - 1) * stride_in_bytes +
+	                             (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+	                                      : sizeof(vk::DrawIndirectCommand)));
+	if (auto* stats = IndirectReadbackStats::Get()) {
+		stats->Add(readback_start, draw_count, false);
+	}
 	const uint32_t max_indices = m_index_buffer_size != 0 ? m_index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
 		const auto addr = args_addr + static_cast<uint64_t>(i) * stride_in_bytes;
 		if (!indexed) {
-			const auto& args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
+			auto args = *reinterpret_cast<const vk::DrawIndirectCommand*>(addr);
+			SanitizeIndirectRecord(args.vertexCount, args.instanceCount, args.firstVertex, addr);
 			PatchIndirectDrawOffsets(*this, registers, args.firstVertex, args.firstInstance, 0, i);
 			executor.DrawAuto(CurrentBuffer(), {.vertex_count   = args.vertexCount,
 			                                    .instance_count = args.instanceCount,
@@ -863,10 +1157,13 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			continue;
 		}
 
-		const auto& args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
+		auto args = *reinterpret_cast<const vk::DrawIndexedIndirectCommand*>(addr);
+		SanitizeIndirectRecord(args.indexCount, args.instanceCount, args.firstIndex, addr);
 		PatchIndirectDrawOffsets(*this, registers, static_cast<uint32_t>(args.vertexOffset),
 		                         args.firstInstance, args.firstIndex, i);
-		executor.DrawIndex(CurrentBuffer(), {.index_count = std::min(args.indexCount, max_indices),
+		// INDEX_BUFFER_SIZE counts indices from the start of the buffer, not from the first index.
+		const uint32_t available = args.firstIndex < max_indices ? max_indices - args.firstIndex : 0u;
+		executor.DrawIndex(CurrentBuffer(), {.index_count = std::min(args.indexCount, available),
 		                                     .index_addr  = IndexAddress(args.firstIndex),
 		                                     .instance_count      = args.instanceCount,
 		                                     .index_type_and_size = m_index_type_and_size,
@@ -918,6 +1215,7 @@ void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id,
                                   bool gl2_writeback) {
+	NoteGuestSync();
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -1014,7 +1312,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: break;
+		case 0x00000010: NoteGuestSync(); break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
 		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:
@@ -1079,6 +1377,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
+	NoteGuestSync();
 	m_renderer.GetOcclusionQueries().Publish();
 
 	auto& command = CurrentBuffer();

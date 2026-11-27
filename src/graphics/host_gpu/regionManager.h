@@ -112,6 +112,45 @@ public:
 		}
 	}
 
+	// Marks the pages of the range GPU dirty unless they are CPU dirty, and calls func(address,
+	// size) for the runs it marked. Callers hold the lock.
+	template <typename Func>
+	void MarkGpuDirtyUnlessCpuDirty(uint64_t offset, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(offset, size);
+		RegionBits mask(~m_cpu_dirty, start, end);
+		if (mask.None()) {
+			return;
+		}
+		// Only the pages that were not GPU dirty yet start being read-watched.
+		auto either = m_cpu_dirty;
+		either |= m_gpu_dirty;
+		RegionBits changed(~either, start, end);
+		for (const auto [first, last]: mask) {
+			m_gpu_dirty.SetRange(first, last);
+		}
+		UpdateProtection<true, true>(changed);
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Pages of the range that are neither CPU- nor GPU-modified become CPU-modified, which drops
+	// their write watch, in one protection change (a guest write fault's window).
+	void MarkCleanAsCpuModified(uint64_t offset, uint64_t size) {
+		const auto [start, end] = GetPageRange(offset, size);
+		RegionBits changed(~m_cpu_dirty, start, end);
+		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
+			changed.UnsetRange(first, last);
+		}
+		if (changed.None()) {
+			return;
+		}
+		for (const auto [first, last]: changed) {
+			m_cpu_dirty.SetRange(first, last);
+		}
+		UpdateProtection<false, false>(changed);
+	}
+
 	template <DirtySource source, bool clear, typename Func>
 	void ForEachModifiedRange(uint64_t offset, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(offset, size);

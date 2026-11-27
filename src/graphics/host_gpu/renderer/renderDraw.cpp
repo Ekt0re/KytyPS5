@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 
 #include "common/assert.h"
@@ -6,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -21,6 +23,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/shaderTrace.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -864,12 +867,31 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	    })) {
 		const auto raster =
 		    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
+		// Resolving marked every target; a dropped one is no attachment of this pass, so it must
+		// not stay marked, or a stage sampling it expects an attachment layout that is never set.
+		std::array<ImageId, RENDER_COLOR_ATTACHMENTS_MAX + 1> unmarked {};
+		size_t                                                unmarked_count = 0;
+		for (const auto& color: colors) {
+			if (color.desc.info.samples != raster) unmarked[unmarked_count++] = color.image_id;
+		}
 		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
 			return color.desc.info.samples != raster;
 		});
 		targets.color_count -= static_cast<uint32_t>(dropped.size());
 		if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
-			targets.depth = {};
+			unmarked[unmarked_count++] = targets.depth.image_id;
+			targets.depth              = {};
+		}
+		auto&      cache = m_context.GetTextureCache();
+		const auto kept  = std::span {targets.colors, targets.color_count};
+		for (size_t i = 0; i < unmarked_count; i++) {
+			const auto id = unmarked[i];
+			if (targets.depth.image_id == id ||
+			    std::ranges::any_of(kept,
+			                        [&](const RenderColorInfo& c) { return c.image_id == id; })) {
+				continue;
+			}
+			cache.GetImage(id).binding.is_target = false;
 		}
 		static std::atomic_bool logged = false;
 		if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -945,9 +967,9 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(Prospero::PrimitiveType primitive, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
-	switch (ucfg.GetPrimType()) {
+	switch (primitive) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
 		case Prospero::PrimitiveType::kLineStrip:
@@ -979,7 +1001,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				}
 			}
 			break;
-		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
+		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(primitive));
 	}
 }
 
@@ -1124,7 +1146,32 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	vk::PipelineStageFlags shader_write_stages = {};
+	for (const auto& stage: vertex_stages) {
+		if (HasShaderBufferWrites(stage.stage)) {
+			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
+		}
+	}
+	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
+		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	// KYTY_ASYNC_PIPELINES (after bloodborne_pc, deadinside28 / Supermedo, GPL-2.0: geometry
+	// may go without its pipeline for a frame; full-screen passes wait, since skipping them
+	// left whole frames grey). Draws whose output later work reads in ways a missing frame
+	// would break wait too: depth or stencil writers (shadow maps, depth pre-passes) and
+	// draws whose shaders write memory. Dispatches always wait (renderCompute.cpp).
+	const int  async_mode = PipelineCache::AsyncPipelineMode();
+	const bool full_screen =
+	    Prospero::IsRectList(ucfg.GetPrimType()) ||
+	    (emit.indirect.address == 0 && draw.instance_count <= 1 && draw.index_count <= 6);
+	const bool depth_writes =
+	    static_cast<bool>(m_targets.depth.image_id) &&
+	    static_cast<bool>(m_targets.depth.AttachmentWriteAspects());
+	const bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
+	                       (async_mode >= 2 || !depth_writes);
+	// A draw that waits may start with an unoptimized pipeline (KYTY_FAST_PIPELINES).
+	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
+	                                                                  false, !skippable);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
 	                                            m_targets.depth, feedback_aspects, stages);
@@ -1191,39 +1238,76 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 
-	vk::PipelineStageFlags shader_write_stages = {};
-	for (const auto& stage: vertex_stages) {
-		if (HasShaderBufferWrites(stage.stage)) {
-			shader_write_stages |= ShaderPipelineStages(NativeShaderStage(stage.logical_stage));
-		}
-	}
-	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
-		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
-	}
 	if (shader_write_stages) {
 		// As for dispatches, buffer writes wait for earlier accesses to the memory.
 		buffer.EndRendering();
 		ShaderWriteHazardBarrier(vk_buffer, shader_write_stages);
 	}
 	buffer.BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
-	if (mesh_task) {
-		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
-	} else if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
-	} else if (args_buffer.first == nullptr) {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
-	} else if (draw.indexed) {
-		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                              emit.indirect.count, emit.indirect.stride);
-	} else {
-		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
-		                       emit.indirect.count, emit.indirect.stride);
+	const auto&    last_vertex = vertex_stages.back().stage;
+	const uint64_t vs_hash = last_vertex.module != nullptr ? last_vertex.module->info.shader_hash : 0;
+	const uint64_t ps_hash = state.ps_active && state.ps_input_info.stage.module != nullptr
+	                             ? state.ps_input_info.stage.module->info.shader_hash
+	                             : 0;
+	if (const auto frame = m_context.GetGpu().GetFrameNum(); ShaderTrace::Active(frame)) {
+		std::string stages;
+		for (const auto& stage: vertex_stages) {
+			if (stage.stage.module != nullptr) {
+				stages += fmt::format("{}=0x{:016x} ",
+				                      ShaderTrace::StageName(static_cast<int>(stage.logical_stage)),
+				                      stage.stage.module->info.shader_hash);
+			}
+		}
+		LOGF("TRACE f=%" PRIu64 " n=%u D %sps=0x%016" PRIx64 " %s idx=%u inst=%u indirect=%u "
+		     "mesh_groups=%u task=%d prim=%u colors=%u depth=%d\n",
+		     frame, ShaderTrace::NextSeq(), stages.c_str(), ps_hash, draw.Name(),
+		     draw.index_count, draw.instance_count, emit.indirect.count, mesh_groups,
+		     mesh_task ? 1 : 0, static_cast<uint32_t>(ucfg.GetPrimType()), m_targets.color_count,
+		     static_cast<bool>(m_targets.depth.image_id) ? 1 : 0);
 	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
+	auto* const    graphics = &m_context.GetGraphics();
+	const auto record = [=, &occlusion_queries, primitive = ucfg.GetPrimType(),
+	                     args   = args_buffer.first != nullptr ? args_buffer.first->Handle()
+	                                                           : vk::Buffer {},
+	                     offset = args_buffer.second](vk::CommandBuffer command,
+	                                                  vk::Pipeline      handle) {
+		command.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+		const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'D', vs_hash, ps_hash);
+		if (mesh_task) {
+			command.drawMeshTasksEXT(emit.indirect.count, 1, 1);
+		} else if (mesh_active) {
+			command.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		} else if (!args) {
+			EmitDrawPrimitives(primitive, command, draw, emit);
+		} else if (draw.indexed) {
+			command.drawIndexedIndirect(args, offset, emit.indirect.count, emit.indirect.stride);
+		} else {
+			command.drawIndirect(args, offset, emit.indirect.count, emit.indirect.stride);
+		}
+		GpuBreadcrumbs::End(*graphics, command, crumb);
+		occlusion_queries.End(command, occlusion_query);
+	};
+	if (pipeline.pipeline) {
+		record(vk_buffer, pipeline.pipeline);
+	} else {
+		m_context.GetCommandScheduler().Split(
+		    [record, skippable, &occlusion_queries, occlusion_query,
+		     pending = pipeline.Pending()](vk::CommandBuffer command) {
+			    if (skippable && !pending.Ready()) {
+				    occlusion_queries.End(command, occlusion_query);
+				    PipelineCache::NoteSkippedDraw();
+			    } else {
+				    record(command, pending.Get());
+			    }
+			    command.endRendering();
+		    });
+		vk_buffer = buffer.Handle();
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::Draws);
+	m_context.GetBufferCache().RecordPendingWrites();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 
 	if (shader_write_stages) {
@@ -1270,7 +1354,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().StartOperation();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1361,7 +1445,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().StartOperation();
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
