@@ -11,6 +11,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/frameCapture.h"
+#include "graphics/guest_gpu/command_processor/waitDiagnostics.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
@@ -937,6 +938,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::Flips);
+	Graphics::WaitDiag::NoteFramePresented();
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;

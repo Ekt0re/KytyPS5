@@ -3081,18 +3081,8 @@ std::string DumpGuestThreads() {
 	const auto now = Common::SteadyNs();
 	g_pthread_context->GetPthreadPool()->ForEach([&](Pthread thread) {
 		if (thread->state.load(std::memory_order_acquire) != PthreadState::Running) return;
-		const char* call = thread->wait.call.load(std::memory_order_acquire);
-		out += fmt::format("  [{}] {:<32} host={}", thread->unique_id, thread->name,
-		                   thread->host_thread_id);
-		if (call != nullptr) {
-			const auto since = thread->wait.since.load(std::memory_order_relaxed);
-			out += fmt::format(" waits in {} object=0x{:x} value={} for {:.1f} s", call,
-			                   thread->wait.object.load(std::memory_order_relaxed),
-			                   thread->wait.value.load(std::memory_order_relaxed),
-			                   since != 0 && now > since ? static_cast<double>(now - since) / 1e9 : 0.0);
-		} else {
-			out += " running";
-		}
+		out += fmt::format("  [{}] {:<32} host={} {}", thread->unique_id, thread->name,
+		                   thread->host_thread_id, DescribeWait(thread->wait, now));
 		out += "\n";
 	});
 	return out;

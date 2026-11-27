@@ -9,6 +9,7 @@
 #include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/runtimeToggles.h"
+#include "graphics/guest_gpu/command_processor/waitDiagnostics.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -597,6 +598,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 					// Resolved in place: a VRAM buffer would have copied the window.
 					m_zero_copy_fences.CountSaved(buffer.CpuAddress());
 					Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcSaved);
+				}
+				if (WaitDiag::Enabled()) {
+					WaitDiag::Global().NoteReadback(start, end - start, WaitDiag::NowMs());
 				}
 				// Buffers the CPU keeps faulting on may move to guest memory (zero-copy).
 				buffer.readback_faults++;
