@@ -22,22 +22,24 @@ public:
 	struct Recorded {
 		bool     fresh = false; // false: this tick fenced the buffer already
 		uint32_t waits = 0;     // recent CPU writes that waited for its reads (decaying)
+		uint32_t saved = 0;     // recent read-backs it spared (decaying)
 	};
 
 	Recorded Record(uint64_t start, uint64_t end, uint64_t tick) {
 		std::scoped_lock lock(m_mutex);
 		auto& fence = m_fences[start];
 		if (fence.end == end && fence.tick == tick) {
-			return {false, fence.waits};
+			return {false, fence.waits, fence.saved};
 		}
 		fence.end  = end;
 		fence.tick = tick;
-		// Halve the count every 64 fences: it measures waits per use, not since creation.
+		// Halve the counts every 64 fences: they measure recent use, not since creation.
 		if ((++fence.fences & 63u) == 0) {
 			fence.waits /= 2;
+			fence.saved /= 2;
 		}
 		m_any.store(true, std::memory_order_release);
-		return {true, fence.waits};
+		return {true, fence.waits, fence.saved};
 	}
 
 	// The newest unreleased tick of the fences that meet [vaddr, vaddr + size), 0 for none.
@@ -61,6 +63,26 @@ public:
 		});
 	}
 
+	// Counts a read-back the buffer spared: a GPU write whose pages went back to the CPU without
+	// a copy, or a CPU read fault resolved in place. Buffers start from their first fence.
+	void CountSaved(uint64_t start) {
+		std::scoped_lock lock(m_mutex);
+		if (const auto it = m_fences.find(start); it != m_fences.end()) {
+			it->second.saved++;
+		}
+	}
+
+	// Forgets every buffer's counts (a policy change judges them afresh); fences stay.
+	void ResetCounts() {
+		std::scoped_lock lock(m_mutex);
+		for (auto& [start, fence]: m_fences) {
+			(void)start;
+			fence.waits  = 0;
+			fence.saved  = 0;
+			fence.fences = 0;
+		}
+	}
+
 	// The fence's tick completed; a newer read replaced it otherwise. The wait count stays.
 	void Release(uint64_t start, uint64_t tick) {
 		std::scoped_lock lock(m_mutex);
@@ -80,11 +102,18 @@ public:
 		return it != m_fences.end() ? it->second.waits : 0;
 	}
 
+	[[nodiscard]] uint32_t Saved(uint64_t start) {
+		std::scoped_lock lock(m_mutex);
+		const auto it = m_fences.find(start);
+		return it != m_fences.end() ? it->second.saved : 0;
+	}
+
 private:
 	struct Fence {
 		uint64_t end    = 0;
 		uint64_t tick   = 0;
 		uint32_t waits  = 0;
+		uint32_t saved  = 0;
 		uint32_t fences = 0;
 	};
 

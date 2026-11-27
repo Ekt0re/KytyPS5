@@ -105,6 +105,8 @@ public:
 	uint64_t read_release_tick  = 0;
 	// Zero-copy: recent CPU writes that waited for its reads, as of its last read fence.
 	uint32_t read_waits         = 0;
+	// Zero-copy: recent read-backs it spared, as of its last read fence.
+	uint32_t read_saved         = 0;
 	// Zero-copy: LibKernel::Memory::BackingGeneration() when the import was last known valid.
 	uint64_t backing_generation = 0;
 

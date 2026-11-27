@@ -1281,6 +1281,16 @@ void TestZeroCopyFences() {
     (void)fences.Record(0x1000, 0x3000, tick);
   }
   Check(fences.Waits(0x1000) < 64, "the wait count did not decay with use");
+  fences.CountSaved(0x1000);
+  fences.CountSaved(0x1000);
+  fences.CountSaved(0x9000); // no fence there: nothing to count
+  const auto recorded = fences.Record(0x1000, 0x3000, 200);
+  Check(fences.Saved(0x1000) == 2 && fences.Saved(0x4000) == 0 && recorded.saved == 2 &&
+            recorded.waits == fences.Waits(0x1000),
+        "spared read-backs were not counted per buffer or not reported by the fence");
+  fences.ResetCounts();
+  Check(fences.Waits(0x1000) == 0 && fences.Saved(0x1000) == 0 && fences.Find(0x1000, 1) == 200,
+        "ResetCounts kept counts or dropped the fence");
   fences.Forget(0x1000);
   Check(fences.Find(0x1000, 1) == 0 && fences.Waits(0x1000) == 0, "Forget kept the fence");
 }

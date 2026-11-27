@@ -593,6 +593,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				}
 			}
 			if (downloaded) {
+				if (buffer.IsZeroCopy()) {
+					// Resolved in place: a VRAM buffer would have copied the window.
+					m_zero_copy_fences.CountSaved(buffer.CpuAddress());
+					Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcSaved);
+				}
 				// Buffers the CPU keeps faulting on may move to guest memory (zero-copy).
 				buffer.readback_faults++;
 				migrate = ZeroCopyEnabled() && !buffer.IsZeroCopy();
@@ -830,7 +835,7 @@ bool BufferCache::ZeroCopyEnabled() const {
 		return text != nullptr && text[0] == '1';
 	}();
 	// GuestBackingImports::Available() settles on first use and is cheap after that.
-	return enabled && (m_graphics.external_memory_host_enabled ||
+	return enabled && !m_zero_copy_policy.off && (m_graphics.external_memory_host_enabled ||
 	                   const_cast<GuestBackingImports&>(m_guest_imports).Available());
 }
 
@@ -887,6 +892,9 @@ void BufferCache::ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t si
 	ReleaseGpuWrittenRuns(m_memory_tracker, vaddr, size, [](uint64_t, uint64_t bytes) {
 		Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcStateKiB, bytes >> 10u);
 	});
+	// A VRAM buffer would need a read-back for the CPU to see this write.
+	m_zero_copy_fences.CountSaved(vaddr);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcSaved);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReleases);
 }
 
@@ -910,9 +918,10 @@ void BufferCache::FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t /*vadd
 		    Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcStateKiB, bytes >> 10u);
 	    },
 	    []() noexcept {});
-	buffer.read_waits =
-	    m_zero_copy_fences.Record(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size(), tick)
-	        .waits;
+	const auto recorded =
+	    m_zero_copy_fences.Record(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size(), tick);
+	buffer.read_waits = recorded.waits;
+	buffer.read_saved = recorded.saved;
 	if (buffer.read_release_tick != tick) {
 		buffer.read_release_tick = tick;
 		m_scheduler.DeferOperation([this, id, address = buffer.CpuAddress(), bytes = buffer.Size(),
@@ -941,44 +950,105 @@ void BufferCache::WaitZeroCopyReads(uint64_t vaddr, uint64_t size) {
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcReadWaits);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReadWaits);
 	m_zero_copy_fences.CountWait(vaddr, size, tick);
-	// As RenderContext::WaitWriteBacks: only the GPU thread submits the current tick.
+	// Only the GPU thread submits the current tick. It only submits it: the writer waits for the
+	// GPU on its own thread, and the GPU thread goes on with the next packets meanwhile.
 	if (GuestGpu::IsGpuThread()) {
 		m_scheduler.Wait(tick);
-	} else if (tick == m_scheduler.CurrentTick()) {
-		m_scheduler.Context().GetGpu().SendCommandSync([this, tick] { m_scheduler.Wait(tick); });
-	} else {
-		m_scheduler.Wait(tick);
+		return;
+	}
+	// The GPU thread may fence the buffer for a newer tick meanwhile (it no longer stops while this
+	// thread waits); those reads come from packets the guest most likely queued before this write,
+	// so they are waited for too (a few rounds: a buffer read by every tick would never settle).
+	auto wait_tick = tick;
+	for (int round = 0; round < 3 && wait_tick != 0 && !m_scheduler.IsFree(wait_tick);
+	     round++, wait_tick = m_zero_copy_fences.Find(vaddr, size)) {
+		if (wait_tick == m_scheduler.CurrentTick()) {
+			Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcOpenWaits);
+			m_scheduler.Context().GetGpu().SendCommandSync([this, wait_tick] {
+				if (wait_tick == m_scheduler.CurrentTick()) {
+					m_scheduler.Flush();
+				}
+			});
+		}
+		m_scheduler.Wait(wait_tick);
 	}
 }
 
-// Read-waits after which a zero-copy buffer goes back to VRAM; KYTY_ZERO_COPY_WAIT_THRESHOLD=<n>.
-static uint32_t ZeroCopyWaitThreshold() {
-	static const uint32_t threshold = [] {
-		const char* text  = std::getenv("KYTY_ZERO_COPY_WAIT_THRESHOLD");
-		const auto  value = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
-		return value != 0 ? static_cast<uint32_t>(value) : 16u;
+static uint32_t EnvValue(const char* name, uint32_t fallback) {
+	const char* text = std::getenv(name);
+	if (text == nullptr || text[0] == 0) {
+		return fallback;
+	}
+	return static_cast<uint32_t>(std::strtoul(text, nullptr, 10));
+}
+
+void BufferCache::RefreshZeroCopyPolicy() {
+	static const bool requested = [] {
+		const char* text = std::getenv("KYTY_ZERO_COPY");
+		return text != nullptr && text[0] == '1';
 	}();
-	return threshold;
+	const auto tick = m_scheduler.CurrentTick();
+	if (!requested || (m_zero_copy_policy.known && tick == m_zero_copy_policy.tick)) {
+		return;
+	}
+	m_zero_copy_policy.tick = tick;
+	const bool known        = m_zero_copy_policy.known;
+	m_zero_copy_policy.known = true;
+	// Read-waits per spared read-back above which a buffer goes back to VRAM
+	// (KYTY_ZERO_COPY_WAIT_RATIO, default 0: never), once it has KYTY_ZERO_COPY_WAIT_MIN recent waits.
+	// Runtime toggles (one run compares settings): zc_off=1 turns zero-copy off,
+	// zc_ratio_b=1 uses KYTY_ZERO_COPY_WAIT_RATIO_B.
+	static const uint32_t ratio_a  = EnvValue("KYTY_ZERO_COPY_WAIT_RATIO", 0);
+	static const uint32_t ratio_b  = EnvValue("KYTY_ZERO_COPY_WAIT_RATIO_B", 8);
+	static const uint32_t min      = std::max(EnvValue("KYTY_ZERO_COPY_WAIT_MIN", 8), 1u);
+	bool                  off      = false;
+	uint32_t              ratio    = ratio_a;
+	if (Common::RuntimeToggles::Enabled()) {
+		off   = Common::RuntimeToggles::Get("zc_off");
+		ratio = Common::RuntimeToggles::Get("zc_ratio_b") ? ratio_b : ratio_a;
+	}
+	if (off != m_zero_copy_policy.off || ratio != m_zero_copy_policy.ratio) {
+		if (known) {
+			std::printf("Zero-copy: policy %s, wait ratio %u (min %u waits)\n", off ? "off" : "on",
+			            ratio, min);
+			std::fflush(stdout);
+		}
+		// Every buffer is judged afresh under the new setting.
+		m_zero_copy_rejected.Clear();
+		m_zero_copy_fences.ResetCounts();
+	}
+	m_zero_copy_policy.off       = off;
+	m_zero_copy_policy.ratio     = ratio;
+	m_zero_copy_policy.min_waits = min;
 }
 
 bool BufferCache::ZeroCopyKeepsWaiting(BufferId id) {
-	auto&      buffer = m_slot_buffers[id];
-	const auto waits  = buffer.read_waits; // as of its last fence
-	if (waits < ZeroCopyWaitThreshold()) {
-		return false;
+	auto& buffer = m_slot_buffers[id];
+	if (!m_zero_copy_policy.off) {
+		// As of its last fence.
+		const auto waits = buffer.read_waits;
+		const auto ratio = m_zero_copy_policy.ratio;
+		if (ratio == 0 || waits < m_zero_copy_policy.min_waits ||
+		    waits <= static_cast<uint64_t>(ratio) * buffer.read_saved) {
+			return false;
+		}
 	}
-	// The CPU keeps rewriting memory the GPU is still reading: a VRAM copy (a snapshot per upload)
-	// is cheaper there than waiting. The range is not judged again.
+	// The CPU keeps rewriting memory the GPU is still reading, far more often than the buffer
+	// spares a read-back: a VRAM copy (a snapshot per upload) is cheaper there than waiting. The
+	// range is not judged again under this setting.
 	const auto vaddr = buffer.CpuAddress();
 	const auto size  = buffer.Size();
-	if (m_zero_copy_rejected_logs++ < 32) {
-		std::printf("Zero-copy: buffer 0x%011llx+0x%llx made the CPU wait %u times; back to VRAM\n",
+	if (!m_zero_copy_policy.off && m_zero_copy_rejected_logs++ < 64) {
+		std::printf("Zero-copy: buffer 0x%011llx+0x%llx made the CPU wait %u times for %u spared "
+		            "read-backs; back to VRAM\n",
 		            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
-		            waits);
+		            buffer.read_waits, buffer.read_saved);
 		std::fflush(stdout);
 	}
-	Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcWaitDrops);
-	m_zero_copy_rejected.Add(vaddr, size);
+	if (!m_zero_copy_policy.off) {
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcWaitDrops);
+		m_zero_copy_rejected.Add(vaddr, size);
+	}
 	DropZeroCopyBuffer(id);
 	m_zero_copy_fences.Forget(vaddr);
 	return true;
@@ -1113,7 +1183,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 	BufferId id {};
 	bool     zero_copy = false;
-	if (!m_zero_copy.Empty() && m_zero_copy.Intersects(overlap.begin, length)) {
+	if (!m_zero_copy.Empty() && !m_zero_copy_policy.off &&
+	    m_zero_copy.Intersects(overlap.begin, length)) {
 		constexpr uint64_t MaxZeroCopy = 512ull * 1024 * 1024;
 		const auto         generation  = LibKernel::Memory::BackingGeneration();
 		const auto         alias =
@@ -1332,6 +1403,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
 		id = FindBuffer(vaddr, end - vaddr);
 	}
+	RefreshZeroCopyPolicy();
 	if (m_slot_buffers[id].IsZeroCopy() && (!ZeroCopyBackingValid(id) || ZeroCopyKeepsWaiting(id))) {
 		id = FindBuffer(vaddr, end - vaddr);
 	}

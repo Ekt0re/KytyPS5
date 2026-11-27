@@ -85,6 +85,8 @@ enum class Counter {
 	ZcWaitUs,     // ... their microseconds.
 	ZcWaitDrops,  // Buffers moved back to VRAM because the CPU kept waiting.
 	ZcStateKiB,   // KiB whose tracking state the zero-copy steps changed.
+	ZcOpenWaits,  // Read waits for the open tick (the GPU thread submits it, the writer waits).
+	ZcSaved,      // Read-backs zero-copy spared (GPU writes released in place, faults resolved).
 	Count
 };
 

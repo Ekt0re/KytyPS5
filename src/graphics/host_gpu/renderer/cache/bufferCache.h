@@ -275,8 +275,11 @@ private:
 	void               FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ReleaseZeroCopyReads(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick);
 	void               WaitZeroCopyReads(uint64_t vaddr, uint64_t size);
-	// True (and the buffer dropped to VRAM) when CPU writes keep waiting for its reads.
+	// True (and the buffer dropped to VRAM) when CPU writes keep waiting for its reads far more
+	// often than it spares read-backs, or zero-copy is switched off.
 	[[nodiscard]] bool ZeroCopyKeepsWaiting(BufferId id);
+	// Re-reads the zero-copy settings once per tick (runtime toggles zc_off, zc_ratio_b).
+	void               RefreshZeroCopyPolicy();
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -328,6 +331,14 @@ private:
 	// Ranges that went back to VRAM because the CPU kept waiting for their reads.
 	RangeSet                                          m_zero_copy_rejected;
 	uint32_t                                          m_zero_copy_rejected_logs = 0;
+	struct ZeroCopyPolicy {
+		uint64_t tick      = 0;
+		bool     known     = false;
+		bool     off       = false;
+		uint32_t ratio     = 0;
+		uint32_t min_waits = 1;
+	};
+	ZeroCopyPolicy                                    m_zero_copy_policy;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
