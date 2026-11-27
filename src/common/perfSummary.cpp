@@ -44,6 +44,8 @@ constexpr std::array<const char*, N> g_names = {
     "zc_resolve_us", "zc_release_us", "zc_fences", "zc_fence_skips", "zc_fence_us",
     "zc_read_waits", "zc_wait_us", "zc_wait_drops", "zc_state_kib",
     "zc_open_waits", "zc_saved",
+    "f_wait_gpu_us", "f_wait_guest_us", "f_materialize_us",
+    "f_module_lookups", "f_module_hits", "f_module_misses",
 };
 
 struct Sample {
@@ -66,6 +68,12 @@ bool              g_started = false;
 uint32_t          g_period  = 10;
 Sample            g_first;
 std::atomic<bool> g_total_printed {false};
+
+// KYTY_FRAME_COST=1: the existing reporter also prints one [frame] line per interval. The warning
+// fires once after ten seconds of consecutive windows with more module misses than hits.
+bool   g_frame_cost     = false;
+double g_frame_bad_secs = 0.0;
+bool   g_frame_warned   = false;
 
 // The GPU thread, set by RegisterGpuThread. Its CPU time, instructions and context switches
 // come from Linux interfaces; other hosts report the counters only ("na" for the rest).
@@ -246,6 +254,30 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 	}
 	line += '\n';
 	std::fputs(line.c_str(), stdout);
+	if (g_frame_cost) {
+		const auto wait_gpu     = count(Counter::FrameWaitGpuUs);
+		const auto wait_guest   = count(Counter::FrameWaitGuestUs);
+		const auto materialize  = count(Counter::FrameMaterializeUs);
+		const auto lookups      = count(Counter::FrameModuleLookups);
+		const auto hits         = count(Counter::FrameModuleHits);
+		const auto misses       = count(Counter::FrameModuleMisses);
+		const auto frame_line = Detail::FormatFrameLine(secs, flips, wait_gpu, wait_guest,
+		                                              materialize, lookups, hits, misses);
+		std::fputs(frame_line.c_str(), stdout);
+		// A module miss streak is only interesting after the store has had time to settle: one
+		// window of more misses than hits is normal while it loads. Ten consecutive seconds is
+		// the same rule our original frame reporter used.
+		if (misses > hits && (hits + misses) != 0) {
+			g_frame_bad_secs += secs;
+		} else {
+			g_frame_bad_secs = 0.0;
+		}
+		const auto warning = Detail::FormatFrameWarning(hits, misses, g_frame_bad_secs);
+		if (!warning.empty() && !g_frame_warned) {
+			g_frame_warned = true;
+			std::fputs(warning.c_str(), stdout);
+		}
+	}
 	std::fflush(stdout);
 }
 
@@ -262,18 +294,67 @@ void PrintTotal() {
 
 } // namespace
 
+namespace Detail {
+
+std::string FormatFrameLine(double secs, uint64_t frames, uint64_t wait_gpu_us,
+                            uint64_t wait_guest_us, uint64_t materialize_us,
+                            uint64_t module_lookups, uint64_t module_hits,
+                            uint64_t module_misses) {
+	const auto per_frame_ms = [frames](uint64_t micros) {
+		return frames == 0 ? 0.0
+		                   : static_cast<double>(micros) / static_cast<double>(frames) * 1e-3;
+	};
+	const auto total_ms = [](uint64_t micros) { return static_cast<double>(micros) * 1e-3; };
+	char       text[512];
+	std::snprintf(text, sizeof(text),
+	    "[frame] secs=%.1f frames=%" PRIu64
+	    " wait_gpu_ms=%.3f wait_guest_ms=%.3f materialize_ms=%.3f"
+	    " ms/frame wait_gpu=%.3f wait_guest=%.3f materialize=%.3f"
+	    " module_lookups=%" PRIu64 " module_hits=%" PRIu64 " module_misses=%" PRIu64 "\n",
+	    secs, frames, total_ms(wait_gpu_us), total_ms(wait_guest_us), total_ms(materialize_us),
+	    per_frame_ms(wait_gpu_us), per_frame_ms(wait_guest_us), per_frame_ms(materialize_us),
+	    module_lookups, module_hits, module_misses);
+	return text;
+}
+
+std::string FormatFrameWarning(uint64_t hits, uint64_t misses, double sustained_seconds) {
+	if (sustained_seconds < 10.0 || misses <= hits || (hits + misses) == 0) {
+		return {};
+	}
+	char text[512];
+	std::snprintf(text, sizeof(text),
+	    "[frame] WARNING module-misses: module lookups missed more often than they hit for "
+	    "%.0f s (last window hits=%" PRIu64 " misses=%" PRIu64
+	    "); modules that exist are not found, each use requests a new translation\n",
+	    sustained_seconds, hits, misses);
+	return text;
+}
+
+} // namespace Detail
+
 void Start() {
 	std::lock_guard lock(g_mutex);
 	if (g_started) {
 		return;
 	}
-	const char* env = std::getenv("KYTY_PERF_SUMMARY");
-	if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+	const char* env        = std::getenv("KYTY_PERF_SUMMARY");
+	const char* frame_env  = std::getenv("KYTY_FRAME_COST");
+	const bool  frame_cost = frame_env != nullptr && frame_env[0] != '\0' && frame_env[0] != '0';
+	if ((env == nullptr || env[0] == '\0' || env[0] == '0') && !frame_cost) {
 		return;
 	}
-	g_started = true;
-	if (const auto period = std::strtoul(env, nullptr, 10); period >= 2) {
-		g_period = static_cast<uint32_t>(period);
+	g_started    = true;
+	g_frame_cost = frame_cost;
+	bool explicit_period = false;
+	if (env != nullptr && env[0] != '\0' && env[0] != '0') {
+		if (const auto period = std::strtoul(env, nullptr, 10); period >= 2) {
+			g_period         = static_cast<uint32_t>(period);
+			explicit_period = true;
+		}
+	}
+	// The frame line is a five-second window unless the caller chose a reporter period.
+	if (frame_cost && !explicit_period) {
+		g_period = 5;
 	}
 	Detail::g_enabled.store(true, std::memory_order_relaxed);
 	g_first = Take();

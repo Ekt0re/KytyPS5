@@ -4,12 +4,16 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <string>
 
 // KYTY_PERF_SUMMARY=1: a work-based performance summary on stdout, one "PerfSummary ..." line
 // every 10 s (KYTY_PERF_SUMMARY=n: every n s, n >= 2) and one "PerfSummary total ..." line at exit.
 // It counts work per guest frame (flip) rather than frames per second, so that two builds can be
 // compared while other programs load the machine: CPU time and retired instructions of the GPU
 // command thread, and how often the expensive paths ran. Off, a counter costs one relaxed load.
+// KYTY_FRAME_COST=1 also prints one [frame] line per interval (5 s by default): presented frames
+// and the wall-time split into GPU wait, guest wait and resource materialisation, plus a one-shot
+// module-miss warning. It uses this same reporter, never a second thread. Off by default.
 namespace Common::PerfSummary {
 
 enum class Counter {
@@ -87,6 +91,14 @@ enum class Counter {
 	ZcStateKiB,   // KiB whose tracking state the zero-copy steps changed.
 	ZcOpenWaits,  // Read waits for the open tick (the GPU thread submits it, the writer waits).
 	ZcSaved,      // Read-backs zero-copy spared (GPU writes released in place, faults resolved).
+	// KYTY_FRAME_COST=1: wall-time split of a presented frame, printed by the existing reporter.
+	// Presented frames are Counter::Flips, which videoOut already counts; do not count them twice.
+	FrameWaitGpuUs,     // Microseconds waiting on the GPU (MasterSemaphore::Wait).
+	FrameWaitGuestUs,   // Microseconds the guest command thread waited on blocked queues.
+	FrameMaterializeUs, // Microseconds in IR resource materialisation.
+	FrameModuleLookups, // Shader-module lookups (Program::FindModule).
+	FrameModuleHits,    // Lookups that found a module.
+	FrameModuleMisses,  // Lookups that did not find one.
 	Count
 };
 
@@ -104,6 +116,19 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 [[nodiscard]] inline bool Enabled() noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
 }
+
+namespace Detail {
+
+// Pure formatters for the [frame] line. They take interval totals (not per-frame values) so the
+// reporter and the unit test can share exactly the same arithmetic. The returned strings end in
+// a newline; `FormatFrameWarning` returns an empty string until the miss streak is long enough.
+std::string FormatFrameLine(double secs, uint64_t frames, uint64_t wait_gpu_us,
+                            uint64_t wait_guest_us, uint64_t materialize_us,
+                            uint64_t module_lookups, uint64_t module_hits,
+                            uint64_t module_misses);
+std::string FormatFrameWarning(uint64_t hits, uint64_t misses, double sustained_seconds);
+
+} // namespace Detail
 
 // Adds the microseconds of its lifetime to `counter` (no clock read while the summary is off).
 class ScopedMicros {

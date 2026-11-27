@@ -626,6 +626,10 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					gpu->m_parks.fetch_add(1, std::memory_order_acq_rel);
+					// Every queue is blocked, most often on guest memory or a shader; the bounded
+					// wait here is the guest-side part of a frame's wall time.
+					Common::PerfSummary::ScopedMicros guest_wait(
+					    Common::PerfSummary::Counter::FrameWaitGuestUs);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {

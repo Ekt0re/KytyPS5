@@ -330,6 +330,7 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
                                                  ShaderRecompiler::IR::PushData::Window push_data) {
 	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
 	                                                    specialization));
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleLookups);
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword !=
@@ -340,8 +341,10 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 		if constexpr (HasCalls) {
 			if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
 		}
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleHits);
 		return &candidate;
 	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleMisses);
 	return nullptr;
 }
 

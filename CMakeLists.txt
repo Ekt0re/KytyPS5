@@ -558,6 +558,9 @@ target_include_directories(slot_vector_tests PRIVATE ${inc_headers})
 add_executable(common_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommonTests.cpp")
 target_link_libraries(common_tests common kyty_test_gtest)
 
+add_executable(perf_summary_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PerfSummaryTests.cpp")
+target_link_libraries(perf_summary_tests common kyty_test_gtest)
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -887,6 +890,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME draw_indirect_count COMMAND $<TARGET_FILE:draw_indirect_count_tests>)
+	add_test(NAME perf_summary COMMAND $<TARGET_FILE:perf_summary_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -1041,6 +1045,7 @@ if(BUILD_TESTING)
 		shader_store_tests
 		common_tests
 		draw_indirect_count_tests
+		perf_summary_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
