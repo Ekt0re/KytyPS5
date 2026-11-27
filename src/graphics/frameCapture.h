@@ -37,6 +37,8 @@ enum class VideoOutCallKind : uint32_t {
 };
 
 [[nodiscard]] bool Enabled() noexcept;
+// This process replays a capture (RunReplay was called).
+[[nodiscard]] bool Replaying() noexcept;
 
 // Guest GPU calls; queue is the AGC queue (0 graphics, 0x20.. compute).
 void Submit(uint32_t queue, const uint32_t* commands, uint32_t dwords);

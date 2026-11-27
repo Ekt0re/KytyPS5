@@ -1299,6 +1299,14 @@ bool Enabled() noexcept {
 	return Active() != nullptr;
 }
 
+namespace {
+std::atomic<bool> g_replaying {false};
+} // namespace
+
+bool Replaying() noexcept {
+	return g_replaying.load(std::memory_order_acquire);
+}
+
 void NoteFlip() noexcept {
 	Flips().fetch_add(1, std::memory_order_acq_rel);
 	auto& replay = Replay();
@@ -1344,6 +1352,7 @@ void VideoOutCall(VideoOutCallKind kind, std::span<const int64_t> args, std::spa
 }
 
 void RunReplay(const ReplayOptions& options) {
+	g_replaying.store(true, std::memory_order_release);
 	int exit_code = 0;
 	{
 		GuardOutput() = options.output;
