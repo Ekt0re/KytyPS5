@@ -2782,7 +2782,8 @@ public:
       scheduler.Begin(registers, user_config, shaders);
 
       const auto commit = [&] {
-        const auto set = context.GetDescriptorHeap().Commit(layout);
+        const auto set = context.GetDescriptorHeap().Commit(
+            layout, DescriptorSetLayoutSizes(bindings));
         Require("DescriptorHeapLargeSet", "allocation", set != nullptr,
                 "ordinary descriptor heap could not allocate an oversized sampler set");
         scheduler.Current().Handle().bindDescriptorSets(
