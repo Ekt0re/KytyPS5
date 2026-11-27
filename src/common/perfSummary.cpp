@@ -33,7 +33,7 @@ constexpr std::array<const char*, N> g_names = {
     "depth_recreates", "barriers",    "layout_transitions",
      "rb_calls",  "rb_batches",  "rb_submits",          "rb_fused",
     "rb_extra_bufs", "rb_neighbour", "rb_handler_us", "rb_flush_us",   "rb_submit_us",
-    "rb_wait_us",    "rb_copy_us",
+    "rb_wait_us",    "rb_copy_us",    "rb_write_calls", "rb_write_us",
 };
 
 struct Sample {

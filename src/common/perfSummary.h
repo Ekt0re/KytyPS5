@@ -48,6 +48,8 @@ enum class Counter {
 	RbSubmitUs,   // ... recording and submitting the copy.
 	RbWaitUs,     // ... waiting for the copy (fence, tick and earlier publications).
 	RbCopyUs,     // ... copying the bytes into guest memory.
+	RbWriteCalls, // ReadMemory requests of guest write faults on GPU-written pages.
+	RbWriteUs,    // Their microseconds (part of rb_handler_us).
 	Count
 };
 
@@ -69,7 +71,8 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 // Adds the microseconds of its lifetime to `counter` (no clock read while the summary is off).
 class ScopedMicros {
 public:
-	explicit ScopedMicros(Counter counter) noexcept: m_counter(counter), m_on(Enabled()) {
+	explicit ScopedMicros(Counter counter, bool active = true) noexcept
+	    : m_counter(counter), m_on(active && Enabled()) {
 		if (m_on) {
 			m_start = std::chrono::steady_clock::now();
 		}

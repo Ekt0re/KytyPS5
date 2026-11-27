@@ -465,8 +465,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
-		Common::PerfSummary::ScopedMicros handler_timer(Common::PerfSummary::Counter::RbHandlerUs);
-		Common::PerfSummary::Add(Common::PerfSummary::Counter::RbCalls);
+		using Common::PerfSummary::Counter;
+		Common::PerfSummary::ScopedMicros handler_timer(Counter::RbHandlerUs);
+		// Guest write faults on GPU-written pages come here too (InvalidateMemory).
+		Common::PerfSummary::ScopedMicros write_timer(Counter::RbWriteUs, is_write);
+		Common::PerfSummary::Add(Counter::RbCalls);
+		if (is_write) {
+			Common::PerfSummary::Add(Counter::RbWriteCalls);
+		}
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
