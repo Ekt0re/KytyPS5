@@ -1,8 +1,6 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_
 
-#include "common/abi.h"
-#include "common/assert.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/uniqueFunction.h"
