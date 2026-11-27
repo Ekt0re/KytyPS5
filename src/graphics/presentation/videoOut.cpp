@@ -29,6 +29,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 #include <fmt/format.h>
 #include <list>
@@ -204,7 +207,25 @@ struct VideoOutConfig {
 	std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups;
 	// The flip and wait packets name a buffer by its label.
 	std::array<uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> labels {};
+	// KYTY_FLIP_TRACE: the last request shown on this port.
+	uint64_t trace_last_id  = 0;
+	int64_t  trace_last_arg = 0;
 };
+
+// KYTY_FLIP_TRACE=1 logs each flip request and each presentation with the request sequence, and
+// counts presentations out of request order and waits on a buffer that last a second or more.
+static bool FlipTraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FLIP_TRACE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+static std::atomic<uint64_t> g_flip_trace_presented {0};
+static std::atomic<uint64_t> g_flip_trace_out_of_order {0};
+static std::atomic<uint64_t> g_flip_trace_arg_backward {0};
+static std::atomic<uint64_t> g_flip_trace_held {0};
 
 class FlipQueue {
 public:
@@ -904,6 +925,14 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	if (FlipTraceEnabled()) {
+		std::fprintf(stderr,
+		             "FLIPTRACE req id=%" PRIu64 " bus=%d idx=%d arg=%" PRId64
+		             " src=%s pending=%d ptc=%" PRIu64 "\n",
+		             r.id, cfg.bus, index, flip_arg,
+		             source == FlipRequestSource::GpuEop ? "eop" : "cpu",
+		             cfg.flip_status.flipPendingNum + 1, r.submit_ptc);
+	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::Flips);
 
@@ -1082,8 +1111,38 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
 		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
 	};
+	if (!FlipTraceEnabled()) {
+		while (has_request()) {
+			m_done_cond_var.Wait(&m_mutex);
+		}
+		return;
+	}
+	const auto begin  = std::chrono::steady_clock::now();
+	auto       waited = [begin] {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
+		    .count();
+	};
+	double reported = 0;
 	while (has_request()) {
-		m_done_cond_var.Wait(&m_mutex);
+		m_done_cond_var.WaitFor(&m_mutex, 100000);
+		if (waited() - reported < 1000.0 || !has_request()) {
+			continue;
+		}
+		reported = waited();
+		g_flip_trace_held++;
+		const auto head = m_requests.begin();
+		std::fprintf(stderr,
+		             "FLIPTRACE held bus=%d idx=%d waited_ms=%.0f eop_queue=%zu cpu_queue=%zu "
+		             "head_id=%" PRIu64 " head_idx=%d head_state=%d held_total=%" PRIu64 "\n",
+		             cfg.bus, index, reported, m_requests.size(), m_cpu_requests.size(),
+		             head != m_requests.end() ? head->id : 0,
+		             head != m_requests.end() ? head->index : -9,
+		             head != m_requests.end() ? static_cast<int>(head->state) : -1,
+		             g_flip_trace_held.load());
+	}
+	if (waited() >= 1.0) {
+		std::fprintf(stderr, "FLIPTRACE wait bus=%d idx=%d waited_ms=%.1f\n", cfg.bus, index,
+		             waited());
 	}
 }
 
@@ -1168,6 +1227,27 @@ bool FlipQueue::Flip() {
 			continue;
 		}
 		auto& r = *it;
+		if (FlipTraceEnabled()) {
+			const bool out_of_order = r.id < r.cfg->trace_last_id;
+			const bool arg_backward = r.flip_arg < r.cfg->trace_last_arg;
+			g_flip_trace_presented++;
+			g_flip_trace_out_of_order += out_of_order;
+			g_flip_trace_arg_backward += arg_backward;
+			std::fprintf(stderr,
+			             "FLIPTRACE present id=%" PRIu64 " bus=%d idx=%d arg=%" PRId64
+			             " src=%s prev_id=%" PRIu64 " prev_arg=%" PRId64
+			             " ooo=%d argback=%d vblank=%" PRIu64 " pending=%d totals: presented=%" PRIu64
+			             " ooo=%" PRIu64 " argback=%" PRIu64 " held=%" PRIu64 "\n",
+			             r.id, r.cfg->bus, r.index, r.flip_arg,
+			             r.source == FlipRequestSource::GpuEop ? "eop" : "cpu", r.cfg->trace_last_id,
+			             r.cfg->trace_last_arg, out_of_order, arg_backward,
+			             static_cast<uint64_t>(r.cfg->vblank_status.count),
+			             r.cfg->flip_status.flipPendingNum - 1, g_flip_trace_presented.load(),
+			             g_flip_trace_out_of_order.load(), g_flip_trace_arg_backward.load(),
+			             g_flip_trace_held.load());
+			r.cfg->trace_last_id  = r.id;
+			r.cfg->trace_last_arg = r.flip_arg;
+		}
 		r.cfg->flip_vblank = r.cfg->vblank_status.count;
 		r.cfg->flip_status.count++;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
