@@ -1120,6 +1120,14 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 static int ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size,
                                         VirtualRangeType type = VirtualRangeType::Reserved);
 
+static bool LargeMemoryBudgetEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_LARGE_MEMORY_BUDGET");
+		return env != nullptr && env[0] == '1' && env[1] == '\0';
+	}();
+	return enabled;
+}
+
 void Initialize() {
 	const auto params = Loader::SystemContentGetMemoryParams();
 	if (params.flexible_size != 0) {
@@ -1131,8 +1139,11 @@ void Initialize() {
 	const auto table_overhead = g_cpu_table_memory + g_gpu_table_memory +
 	                            std::max(params.amm_table_memory, INCLUDED_TABLE_MEMORY) -
 	                            3 * INCLUDED_TABLE_MEMORY;
-	const auto memory_budget = GUEST_MEMORY_BUDGET +
-	                           (Loader::SystemContentIsTrinityMode() ? 1216ull * 1024ull * 1024ull : 0);
+	// Extended mode grants an additional 1216 MiB. A package can lack the metadata flag while
+	// still requiring that budget, so allow an explicit opt-in without changing the default.
+	const bool large_memory =
+	    Loader::SystemContentIsTrinityMode() || LargeMemoryBudgetEnabled();
+	const auto memory_budget = GUEST_MEMORY_BUDGET + (large_memory ? 1216ull * 1024ull * 1024ull : 0);
 	EXIT_IF(g_flexible_memory_size + table_overhead >= memory_budget - RESERVED_CACHE_SIZE);
 	g_guest_memory_size = memory_budget - RESERVED_CACHE_SIZE - table_overhead;
 	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB\n",

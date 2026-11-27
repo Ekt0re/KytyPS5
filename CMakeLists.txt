@@ -940,6 +940,10 @@ if(BUILD_TESTING)
 		set_tests_properties(virtual_memory_allocation_vk_backing_memfd PROPERTIES
 			ENVIRONMENT "KYTY_VK_GUEST_BACKING=1;KYTY_VK_GUEST_BACKING_MAX_MB=0")
 	endif()
+	add_test(NAME large_memory_budget
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --large-memory-budget-only)
+	add_test(NAME base_memory_budget
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --base-memory-budget-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher

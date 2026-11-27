@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <semaphore>
@@ -6717,6 +6718,18 @@ void TestSmallFiberStacksAndMigration() {
 }
 #endif
 
+void SetLargeMemoryBudget(bool enabled) {
+#ifdef _WIN32
+	_putenv_s("KYTY_LARGE_MEMORY_BUDGET", enabled ? "1" : "0");
+#else
+	if (enabled) {
+		setenv("KYTY_LARGE_MEMORY_BUDGET", "1", 1);
+	} else {
+		unsetenv("KYTY_LARGE_MEMORY_BUDGET");
+	}
+#endif
+}
+
 } // namespace
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -6792,11 +6805,19 @@ void TestGuestTlsGetAddrUsesPerThreadBlocks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
-int RunTrinityTests();
+int RunTrinityTests(bool metadata_less, bool expect_large);
 
 int main(int argc, char** argv) {
 	if (argc == 2 && std::strcmp(argv[1], "--trinity-only") == 0) {
-		return RunTrinityTests();
+		return RunTrinityTests(false, true);
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--large-memory-budget-only") == 0) {
+		SetLargeMemoryBudget(true);
+		return RunTrinityTests(true, true);
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--base-memory-budget-only") == 0) {
+		SetLargeMemoryBudget(false);
+		return RunTrinityTests(true, false);
 	}
 	InitSubsystems();
 	if (argc == 2 && std::strcmp(argv[1], "--memory-bottlenecks-only") == 0) {
