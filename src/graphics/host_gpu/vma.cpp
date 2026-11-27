@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/bdaGuard.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #if defined(__clang__)
@@ -58,6 +59,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	BdaGuard::Shutdown(); // Buffers KYTY_BDA_GUARD=2 kept alive.
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }

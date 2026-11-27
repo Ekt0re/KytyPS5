@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
+#include "graphics/host_gpu/renderer/bdaGuard.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -145,6 +147,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
+		// Work recorded after the fill above finds no entry for the buffer.
+		BdaGuard::Retire(buffer.BufferDeviceAddress());
 	}
 }
 

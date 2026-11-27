@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
+#include "graphics/host_gpu/renderer/bdaGuard.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -653,6 +655,67 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// KYTY_BDA_GUARD: a resident image heap gives its program the device address of the view's slot
+// words and their count (three flattened-SRT words per root), and the program reads them without
+// a bounds check of the driver. Checks each root's range against the live host buffers, and its
+// kinds and slot words against the view they come from; a root that fails gets a zeroed slot
+// buffer instead (every key then selects the null image), so the fault shows here and not on the
+// GPU.
+static std::span<const uint32_t> GuardHeapSlots(RenderContext& context,
+                                                const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                                const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	static thread_local std::vector<uint32_t> patched;
+	const auto& flat   = snapshot.flattened_srt;
+	bool        copied = false;
+	BdaGuard::Poll();
+	for (uint32_t index = 0; index < program.info.images.size(); ++index) {
+		const auto& image = program.info.images[index];
+		if (!image.heap || image.indirect_root != index || image.indirect_resources.size() < 2u) continue;
+		const auto offset = image.indirect_mapping_offset;
+		if (offset + 3u > flat.size()) {
+			BdaGuard::Report(fmt::format("heap root: shader 0x{:016x} image {} maps words {}..{} of "
+			                             "a {}-word table", program.shader_hash, index, offset,
+			                             offset + 2u, flat.size()));
+			continue;
+		}
+		const auto count   = flat[offset];
+		const auto address = flat[offset + 1u] | uint64_t {flat[offset + 2u]} << 32u;
+		const auto kinds   = static_cast<uint32_t>(image.indirect_resources.size() - 1u);
+		bool       ok      = BdaGuard::Check(address, (uint64_t {count} + 1u) * 4u, "heap slots",
+		                                     program.shader_hash, index);
+		if (ok) {
+			const auto view = context.GetImageHeap().GuardFind(address);
+			if (!view.found) {
+				ok = false;
+				BdaGuard::Report(fmt::format("heap slots: shader 0x{:016x} image {} gets 0x{:x}, "
+				                             "which no heap view owns any more",
+				                             program.shader_hash, index, address));
+			} else if (view.kinds != kinds || view.slot_count != count || view.bad) {
+				ok = false;
+				BdaGuard::Report(fmt::format(
+				    "heap slots: shader 0x{:016x} image {} was compiled for {} kinds and given {} "
+				    "slots; its view at 0x{:x} now has {} kinds, {} slots{}",
+				    program.shader_hash, index, kinds, count, address, view.kinds, view.slot_count,
+				    view.bad ? fmt::format(" and the out-of-range word 0x{:08x}", view.bad_word)
+				             : std::string()));
+			}
+		}
+		if (ok) {
+			BdaGuard::Use(address);
+			continue;
+		}
+		if (!copied) {
+			patched.assign(flat.begin(), flat.end());
+			copied = true;
+		}
+		const auto null_slots = context.GetImageHeap().GuardNullSlots();
+		patched[offset]       = 0u;
+		patched[offset + 1u]  = static_cast<uint32_t>(null_slots);
+		patched[offset + 2u]  = static_cast<uint32_t>(null_slots >> 32u);
+	}
+	return copied ? std::span<const uint32_t>(patched) : std::span<const uint32_t>(flat);
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {
 		return;
@@ -819,7 +882,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	ShaderRecompiler::IR::PackBufferRuntimeStrides(program.info.buffers, layout, snapshot,
 	                                               prepared.shader_data);
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (BdaGuard::Mode() != 0) {
+			prepared.flattened_srt = NativeUpload(m_context, GuardHeapSlots(m_context, program, snapshot));
+		} else {
+			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
@@ -963,6 +1030,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			LOGF("CommitBindings: the command buffer was submitted while bindings were committed; "
 			     "state recorded for this draw before them is lost\n");
 		}
+		BdaGuard::Report("the command buffer was submitted inside CommitBindings");
 	}
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();

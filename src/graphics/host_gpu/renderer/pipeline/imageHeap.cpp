@@ -7,6 +7,7 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/bdaGuard.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -16,6 +17,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <fmt/format.h>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -718,6 +720,13 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		// of their own.
 		auto&         stream = m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 		const Buffer* source = &stream;
+		if (BdaGuard::Mode() != 0 && slots.size_bytes() >= (1u << 20u)) {
+			BdaGuard::Note(fmt::format("heap slot upload of {} bytes at tick {}, stream position {} "
+			                           "MiB of a {} MiB ring",
+			                           slots.size_bytes(),
+			                           m_context.GetCommandScheduler().CurrentTick(),
+			                           stream.Position() >> 20u, stream.Size() >> 20u));
+		}
 		// KYTY_HEAP_UPLOAD_WAIT=1 restores the waiting upload, only to show the test failing.
 		static const bool wait = [] {
 			const char* value = std::getenv("KYTY_HEAP_UPLOAD_WAIT");
@@ -729,6 +738,19 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			stream.Commit();
 		} else {
 			auto& scheduler = m_context.GetCommandScheduler();
+			if (BdaGuard::Mode() != 0) {
+				const auto tick = scheduler.CurrentTick();
+				BdaGuard::Report(fmt::format(
+				    "heap slot upload of {} bytes found the stream ring full at tick {} ({}); "
+				    "waiting here {} the command buffer under the draw being recorded",
+				    slots.size_bytes(), tick,
+				    slots.size_bytes() > stream.Size() ? "larger than the ring"
+				    : scheduler.IsFree(tick - 1u)      ? "its space belongs to this tick"
+				                                       : "its space belongs to this or a pending tick",
+				    slots.size_bytes() > stream.Size() ? "would have stopped the emulator instead of submitting"
+				    : scheduler.IsFree(tick - 1u)      ? "submitted"
+				                                       : "could have submitted"));
+			}
 			auto temporary = std::make_unique<Buffer>(
 			    m_context.GetGraphics(), scheduler, MemoryUsage::Upload, 0,
 			    vk::BufferUsageFlagBits::eTransferSrc, slots.size_bytes());
@@ -780,6 +802,43 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 	});
 	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
 	                                   nullptr);
+}
+
+ImageHeap::GuardView ImageHeap::GuardFind(uint64_t slots) const {
+	GuardView result;
+	for (const auto& memory: m_memories) {
+		for (const auto& view: memory->views) {
+			if (view->buffer == nullptr || view->buffer->BufferDeviceAddress() != slots) continue;
+			result.found      = true;
+			result.kinds      = static_cast<uint32_t>(view->kind_keys.size());
+			result.slot_count = static_cast<uint32_t>(view->slots.size() - 1u);
+			// The words not uploaded yet; the others were checked before their upload.
+			for (auto slot = view->dirty_begin; slot < view->dirty_end; ++slot) {
+				const auto word = view->slots[slot];
+				const auto arm  = word >> IR::ImageHeapKindShift;
+				if ((word & ElementMask) >= m_elements.size() ||
+				    (word != 0u && arm >= view->kind_keys.size())) {
+					result.bad      = true;
+					result.bad_word = word;
+					break;
+				}
+			}
+			return result;
+		}
+	}
+	return result;
+}
+
+uint64_t ImageHeap::GuardNullSlots() {
+	if (m_guard_null == nullptr) {
+		m_guard_null = std::make_unique<Buffer>(
+		    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::Upload, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    4096);
+		std::ranges::fill(m_guard_null->Mapped(), uint8_t {0});
+		m_guard_null->Flush(0, m_guard_null->Size());
+	}
+	return m_guard_null->BufferDeviceAddress();
 }
 
 void ImageHeap::UnmapMemory(uint64_t address, uint64_t size) {

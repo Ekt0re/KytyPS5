@@ -58,6 +58,19 @@ public:
 	// At a suspend point.
 	void RunGarbageCollector();
 
+	// KYTY_BDA_GUARD: what the view whose slot words live at `slots` (the device address Acquire
+	// returned) looks like now, to check it against the words a program is about to be given.
+	struct GuardView {
+		bool     found      = false;
+		uint32_t kinds      = 0; // Arms the view's slot words select among.
+		uint32_t slot_count = 0;
+		uint32_t bad_word   = 0; // A slot word whose kind or element is out of range, if any.
+		bool     bad        = false;
+	};
+	[[nodiscard]] GuardView GuardFind(uint64_t slots) const;
+	// A zeroed slot buffer: every key selects the null image.
+	[[nodiscard]] uint64_t GuardNullSlots();
+
 private:
 	using DescriptorValue = ShaderRecompiler::IR::DescriptorValue;
 	using ImageResource   = ShaderRecompiler::IR::ImageResource;
@@ -185,6 +198,7 @@ private:
 	vk::DescriptorSetLayout                           m_layout = nullptr;
 	vk::DescriptorPool                                m_pool   = nullptr;
 	vk::DescriptorSet                                 m_set    = nullptr;
+	std::unique_ptr<Buffer>                           m_guard_null; // KYTY_BDA_GUARD only.
 
 	friend struct ImageHeapTestAccess;
 };

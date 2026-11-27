@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include "graphics/host_gpu/renderer/bdaGuard.h"
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -108,6 +110,7 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		BdaGuard::OnCreate(m_device_address, size, cpu_address);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
@@ -121,6 +124,12 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 
 Buffer::~Buffer() {
 	if (m_buffer != nullptr) {
+		// KYTY_BDA_GUARD=2 keeps the buffer until the GPU completed the work recorded so far.
+		if (m_device_address != 0 &&
+		    BdaGuard::OnDestroy(m_device_address, m_graphics->allocator,
+		                        static_cast<VkBuffer>(m_buffer), m_allocation)) {
+			return;
+		}
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

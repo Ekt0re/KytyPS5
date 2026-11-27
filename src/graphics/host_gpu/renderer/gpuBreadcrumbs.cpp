@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 
 #include "common/logging/log.h"
+#include "graphics/host_gpu/renderer/bdaGuard.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -102,6 +103,18 @@ void End(GraphicContext& graphics, vk::CommandBuffer command, uint32_t id) {
 	command.writeBufferMarkerAMD(vk::PipelineStageFlagBits::eBottomOfPipe, g_buffer, 4, id);
 }
 
+uint32_t Recorded() {
+	return g_next.load(std::memory_order_relaxed);
+}
+
+uint32_t Completed() {
+	return g_markers != nullptr ? g_markers[1] : 0u;
+}
+
+bool Available() {
+	return g_markers != nullptr;
+}
+
 void ReportDeviceLost(GraphicContext& graphics, const char* where) {
 	std::string text = fmt::format("GPU device lost ({})\n", where);
 	if (g_markers != nullptr) {
@@ -146,6 +159,9 @@ void ReportDeviceLost(GraphicContext& graphics, const char* where) {
 					text += fmt::format("  address type {} 0x{:016x} (precision {})\n",
 					                    static_cast<int>(address.addressType),
 					                    address.reportedAddress, address.addressPrecision);
+					// The driver sign-extends the 48-bit GPU address.
+					text += BdaGuard::Describe(address.reportedAddress & 0xffffffffffffull,
+					                           address.addressPrecision);
 				}
 				for (const auto& vendor: vendors) {
 					text += fmt::format("  vendor 0x{:x} data 0x{:x}: {}\n", vendor.vendorFaultCode,

@@ -24,6 +24,12 @@ namespace GpuBreadcrumbs {
 // Records the completion marker of the work Begin numbered.
 void End(GraphicContext& graphics, vk::CommandBuffer command, uint32_t id);
 
+// The number of the last recorded draw or dispatch, and of the last one the GPU completed (both 0
+// while disabled). Completed() reads the host-visible marker, so it trails the GPU by nothing.
+[[nodiscard]] uint32_t Recorded();
+[[nodiscard]] uint32_t Completed();
+[[nodiscard]] bool     Available();
+
 // Prints what the GPU was running; call before exiting on VK_ERROR_DEVICE_LOST.
 void ReportDeviceLost(GraphicContext& graphics, const char* where);
 
