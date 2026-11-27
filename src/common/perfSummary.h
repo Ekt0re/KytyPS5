@@ -2,6 +2,7 @@
 #define KYTY_COMMON_PERF_SUMMARY_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 // KYTY_PERF_SUMMARY=1: a work-based performance summary on stdout, one "PerfSummary ..." line
@@ -35,6 +36,18 @@ enum class Counter {
 	DepthRecreates, // Depth images replaced by one of another format, layout or binding kind.
 	ImageBarriers,     // Image memory barriers of cached images (Image::GetBarriers).
 	LayoutTransitions, // Those that change the layout.
+	// Synchronous buffer readbacks (BufferCache::ReadMemory on the GPU thread), per phase.
+	RbCalls,      // ReadMemory requests the GPU thread ran.
+	RbBatches,    // Synchronous downloads (one or more buffers copied in one go).
+	RbSubmits,    // Queue submissions a synchronous download made (its copy, flushes).
+	RbFused,      // Downloads whose copy went into the same queue submission as the open work.
+	RbExtraBufs,  // Buffers a batch copied besides the one the request was for.
+	RbNeighbour,  // Downloads of a window next to one of the last 8 downloaded (prefetch potential).
+	RbHandlerUs,  // Microseconds in ReadMemory on the GPU thread (all phases).
+	RbFlushUs,    // ... submitting the open command buffer (a detached download's flush).
+	RbSubmitUs,   // ... recording and submitting the copy.
+	RbWaitUs,     // ... waiting for the copy (fence, tick and earlier publications).
+	RbCopyUs,     // ... copying the bytes into guest memory.
 	Count
 };
 
@@ -48,6 +61,34 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 		Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
 	}
 }
+
+[[nodiscard]] inline bool Enabled() noexcept {
+	return Detail::g_enabled.load(std::memory_order_relaxed);
+}
+
+// Adds the microseconds of its lifetime to `counter` (no clock read while the summary is off).
+class ScopedMicros {
+public:
+	explicit ScopedMicros(Counter counter) noexcept: m_counter(counter), m_on(Enabled()) {
+		if (m_on) {
+			m_start = std::chrono::steady_clock::now();
+		}
+	}
+	~ScopedMicros() {
+		if (m_on) {
+			Add(m_counter, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                         std::chrono::steady_clock::now() - m_start)
+			                                         .count()));
+		}
+	}
+	ScopedMicros(const ScopedMicros&)            = delete;
+	ScopedMicros& operator=(const ScopedMicros&) = delete;
+
+private:
+	Counter                               m_counter;
+	bool                                  m_on;
+	std::chrono::steady_clock::time_point m_start {};
+};
 
 // Reads KYTY_PERF_SUMMARY and starts the reporter. Safe to call more than once.
 void Start();

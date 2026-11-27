@@ -9,9 +9,11 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/readbackBatch.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -203,6 +205,31 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// One buffer's ranges of a download, packed into the download buffer at dstOffset.
+	struct DownloadPart {
+		Buffer*                     buffer;
+		uint64_t                    buffer_address;
+		std::vector<vk::BufferCopy> copies;
+	};
+	// Takes the GPU-modified ranges of [vaddr, vaddr + size) out of the dirty set into a new part
+	// (false when there is none). Not for zero-copy buffers.
+	[[nodiscard]] bool CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                   std::vector<DownloadPart>& parts, uint64_t& total_size);
+	// Copies the parts to the host in one command sequence and publishes them into guest memory:
+	// synchronously (before returning) or, `async`, at the tick's completion. `fuse`: a detached
+	// copy goes into the same submission as the open command buffer.
+	template <bool async>
+	void DownloadParts(std::vector<DownloadPart>& parts, uint64_t total_size, bool fuse);
+	// KYTY_BATCH_READBACK=1 or toggle batch_readback (re-read 4x per second): one synchronous
+	// download copies every buffer of the access's window, in the open command buffer's
+	// submission when it can run detached.
+	[[nodiscard]] bool BatchReadback();
+	// The batched download of a CPU access at [vaddr, vaddr + size) in buffer `first_id`, whose
+	// own window is `first_window`: that window and the GPU-written bytes of every other
+	// non-zero-copy buffer in the access's aligned window, in one copy sequence, then all those
+	// windows are returned to the CPU. True when the first buffer had bytes to copy.
+	[[nodiscard]] bool DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_t size,
+	                                       ReadbackBatch::Range first_window);
 	// GPU writes recorded in the current command buffer, or bound and not recorded yet. A
 	// synchronous download of ranges without such writes reads them in a detached submission
 	// behind the submitted work, without flushing the current command buffer.
@@ -254,6 +281,13 @@ private:
 	bool                                              m_address_writes_pending = false;
 	enum class DetachedReadback { Off, Submit, NoSubmit };
 	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;
+	// KYTY_BATCH_READBACK (default 0), overridden by the batch_readback toggle when present.
+	bool                                              m_batch_readback_env = false;
+	bool                                              m_batch_readback     = false;
+	std::chrono::steady_clock::time_point             m_batch_readback_next {};
+	// KYTY_BATCH_READBACK_PREFETCH=KiB: a batch also copies this much on both sides of the window.
+	uint64_t                                          m_batch_prefetch = 0;
+	ReadbackBatch::NeighbourHistory                   m_readback_neighbours;
 	// Statistics only (KYTY_SYNC_STATS): bytes last downloaded, and hashes of uploaded pages.
 	RangeSet                                          m_stats_downloaded;
 	std::unordered_map<uint64_t, uint64_t>            m_stats_upload_hashes;

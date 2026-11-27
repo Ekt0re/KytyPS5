@@ -36,6 +36,20 @@ public:
 		record(BeginDetached());
 		EndDetached();
 	}
+	// Like SubmitDetached followed by Flush, in ONE queue submission: the detached commands go
+	// first in it, the open command buffer after them, and only the detached commands are waited
+	// for (a timeline semaphore of their own). A new command buffer begins. False, with nothing
+	// recorded, when that cannot be done (the command recorder submits on its own thread).
+	template <typename Record>
+	bool SubmitDetachedWithCurrent(Record&& record) {
+		if (!CanSubmitDetachedWithCurrent()) {
+			return false;
+		}
+		record(BeginDetached());
+		EndDetachedWithCurrent();
+		return true;
+	}
+	[[nodiscard]] bool CanSubmitDetachedWithCurrent() const;
 	// Moves recording to a new command buffer. `tail` records what is left of the current one when
 	// the commands are submitted, so a draw can wait there for its pipeline while this thread goes
 	// on. The tail ends the rendering if it is open.
@@ -96,6 +110,14 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	// Detached commands submitted in the same vkQueueSubmit as the open command buffer, ahead of
+	// it, signalling `semaphore` to `value`.
+	struct DetachedPrefix {
+		vk::CommandBuffer buffer;
+		vk::Semaphore     semaphore;
+		uint64_t          value;
+	};
+
 	struct Segment {
 		vk::CommandBuffer                               buffer;
 		Common::UniqueFunction<void, vk::CommandBuffer> tail;
@@ -104,6 +126,8 @@ private:
 	void              BeginNext();
 	vk::CommandBuffer BeginDetached();
 	void              EndDetached();
+	void              EndDetachedWithCurrent();
+	uint64_t          SubmitWith(SubmitInfo submit, const DetachedPrefix* prefix);
 	void PriorityOperationsThread(std::stop_token stop);
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void SealReleasesLocked();
@@ -113,6 +137,8 @@ private:
 	vk::CommandPool              m_detached_pool    = nullptr;
 	vk::CommandBuffer            m_detached_command = nullptr;
 	vk::Fence                    m_detached_fence   = nullptr;
+	vk::Semaphore                m_detached_timeline = nullptr;
+	uint64_t                     m_detached_value    = 0;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
