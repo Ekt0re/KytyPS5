@@ -525,6 +525,7 @@ target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
 
 add_executable(shader_store_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderStoreTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderStoreLock.cpp"
 )
 target_include_directories(shader_store_tests PRIVATE ${inc_headers})

@@ -85,8 +85,12 @@ static void PrintUsage() {
 	::printf("  --precompile-threads <num>           Threads of --precompile-shaders. Default: all.\n");
 	::printf("  --restamp-shader-store               With --game: check a shader store written under\n"
 	         "                                       another KYTY_SHADER_CACHE_STAMP by translating its\n"
-	         "                                       shaders again, and give it the current stamp if\n"
-	         "                                       none changed. Exit code 4: refused.\n");
+	         "                                       shaders again, keep those that came out the same\n"
+	         "                                       under the current stamp and drop the others.\n"
+	         "                                       Exit code 4: nothing could be kept.\n");
+	::printf("  --restamp-strict                     With --restamp-shader-store: all or nothing; the\n"
+	         "                                       store gets the current stamp only if no shader\n"
+	         "                                       changed. Exit code 4: refused.\n");
 	::printf("  --restamp-sample <num>               Shaders --restamp-shader-store translates.\n"
 	         "                                       Default: 0, all of them.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
@@ -229,6 +233,7 @@ static constexpr Flag FLAGS[] = {
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
     {"--precompile-shaders", &ConfigOptions::precompile_shaders},
     {"--restamp-shader-store", &ConfigOptions::restamp_shader_store},
+    {"--restamp-strict", &ConfigOptions::restamp_strict},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},

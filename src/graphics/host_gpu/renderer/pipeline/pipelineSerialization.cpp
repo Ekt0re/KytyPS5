@@ -260,6 +260,14 @@ bool PrecompileMode() {
 // --restamp-shader-store: the store of another stamp is checked against this translator.
 std::atomic<bool>   g_restamp_mode {false};
 std::atomic<size_t> g_restamp_sample {0};
+// --restamp-strict: all or nothing, as before partial carry-over existed.
+std::atomic<bool>   g_restamp_strict {false};
+
+// Whether Restamp() keeps what it verified and drops the rest (with a sample, the modules it
+// leaves out are dropped as well).
+bool PartialRestamp() {
+	return !g_restamp_strict.load(std::memory_order_relaxed);
+}
 
 bool RestampMode() {
 	return g_restamp_mode.load(std::memory_order_relaxed);
@@ -363,6 +371,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		m_restamp_store = store_data;
 		m_restamp_path  = path;
 		m_restamp_stamp.assign(header.begin(), header.begin() + StampBytes);
+		m_restamp_header = header;
 	}
 	if (reusable) {
 		records = records.subspan(header.size());
@@ -391,6 +400,29 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		for (; kept < loaded.size() && loaded[kept].ok; kept++) {
 			if (loaded[kept].module.stored != nullptr) {
 				stored.push_back(loaded[kept].module.stored);
+			}
+			if (RestampMode()) {
+				// What a partial restamp keeps or drops, record by record.
+				RestampRecord record;
+				switch (static_cast<Record>(loaded[kept].type)) {
+					case Record::Module: {
+						record.type      = RestampRecord::Type::Module;
+						record.module_id = loaded[kept].module.id;
+						Writer key;
+						IoKey(key, loaded[kept].key);
+						record.program = XXH3_64bits(key.bytes.data(), key.bytes.size());
+						break;
+					}
+					case Record::GraphicsPipeline:
+						record.type      = RestampRecord::Type::GraphicsPipeline;
+						record.stage_ids = loaded[kept].pipeline_key.stage_ids;
+						break;
+					case Record::TessellationLayout:
+						record.type = RestampRecord::Type::TessellationLayout;
+						break;
+				}
+				m_restamp_records.push_back(record);
+				m_restamp_frames.push_back(frames[kept]);
 			}
 			InsertRecord(std::move(loaded[kept]));
 			records = records.subspan(frames[kept].size());
@@ -449,7 +481,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		}
 	}
 	const bool sync = SyncWarmUp();
-	if (sync) {
+	if (RestampMode()) {
+		// Nothing is created: a restamp only compares modules.
+	} else if (sync) {
 		std::vector<Common::UniqueFunction<void>> jobs;
 		jobs.reserve(graphics.size() + compute.size());
 		for (const auto& [key, stages]: graphics) {
@@ -1183,6 +1217,11 @@ void PipelineCache::VerifyRecipe(RecipeJob& job) {
 		const bool     usable = TranslateRecipe(job, replayed);
 		const auto     stored = m_restamp_modules.find(job.id);
 		bool           same   = false;
+		// The record as StoreModule would write it, apart from the resource plan: program key,
+		// module fields and SPIR-V. And the plan on its own (SelectRestampRecords says when it
+		// matters).
+		bool           module_same = false;
+		bool           plan_same   = false;
 		if (usable && replayed.module.id == job.id && stored != m_restamp_modules.end() &&
 		    stored->second->stored != nullptr &&
 		    stored->second->stored->spirv_words == replayed.spirv.size()) {
@@ -1190,18 +1229,51 @@ void PipelineCache::VerifyRecipe(RecipeJob& job) {
 			const auto  raw    = DecompressStored(record);
 			same = std::memcmp(raw.data() + record.spirv_offset, replayed.spirv.data(),
 			                   replayed.spirv.size() * sizeof(uint32_t)) == 0;
+			if (same) {
+				Writer head;
+				IoAll(head, Record::Module);
+				IoKey(head, job.key);
+				Writer plan;
+				IoAll(plan, ShaderRecompiler::IR::SaveResourcePlan(replayed.plan));
+				Writer fields;
+				IoModule(fields, replayed.module);
+				// The stored record's parts: [head][plan count, plan][fields][SPIR-V count, SPIR-V].
+				const size_t plan_begin = record.plan_offset - sizeof(uint32_t);
+				const size_t plan_end   = size_t {record.plan_offset} + record.plan_size;
+				const size_t spirv_head = record.spirv_offset - sizeof(uint32_t);
+				const auto   part_equal = [&](size_t begin, size_t end,
+				                            const std::vector<uint8_t>& bytes) {
+					return begin <= end && end <= raw.size() && end - begin == bytes.size() &&
+					       std::memcmp(raw.data() + begin, bytes.data(), bytes.size()) == 0;
+				};
+				module_same = part_equal(0, plan_begin, head.bytes) &&
+				              part_equal(plan_end, spirv_head, fields.bytes);
+				plan_same   = module_same && part_equal(plan_begin, plan_end, plan.bytes);
+			}
 		}
 		std::scoped_lock lock(m_replay_mutex);
 		m_restamp_verified++;
-		if (!same) {
-			m_restamp_differing++;
+		if (module_same) {
+			m_restamp_identical.insert(job.id);
+			if (plan_same) {
+				m_restamp_plan_identical.insert(job.id);
+			} else {
+				m_restamp_plan_differing++;
+			}
+		} else if (same) {
+			m_restamp_spirv_only++;
+		}
+		if (!usable) m_restamp_failed++;
+		if (!same || (!module_same && PartialRestamp())) {
+			if (!same) m_restamp_differing++;
 			if (m_replay_failures.size() < 16) {
 				m_replay_failures.push_back(fmt::format(
 				    "{} 0x{:016x} module 0x{:016x}: {}", ShaderRecompiler::StageName(job.key.stage),
 				    job.key.hash, job.id,
 				    !usable                          ? "translation failed"
 				    : replayed.module.id != job.id ? "another module id"
-				                                     : "other SPIR-V"));
+				    : !same                          ? "other SPIR-V"
+				                                     : "same SPIR-V, other module fields"));
 			}
 		}
 	}
@@ -1434,10 +1506,11 @@ bool PipelineCache::Precompile() {
 	return !interrupted && failed == 0 && dropped == 0;
 }
 
-void PipelineCache::SetRestampMode(size_t sample) {
+void PipelineCache::SetRestampMode(size_t sample, bool strict) {
 	g_precompile_mode = true;
 	g_restamp_mode    = true;
 	g_restamp_sample  = sample;
+	g_restamp_strict  = strict;
 }
 
 int PipelineCache::Restamp() {
@@ -1461,9 +1534,11 @@ int PipelineCache::Restamp() {
 	const auto interrupt     = [](int) { g_precompile_interrupted = 1; };
 	std::signal(SIGINT, interrupt);
 	std::signal(SIGTERM, interrupt);
+	const bool partial = PartialRestamp();
 	Log::WriteToConsoleAndLog(fmt::format(
-	    "Shader restamp: translating {} of {} stored modules again to compare, {} threads\n",
-	    m_replay_total, m_restamp_stored, Common::ParallelThreads()));
+	    "Shader restamp: translating {} of {} stored modules again to compare, {} threads, {}\n",
+	    m_replay_total, m_restamp_stored, Common::ParallelThreads(),
+	    partial ? "partial (keeps the identical ones)" : "strict (all or nothing)"));
 	auto next_report = start + std::chrono::seconds {5};
 	while (m_replay_left != 0 && g_precompile_interrupted == 0) {
 		if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
@@ -1485,6 +1560,9 @@ int PipelineCache::Restamp() {
 	PipelineBinaryStore::Get().Close();
 	for (const auto& failure: m_replay_failures) {
 		Log::WriteToConsoleAndLog(fmt::format("Shader restamp: differs: {}\n", failure));
+	}
+	if (partial) {
+		return RestampPartial(start, interrupted);
 	}
 	// With every module asked for, one without a recipe cannot be vouched for either.
 	const bool all     = g_restamp_sample == 0;
@@ -1510,6 +1588,77 @@ int PipelineCache::Restamp() {
 	    MillisecondsSince(start) / 1000.0, m_restamp_verified, m_restamp_stored,
 	    m_restamp_differing, m_restamp_uncovered));
 	return interrupted ? 1 : refused ? 4 : written ? 0 : 1;
+}
+
+int PipelineCache::RestampPartial(std::chrono::steady_clock::time_point start, bool interrupted) {
+	if (interrupted) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader restamp: interrupted, store left as it was, in {:.1f} s\n",
+		    MillisecondsSince(start) / 1000.0));
+		return 1;
+	}
+	const auto selection =
+	    SelectRestampRecords(m_restamp_records, m_restamp_identical, m_restamp_plan_identical);
+	const auto dropped   = static_cast<size_t>(std::ranges::count(selection.keep, false));
+	bool       written   = false;
+	const char* outcome  = nullptr;
+	if (selection.modules_kept == 0) {
+		outcome = "refused (nothing to keep), store left as it was";
+	} else if (dropped == 0) {
+		// Everything verified: only the stamp changes, in place.
+		if (Common::File file; file.Open(m_restamp_path, Common::File::Mode::ReadWrite)) {
+			uint32_t count = 0;
+			file.Seek(0);
+			file.Write(m_restamp_stamp.data(), static_cast<uint32_t>(m_restamp_stamp.size()),
+			           &count);
+			written = count == m_restamp_stamp.size() && file.Flush();
+		}
+		outcome = written ? "done, every record kept, the store now has this stamp"
+		                  : "failed to write the store";
+	} else {
+		// The kept records under this build's header, written beside the store and moved over it.
+		// The lock stays held until the process ends, so no other writer opens the old file.
+		m_store.CloseFile();
+		auto temp = m_restamp_path;
+		temp += ".restamp";
+		if (Common::File file; file.Create(temp)) {
+			const auto write = [&](std::span<const uint8_t> bytes) {
+				uint32_t count = 0;
+				file.Write(bytes.data(), static_cast<uint32_t>(bytes.size()), &count);
+				return count == bytes.size();
+			};
+			written = write(m_restamp_header);
+			for (size_t i = 0; written && i < m_restamp_frames.size(); i++) {
+				if (selection.keep[i]) written = write(m_restamp_frames[i]);
+			}
+			written = written && file.Flush();
+			file.Close();
+		}
+		std::error_code error;
+		if (written) {
+			std::filesystem::rename(temp, m_restamp_path, error);
+			written = !error;
+		}
+		if (!written) std::filesystem::remove(temp, error);
+		outcome = written ? "done, the store now has this stamp" : "failed to write the store";
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader restamp: {} in {:.1f} s: {} of {} stored modules translated again; modules: {} "
+	    "kept, {} dropped ({} other SPIR-V, {} same SPIR-V but other module fields, {} failed to "
+	    "translate, {} have no recipe, {} not translated (sample), {} duplicate records, {} give "
+	    "their program a plan this build extracts differently; {} kept records carry another plan "
+	    "that no load reads); pipelines: {} kept, {} dropped; {} tessellation layouts dropped\n",
+	    outcome, MillisecondsSince(start) / 1000.0, m_restamp_verified, m_restamp_stored,
+	    selection.modules_kept,
+	    selection.modules_dropped + selection.modules_duplicate + selection.modules_plan_dropped,
+	    m_restamp_differing - m_restamp_failed, m_restamp_spirv_only, m_restamp_failed,
+	    m_restamp_uncovered,
+	    m_restamp_stored - m_restamp_uncovered - std::min(m_restamp_verified, m_restamp_stored - m_restamp_uncovered),
+	    selection.modules_duplicate, selection.modules_plan_dropped,
+	    m_restamp_plan_differing - std::min(m_restamp_plan_differing, selection.modules_plan_dropped),
+	    selection.pipelines_kept,
+	    selection.pipelines_dropped, selection.layouts_dropped));
+	return selection.modules_kept == 0 ? 4 : written ? 0 : 1;
 }
 
 void PipelineCache::RecordRecipe(const ProgramKey& key, const ShaderParams& params,

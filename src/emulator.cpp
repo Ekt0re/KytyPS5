@@ -181,7 +181,7 @@ int RunPrecompile(const RunOptions& options) {
 	// Before the renderer starts its workers.
 	Common::g_parallel_threads_override = threads;
 	if (config.restamp_shader_store) {
-		Libs::Graphics::PipelineCache::SetRestampMode(config.restamp_sample);
+		Libs::Graphics::PipelineCache::SetRestampMode(config.restamp_sample, config.restamp_strict);
 	} else {
 		Libs::Graphics::PipelineCache::SetPrecompileMode();
 	}

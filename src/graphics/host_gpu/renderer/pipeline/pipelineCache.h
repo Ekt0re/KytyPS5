@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -223,6 +224,16 @@ public:
 	void Post(Common::UniqueFunction<void>&& job);
 	// Runs the queued jobs and stops the thread; jobs posted later never run. Safe to call again.
 	void Finish() { m_thread = {}; }
+	// Finish(), then closes the file; the lock stays held (the file may be replaced meanwhile).
+	void CloseFile() {
+		Finish();
+		m_file.Close();
+	}
+	// CloseFile(), then releases the lock.
+	void Close() {
+		CloseFile();
+		m_lock.Release();
+	}
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -314,11 +325,15 @@ public:
 	bool Precompile();
 	// --restamp-shader-store, set before the cache exists: a store written under another stamp
 	// is loaded if it agrees in everything else, and `sample` of its modules (0: all) are
-	// translated again from their recipes.
-	static void SetRestampMode(size_t sample);
-	// With SetRestampMode: gives the store this build's stamp if every module translated again
-	// has the stored SPIR-V, and leaves it alone otherwise. 0 done, 4 refused, 1 interrupted or
-	// failed.
+	// translated again from their recipes. `strict` (and any sample) keeps the all-or-nothing
+	// check; otherwise the carry-over is partial.
+	static void SetRestampMode(size_t sample, bool strict = false);
+	// With SetRestampMode. Strict: gives the store this build's stamp if every module translated
+	// again has the stored SPIR-V, and leaves it alone otherwise. Partial (the default): rewrites
+	// the store under this build's stamp with only the module records this build translates to
+	// exactly the stored record (SPIR-V, resource plan and module fields), and the pipelines whose
+	// stages all stayed; the rest is dropped and comes back from the recipes. 0 done, 4 refused
+	// (partial: nothing could be kept), 1 interrupted or failed.
 	int Restamp();
 
 	struct Pipeline {
@@ -531,6 +546,17 @@ private:
 	size_t                                      m_restamp_uncovered = 0;
 	size_t                                      m_restamp_verified  = 0;
 	size_t                                      m_restamp_differing = 0;
+	size_t                                      m_restamp_failed    = 0;
+	// Partial restamp: the module ids whose record this build reproduced apart from the plan, those
+	// whose plan matched too, the count whose SPIR-V matched but not the module fields, the store's
+	// records in order (their frames in m_restamp_store) and this build's store header.
+	std::unordered_set<uint64_t>                m_restamp_identical;
+	size_t                                      m_restamp_spirv_only = 0;
+	std::unordered_set<uint64_t>                m_restamp_plan_identical;
+	size_t                                      m_restamp_plan_differing = 0;
+	std::vector<RestampRecord>                  m_restamp_records;
+	std::vector<std::span<const uint8_t>>       m_restamp_frames;
+	std::vector<uint8_t>                        m_restamp_header;
 	std::chrono::steady_clock::time_point       m_replay_start;
 	// Decode the store's records not asked for yet, in store order, at low priority.
 	struct StoreDecoders;
@@ -610,6 +636,8 @@ private:
 	bool TranslateRecipe(RecipeJob& job, ReplayedModule& replayed);
 	// Restamp(): compares the translation with the stored module of the recipe's id.
 	void VerifyRecipe(RecipeJob& job);
+	// Restamp() in partial mode, once every comparison is done.
+	int RestampPartial(std::chrono::steady_clock::time_point start, bool interrupted);
 	// On the command thread: adds the modules translated from recipes, then creates the recipes'
 	// pipelines whose stages all exist, in the background.
 	void MergeReplayed();

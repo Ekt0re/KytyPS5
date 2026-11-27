@@ -97,6 +97,9 @@ struct ConfigOptions {
 	bool                   restamp_shader_store        = false;
 	// --restamp-sample: how many modules that check translates; 0 is all of them.
 	uint32_t               restamp_sample              = 0;
+	// --restamp-strict: that check gives the stamp only if every module is unchanged, and leaves
+	// the store alone otherwise. Without it the unchanged modules are kept and the rest dropped.
+	bool                   restamp_strict              = false;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
