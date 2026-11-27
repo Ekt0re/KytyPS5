@@ -6,6 +6,8 @@
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/skipCatchUp.h"
+#include "graphics/host_gpu/renderer/pipeline/skipTaint.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/upscaler/upscaler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -208,6 +210,22 @@ private:
 	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
 	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
 
+	// One skipped dispatch, kept so it can be replayed when its program becomes available.
+	struct CapturedDispatch {
+		HW::ComputeShaderInfo cs_regs {};
+		uint32_t              groups[3]     = {0, 0, 0};
+		uint32_t              mode          = 0;
+		bool                  async_compute = false;
+		uint64_t              args_addr     = 0;
+		bool                  is_indirect   = false;
+	};
+
+	// KYTY_SKIP_TAINT: taint what a skipped dispatch would have written and queue its replay.
+	static uint64_t DispatchKey(const CapturedDispatch& dispatch);
+	void NoteSkippedDispatch(const CapturedDispatch& dispatch,
+	                         const std::vector<SkipTaint::Use>& uses);
+	void DrainSkippedDispatches(CommandBuffer& buffer);
+
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
 		PreparedBindings                pixel;
@@ -270,6 +288,10 @@ private:
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
+	// KYTY_SKIP_TAINT: outputs of skipped dispatches and the work held for catch-up replay.
+	SkipTaint                                  m_skip_taint;
+	SkipCatchUp::Queue<CapturedDispatch>       m_skip_catchup;
+	bool                                       m_replaying_catchup = false;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
 	std::array<MipStatsCounter, 256>      m_mip_stats {};
 

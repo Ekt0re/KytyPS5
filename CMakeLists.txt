@@ -558,6 +558,9 @@ add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(slot_vector_tests PRIVATE ${inc_headers})
 
+add_executable(skip_taint_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SkipTaintTests.cpp")
+target_include_directories(skip_taint_tests PRIVATE ${inc_headers})
+
 add_executable(common_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommonTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(common_tests common kyty_test_gtest)
@@ -895,6 +898,7 @@ if(BUILD_TESTING)
 	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)
+	add_test(NAME skip_taint COMMAND $<TARGET_FILE:skip_taint_tests>)
 	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME draw_indirect_count COMMAND $<TARGET_FILE:draw_indirect_count_tests>)
@@ -1053,6 +1057,7 @@ if(BUILD_TESTING)
 		driver_cache_file_tests
 		lru_cache_tests
 		readback_batch_tests
+		skip_taint_tests
 		shader_store_tests
 		common_tests
 		draw_indirect_count_tests

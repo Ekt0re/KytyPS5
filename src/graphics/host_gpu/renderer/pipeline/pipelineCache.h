@@ -361,6 +361,10 @@ public:
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
+	// Retries a program previously skipped because translation failed. Only used by the
+	// KYTY_SKIP_TAINT catch-up path; a program with modules is never retried.
+	bool RetryComputeProgram(const HW::ComputeShaderInfo& regs,
+	                         ShaderComputeInputInfo&      input_info);
 
 	// `fast_first`: the draw waits for a new pipeline, so it may be created unoptimized first.
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,

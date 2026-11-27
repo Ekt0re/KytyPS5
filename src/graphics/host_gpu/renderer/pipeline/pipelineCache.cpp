@@ -1825,6 +1825,18 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	return module;
 }
 
+bool PipelineCache::RetryComputeProgram(const HW::ComputeShaderInfo& regs,
+                                        ShaderComputeInputInfo&      input_info) {
+	auto params = PrepareProgram(regs, input_info);
+	// A skipped program holds no modules or pipelines: dropping the marker is enough to try its
+	// translation again. Other programs and stored records are untouched.
+	std::erase_if(m_program_cache, [&](const auto& entry) {
+		return entry.first.stage == ShaderType::Compute && entry.first.hash == params.hash &&
+		       entry.second.skip_dispatch && entry.second.modules.empty();
+	});
+	return GetComputeProgram(regs, input_info) != nullptr;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets,

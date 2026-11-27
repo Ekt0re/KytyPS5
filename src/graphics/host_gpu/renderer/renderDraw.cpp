@@ -38,6 +38,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -1128,6 +1129,28 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
+	// KYTY_SKIP_TAINT: an indirect draw whose records a skipped dispatch was to write reads stale
+	// counts; large counts can launch far more groups than the device supports. The draw writes
+	// nothing tracked, so nothing new becomes tainted.
+	if (SkipTaintEnabled() && !m_skip_taint.Empty() && emit.indirect.address != 0 &&
+	    emit.indirect.count != 0) {
+		const uint64_t record = draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                     : sizeof(vk::DrawIndirectCommand);
+		const uint64_t size =
+		    static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride + record;
+		const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count());
+		if (m_skip_taint.ReadsTainted({{emit.indirect.address, size, true, false}}, now)) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("[skip] indirect draw reads records a skipped dispatch was to write; skipped "
+				     "(tainted ranges=%zu)\n",
+				     m_skip_taint.Size());
+			}
+			return;
+		}
+	}
 	const auto  vertex_stages = state.VertexStages();
 	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
 	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
@@ -1447,6 +1470,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	auto& sh_ctx = buffer.GetShaders();
 
 	Common::LockGuard lock(m_context.GetMutex());
+	DrainSkippedDispatches(buffer);
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
@@ -1538,6 +1562,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	auto& sh_ctx = buffer.GetShaders();
 
 	Common::LockGuard lock(m_context.GetMutex());
+	DrainSkippedDispatches(buffer);
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}

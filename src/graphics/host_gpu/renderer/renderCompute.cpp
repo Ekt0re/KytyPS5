@@ -40,6 +40,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -538,6 +539,146 @@ static void LogAddressWrites(const ShaderStageRuntime& stage, uint32_t x, uint32
 	std::printf("%s\n", text.c_str());
 }
 
+// KYTY_SKIP_TAINT: the guest buffers a compute program names through descriptors, with how it uses
+// them. Memory reached through a pointer the shader computes itself is not listed.
+static std::vector<SkipTaint::Use> ComputeBufferUses(const ShaderStageRuntime& stage) {
+	std::vector<SkipTaint::Use> uses;
+	if (stage.module == nullptr || stage.resources == nullptr) {
+		return uses;
+	}
+	const auto& metadata = stage.module->info.info.buffers;
+	const auto& snapshot = stage.resources->buffers;
+	for (uint32_t i = 0; i < metadata.size() && i < snapshot.size(); i++) {
+		if (metadata[i].descriptor_index == UINT32_MAX) continue;
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot[i]);
+		auto       size       = ShaderRecompiler::IR::BufferBindingSize(metadata[i], descriptor);
+		if (descriptor.NumRecords() == UINT32_MAX) size = std::min<uint64_t>(size, 256u << 20u);
+		if (descriptor.Base48() == 0 || size == 0) continue;
+		uses.push_back({descriptor.Base48(), size, metadata[i].read || !metadata[i].written,
+		                metadata[i].written});
+	}
+	return uses;
+}
+
+static uint64_t SteadyNowMs() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
+uint64_t RenderExecutor::DispatchKey(const CapturedDispatch& dispatch) {
+	uint64_t h = dispatch.cs_regs.cs_regs.data_addr;
+	const auto mix = [&h](uint64_t v) {
+		h ^= v + 0x9e3779b9u + (h << 6u) + (h >> 2u);
+	};
+	mix((uint64_t {dispatch.groups[0]} << 32u) | dispatch.groups[1]);
+	mix((uint64_t {dispatch.groups[2]} << 32u) | dispatch.mode);
+	mix(dispatch.args_addr ^ (uint64_t {dispatch.async_compute ? 1u : 0u} << 1u) ^
+	    uint64_t {dispatch.is_indirect ? 1u : 0u});
+	for (uint32_t i = 0; i < 16u; ++i) {
+		mix(dispatch.cs_regs.cs_user_sgpr.value[i]);
+	}
+	return h;
+}
+
+// Reinstates the captured compute registers on the command buffer for a catch-up replay.
+static void RestoreCs(HW::Shader& shaders, const HW::ComputeShaderInfo& cs) {
+	shaders.SetCsShader(cs.cs_regs);
+	const auto count = std::min<size_t>(cs.cs_regs.user_sgpr, std::size(cs.cs_user_sgpr.value));
+	for (size_t i = 0; i < count; i++) {
+		shaders.SetCsUserSgpr(static_cast<uint32_t>(i), cs.cs_user_sgpr.value[i]);
+	}
+}
+
+void RenderExecutor::NoteSkippedDispatch(const CapturedDispatch& dispatch,
+                                         const std::vector<SkipTaint::Use>& uses) {
+	if (!SkipTaintEnabled() || m_replaying_catchup) {
+		return;
+	}
+	const auto now = SteadyNowMs();
+	m_skip_taint.Taint(uses, now);
+	m_skip_catchup.Enqueue(DispatchKey(dispatch), dispatch.cs_regs.cs_regs.data_addr, uses, dispatch,
+	                       now);
+}
+
+// Probes held dispatches in submission order and replays the ones whose program can now be built.
+// A ready consumer waits behind an earlier held producer that touches the same memory.
+void RenderExecutor::DrainSkippedDispatches(CommandBuffer& buffer) {
+	if (!SkipTaintEnabled() || m_replaying_catchup || m_skip_catchup.Empty()) {
+		return;
+	}
+	m_replaying_catchup = true;
+	const auto now = SteadyNowMs();
+	auto ready = m_skip_catchup.TakeReady(now, [this](const auto& entry) {
+		const auto&            cap   = entry.payload;
+		ShaderComputeInputInfo probe {};
+		probe.async_compute = cap.async_compute;
+		if (cap.is_indirect) {
+			probe.indirect_args_address = cap.args_addr;
+		} else {
+			const bool use_threads =
+			    (cap.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+			probe.dispatch_thread_dimensions = use_threads;
+			for (uint32_t axis = 0; axis < 3u; ++axis) {
+				probe.workgroup_counts[axis] = cap.groups[axis];
+			}
+			if (use_threads) {
+				const uint32_t sizes[3] = {cap.cs_regs.cs_regs.num_thread_x,
+				                          cap.cs_regs.cs_regs.num_thread_y,
+				                          cap.cs_regs.cs_regs.num_thread_z};
+				for (uint32_t axis = 0; axis < 3u; ++axis) {
+					const auto size = std::max(sizes[axis], 1u);
+					probe.workgroup_counts[axis] =
+					    cap.groups[axis] / size + (cap.groups[axis] % size != 0u);
+				}
+			}
+		}
+		return m_context.GetPipelineCache().RetryComputeProgram(cap.cs_regs, probe)
+		           ? SkipCatchUp::ProbeState::Ready
+		           : SkipCatchUp::ProbeState::Pending;
+	});
+	const auto saved_cs = buffer.GetShaders().GetCs();
+	for (const auto& entry: ready) {
+		const auto& cap = entry.payload;
+		RestoreCs(buffer.GetShaders(), cap.cs_regs);
+		if (cap.is_indirect) {
+			DispatchIndirect(buffer, cap.args_addr, cap.mode, cap.async_compute);
+		} else {
+			DispatchDirect(buffer, cap.groups[0], cap.groups[1], cap.groups[2], cap.mode,
+			               cap.async_compute);
+		}
+		m_skip_catchup.DropByKey(entry.key);
+	}
+	RestoreCs(buffer.GetShaders(), saved_cs);
+	m_replaying_catchup = false;
+}
+
+// A dispatch whose inputs are tainted is skipped, and its outputs become tainted in turn. A dispatch
+// that runs clears the taint of what it wrote. `uses` is returned for the catch-up record.
+static bool SkipOnTaintedInput(SkipTaint& taint, const ShaderStageRuntime& stage, uint64_t args_addr,
+                               std::vector<SkipTaint::Use>& uses) {
+	uses = ComputeBufferUses(stage);
+	if (args_addr != 0) {
+		uses.push_back({args_addr, sizeof(vk::DispatchIndirectCommand), true, false});
+	}
+	if (!SkipTaintEnabled() || taint.Empty()) {
+		return false;
+	}
+	const auto now = SteadyNowMs();
+	if (taint.ReadsTainted(uses, now)) {
+		taint.Taint(uses, now);
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("[skip] compute dispatch reads a buffer a skipped dispatch was to write; "
+			     "skipped too (tainted ranges=%zu)\n",
+			     taint.Size());
+		}
+		return true;
+	}
+	taint.ClearWritten(uses);
+	return false;
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -556,6 +697,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	Common::LockGuard lock(m_context.GetMutex());
+	DrainSkippedDispatches(buffer);
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
@@ -581,6 +723,13 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 
 	const auto& cs_regs = sh_ctx.GetCs();
+	CapturedDispatch capture {};
+	capture.cs_regs       = cs_regs;
+	capture.groups[0]     = thread_group_x;
+	capture.groups[1]     = thread_group_y;
+	capture.groups[2]     = thread_group_z;
+	capture.mode          = mode;
+	capture.async_compute = async_compute;
 
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
@@ -600,7 +749,19 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	}
 	m_context.GetImageHeap().BeginDraw();
-	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) {
+		NoteSkippedDispatch(capture, ComputeBufferUses(input_info.stage));
+		return;
+	}
+	std::vector<SkipTaint::Use> uses;
+	if (SkipOnTaintedInput(m_skip_taint, input_info.stage, 0, uses)) {
+		NoteSkippedDispatch(capture, uses);
+		return;
+	}
+	if (!m_replaying_catchup && !m_skip_catchup.Empty()) {
+		m_skip_catchup.DropByKey(DispatchKey(capture));
+		m_skip_catchup.DropSuperseded(uses);
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -815,6 +976,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
 	m_context.GetCommandScheduler().StartOperation();
 	Common::LockGuard lock(m_context.GetMutex());
+	DrainSkippedDispatches(buffer);
 	vk::DispatchIndirectCommand args {};
 	auto&                       cache = m_context.GetBufferCache();
 	if (m_indirect_sequence == 0) {
@@ -869,11 +1031,30 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
+	CapturedDispatch capture {};
+	capture.cs_regs       = cs_regs;
+	capture.mode          = mode;
+	capture.async_compute = async_compute;
+	capture.args_addr     = args_addr;
+	capture.is_indirect   = true;
+
 	ShaderComputeInputInfo input_info {};
 	input_info.async_compute = async_compute;
 	input_info.indirect_args_address = args_addr;
 	m_context.GetImageHeap().BeginDraw();
-	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) return;
+	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) {
+		NoteSkippedDispatch(capture, ComputeBufferUses(input_info.stage));
+		return;
+	}
+	std::vector<SkipTaint::Use> uses;
+	if (SkipOnTaintedInput(m_skip_taint, input_info.stage, args_addr, uses)) {
+		NoteSkippedDispatch(capture, uses);
+		return;
+	}
+	if (!m_replaying_catchup && !m_skip_catchup.Empty()) {
+		m_skip_catchup.DropByKey(DispatchKey(capture));
+		m_skip_catchup.DropSuperseded(uses);
+	}
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, false);
 	auto& bindings = m_compute_bindings;
