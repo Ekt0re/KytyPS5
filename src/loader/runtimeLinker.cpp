@@ -7,6 +7,7 @@
 #include "common/faultReport.h"
 #include "common/file.h"
 #include "common/fpEnv.h"
+#include "common/guestPark.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
@@ -18,6 +19,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
+#include "kernel/guestWait.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "kytyGitVersion.h"
@@ -669,6 +671,24 @@ static bool RageAssertBypassEnabled() {
 	return enabled;
 }
 
+// KYTY_GUEST_FAULT_PARK=1, off by default: an unresolved fault whose pc is inside a guest module
+// parks that guest thread (logging the full crash report with guest code bytes and stack once per
+// pc) instead of ending the process. Faults in emulator/driver code still end the process.
+static bool GuestFaultParkEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_FAULT_PARK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static std::string FormatGuestModuleOffset(RuntimeLinker* rt, uint64_t vaddr) {
+	if (auto* p = rt->FindProgramByAddr(vaddr); p != nullptr) {
+		return fmt::format("{}+0x{:x}", p->file_name.filename().string(), vaddr - p->base_vaddr);
+	}
+	return "not in a loaded module";
+}
+
 static bool TryBypassGuestTrap(const Common::HostException::ExceptionInfo& info) {
 	if (!RageAssertBypassEnabled() ||
 	    info.type != Common::HostException::ExceptionType::AccessViolation) {
@@ -707,7 +727,8 @@ static bool TryBypassGuestTrap(const Common::HostException::ExceptionInfo& info)
 }
 
 // The fault context, also kept in _Logs/crash_<time>.txt (after Axellito/VIKyng bcee3021).
-static void WriteCrashReport(const Common::HostException::ExceptionInfo& exception_info) {
+static void WriteCrashReport(const Common::HostException::ExceptionInfo& exception_info,
+                             bool extended_guest_dump = false) {
 	const auto* info = &exception_info;
 	char thread_name[64] = "(host thread)";
 	if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
@@ -757,6 +778,46 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 			r += fmt::format("{}{:016x}", (i % 4 == 0) ? "\n " : " ", stack[i]);
 		}
 		r += "\n";
+	}
+	if (extended_guest_dump) {
+		auto* rt = Common::Singleton<RuntimeLinker>::Instance();
+		r += fmt::format("guest pc = {}\n", FormatGuestModuleOffset(rt, info->exception_address));
+		constexpr uint64_t SPAN  = 0x400;
+		constexpr uint64_t ROW   = 16;
+		const uint64_t     start = info->exception_address >= SPAN / 2
+		                               ? info->exception_address - SPAN / 2
+		                               : 0;
+		r += fmt::format("guest code (0x{:016x} .. 0x{:016x}, pc at +0x{:x}):\n", start,
+		                 start + SPAN, info->exception_address - start);
+		for (uint64_t row = start; row < start + SPAN; row += ROW) {
+			r += fmt::format(" {:016x}:", row);
+			if (!IsReadableRange(row, ROW)) {
+				r += " not readable\n";
+				continue;
+			}
+			const auto* bytes = reinterpret_cast<const uint8_t*>(row);
+			for (uint64_t i = 0; i < ROW; i++) {
+				r += fmt::format(" {:02x}", bytes[i]);
+			}
+			r += "\n";
+		}
+		r += "guest stack code pointers (rsp upward):\n";
+		int named = 0;
+		for (int i = 0; i < 192 && named < 32; i++) {
+			const uint64_t addr = info->rsp + static_cast<uint64_t>(i) * sizeof(uint64_t);
+			if (!IsReadableRange(addr, sizeof(uint64_t))) {
+				break;
+			}
+			const uint64_t value = *reinterpret_cast<const uint64_t*>(addr);
+			if (rt->FindProgramByAddr(value) != nullptr) {
+				r += fmt::format(" rsp+0x{:03x} {:016x} = {}\n", i * sizeof(uint64_t), value,
+				                 FormatGuestModuleOffset(rt, value));
+				named++;
+			}
+		}
+		if (named == 0) {
+			r += " (none)\n";
+		}
 	}
 	r += "modules (base / size / name; * holds pc):\n";
 	Common::Singleton<RuntimeLinker>::Instance()->DescribeModules(info->exception_address, r);
@@ -833,6 +894,36 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 	}
 	if (TryBypassGuestTrap(exception_info)) {
 		return true;
+	}
+	auto*      rt   = Common::Singleton<RuntimeLinker>::Instance();
+	const bool park = GuestFaultParkEnabled() && rt->FindProgramByAddr(info->exception_address) != nullptr;
+	if (park) {
+		char       thread_name[64] = "(host thread)";
+		const auto self            = Libs::LibKernel::PthreadSelfOrNull();
+		const int32_t tid          = self != nullptr ? Libs::LibKernel::PthreadGetthreadid() : 0;
+		if (self != nullptr && Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+		}
+		const auto added = Common::GuestPark::Global().Add(
+		    info->exception_address, info->access_violation_vaddr, tid, thread_name);
+		const auto where = FormatGuestModuleOffset(rt, info->exception_address);
+		if (added.first_at_pc) {
+			WriteCrashReport(exception_info, true);
+		} else {
+			std::printf("[park] thread '%s' (id %d) faulted again at pc=0x%016" PRIx64
+			            " = %s (%u threads at this pc); full report was printed for the first\n",
+			            thread_name, tid, info->exception_address, where.c_str(), added.at_pc);
+		}
+		std::printf("[park] thread '%s' (id %d) parked for good: pc=0x%016" PRIx64
+		            " = %s access=%u address=0x%016" PRIx64 "\n[park] %u guest threads parked\n",
+		            thread_name, tid, info->exception_address, where.c_str(),
+		            static_cast<unsigned>(info->access_violation_type),
+		            info->access_violation_vaddr, added.count);
+		std::fflush(stdout);
+		const Libs::LibKernel::GuestWaitScope parked_wait(
+		    "parked-fault", info->exception_address,
+		    static_cast<int64_t>(info->access_violation_vaddr));
+		Common::GuestPark::ParkForever();
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes, the top of its stack and the modules.

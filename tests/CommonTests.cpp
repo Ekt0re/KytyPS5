@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/faultReport.h"
 #include "common/file.h"
+#include "common/guestPark.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/memAccount.h"
@@ -560,6 +561,31 @@ TEST(MemAccount, LimitGuardDropsThenStopsOnlyWhileOver) {
 	EXPECT_EQ(guard.Step(13000, 150), Action::DropCaches);
 	EXPECT_EQ(guard.Step(22999, 150), Action::None);
 	EXPECT_EQ(guard.Step(23000, 150), Action::Stop);
+
+TEST(GuestPark, RegistryCountsThreadsAndFlagsFirstAtEachPc) {
+	Common::GuestPark::Registry registry;
+	EXPECT_EQ(registry.Count(), 0u);
+
+	const auto first = registry.Add(0x1000, 0x0, 11, "worker-a");
+	EXPECT_EQ(first.count, 1u);
+	EXPECT_TRUE(first.first_at_pc);
+	EXPECT_EQ(first.at_pc, 1u);
+
+	const auto repeat = registry.Add(0x1000, 0x8, 12, "worker-b");
+	EXPECT_EQ(repeat.count, 2u);
+	EXPECT_FALSE(repeat.first_at_pc);
+	EXPECT_EQ(repeat.at_pc, 2u);
+
+	const auto other = registry.Add(0x2000, 0x10, 13, nullptr);
+	EXPECT_EQ(other.count, 3u);
+	EXPECT_TRUE(other.first_at_pc);
+	EXPECT_EQ(other.at_pc, 1u);
+	EXPECT_EQ(registry.Count(), 3u);
+
+	for (size_t i = 0; i < Common::GuestPark::Registry::kCapacity; i++) {
+		(void)registry.Add(0x3000 + i * 4, 0, static_cast<int32_t>(100 + i), "fill");
+	}
+	EXPECT_EQ(registry.Count(), 3u + Common::GuestPark::Registry::kCapacity);
 }
 
 } // namespace
