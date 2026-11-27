@@ -19,6 +19,10 @@
 // addresses, filled from the snapshot, and the calls issued in their order, each one once the GPU
 // has completed as many submissions as it had when the guest made it. Frame times and the final
 // display image (PNG) are written to --replay-out.
+namespace Libs::Graphics {
+struct ShaderMappedData;
+} // namespace Libs::Graphics
+
 namespace Libs::Graphics::FrameCapture {
 
 enum class VideoOutCallKind : uint32_t {
@@ -40,6 +44,8 @@ void ReleaseRewind(const uint32_t* rewind);
 void SuspendPoint();
 void VideoOutCall(VideoOutCallKind kind, std::span<const int64_t> args,
                   std::span<const uint8_t> blob = {});
+// The guest created a shader (sceAgcCreateShader): the replay maps it the same way.
+void ShaderMapped(uint64_t address, const ShaderMappedData& data);
 // A flip was submitted by the CPU or a GPU end-of-pipe packet: a frame boundary.
 void NoteFlip() noexcept;
 

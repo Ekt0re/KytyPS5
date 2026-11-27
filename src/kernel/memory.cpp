@@ -867,6 +867,18 @@ const void* TryGetBackingView(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->TryGetBackingView(vaddr, size);
 }
 
+uint64_t BackingOffset(uint64_t vaddr) {
+	return g_guest_address_space->BackingOffset(vaddr);
+}
+
+uint64_t BackingAliasBase() {
+	return g_guest_address_space->GetBackingBase();
+}
+
+uint64_t BackingAliasSize() {
+	return g_guest_address_space->GetBackingSize();
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {

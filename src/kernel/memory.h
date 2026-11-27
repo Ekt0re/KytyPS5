@@ -153,6 +153,11 @@ bool                   BackingChangedSince(uint64_t generation, uint64_t vaddr, 
 // never fault: they see what the CPU (and every publication of GPU data) stored last, not GPU
 // writes that were not read back yet. Raw command-buffer decoding (KYTY_RAW_CMDBUF) uses it.
 [[nodiscard]] const void* TryGetBackingView(uint64_t vaddr, uint64_t size);
+// The backing as the emulator maps it (its writes to guest memory go through this alias), and
+// where a guest page lives in it (UINT64_MAX: nowhere). For frame capture's write tracking.
+[[nodiscard]] uint64_t BackingAliasBase();
+[[nodiscard]] uint64_t BackingAliasSize();
+[[nodiscard]] uint64_t BackingOffset(uint64_t vaddr);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.

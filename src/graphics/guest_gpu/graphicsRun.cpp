@@ -54,6 +54,9 @@ static thread_local GuestGpu*     g_gpu_state         = nullptr;
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	for (auto& limit: m_packet_limit) {
+		limit.store(UINT64_MAX, std::memory_order_relaxed);
+	}
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -477,10 +480,39 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 void GuestGpu::Enqueue(Submission submission) {
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
+	submission.epoch = m_epoch.load(std::memory_order_acquire);
 	m_accepted[submission.queue_id].fetch_add(1, std::memory_order_acq_rel);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
+}
+
+std::string GuestGpu::DescribeUnfinished() {
+	std::string text;
+	SendCommandSync([&] {
+		Common::LockGuard lock(m_queue_mutex);
+		for (uint32_t queue = 0; queue < QueueCount; queue++) {
+			if (m_queues[queue].empty()) continue;
+			const auto& front    = m_queues[queue].front();
+			const auto* position = front.execution.Position();
+			text += fmt::format("queue {} ({} waiting): ", queue, m_queues[queue].size());
+			if (front.type != SubmissionType::Commands) {
+				text += front.type == SubmissionType::SuspendPoint ? "suspend point\n" : "flip\n";
+			} else if (position == nullptr) {
+				text += fmt::format("not started, {} dwords at 0x{:x}\n", front.commands.size(),
+				                    reinterpret_cast<uintptr_t>(front.commands.data()));
+			} else {
+				text += fmt::format("at 0x{:x} opcode 0x{:02x}:",
+				                    reinterpret_cast<uintptr_t>(position), (position[0] >> 8u) & 0xffu);
+				const auto dwords = std::min<uint32_t>(KYTY_PM4_LEN(position[0]), 10);
+				for (uint32_t index = 0; index < dwords; index++) {
+					text += fmt::format(" {:08x}", position[index]);
+				}
+				text += "\n";
+			}
+		}
+	});
+	return text;
 }
 
 void GuestGpu::WaitForIdle() {
@@ -510,6 +542,7 @@ void GuestGpu::ThreadRun(void* data) {
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
+				gpu->m_parks.fetch_add(1, std::memory_order_acq_rel);
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
 			}
@@ -533,6 +566,7 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					gpu->m_parks.fetch_add(1, std::memory_order_acq_rel);
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
@@ -601,6 +635,7 @@ bool GuestGpu::Process(Submission& submission) {
 
 	cp.BufferInit();
 	bool complete = true;
+	m_counting    = submission.epoch == m_epoch.load(std::memory_order_acquire);
 
 	switch (submission.type) {
 		case SubmissionType::Commands:
@@ -718,9 +753,20 @@ void CommandProcessor::SuspendPm4() {
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 	const bool debug_dump = graphics_debug_dump_enabled();
+	const auto queue_id   = m_interrupt_event_id == 0
+	                            ? 0u
+	                            : 1u + static_cast<uint32_t>(m_interrupt_event_id) -
+	                                  GuestGpu::ComputeQueueBase;
 	while (!execution.m_buffer_stack.empty()) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
+			// A replay holds the queue at the packet the recorded run had reached.
+			if (g_gpu_state->m_counting &&
+			    g_gpu_state->m_packets[queue_id].load(std::memory_order_relaxed) >=
+			        g_gpu_state->m_packet_limit[queue_id].load(std::memory_order_acquire)) {
+				execution.m_suspended = true;
+				return;
+			}
 		}
 		auto& cursor = execution.m_buffer_stack.back();
 		if (cursor.offset_dw == cursor.commands.size()) {
@@ -790,6 +836,11 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		}
 		cursor.offset_dw += packet_dw;
 		execution.m_made_progress = true;
+		if (g_gpu_state != nullptr && g_gpu_state->m_counting) {
+			// Only this thread writes the counter.
+			auto& packets = g_gpu_state->m_packets[queue_id];
+			packets.store(packets.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+		}
 		if (!execution.m_next_buffer.empty()) {
 			// Chains and taken branches reuse the fetcher; only calls retain a return cursor.
 			if (execution.m_chain) {
