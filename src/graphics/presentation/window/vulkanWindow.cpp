@@ -539,6 +539,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 	graphics.physical_device_properties = properties2.properties;
 	graphics.driver_id                  = driver_properties.driverID;
+	// RADV: the VkPipelineCache file already keeps every pipeline (no size cap), and capturing
+	// binaries bypasses it, so each store miss compiles from scratch. Opt-in there.
+	if (graphics.pipeline_binary_enabled && graphics.driver_id == vk::DriverId::eMesaRadv) {
+		const char* store = std::getenv("KYTY_PIPELINE_BINARIES");
+		if (!(store != nullptr && store[0] == '1')) {
+			graphics.pipeline_binary_enabled = false;
+			LOGF("Vulkan pipeline binaries: off on RADV (KYTY_PIPELINE_BINARIES=1 turns them on)\n");
+		}
+	}
 	graphics.max_push_descriptors       = push_descriptor.maxPushDescriptors;
 	graphics.mesh_shader_properties     = mesh_properties;
 	LOGF("Select device: %s\n", graphics.physical_device_properties.deviceName.data());
@@ -709,7 +718,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		physical_device.getProperties2(&binary_properties.get<vk::PhysicalDeviceProperties2>());
 		const auto& binary = binary_properties.get<vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
 		const char* keep   = std::getenv("KYTY_PIPELINE_BINARY_INTERNAL_CACHE");
-		disable_internal_cache = binary.pipelineBinaryInternalCache &&
+		// KYTY_PIPELINE_BINARIES=0 (no store) must keep the driver's cache, or nothing caches.
+		const char* store  = std::getenv("KYTY_PIPELINE_BINARIES");
+		disable_internal_cache = !(store != nullptr && store[0] == '0') &&
+		                         binary.pipelineBinaryInternalCache &&
 		                         binary.pipelineBinaryInternalCacheControl &&
 		                         !(keep != nullptr && keep[0] == '1');
 		graphics.pipeline_binary_internal_cache_disabled = disable_internal_cache;

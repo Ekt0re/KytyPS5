@@ -151,6 +151,13 @@ struct PipelineBinaryStore::Impl {
 		return at;
 	}
 
+	// Drops a record whose binaries could not be used, so the pipeline is captured and appended
+	// again (the later record wins on the next scan).
+	void Forget(const Key& key) {
+		std::lock_guard lock(mutex);
+		index.erase(key);
+	}
+
 	// The binaries of `key`, or none (also when the record does not match its hash).
 	bool Load(const Key& key, std::vector<Binary>& binaries) {
 		std::vector<uint8_t> record;
@@ -167,6 +174,7 @@ struct PipelineBinaryStore::Impl {
 			}
 		}
 		if (XXH3_64bits(record.data(), record.size()) != hash) {
+			Forget(key);
 			return false;
 		}
 		size_t     at   = 4 + KeyBytes; // Past the pipeline key.
@@ -434,7 +442,8 @@ vk::Result CreateThroughStore(PipelineBinaryStore::Impl& impl, vk::Device device
 		              binaries_result == VK_SUCCESS ? vk::to_string(pipeline_result).c_str() : "-");
 		g_last_source = reason;
 		impl.fallbacks++;
-		return create(nullptr);
+		// Captured again below; the rejected record is replaced on the next scan.
+		impl.Forget(key);
 	}
 
 	// Not stored: create it with its data captured, store the binaries, release the data.
@@ -514,8 +523,10 @@ vk::Result PipelineBinaryStore::CreateCompute(GraphicContext& graphics, vk::Pipe
             chained.pNext = next;
         }
         VkPipeline handle = VK_NULL_HANDLE;
+        // VUID-vkCreateComputePipelines-pNext-09616/09617: no cache with binaries or capture.
         const auto result = static_cast<vk::Result>(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateComputePipelines(
-            graphics.device, cache, 1, &chained, nullptr, &handle));
+            graphics.device, next != nullptr ? VK_NULL_HANDLE : static_cast<VkPipelineCache>(cache), 1,
+            &chained, nullptr, &handle));
         *pipeline = handle;
         return result;
 	};
@@ -538,8 +549,10 @@ vk::Result PipelineBinaryStore::CreateGraphics(GraphicContext& graphics, vk::Pip
             chained.pNext = next;
         }
         VkPipeline handle = VK_NULL_HANDLE;
+        // VUID-vkCreateGraphicsPipelines-pNext-09616/09617: no cache with binaries or capture.
         const auto result = static_cast<vk::Result>(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateGraphicsPipelines(
-            graphics.device, cache, 1, &chained, nullptr, &handle));
+            graphics.device, next != nullptr ? VK_NULL_HANDLE : static_cast<VkPipelineCache>(cache), 1,
+            &chained, nullptr, &handle));
         *pipeline = handle;
         return result;
 	};
