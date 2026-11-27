@@ -521,6 +521,12 @@ void ImageHeap::Release(uint32_t entry) {
 	const auto index = entry & ElementMask;
 	if (index == 0u || --m_elements[index].refs != 0u) return;
 	auto& element = m_elements[index];
+	if (element.image) {
+		if (const auto found = m_by_serial.find(element.serial); found != m_by_serial.end()) {
+			std::erase(found->second, index);
+			if (found->second.empty()) m_by_serial.erase(found);
+		}
+	}
 	Mark(index, State::Stale);
 	if (index < m_users.size()) m_users[index].clear();
 	auto& textures = m_context.GetTextureCache();
@@ -562,16 +568,23 @@ void ImageHeap::Mark(uint32_t index, State state) {
 // Calls fn with each selected element of an image in m_changes, sorted by serial; true if any.
 template <typename Fn>
 bool ImageHeap::ForEachChanged(Fn&& fn) {
-	bool found = false;
-	for (uint32_t index = 1; !m_changes.empty() && index < m_elements.size(); ++index) {
-		const auto& element = m_elements[index];
-		if (element.refs != 0u && element.image &&
-		    std::ranges::binary_search(m_changes, element.serial, {}, &Image::HeapChange::serial)) {
-			fn(index);
-			found = true;
+	m_changed.clear();
+	for (const auto& change: m_changes) {
+		const auto found = m_by_serial.find(change.serial);
+		if (found == m_by_serial.end()) continue;
+		for (const auto index: found->second) {
+			const auto& element = m_elements[index];
+			if (element.refs != 0u && element.image && element.serial == change.serial) {
+				m_changed.push_back(index);
+			}
 		}
 	}
-	return found;
+	std::ranges::sort(m_changed);
+	m_changed.erase(std::ranges::unique(m_changed).begin(), m_changed.end());
+	for (const auto index: m_changed) {
+		fn(index);
+	}
+	return !m_changed.empty();
 }
 
 // Moves the slots of every view off marked elements; pending draws keep reading those. Only the
@@ -964,6 +977,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
 			element.image      = binding.image_id;
 			element.serial     = image.serial;
+			m_by_serial[image.serial].push_back(index);
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
 			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back({index});

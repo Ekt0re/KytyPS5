@@ -217,6 +217,8 @@ private:
 	std::vector<std::pair<size_t, size_t>>            m_runs;
 	std::vector<uint32_t>                             m_scratch;
 	std::vector<Image::HeapChange>                    m_changes;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_by_serial;
+	std::vector<uint32_t>                             m_changed;
 	std::vector<std::pair<uint32_t, vk::DescriptorImageInfo>> m_writes;
 	vk::DescriptorSetLayout                           m_layout = nullptr;
 	vk::DescriptorPool                                m_pool   = nullptr;
