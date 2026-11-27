@@ -31,6 +31,16 @@ not grow memory without limit.
 The verdict leads with the frame-related numbers, then the worst compile, cache, device-loss,
 fault and fatal findings. The same numbers are in `--json`.
 
+## Run wrapper
+
+`run.py` makes a fresh run folder, writes `run.txt` with the command line, platform and the
+`KYTY_*` environment switches, runs the emulator there with `subprocess` (no shell), and writes
+`kyty.log`, `triage.txt` and `triage.json` in that folder at the end:
+
+    python3 tools/triage/run.py --out RUN_DIR -e KYTY_PERF_SUMMARY=1 --emulator ./kyty_emulator
+
+It exits with the child's exit code. Arguments after `--` go to the emulator.
+
 ## What is parsed
 
 Every regular expression in `triage.py` carries the upstream `file:line` of the format string it

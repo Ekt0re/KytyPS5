@@ -341,5 +341,25 @@ class RobustnessTest(unittest.TestCase):
         self.assertEqual(lf['findings']['sync'], crlf['findings']['sync'])
 
 
+class RunWrapperTest(unittest.TestCase):
+    def test_run_folder_manifest_log_and_triage(self):
+        # run.py starts the child with subprocess only; a second Python is a portable stand-in.
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / 'run'
+            code = "print('PerfSummary t=10 secs=10.0 flips=1 draws=2 dispatches=0')"
+            p = subprocess.run([sys.executable, str(HERE.parent / 'run.py'), '--out', str(run),
+                                '--emulator', sys.executable, '-e', 'KYTY_TEST_SWITCH=1',
+                                '--', '-c', code], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, universal_newlines=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            manifest = (run / 'run.txt').read_text(encoding='utf-8')
+            self.assertIn('KYTY_TEST_SWITCH=1', manifest)
+            self.assertIn('exit code: 0', manifest)
+            self.assertIn('PerfSummary', (run / 'kyty.log').read_text(encoding='utf-8'))
+            data = json.loads((run / 'triage.json').read_text(encoding='utf-8'))
+            self.assertEqual(data['findings']['perf']['intervals'][0]['counters']['flips'], '1')
+            self.assertIn('VERDICT:', (run / 'triage.txt').read_text(encoding='utf-8'))
+
+
 if __name__ == '__main__':
     unittest.main()
