@@ -3,8 +3,10 @@
 
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 
 namespace Libs::Graphics {
 
@@ -55,6 +57,26 @@ struct TargetViewInfo {
 
 inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint32_t last_layer) {
 	return {base_layer, last_layer - base_layer + 1u, last_layer + 1u};
+}
+
+[[nodiscard]] inline constexpr vk::Extent2D ClampRenderArea(vk::Extent2D extent,
+                                                          vk::Extent3D backing,
+                                                          uint32_t base_level) noexcept {
+	if (base_level >= std::numeric_limits<uint32_t>::digits) {
+		return {0, 0};
+	}
+	const vk::Extent2D available {std::max(backing.width >> base_level, 1u),
+	                              std::max(backing.height >> base_level, 1u)};
+	return {std::min(extent.width, available.width), std::min(extent.height, available.height)};
+}
+
+[[nodiscard]] inline constexpr uint32_t ClampRenderLayers(uint32_t base_layer,
+                                                         uint32_t layer_count,
+                                                         uint32_t available_layers) noexcept {
+	if (base_layer >= available_layers) {
+		return 0;
+	}
+	return std::min(layer_count, available_layers - base_layer);
 }
 
 } // namespace Libs::Graphics

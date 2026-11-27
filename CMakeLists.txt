@@ -498,6 +498,12 @@ add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 target_link_libraries(trophy_system_tests common Vulkan::Headers)
 target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
 
+add_executable(render_target_bounds_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RenderTargetBoundsTests.cpp"
+)
+target_link_libraries(render_target_bounds_tests kyty_test_gtest Vulkan::Headers)
+target_include_directories(render_target_bounds_tests PRIVATE ${inc_headers})
+
 add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
@@ -855,6 +861,7 @@ if(BUILD_TESTING)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
+	add_test(NAME render_target_bounds COMMAND $<TARGET_FILE:render_target_bounds_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
@@ -1001,6 +1008,7 @@ if(BUILD_TESTING)
 		build_flags_tests
 		archive_file_tests
 		trophy_system_tests
+		render_target_bounds_tests
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
