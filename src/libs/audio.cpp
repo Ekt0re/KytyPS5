@@ -2,6 +2,7 @@
 #include "libs/audio.h"
 
 #include "common/assert.h"
+#include "common/compilePause.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -16,6 +17,12 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <vector>
@@ -48,6 +55,78 @@ struct OutputClock {
 		return deadline;
 	}
 };
+
+// Blocking output is paced by the port's sample clock alone, as the console's 48 kHz output does:
+// the host device's pulls change the SDL queue level, never the guest's cadence. A silent cushion
+// primes the queue, the stream's resampling ratio follows the queue level to absorb the drift
+// between the host device and the guest clock, and a queue the device stopped draining is
+// dropped. KYTY_AUDIO_CLOCK_PACING=0 restores the wait on the SDL queue. -1 reads the environment.
+int g_audio_clock_pacing = -1;
+
+bool AudioClockPacing() {
+	if (g_audio_clock_pacing < 0) {
+		const char* value    = std::getenv("KYTY_AUDIO_CLOCK_PACING");
+		g_audio_clock_pacing = (value == nullptr || std::strcmp(value, "0") != 0) ? 1 : 0;
+	}
+	return g_audio_clock_pacing != 0;
+}
+
+// KYTY_AUDIO_TRACE=1 prints once a second how long blocking output waited on the SDL queue and on
+// the sample clock, and how even the output cadence was.
+struct AudioTrace {
+	std::atomic<uint64_t> queue_wait_us {0}; // Host time in the SDL queue wait.
+	std::atomic<uint64_t> clock_sleep_us {0}; // Host time in the sample clock sleep.
+	std::atomic<uint64_t> outputs {0};
+	std::atomic<uint64_t> unpaced {0}; // Blocking outputs that returned without any wait.
+	std::atomic<uint64_t> underruns {0};
+	std::atomic<uint64_t> dropped {0}; // Queue clears.
+	std::atomic<uint64_t> max_gap_us {0}; // Longest time between two outputs of one port.
+	std::atomic<uint64_t> max_queued_us {0};
+	std::atomic<uint64_t> next_report_us {0};
+	std::atomic<uint64_t> total_queue_wait_us {0};
+
+	static bool Enabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_AUDIO_TRACE");
+			return value != nullptr && value[0] != '\0' && value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	static uint64_t HostUs() {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                                 std::chrono::steady_clock::now().time_since_epoch())
+		                                 .count());
+	}
+
+	static void Max(std::atomic<uint64_t>& value, uint64_t candidate) {
+		auto current = value.load();
+		while (candidate > current && !value.compare_exchange_weak(current, candidate)) {
+		}
+	}
+
+	void Report() {
+		const auto now  = HostUs();
+		auto       next = next_report_us.load();
+		if (now < next || !next_report_us.compare_exchange_strong(next, now + 1000000)) {
+			return;
+		}
+		const auto queue_wait = queue_wait_us.exchange(0);
+		total_queue_wait_us += queue_wait;
+		std::fprintf(stderr,
+		             "AUDIOTRACE mode=%s queue_wait_ms=%.1f clock_sleep_ms=%.1f outputs=%" PRIu64
+		             " unpaced=%" PRIu64 " underruns=%" PRIu64 " dropped=%" PRIu64
+		             " max_gap_ms=%.1f max_queued_ms=%.1f total_queue_wait_ms=%.1f\n",
+		             AudioClockPacing() ? "clock" : "sdl", static_cast<double>(queue_wait) / 1000.0,
+		             static_cast<double>(clock_sleep_us.exchange(0)) / 1000.0, outputs.exchange(0),
+		             unpaced.exchange(0), underruns.exchange(0), dropped.exchange(0),
+		             static_cast<double>(max_gap_us.exchange(0)) / 1000.0,
+		             static_cast<double>(max_queued_us.exchange(0)) / 1000.0,
+		             static_cast<double>(total_queue_wait_us.load()) / 1000.0);
+	}
+};
+
+AudioTrace g_audio_trace;
 
 static bool audio_out_port_type_is_valid(int type) {
 	return (type >= AUDIO_OUT_PORT_TYPE_MAIN && type <= AUDIO_OUT_PORT_TYPE_PADSPK) ||
@@ -118,6 +197,11 @@ private:
 		Format      format      = Format::Unknown;
 		OutputClock clock;
 		bool        queue_primed = false;
+		// Sample clock pacing: the smoothed SDL queue level in bytes and the resampling ratio
+		// that follows it.
+		double      queue_level  = 0.0;
+		float       queue_ratio  = 1.0f;
+		uint64_t    trace_last_output_us = 0;
 		int         channels_num = 0;
 		int         volume[12]   = {};
 
@@ -379,28 +463,95 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
-	uint32_t min_queued_size = 0;
+	const bool tracing         = AudioTrace::Enabled();
+	uint32_t   min_queued_size = 0;
 	if (blocking) {
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0
 		        ? static_cast<uint32_t>((AUDIO_OUT_TARGET_LATENCY_US + buffer_us - 1) / buffer_us)
 		        : 2u;
-		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
+		min_queued_size = prepared_size * std::clamp(buffers, 2u, 16u);
+	}
+	if (tracing && blocking) {
+		const auto bytes_per_second =
+		    static_cast<uint64_t>(BytesPerSample(port->format)) * output_channels * port->freq;
+		const auto queued = SDL_GetAudioStreamQueued(port->stream);
+		if (queued > 0 && bytes_per_second != 0) {
+			AudioTrace::Max(g_audio_trace.max_queued_us,
+			                1000000ULL * static_cast<uint64_t>(queued) / bytes_per_second);
+		}
+	}
+	if (blocking && AudioClockPacing()) {
+		// The guest is never held for the host device. The level before a block is queued settles
+		// at the cushion when the device and the guest clock agree.
+		constexpr int   DropCushions = 6;
+		constexpr float MaxDrift     = 0.02f;
+		auto            queued       = SDL_GetAudioStreamQueued(port->stream);
+		bool            late         = !port->queue_primed;
+		if (queued > static_cast<int>(min_queued_size) * DropCushions) {
+			// The device stopped draining: drop the stale queue and start over.
+			SDL_ClearAudioStream(port->stream);
+			queued             = 0;
+			port->queue_primed = false;
+			if (tracing) g_audio_trace.dropped++;
+		} else if (port->queue_primed && queued < static_cast<int>(prepared_size)) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
+			port->queue_primed = false;
+			late               = true;
+			if (tracing) g_audio_trace.underruns++;
+		}
+		float ratio = 1.0f;
+		if (!port->queue_primed) {
+			// Silence fills the cushion, so the first block is paced like every other one and
+			// a late guest does not catch up into a longer queue.
+			const auto cushion = min_queued_size - prepared_size;
+			if (queued >= 0 && queued < static_cast<int>(cushion)) {
+				const std::vector<uint8_t> silence(cushion - static_cast<uint32_t>(queued));
+				SDL_PutAudioStreamData(port->stream, silence.data(),
+				                       static_cast<int>(silence.size()));
+			}
+			if (late) {
+				port->clock = {};
+			}
+			port->queue_level = min_queued_size;
+		} else {
+			port->queue_level += (static_cast<double>(queued) - port->queue_level) / 64.0;
+			const auto error = (port->queue_level - min_queued_size) / min_queued_size;
+			ratio = 1.0f + MaxDrift * static_cast<float>(std::clamp(error, -1.0, 1.0));
+		}
+		if (std::fabs(ratio - port->queue_ratio) >= 0.0005f) {
+			SDL_SetAudioStreamFrequencyRatio(port->stream, ratio);
+			port->queue_ratio = ratio;
+		}
+		if (!SDL_PutAudioStreamData(port->stream, prepared_data,
+		                            static_cast<int>(prepared_size))) {
+			LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
+			port->queue_primed = false;
+			return false;
+		}
+		port->queue_primed = true;
+		return true;
+	}
+	if (blocking) {
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
+		const auto trace_start     = tracing ? AudioTrace::HostUs() : 0;
 		auto       queued          = SDL_GetAudioStreamQueued(port->stream);
 		while (queued > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearAudioStream(port->stream);
 				port->queue_primed = false;
+				if (tracing) g_audio_trace.dropped++;
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
 			queued = SDL_GetAudioStreamQueued(port->stream);
 		}
+		if (tracing) g_audio_trace.queue_wait_us += AudioTrace::HostUs() - trace_start;
 		if (queued < static_cast<int>(prepared_size)) {
 			if (port->queue_primed) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::AudioUnderruns);
+				if (tracing) g_audio_trace.underruns++;
 			}
 			port->queue_primed = false;
 		}
@@ -608,8 +759,33 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			port.queue_primed = false;
 		}
 	}
-	if (deadline > now) {
+	const bool tracing     = blocking && AudioTrace::Enabled();
+	const auto sleep_start = tracing ? AudioTrace::HostUs() : 0;
+	if (deadline > now && AudioClockPacing()) {
+		// The deadline is guest time: it does not pass while the guest clock is held, so a hold
+		// neither lets blocks through nor leaves a debt to catch up on afterwards.
+		for (auto remaining = deadline - now; remaining != 0;) {
+			Common::Thread::SleepMicro(remaining);
+			if (!Common::CompilePause::Paused()) {
+				break;
+			}
+			const auto current = LibKernel::KernelGetProcessTime();
+			remaining          = deadline > current ? deadline - current : 0;
+		}
+	} else if (deadline > now) {
 		Common::Thread::SleepMicro(deadline - now);
+	}
+	if (tracing) {
+		const auto end = AudioTrace::HostUs();
+		g_audio_trace.clock_sleep_us += end - sleep_start;
+		g_audio_trace.outputs++;
+		g_audio_trace.unpaced += deadline <= now;
+		auto& last = m_out_ports[params[0].handle.GetId()].trace_last_output_us;
+		if (last != 0) {
+			AudioTrace::Max(g_audio_trace.max_gap_us, end - last);
+		}
+		last = end;
+		g_audio_trace.Report();
 	}
 
 	return first_port.samples_num;
