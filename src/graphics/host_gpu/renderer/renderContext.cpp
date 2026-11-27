@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -136,6 +137,9 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	Common::DebugCounters::ScopedTimer timer(
 	    access == PageFaultAccess::Write ? Counter::SyncWriteFaults : Counter::SyncReadFaults,
 	    Counter::SyncFaultNs);
+	Common::PerfSummary::Add(access == PageFaultAccess::Write
+	                             ? Common::PerfSummary::Counter::WriteFaults
+	                             : Common::PerfSummary::Counter::ReadFaults);
 	if (access == PageFaultAccess::Write) {
 		{
 			Common::DebugCounters::ScopedTimer buffer_timer(Counter::SyncFaultBufferNs);
@@ -218,6 +222,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::GpuUnmaps);
 	const auto unmap = [this, vaddr, size] {
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.

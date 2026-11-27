@@ -3,6 +3,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -685,6 +686,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 
 void ImageHeap::WriteDescriptors() {
 	if (m_writes.empty()) return;
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::HeapDescriptorWrites, m_writes.size());
 	std::vector<vk::WriteDescriptorSet> writes(m_writes.size());
 	for (size_t write = 0; write < m_writes.size(); ++write) {
 		writes[write].dstSet          = m_set;

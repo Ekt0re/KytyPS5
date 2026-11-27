@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/runtimeToggles.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -1433,6 +1434,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::TextureLookups);
 	ValidateImageDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
@@ -2039,6 +2041,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	DownloadImage(image, *download.buffer, download.offset, range.size,
 	              image.info.resources.levels);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::TextureReadbacks);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;

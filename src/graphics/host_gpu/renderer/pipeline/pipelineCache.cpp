@@ -1,4 +1,5 @@
 #include "common/compilePause.h"
+#include "common/perfSummary.h"
 #include "common/shaderCompileStatus.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
@@ -1744,6 +1745,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets,
                                                             bool wait, bool fast_first) {
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::PipelineLookups);
 	const auto* colors        = targets.colors;
 	const auto& depth         = targets.depth;
 	const auto  vertex_info   = state.VertexStages();
@@ -1968,6 +1970,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	}
 
 	{
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::PipelinesCreated);
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
@@ -1987,6 +1990,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
                                                            bool                          wait) {
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::PipelineLookups);
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	const auto& module = *input_info.stage.module;
@@ -2004,6 +2008,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 	}
 
 	{
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::PipelinesCreated);
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);

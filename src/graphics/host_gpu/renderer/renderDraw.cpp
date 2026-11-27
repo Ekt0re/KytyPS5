@@ -7,6 +7,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -1288,6 +1289,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer = buffer.Handle();
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::Draws);
 	m_context.GetBufferCache().RecordPendingWrites();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

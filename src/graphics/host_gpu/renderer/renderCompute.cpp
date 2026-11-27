@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/runtimeToggles.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -755,6 +756,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		vk_buffer = buffer.Handle();
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::Dispatches);
 	m_context.GetBufferCache().RecordPendingWrites();
 
 	// The removed host fence also ordered read-only dispatches before later writers.
@@ -838,6 +840,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	               });
 	vk_buffer = buffer.Handle();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::Dispatches);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::IndirectDispatches);
 	m_context.GetBufferCache().RecordPendingWrites();
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();

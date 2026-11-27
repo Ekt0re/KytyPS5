@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfSummary.h"
 
 #include <algorithm>
 #include <array>
@@ -96,6 +97,7 @@ void Load(const ConfigOptions& cfg) {
 	*g_config = cfg;
 	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled || SyncStatsPeriod() != 0);
 	StartSyncStatsReporter();
+	Common::PerfSummary::Start();
 }
 
 uint32_t GetScreenWidth() {

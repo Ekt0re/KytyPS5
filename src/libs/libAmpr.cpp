@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/stringUtils.h"
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
@@ -1071,8 +1072,10 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 		const auto& command = *payload;
 		int         result  = OK;
 		if (command.kind == AmmCommandKind::Unmap) {
+			Common::PerfSummary::Add(Common::PerfSummary::Counter::AmmUnmaps);
 			result = LibKernel::Memory::UnmapAmmMemory(command.va, command.size);
 		} else {
+			Common::PerfSummary::Add(Common::PerfSummary::Counter::AmmMaps);
 			result = ExecuteAmmMapCommand(command);
 		}
 

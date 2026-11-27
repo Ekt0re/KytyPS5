@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -181,6 +182,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		return false;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::BufferReadbacks);
 	if (DetailedSyncStats()) {
 		for (const auto& copy: copies) {
 			m_stats_downloaded.Add(buffer_address + copy.srcOffset, copy.size);
@@ -598,6 +600,7 @@ void BufferCache::UploadCopies(std::span<const BufferUpload> uploads,
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::BufferLookups);
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
 
 	const auto image             = is_texel_buffer && !is_written
