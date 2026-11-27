@@ -3,6 +3,8 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "SrtWalkerTestMemory.h"
 
+#include <vector>
+#include <atomic>
 #include <algorithm>
 #include <bit>
 #include <cstdio>
@@ -157,6 +159,58 @@ void TestWalkerLoadsBypassSpecializationReader() {
   Check(snapshot.flattened_srt.size() == 1 &&
             snapshot.flattened_srt[0] == dword,
         "walker did not load the mapped SRT DWORD");
+}
+
+// The walker asks the guard before loading from a page the host may have made inaccessible, and
+// loads plainly when the page is not listed, the guard declines or the guard is off.
+void TestWalkerGuardServesWatchedLoads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  static const uint32_t dword = 0x12345678;
+  static bool decline = false;
+  static std::vector<std::atomic<uint16_t>> counts(size_t{1} << 20u);
+  const auto address = reinterpret_cast<uint64_t>(&dword);
+  auto plan = Extract(SrtProgram(address));
+  uint32_t specialization_reads = 0;
+  const SrtRuntime runtime{.userdata = &specialization_reads,
+                           .read_specialization_memory =
+                               RejectSpecializationRead};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto walk = [&] {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.flattened_srt.size() == 1,
+          "guarded SRT stage materialization failed");
+    return snapshot.flattened_srt[0];
+  };
+  SetSrtWalkerGuard(counts.data(), counts.size(),
+                    [](uint64_t load, uint32_t& value) {
+                      if (decline) return false;
+                      value = *reinterpret_cast<const uint32_t*>(load) ^ 0xffu;
+                      return true;
+                    });
+  SetSrtWalkerGuardCounting(true);
+  auto& slot = counts[(address >> 12u) & (counts.size() - 1)];
+  slot = 1;
+  Check(walk() == dword && GetSrtWalkerGuardStats().served == 0,
+        "walker guard served a load while off");
+  SetSrtWalkerGuardMode(SrtWalkerGuardMode::On);
+  Check(walk() == (dword ^ 0xffu) && GetSrtWalkerGuardStats().served == 1,
+        "walker guard did not serve a listed page's load");
+  decline = true;
+  Check(walk() == dword && GetSrtWalkerGuardStats().declined == 1,
+        "walker did not load plainly after the guard declined");
+  decline = false;
+  slot = 0;
+  Check(walk() == dword && GetSrtWalkerGuardStats().served == 1,
+        "walker guard served an unlisted page's load");
+  slot = 1;
+  SetSrtWalkerGuardMode(SrtWalkerGuardMode::Verify);
+  const auto mismatches = GetSrtWalkerGuardStats().mismatches;
+  Check(walk() == dword && GetSrtWalkerGuardStats().mismatches > mismatches,
+        "walker guard verification missed a differing load");
+  SetSrtWalkerGuardMode(SrtWalkerGuardMode::Off);
+  slot = 0;
+  Check(specialization_reads == 0, "guarded walker load used the specialization reader");
 }
 
 void TestNativeNestedSrtRefresh() {
@@ -1712,6 +1766,7 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 int main() {
   TestWalkerLoadsBypassSpecializationReader();
+  TestWalkerGuardServesWatchedLoads();
   TestNativeNestedSrtRefresh();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestSrtAliasesShareReads();

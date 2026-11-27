@@ -79,6 +79,30 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
 };
 
+// Walker loads from pages the host made inaccessible (they share a page with GPU-written bytes)
+// used to fault once per load and per walk; the fault handler then served the load from the
+// backing. With a guard installed the walker asks `counts` (one uint16 per page slot, nonzero
+// when a page of the slot may be inaccessible; see ReadWatchFilter) before each load and calls
+// `load` instead of faulting. `load` returns false when it cannot serve the address, and the
+// plain load (with its fault handling) runs as before. Without a guard nothing changes.
+using SrtGuardedLoad = bool (*)(uint64_t address, uint32_t& value);
+void SetSrtWalkerGuard(const void* counts, uint64_t slot_count, SrtGuardedLoad load);
+enum class SrtWalkerGuardMode : uint8_t { Off, On, Verify };
+// Verify walks twice, guarded and plain, compares everything the walk wrote and counts
+// differences; the plain walk's results are used.
+void SetSrtWalkerGuardMode(SrtWalkerGuardMode mode);
+struct SrtWalkerGuardStats {
+	uint64_t walks      = 0;
+	uint64_t served     = 0; // Loads the guard served without a fault.
+	uint64_t declined   = 0; // Loads it passed on to the plain load.
+	uint64_t verified   = 0; // Walks compared in verify mode.
+	uint64_t mismatches = 0;
+};
+// Counts walks and served/passed-on loads; off by default (verified walks and mismatches are
+// always counted).
+void SetSrtWalkerGuardCounting(bool counting);
+SrtWalkerGuardStats GetSrtWalkerGuardStats();
+
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,

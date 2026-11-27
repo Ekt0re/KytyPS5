@@ -16,6 +16,8 @@
 //   exact     - GPU buffer writes refresh only images starting at the write (overlap refresh off)
 //   pred_off  - SET_PREDICATION never skips draws or dispatches
 //   trace_shaders - log draws and dispatches with their shader hashes (see shaderTrace.h)
+//   walker_guard  - SRT walker loads from read-watched pages skip the page fault (default on;
+//                   only a walker_guard line in the file changes it)
 namespace Common::RuntimeToggles {
 
 namespace Detail {
@@ -32,8 +34,9 @@ inline bool Enabled() {
 	return Detail::Path() != nullptr && Detail::Path()[0] != 0;
 }
 
-inline bool Get(const char* name) {
-	if (!Enabled()) return false;
+// 1 or 0 as the file says, -1 when the file has no line for `name` (or there is no file).
+inline int Find(const char* name) {
+	if (!Enabled()) return -1;
 	std::scoped_lock lock {Detail::g_mutex};
 	const auto now = std::chrono::steady_clock::now();
 	if (now >= Detail::g_next) {
@@ -54,11 +57,15 @@ inline bool Get(const char* name) {
 	size_t            pos = 0;
 	while ((pos = Detail::g_text.find(key, pos)) != std::string::npos) {
 		if (pos == 0 || Detail::g_text[pos - 1] == '\n') {
-			return Detail::g_text.compare(pos + key.size(), 1, "1") == 0;
+			return Detail::g_text.compare(pos + key.size(), 1, "1") == 0 ? 1 : 0;
 		}
 		pos += key.size();
 	}
-	return false;
+	return -1;
+}
+
+inline bool Get(const char* name) {
+	return Find(name) == 1;
 }
 
 } // namespace Common::RuntimeToggles
