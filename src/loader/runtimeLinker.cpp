@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/faultReport.h"
 #include "common/file.h"
 #include "common/fpEnv.h"
 #include "common/hostException.h"
@@ -721,6 +722,19 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 	                 static_cast<unsigned>(info->type), info->native_code, info->exception_address,
 	                 static_cast<unsigned>(info->access_violation_type),
 	                 info->access_violation_vaddr);
+	// A pc outside every guest module is emulator or driver code: extend the report with host
+	// module, symbol, thread tag and call chain.
+	if (Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(info->exception_address) ==
+	    nullptr) {
+		Common::FaultReport::Registers regs {};
+		regs.pc             = info->exception_address;
+		regs.rsp            = info->rsp;
+		regs.rbp            = info->rbp;
+		regs.native_context = info->native_context;
+		Common::FaultReport::WriteHostContext(
+		    regs, {[](void* user, const char* text) { static_cast<std::string*>(user)->append(text); },
+		           &r});
+	}
 	r += fmt::format("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 	                 "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
 	                 "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
@@ -1777,6 +1791,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	     "mapped_size            = 0x%016" PRIx64 "\n",
 	     program->base_vaddr, program->base_size, program->base_size_aligned, program->mapped_size);
 
+	Common::FaultReport::RefreshModules();
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/faultReport.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
@@ -527,6 +528,8 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
+	Common::FaultReport::SetThreadTag("render", "gpu-render");
+	Common::FaultReport::RegisterThreadStack();
 	Common::PerfSummary::RegisterGpuThread();
 	g_gpu_state = gpu;
 	if (const auto processor = Common::Thread::ReserveCoreForCurrentThread(); processor >= 0) {

@@ -2,6 +2,7 @@
 #include "common/assert.h"
 #include "common/config.h"
 #include "common/emulatorConfig.h"
+#include "common/faultReport.h"
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -15,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -25,6 +27,10 @@
 
 #ifdef __linux__
 #include <sched.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 namespace {
@@ -103,6 +109,125 @@ TEST(HostException, GuestSignalWaitsUntilTheFaultHandlerReturns) {
 		    std::_Exit(installs && mapped && g_dispatched == 1 ? 0 : 1);
 	    },
 	    testing::ExitedWithCode(0), "");
+}
+#endif
+
+size_t CountOf(const char* text, const char* needle) {
+	size_t count = 0;
+	for (const char* p = text; (p = std::strstr(p, needle)) != nullptr; p++) {
+		count++;
+	}
+	return count;
+}
+
+#if defined(__linux__)
+int g_fault_pipe = -1;
+
+// Writes the host fault report to the pipe the parent reads, then ends the child.
+bool ReportAndExit(const Common::HostException::ExceptionInfo& info) {
+	Common::FaultReport::Registers regs {};
+	regs.pc  = info.exception_address;
+	regs.rsp = info.rsp;
+	regs.rbp = info.rbp;
+	Common::FaultReport::WriteHostContext(
+	    regs,
+	    {[](void*, const char* text) { (void)!::write(g_fault_pipe, text, std::strlen(text)); },
+	     nullptr});
+	std::_Exit(0);
+}
+
+extern "C" __attribute__((noinline, used)) void KytyFaultReportTestNullWrite(volatile int* p) {
+	*p = 1;
+	asm volatile("" ::: "memory");
+}
+
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	int fds[2];
+	ASSERT_EQ(::pipe(fds), 0);
+	const pid_t child = ::fork();
+	ASSERT_GE(child, 0);
+	if (child == 0) {
+		::close(fds[0]);
+		g_fault_pipe = fds[1];
+		Common::FaultReport::RefreshModules();
+		Common::HostException::InstallHandler(ReportAndExit);
+		std::thread worker([] {
+			Common::FaultReport::SetThreadTag("fault test tag", "fault-test-worker");
+			Common::FaultReport::RegisterThreadStack();
+			KytyFaultReportTestNullWrite(nullptr);
+		});
+		worker.join();
+		std::_Exit(2);
+	}
+	::close(fds[1]);
+	std::string text;
+	char        buffer[4096];
+	for (ssize_t n; (n = ::read(fds[0], buffer, sizeof(buffer))) > 0;) {
+		text.append(buffer, static_cast<size_t>(n));
+	}
+	::close(fds[0]);
+	int status = 0;
+	::waitpid(child, &status, 0);
+	const size_t frames = CountOf(text.c_str(), " bt[") + CountOf(text.c_str(), " fp[");
+	EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << "status " << status;
+	EXPECT_NE(text.find("fault-test-worker"), std::string::npos) << text;
+	EXPECT_NE(text.find("doing: fault test tag"), std::string::npos) << text;
+	EXPECT_NE(text.find("common_tests+0x"), std::string::npos) << text;
+	EXPECT_NE(text.find("[KytyFaultReportTestNullWrite+0x"), std::string::npos) << text;
+	EXPECT_GE(frames, 3u) << text;
+}
+#elif defined(_WIN32)
+__declspec(noinline) void KytyFaultReportTestCapture(std::string* out) {
+	CONTEXT ctx {};
+	RtlCaptureContext(&ctx);
+	Common::FaultReport::Registers regs {};
+	regs.pc             = ctx.Rip;
+	regs.rsp            = ctx.Rsp;
+	regs.rbp            = ctx.Rbp;
+	regs.native_context = &ctx;
+	Common::FaultReport::WriteHostContext(
+	    regs, {[](void* user, const char* text) { static_cast<std::string*>(user)->append(text); },
+	           out});
+}
+
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	Common::FaultReport::RefreshModules();
+	std::string text;
+	std::thread worker([&] {
+		Common::FaultReport::SetThreadTag("fault test tag", "fault-test-worker");
+		KytyFaultReportTestCapture(&text);
+	});
+	worker.join();
+	EXPECT_NE(text.find("fault-test-worker"), std::string::npos) << text;
+	EXPECT_NE(text.find("doing: fault test tag"), std::string::npos) << text;
+	EXPECT_NE(text.find("common_tests"), std::string::npos) << text;
+	EXPECT_NE(text.find("+0x"), std::string::npos) << text;
+	EXPECT_GE(CountOf(text.c_str(), " bt["), 2u) << text;
+}
+#elif defined(__APPLE__)
+__attribute__((noinline)) void KytyFaultReportTestCapture(std::string* out) {
+	Common::FaultReport::Registers regs {};
+	regs.pc = reinterpret_cast<uint64_t>(&KytyFaultReportTestCapture);
+	Common::FaultReport::WriteHostContext(
+	    regs, {[](void* user, const char* text) { static_cast<std::string*>(user)->append(text); },
+	           out});
+}
+
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	std::string text;
+	std::thread worker([&] {
+		Common::FaultReport::SetThreadTag("fault test tag", "fault-test-worker");
+		KytyFaultReportTestCapture(&text);
+	});
+	worker.join();
+	EXPECT_NE(text.find("fault-test-worker"), std::string::npos) << text;
+	EXPECT_NE(text.find("doing: fault test tag"), std::string::npos) << text;
+	EXPECT_NE(text.find("common_tests+0x"), std::string::npos) << text;
+	EXPECT_GE(CountOf(text.c_str(), " bt["), 2u) << text;
+}
+#else
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	GTEST_SKIP() << "Host fault symbolization is not available on this platform";
 }
 #endif
 

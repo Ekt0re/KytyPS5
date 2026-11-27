@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "common/faultReport.h"
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/shaderCompileStatus.h"
@@ -212,6 +213,8 @@ bool ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 
 ShaderStoreWriter::ShaderStoreWriter() {
 	m_thread = std::jthread([this](std::stop_token stop) {
+		Common::FaultReport::SetThreadTag("store write", "store-writer");
+		Common::FaultReport::RegisterThreadStack();
 		std::unique_lock lock(m_mutex);
 		// Once stop is requested the wait returns false only when the queue is empty.
 		while (m_ready.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
@@ -781,6 +784,8 @@ void PipelineCache::StartStoreDecoders(std::vector<std::shared_ptr<StoredModule>
 	for (size_t i = 0; i < count; i++) {
 		decoders->threads.emplace_back([state = decoders.get(), left, start] {
 			LowerThreadPriority();
+			Common::FaultReport::SetThreadTag("store decode", "store-decode");
+			Common::FaultReport::RegisterThreadStack();
 			while (true) {
 				const auto index = state->next++;
 				if (index >= state->records.size()) break;
