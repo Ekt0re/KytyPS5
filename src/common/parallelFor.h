@@ -9,8 +9,14 @@
 
 namespace Common {
 
+// --precompile-threads: the thread count of a shader precompile; 0 otherwise.
+inline std::atomic_size_t g_parallel_threads_override {0};
+
 // Half the hardware threads, at least one.
 inline size_t ParallelThreads() {
+	if (const auto fixed = g_parallel_threads_override.load(std::memory_order_relaxed); fixed != 0) {
+		return fixed;
+	}
 	return std::max(1u, std::thread::hardware_concurrency() / 2);
 }
 

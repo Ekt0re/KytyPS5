@@ -4,12 +4,14 @@
 #include "common/parallelFor.h"
 #include "common/shaderCompileStatus.h"
 #include "common/stringUtils.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/shaderCompiler.h"
 
 #include <csetjmp>
+#include <csignal>
 #include <thread>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
@@ -85,17 +87,67 @@ uint64_t BuildStamp() {
 	return error ? 0 : static_cast<uint64_t>(time);
 }
 
+// The store's own format: what this file and pipelineCache.cpp make of the translator's output.
+// KYTY_SHADER_CACHE_STAMP names the translator alone (the sources under graphics/shader and the
+// guest_gpu definitions they include), so it no longer changes when this code does. BUMP THIS
+// whenever any of these change:
+//   - the record framing or the fields of a record (Frame, Record, IoKey, IoModule, the store
+//     header);
+//   - GraphicsPipelineKey or a struct in it, which records hold as raw bytes (the asserts below
+//     fail when their layout changes);
+//   - the module id formula (PipelineCache::CompileModule, ReplayRecipe);
+//   - what a translation is given (the CompileOptions of PipelineCache::GetProgramImpl and of the
+//     translations ahead, SpirvProfile's meaning for the same bytes).
+// Version 1 leaves the header as it was before the constant existed.
+constexpr uint64_t StoreFormatVersion = 1;
+
+static_assert(sizeof(PipelineStaticParameters) == 118 && sizeof(PipelineRenderingState) == 44 &&
+                  sizeof(PipelineVertexInputState) == 354 && sizeof(GraphicsPipelineKey) == 548 &&
+                  offsetof(GraphicsPipelineKey, rendering) == 32 &&
+                  offsetof(GraphicsPipelineKey, vertex_input) == 76 &&
+                  offsetof(GraphicsPipelineKey, static_params) == 430 &&
+                  offsetof(PipelineStaticParameters, color_mask) == 17 &&
+                  offsetof(PipelineStaticParameters, color_srcblend) == 54 &&
+                  offsetof(PipelineStaticParameters, blend_enable) == 110,
+              "stored pipeline keys changed their layout: bump StoreFormatVersion, then update "
+              "these numbers");
+
+// The translator's code-generation switches read from the environment that Profile does not
+// hold: a store written with one of them changed must not serve a run without it. Each switch
+// away from its default changes the key; the defaults leave it as it was. A new switch of this
+// kind in the translator belongs here.
+uint64_t CodegenSwitchKey() {
+	const auto env = [](const char* name) {
+		const char* value = std::getenv(name);
+		return value != nullptr ? value : "";
+	};
+	uint64_t switches = 0;
+	// F16StoreClampEnabled.
+	if (ShaderRecompiler::IR::F16StoreClampEnabled()) switches |= 1u;
+	// PixelQuadDppEnabled (spirvEmitterFlow.cpp).
+	if (env("KYTY_PS_QUAD_DPP")[0] != 0 && env("KYTY_PS_QUAD_DPP")[0] != '0') switches |= 2u;
+	// MovrelLaneBoundsEnabled (ConstantPropagation.cpp).
+	if (env("KYTY_MOVREL_LANE_BOUNDS")[0] == '0') switches |= 4u;
+	// ExecSelectsEnabled (ShaderRecompiler.cpp).
+	if (env("KYTY_EXEC_SELECTS")[0] == '0' || env("KYTY_EXEC_SELECT_ELIM")[0] == '0') {
+		switches |= 8u;
+	}
+	uint64_t key = switches * 0x9e3779b97f4a7c15ull;
+	// Ballot guards change the SPIR-V of most modules but are not part of Profile (whose bytes
+	// stay those of stores written without them).
+	constexpr uint64_t BallotGuardsStamp = 0x62616c6c6f740001ull;
+	if (ShaderRecompiler::Spirv::BallotGuardsEnabled()) key ^= BallotGuardsStamp;
+	return key;
+}
+
 // What every record depends on besides its own fields; empty when the build is unknown.
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	const auto stamp = BuildStamp();
 	if (stamp == 0) {
 		return {};
 	}
-	// Ballot guards change the SPIR-V of most modules but are not part of Profile (whose bytes
-	// stay those of stores written without them): a different stamp keeps the two apart.
-	constexpr uint64_t BallotGuardsStamp = 0x62616c6c6f740001ull;
-	const uint64_t     keyed_stamp =
-	    ShaderRecompiler::Spirv::BallotGuardsEnabled() ? stamp ^ BallotGuardsStamp : stamp;
+	const uint64_t keyed_stamp =
+	    stamp ^ CodegenSwitchKey() ^ ((StoreFormatVersion - 1) * 0xc2b2ae3d27d4eb4full);
 	Writer header;
 	IoAll(header, keyed_stamp, SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
@@ -169,6 +221,25 @@ void ShaderStoreWriter::Post(Common::UniqueFunction<void>&& job) {
 }
 
 namespace {
+
+std::atomic<bool> g_precompile_mode {false};
+// Set by SIGINT or SIGTERM during a precompile.
+volatile std::sig_atomic_t g_precompile_interrupted = 0;
+
+bool PrecompileMode() {
+	return g_precompile_mode.load(std::memory_order_relaxed);
+}
+
+// --restamp-shader-store: the store of another stamp is checked against this translator.
+std::atomic<bool>   g_restamp_mode {false};
+std::atomic<size_t> g_restamp_sample {0};
+
+bool RestampMode() {
+	return g_restamp_mode.load(std::memory_order_relaxed);
+}
+
+// The header's first field, the keyed stamp.
+constexpr size_t StampBytes = sizeof(uint64_t);
 
 // KYTY_SYNC_WARMUP=1: the warm-up creates every pipeline before the game starts (as before),
 // instead of in the background.
@@ -247,9 +318,25 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
 	    Common::ParallelThreads()));
-	auto       records = std::span<const uint8_t>(bytes);
-	const bool reusable =
+	auto records  = std::span<const uint8_t>(bytes);
+	bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
+	if (RestampMode()) {
+		// A store of another stamp that agrees in everything else (device profile, format) is
+		// loaded as it is; Restamp() gives it this stamp once its modules are verified.
+		m_restamp_current = reusable;
+		reusable = records.size() >= header.size() &&
+		           std::ranges::equal(records.subspan(StampBytes, header.size() - StampBytes),
+		                              std::span(header).subspan(StampBytes));
+		m_restamp_loaded = reusable && !m_restamp_current;
+		if (!m_restamp_loaded) {
+			// Nothing to verify, and nothing here may be overwritten.
+			return;
+		}
+		m_restamp_store = store_data;
+		m_restamp_path  = path;
+		m_restamp_stamp.assign(header.begin(), header.begin() + StampBytes);
+	}
 	if (reusable) {
 		records = records.subspan(header.size());
 		// The frames' bounds first, then their contents on several threads, inserted in order.
@@ -300,7 +387,8 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			    static_cast<double>(g_decode_zstd_ns) / 1e6,
 			    static_cast<double>(g_decode_plan_ns) / 1e6,
 			    static_cast<double>(g_decode_spirv_ns) / 1e6));
-		} else if (!stored.empty()) {
+		} else if (!stored.empty() && !PrecompileMode()) {
+			// A precompile decodes only the modules its pipelines need, on their workers.
 			StartStoreDecoders(std::move(stored));
 		}
 	}
@@ -746,6 +834,9 @@ struct PipelineCache::RecipeJob {
 	ShaderRecompiler::IR::PushData::Window       window;
 	ShaderRecompiler::IR::ResourceSpecialization specialization;
 	uint64_t                                     id = 0;
+	// The ids other recipes with the same inputs have (from other translators).
+	std::vector<uint64_t>                        other_ids;
+	std::vector<uint8_t>                         input;
 	ShaderVertexInputInfo                        vertex {};
 	ShaderPixelInputInfo                         pixel {};
 	ShaderComputeInputInfo                       compute {};
@@ -777,6 +868,16 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 	                                        codes;
 	std::vector<std::unique_ptr<RecipeJob>> jobs;
 	const auto                              known = MapModules();
+	// The variants by what they are translated from, in file order. A module's id also depends on
+	// what the translator makes of these inputs, so a file that went through several translators
+	// may name one variant by several ids: the last one is translated, and whatever id this
+	// translator gives it stands for the others in the recipes' pipeline keys.
+	struct Variants {
+		std::vector<uint64_t>      ids;
+		std::unique_ptr<RecipeJob> job;
+	};
+	std::vector<Variants>                variants;
+	std::unordered_map<uint64_t, size_t> variant_index;
 	if (reusable) {
 		records = records.subspan(header.bytes.size());
 		while (records.size() >= sizeof(Frame)) {
@@ -826,14 +927,26 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 						// A build with other stage inputs keeps the record but cannot use it.
 						m_recipe_modules.insert(job->id);
 						const auto code = codes.find(RecipeCodeKey(stage, job->key.hash));
-						if (input.size() == size && code != codes.end() && !known.contains(job->id)) {
+						if (input.size() == size && code != codes.end()) {
 							std::memcpy(stage == ShaderType::Pixel     ? static_cast<void*>(&job->pixel)
 							            : stage == ShaderType::Compute ? static_cast<void*>(&job->compute)
 							                                           : static_cast<void*>(&job->vertex),
 							            input.data(), size);
 							job->code      = code->second.first;
 							job->back_code = code->second.second;
-							jobs.push_back(std::move(job));
+							Writer same;
+							IoKey(same, job->key);
+							IoAll(same, job->wave_size, job->user_data_base, job->user_data,
+							      job->window.begin, job->window.end, job->specialization, input);
+							job->input = std::move(input);
+							const auto [index, first] = variant_index.try_emplace(
+							    XXH3_64bits(same.bytes.data(), same.bytes.size()), variants.size());
+							if (first) variants.emplace_back();
+							auto& variant = variants[index->second];
+							if (std::ranges::find(variant.ids, job->id) == variant.ids.end()) {
+								variant.ids.push_back(job->id);
+							}
+							variant.job = std::move(job);
 						}
 					}
 					break;
@@ -853,6 +966,31 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 			records = records.subspan(sizeof(frame) + compressed.size());
 		}
 	}
+	std::vector<std::unique_ptr<RecipeJob>> verify;
+	for (auto& variant: variants) {
+		// A stored id needs no translation and stands for the others.
+		uint64_t stored = 0;
+		for (const auto id: variant.ids) {
+			if (known.contains(id)) stored = id;
+		}
+		if (RestampMode()) {
+			if (stored != 0) {
+				variant.job->id = stored;
+				verify.push_back(std::move(variant.job));
+			}
+			continue;
+		}
+		if (stored != 0) {
+			for (const auto id: variant.ids) {
+				if (id != stored) m_recipe_aliases.insert_or_assign(id, stored);
+			}
+			continue;
+		}
+		for (const auto id: variant.ids) {
+			if (id != variant.job->id) variant.job->other_ids.push_back(id);
+		}
+		jobs.push_back(std::move(variant.job));
+	}
 	m_recipes.Open(path, header.bytes, reusable ? bytes.size() - records.size() : 0);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader recipes: {} programs, {} modules, {} pipelines in {} ({:.1f} MB, {:.0f} ms); "
@@ -860,7 +998,30 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 	    m_recipe_codes.size(), m_recipe_modules.size(), m_recipe_pipeline_keys.size(),
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
 	    MillisecondsSince(start), jobs.size()));
+	if (RestampMode()) {
+		// Only the stored modules are translated, to compare; nothing is added to the store.
+		m_recipe_pipelines.clear();
+		m_restamp_modules = known;
+		m_restamp_stored  = known.size() - 1;
+		std::unordered_set<uint64_t> covered;
+		for (const auto& job: verify) covered.insert(job->id);
+		m_restamp_uncovered = m_restamp_stored - covered.size();
+		// Every module, or a sample spread evenly over the file.
+		const auto   sample = g_restamp_sample.load();
+		const size_t step   = sample == 0 || sample >= verify.size() ? 1 : verify.size() / sample;
+		for (size_t i = 0; i < verify.size(); i += step) {
+			m_replay_left++;
+			m_replay_total++;
+			m_workers.Post([this, job = std::shared_ptr<RecipeJob>(std::move(verify[i]))] {
+				VerifyRecipe(*job);
+			});
+		}
+		return;
+	}
 	if (jobs.empty()) {
+		// Pipelines an interrupted run left, or whose stages a stored module stands for.
+		CreateRecipePipelines();
+		m_replay_lacking = m_recipe_pipelines.size();
 		m_recipe_pipelines.clear();
 		return;
 	}
@@ -869,24 +1030,25 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 		const auto  value = env != nullptr ? std::strtoul(env, nullptr, 10) : 0ul;
 		return value != 0 ? size_t {value} : Common::ParallelThreads();
 	}();
-	m_replay_start = std::chrono::steady_clock::now();
-	m_replay_left  = jobs.size();
-	m_replayers    = std::make_unique<PipelineWorkers>(threads);
+	m_replay_start  = std::chrono::steady_clock::now();
+	m_replay_left   = jobs.size();
+	m_replay_total  = jobs.size();
+	m_replay_active = true;
+	// A precompile has no game to leave threads to: the pipeline workers translate, and create
+	// pipelines (their background queue) when no translation waits.
+	if (!PrecompileMode()) {
+		m_replayers = std::make_unique<PipelineWorkers>(threads);
+	}
+	auto& workers = PrecompileMode() ? m_workers : *m_replayers;
 	for (auto& job: jobs) {
-		m_replayers->Post([this, job = std::shared_ptr<RecipeJob>(std::move(job))] {
+		workers.Post([this, job = std::shared_ptr<RecipeJob>(std::move(job))] {
 			ReplayRecipe(*job);
 		});
 	}
 }
 
-void PipelineCache::ReplayRecipe(RecipeJob& job) {
-	if (m_ahead_stop) {
-		return;
-	}
-	// The game's own translations go first: a program it needs now is translated on the command
-	// thread at normal priority.
-	static thread_local const bool lowered = (LowerThreadPriority(), true);
-	(void)lowered;
+// Translates a recipe as the command thread did when it recorded it; false if that fails.
+bool PipelineCache::TranslateRecipe(RecipeJob& job, ReplayedModule& replayed) {
 	const Common::ShaderCompileStatus::Work work;
 	const auto                              profile = SpirvProfile(m_graphics);
 	ShaderRecompiler::CompileOptions        options {.wave_size = job.wave_size};
@@ -904,7 +1066,6 @@ void PipelineCache::ReplayRecipe(RecipeJob& job) {
 	} else {
 		options.input_info.vertex = &job.vertex;
 	}
-	ReplayedModule replayed {.key = job.key};
 	volatile bool  usable = false;
 	std::jmp_buf   recover;
 	// Like a translation ahead, a failure ends this job only (and leaks what it held).
@@ -915,36 +1076,131 @@ void PipelineCache::ReplayRecipe(RecipeJob& job) {
 		auto result     = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                                   job.specialization, job.window);
 		auto info       = std::move(result.program).TakeCompiledInfo();
-		// The id CompileModule gives these inputs; another one names no stored pipeline.
+		// The id CompileModule gives these inputs. Another translator may have given another
+		// one: the module is the one a lookup with these inputs finds all the same, and its id
+		// replaces the recorded ones in the recipes' pipeline keys.
 		Writer inputs;
 		IoAll(inputs, job.key.stage, job.key.hash, job.key.user_data_count, job.key.static_state,
 		      info.bindings.push_data_start_dword, job.specialization);
-		if (XXH3_64bits(inputs.bytes.data(), inputs.bytes.size()) == job.id) {
-			replayed.module = ShaderModule {.id             = job.id,
-			                                .info           = std::move(info),
-			                                .specialization = job.specialization};
-			if (job.key.stage == ShaderType::Pixel &&
-			    job.pixel.parameter_mode == ShaderPixelParameterMode::Rectangle) {
-				replayed.module.rect_parameters =
-				    RectListParameters(job.pixel, replayed.module.info);
-			} else if (job.key.stage == ShaderType::Mesh) {
-				replayed.module.mesh_task = job.vertex.indirect_draw;
-			}
-			replayed.spirv = std::move(result.spirv);
-			usable         = true;
+		const auto id    = XXH3_64bits(inputs.bytes.data(), inputs.bytes.size());
+		replayed.old_ids = job.other_ids;
+		if (id != job.id) {
+			replayed.old_ids.push_back(job.id);
+			Writer record;
+			IoAll(record, RecipeRecord::Variant);
+			IoKey(record, job.key);
+			IoAll(record, job.wave_size, job.user_data_base, job.user_data, job.window.begin,
+			      job.window.end, job.specialization, id, job.input);
+			replayed.recipe = std::move(record.bytes);
 		}
+		replayed.module = ShaderModule {.id             = id,
+		                                .info           = std::move(info),
+		                                .specialization = job.specialization};
+		if (job.key.stage == ShaderType::Pixel &&
+		    job.pixel.parameter_mode == ShaderPixelParameterMode::Rectangle) {
+			replayed.module.rect_parameters = RectListParameters(job.pixel, replayed.module.info);
+		} else if (job.key.stage == ShaderType::Mesh) {
+			replayed.module.mesh_task = job.vertex.indirect_draw;
+		}
+		replayed.spirv = std::move(result.spirv);
+		usable         = true;
 		Common::g_dbg_recover = nullptr;
 	}
+	return usable;
+}
+
+void PipelineCache::VerifyRecipe(RecipeJob& job) {
+	if (!m_ahead_stop) {
+		ReplayedModule replayed {.key = job.key};
+		const bool     usable = TranslateRecipe(job, replayed);
+		const auto     stored = m_restamp_modules.find(job.id);
+		bool           same   = false;
+		if (usable && replayed.module.id == job.id && stored != m_restamp_modules.end() &&
+		    stored->second->stored != nullptr &&
+		    stored->second->stored->spirv_words == replayed.spirv.size()) {
+			const auto& record = *stored->second->stored;
+			const auto  raw    = DecompressStored(record);
+			same = std::memcmp(raw.data() + record.spirv_offset, replayed.spirv.data(),
+			                   replayed.spirv.size() * sizeof(uint32_t)) == 0;
+		}
+		std::scoped_lock lock(m_replay_mutex);
+		m_restamp_verified++;
+		if (!same) {
+			m_restamp_differing++;
+			if (m_replay_failures.size() < 16) {
+				m_replay_failures.push_back(fmt::format(
+				    "{} 0x{:016x} module 0x{:016x}: {}", ShaderRecompiler::StageName(job.key.stage),
+				    job.key.hash, job.id,
+				    !usable                          ? "translation failed"
+				    : replayed.module.id != job.id ? "another module id"
+				                                     : "other SPIR-V"));
+			}
+		}
+	}
+	m_replay_left--;
+}
+
+void PipelineCache::ReplayRecipe(RecipeJob& job) {
+	if (m_ahead_stop) {
+		return;
+	}
+	// The game's own translations go first: a program it needs now is translated on the command
+	// thread at normal priority.
+	if (!PrecompileMode()) {
+		static thread_local const bool lowered = (LowerThreadPriority(), true);
+		(void)lowered;
+	}
+	ReplayedModule replayed {.key = job.key};
+	const bool     usable = TranslateRecipe(job, replayed);
 	{
 		std::scoped_lock lock(m_replay_mutex);
 		if (usable) {
 			m_replayed.push_back(std::move(replayed));
 		} else {
 			m_replay_dropped++;
+			if (m_replay_failures.size() < 16) {
+				m_replay_failures.push_back(
+				    fmt::format("{} 0x{:016x} module 0x{:016x}",
+				                ShaderRecompiler::StageName(job.key.stage), job.key.hash, job.id));
+			}
 		}
 	}
 	m_replay_left--;
 	m_replay_ready = true;
+}
+
+void PipelineCache::CreateRecipePipelines() {
+	if (m_recipe_pipelines.empty()) {
+		return;
+	}
+	// The pipelines whose stages now all exist.
+	const auto modules = MapModules();
+	std::erase_if(m_recipe_pipelines, [&](const GraphicsPipelineKey& recorded) {
+		auto                               key = recorded;
+		std::array<const ShaderModule*, 4> stages {};
+		for (size_t i = 0; i < stages.size(); i++) {
+			if (const auto alias = m_recipe_aliases.find(key.stage_ids[i]);
+			    alias != m_recipe_aliases.end()) {
+				key.stage_ids[i] = alias->second;
+			}
+			const auto found = modules.find(key.stage_ids[i]);
+			if (found == modules.end()) return false;
+			stages[i] = found->second;
+		}
+		auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
+		if (inserted) {
+			auto& pipeline = iter->second;
+			CreatePipelineLayouts(m_graphics, pipeline, stages);
+			StartDeferredCompile(pipeline,
+			                     [this, layout = pipeline.pipeline_layout, &key = iter->first,
+			                      stages] {
+				                     return CreateHostPipeline(m_graphics, layout, key, stages,
+				                                               m_driver_cache);
+			                     });
+			StorePipeline(iter->first);
+		}
+		return true;
+	});
 }
 
 void PipelineCache::MergeReplayed() {
@@ -965,10 +1221,21 @@ void PipelineCache::MergeReplayed() {
 		auto& program          = entry->second;
 		if (inserted) {
 			program.resource_plan = std::move(done.plan);
-		} else if (program.call_source != nullptr || program.skip_dispatch ||
-		           std::ranges::any_of(program.modules, [&](const ShaderModule& module) {
-			           return module.id == done.module.id;
-		           })) {
+		} else if (program.call_source != nullptr || program.skip_dispatch) {
+			continue;
+		}
+		for (const auto old: done.old_ids) {
+			if (old != done.module.id) m_recipe_aliases.insert_or_assign(old, done.module.id);
+		}
+		if (!done.recipe.empty()) {
+			m_replay_renamed++;
+			if (m_recipes && m_recipe_modules.insert(done.module.id).second) {
+				m_recipes.Append(std::move(done.recipe));
+			}
+		}
+		if (std::ranges::any_of(program.modules, [&](const ShaderModule& module) {
+			    return module.id == done.module.id;
+		    })) {
 			continue;
 		}
 		done.module.module = CompileSPV(done.spirv, m_graphics.device);
@@ -985,38 +1252,190 @@ void PipelineCache::MergeReplayed() {
 			});
 		}
 	}
-	// The pipelines whose stages now all exist.
-	const auto modules = MapModules();
-	std::erase_if(m_recipe_pipelines, [&](const GraphicsPipelineKey& key) {
-		std::array<const ShaderModule*, 4> stages {};
-		for (size_t i = 0; i < stages.size(); i++) {
-			const auto found = modules.find(key.stage_ids[i]);
-			if (found == modules.end()) return false;
-			stages[i] = found->second;
-		}
-		auto [iter, inserted] = m_graphics_pipelines.try_emplace(key);
-		if (inserted) {
-			auto& pipeline = iter->second;
-			CreatePipelineLayouts(m_graphics, pipeline, stages);
-			StartDeferredCompile(pipeline,
-			                     [this, layout = pipeline.pipeline_layout, &key = iter->first,
-			                      stages] {
-				                     return CreateHostPipeline(m_graphics, layout, key, stages,
-				                                               m_driver_cache);
-			                     });
-			StorePipeline(iter->first);
-		}
-		return true;
-	});
-	if (finished && m_replayers != nullptr) {
+	CreateRecipePipelines();
+	if (finished && m_replay_active) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "Shader recipes: translated {} modules again in {:.1f} s ({} unusable); {} pipelines "
 		    "wait for stages the recipes lacked\n",
 		    m_replay_merged, MillisecondsSince(m_replay_start) / 1000.0, dropped,
 		    m_recipe_pipelines.size()));
+		m_replay_lacking = m_recipe_pipelines.size();
+		m_replay_active  = false;
 		m_recipe_pipelines.clear();
-		m_replayers->Finish();
+		if (m_replayers != nullptr) m_replayers->Finish();
 	}
+}
+
+void PipelineCache::SetPrecompileMode() {
+	g_precompile_mode = true;
+}
+
+bool PipelineCache::Precompile() {
+	using Clock      = std::chrono::steady_clock;
+	const auto start = Clock::now();
+	if (!m_store) {
+		Log::WriteToConsoleAndLog(
+		    "Shader precompile: no shader store (a Release build and a title id are needed)\n");
+		return false;
+	}
+	g_precompile_interrupted = 0;
+	const auto interrupt     = [](int) { g_precompile_interrupted = 1; };
+	std::signal(SIGINT, interrupt);
+	std::signal(SIGTERM, interrupt);
+	const auto ready = [](const auto& pipelines) {
+		return static_cast<size_t>(std::ranges::count_if(pipelines | std::views::values,
+		                                                 [](const Pipeline& pipeline) {
+			return !pipeline.compiling.valid() ||
+			       pipeline.compiling.wait_for(std::chrono::seconds {0}) ==
+			           std::future_status::ready;
+		}));
+	};
+	const auto stored_modules = MapModules().size() - 1;
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader precompile: {} modules to translate, {} modules in the store, {} pipelines "
+	    "known, {} threads\n",
+	    m_replay_total, stored_modules, m_graphics_pipelines.size() + m_compute_pipelines.size(),
+	    Common::ParallelThreads()));
+	double translate_s = 0.0;
+	auto   next_report = start + std::chrono::seconds {5};
+	bool   interrupted = false;
+	while (true) {
+		MergeReplayed();
+		const bool translated = !m_replay_active && m_replay_left == 0;
+		if (translated && translate_s == 0.0) translate_s = MillisecondsSince(start) / 1000.0;
+		const auto total = m_graphics_pipelines.size() + m_compute_pipelines.size();
+		const auto done  = ready(m_graphics_pipelines) + ready(m_compute_pipelines);
+		if (translated && done == total) break;
+		if (g_precompile_interrupted != 0) {
+			interrupted = true;
+			break;
+		}
+		if (const auto now = Clock::now(); now >= next_report) {
+			next_report = now + std::chrono::seconds {5};
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader precompile: {:.0f} s: modules {}/{}, pipelines {}/{}\n",
+			    MillisecondsSince(start) / 1000.0, m_replay_total - m_replay_left, m_replay_total,
+			    done, total));
+			std::fflush(stdout);
+			// Writes the driver cache once per interval, so an interrupted run keeps most of it.
+			if (done != 0) CheckpointDriverCache();
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds {100});
+	}
+	if (interrupted) {
+		Log::WriteToConsoleAndLog("Shader precompile: interrupted; saving what is done\n");
+		// Queued translations and pipelines are dropped, running ones end.
+		m_ahead_stop     = true;
+		*m_deferred_stop = true;
+		m_workers.Finish();
+		MergeReplayed();
+	}
+	size_t created = 0;
+	size_t failed  = 0;
+	const auto count = [&](auto& pipelines) {
+		for (auto& pipeline: pipelines | std::views::values) {
+			(Resolve(pipeline, !interrupted).pipeline != nullptr ? created : failed)++;
+		}
+	};
+	count(m_graphics_pipelines);
+	count(m_compute_pipelines);
+	// Dropped ones are not failures.
+	if (interrupted) failed = 0;
+	if (m_driver_cache != nullptr) m_driver_cache_dirty = true;
+	Save();
+	PipelineBinaryStore::Get().Close();
+	size_t                   dropped = 0;
+	std::vector<std::string> failures;
+	{
+		std::scoped_lock lock(m_replay_mutex);
+		dropped  = m_replay_dropped;
+		failures = m_replay_failures;
+	}
+	for (const auto& failure: failures) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("Shader precompile: translation failed: {}\n", failure));
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader precompile: {} in {:.1f} s ({:.1f} s translating): {} modules translated ({} got "
+	    "a new id), {} failed to translate, {} modules were stored before; {} pipelines created "
+	    "of {} graphics and {} compute, {} failed, {} recipe pipelines lack a stage\n",
+	    interrupted ? "interrupted" : "done", MillisecondsSince(start) / 1000.0, translate_s,
+	    m_replay_merged, m_replay_renamed, dropped, stored_modules, created,
+	    m_graphics_pipelines.size(), m_compute_pipelines.size(), failed, m_replay_lacking));
+	return !interrupted && failed == 0 && dropped == 0;
+}
+
+void PipelineCache::SetRestampMode(size_t sample) {
+	g_precompile_mode = true;
+	g_restamp_mode    = true;
+	g_restamp_sample  = sample;
+}
+
+int PipelineCache::Restamp() {
+	const auto start = std::chrono::steady_clock::now();
+	if (m_restamp_current) {
+		Log::WriteToConsoleAndLog("Shader restamp: the store has this stamp already\n");
+		return 0;
+	}
+	if (!m_restamp_loaded) {
+		Log::WriteToConsoleAndLog(
+		    "Shader restamp: refused: no store, or one written for another device profile or "
+		    "store format\n");
+		return 4;
+	}
+	g_precompile_interrupted = 0;
+	const auto interrupt     = [](int) { g_precompile_interrupted = 1; };
+	std::signal(SIGINT, interrupt);
+	std::signal(SIGTERM, interrupt);
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader restamp: translating {} of {} stored modules again to compare, {} threads\n",
+	    m_replay_total, m_restamp_stored, Common::ParallelThreads()));
+	auto next_report = start + std::chrono::seconds {5};
+	while (m_replay_left != 0 && g_precompile_interrupted == 0) {
+		if (const auto now = std::chrono::steady_clock::now(); now >= next_report) {
+			next_report = now + std::chrono::seconds {5};
+			Log::WriteToConsoleAndLog(fmt::format("Shader restamp: {:.0f} s: modules {}/{}\n",
+			                                      MillisecondsSince(start) / 1000.0,
+			                                      m_replay_total - m_replay_left, m_replay_total));
+			std::fflush(stdout);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds {100});
+	}
+	const bool interrupted = m_replay_left != 0;
+	// Queued translations and pipelines are dropped, running ones end.
+	m_ahead_stop     = true;
+	*m_deferred_stop = true;
+	m_workers.Finish();
+	m_store.Finish();
+	m_recipes.Finish();
+	PipelineBinaryStore::Get().Close();
+	for (const auto& failure: m_replay_failures) {
+		Log::WriteToConsoleAndLog(fmt::format("Shader restamp: differs: {}\n", failure));
+	}
+	// With every module asked for, one without a recipe cannot be vouched for either.
+	const bool all     = g_restamp_sample == 0;
+	const bool refused = interrupted || m_restamp_differing != 0 || m_restamp_verified == 0 ||
+	                     (all && m_restamp_uncovered != 0);
+	bool written = false;
+	if (!refused) {
+		if (Common::File file; file.Open(m_restamp_path, Common::File::Mode::ReadWrite)) {
+			uint32_t count = 0;
+			file.Seek(0);
+			file.Write(m_restamp_stamp.data(), static_cast<uint32_t>(m_restamp_stamp.size()),
+			           &count);
+			written = count == m_restamp_stamp.size() && file.Flush();
+		}
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader restamp: {} in {:.1f} s: {} of {} stored modules translated again, {} differ, {} "
+	    "have no recipe\n",
+	    interrupted ? "interrupted, store left as it was"
+	    : refused   ? "refused, store left as it was"
+	    : written   ? "done, the store now has this stamp"
+	                : "failed to write the store",
+	    MillisecondsSince(start) / 1000.0, m_restamp_verified, m_restamp_stored,
+	    m_restamp_differing, m_restamp_uncovered));
+	return interrupted ? 1 : refused ? 4 : written ? 0 : 1;
 }
 
 void PipelineCache::RecordRecipe(const ProgramKey& key, const ShaderParams& params,

@@ -314,6 +314,8 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	auto info = std::move(result.program).TakeCompiledInfo();
 
 	// The same inputs give the same module id across runs.
+	// BUMP StoreFormatVersion (pipelineSerialization.cpp) WHEN THIS FORMULA CHANGES: stored
+	// modules and pipeline keys carry these ids, and the store's stamp no longer covers this file.
 	const auto function_code = program.FunctionCode();
 	ShaderRecompiler::IR::Writer inputs;
 	ShaderRecompiler::IR::IoAll(inputs, key.stage, key.hash, key.user_data_count, key.static_state,
@@ -543,6 +545,9 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	    .image_heap                 = m_image_heap,
 	    .heap_rows                  = m_heap_rows,
 	};
+	// BUMP StoreFormatVersion (pipelineSerialization.cpp) WHEN WHAT A TRANSLATION IS GIVEN CHANGES
+	// (these options, and the same ones in the translations ahead and in ReplayRecipe): the
+	// store's stamp names the translator only and no longer covers this file.
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 		options.stage            = input_info.logical_stage;

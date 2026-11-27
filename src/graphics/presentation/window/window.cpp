@@ -809,6 +809,10 @@ static void WindowCreate(WindowContext& context) {
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
 	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
+	// A shader precompile needs the device a game run picks (by its surface), but shows nothing.
+	if (Config::PrecompileShadersEnabled()) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
 #if defined(__APPLE__)
 	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user

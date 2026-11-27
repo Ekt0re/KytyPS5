@@ -24,6 +24,9 @@ struct RunOptions {
 
 void Run(const RunOptions& options);
 void RunReplay(const RunOptions& options);
+// --precompile-shaders, --restamp-shader-store: fills or re-stamps the title's shader cache
+// without loading the game; the exit code.
+int  RunPrecompile(const RunOptions& options);
 int LoadExec(const char* path, const char* const argv[]);
 
 } // namespace Emulator

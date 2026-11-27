@@ -299,6 +299,23 @@ public:
 	// changed.
 	void Save();
 
+	// --precompile-shaders (emulator.cpp), set before the cache exists: the recipes' modules are
+	// translated on the pipeline workers at their normal priority, and nothing is decoded for a
+	// game that never runs.
+	static void SetPrecompileMode();
+	// With SetPrecompileMode: waits until every module the recipes name is translated and stored
+	// and every known pipeline is created, printing progress, then saves the caches and prints a
+	// summary. SIGINT or SIGTERM ends it early with what is done saved. False if anything failed.
+	bool Precompile();
+	// --restamp-shader-store, set before the cache exists: a store written under another stamp
+	// is loaded if it agrees in everything else, and `sample` of its modules (0: all) are
+	// translated again from their recipes.
+	static void SetRestampMode(size_t sample);
+	// With SetRestampMode: gives the store this build's stamp if every module translated again
+	// has the stored SPIR-V, and leaves it alone otherwise. 0 done, 4 refused, 1 interrupted or
+	// failed.
+	int Restamp();
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		// Null while a worker still compiles it.
@@ -425,6 +442,9 @@ private:
 		ShaderRecompiler::IR::ResourcePlan plan;
 		ShaderModule                       module;
 		std::vector<uint32_t>              spirv;
+		// Recorded ids the module's id stands for, and its recipe if no recipe has that id.
+		std::vector<uint64_t>              old_ids;
+		std::vector<uint8_t>               recipe;
 	};
 
 	GraphicContext&                        m_graphics;
@@ -473,6 +493,26 @@ private:
 	std::atomic<size_t>                         m_replay_left  = 0;
 	size_t                                      m_replay_merged = 0;
 	size_t                                      m_replay_dropped = 0;
+	// Modules this translator gives another id than their recipe; the id stands for the
+	// recorded ones in the recipes' pipeline keys.
+	size_t                                      m_replay_renamed = 0;
+	std::unordered_map<uint64_t, uint64_t>      m_recipe_aliases;
+	std::vector<std::string>                    m_replay_failures;
+	size_t                                      m_replay_total   = 0;
+	// Recipe pipelines whose stages no recipe gave.
+	size_t                                      m_replay_lacking = 0;
+	bool                                        m_replay_active  = false;
+	// Restamp(): the store's bytes and modules, and what the comparison found.
+	std::shared_ptr<const std::vector<uint8_t>> m_restamp_store;
+	std::filesystem::path                       m_restamp_path;
+	std::vector<uint8_t>                        m_restamp_stamp;
+	ModuleMap                                   m_restamp_modules;
+	bool                                        m_restamp_current   = false;
+	bool                                        m_restamp_loaded    = false;
+	size_t                                      m_restamp_stored    = 0;
+	size_t                                      m_restamp_uncovered = 0;
+	size_t                                      m_restamp_verified  = 0;
+	size_t                                      m_restamp_differing = 0;
 	std::chrono::steady_clock::time_point       m_replay_start;
 	// Decode the store's records not asked for yet, in store order, at low priority.
 	struct StoreDecoders;
@@ -549,9 +589,14 @@ private:
 	                  ShaderRecompiler::IR::PushData::Window push_data, const ShaderModule& module);
 	void RecordRecipePipeline(const GraphicsPipelineKey& key);
 	void ReplayRecipe(RecipeJob& job);
+	bool TranslateRecipe(RecipeJob& job, ReplayedModule& replayed);
+	// Restamp(): compares the translation with the stored module of the recipe's id.
+	void VerifyRecipe(RecipeJob& job);
 	// On the command thread: adds the modules translated from recipes, then creates the recipes'
 	// pipelines whose stages all exist, in the background.
 	void MergeReplayed();
+	// Creates, in the background, the recipes' pipelines whose stages all exist.
+	void CreateRecipePipelines();
 	// Every module by id, with id 0 naming an absent stage.
 	[[nodiscard]] ModuleMap MapModules() const;
 	// False when a stage id of the key is not in `modules`.

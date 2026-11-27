@@ -79,6 +79,16 @@ static void PrintUsage() {
 	         "                                       Implies --vulkan-validation; very slow.\n");
 	::printf("  --shader-validation                  Enable shader validation.\n");
 	::printf("  --shader-cache                       Keep compiled shaders and pipelines between boots.\n");
+	::printf("  --precompile-shaders                 With --game: compile every shader and pipeline the\n"
+	         "                                       title's shader cache knows, without running the\n"
+	         "                                       game, then exit. Pass the game's other options.\n");
+	::printf("  --precompile-threads <num>           Threads of --precompile-shaders. Default: all.\n");
+	::printf("  --restamp-shader-store               With --game: check a shader store written under\n"
+	         "                                       another KYTY_SHADER_CACHE_STAMP by translating its\n"
+	         "                                       shaders again, and give it the current stamp if\n"
+	         "                                       none changed. Exit code 4: refused.\n");
+	::printf("  --restamp-sample <num>               Shaders --restamp-shader-store translates.\n"
+	         "                                       Default: 0, all of them.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --occlusion-queries                  Count occlusion query samples on the GPU.\n");
 	::printf("  --relaxed-shader-float               Native GPU float ops in shaders; faster, can be inaccurate.\n");
@@ -217,6 +227,8 @@ static constexpr Flag FLAGS[] = {
     {"--gpu-assisted-validation", &ConfigOptions::gpu_assisted_validation_enabled},
     {"--shader-validation", &ConfigOptions::shader_validation_enabled},
     {"--shader-cache", &ConfigOptions::shader_cache_enabled},
+    {"--precompile-shaders", &ConfigOptions::precompile_shaders},
+    {"--restamp-shader-store", &ConfigOptions::restamp_shader_store},
     {"--tessellation", &ConfigOptions::tessellation_enabled},
     {"--occlusion-queries", &ConfigOptions::occlusion_queries_enabled},
     {"--relaxed-shader-float", &ConfigOptions::relaxed_shader_float},
@@ -439,6 +451,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid vblank frequency: %s\n", value.c_str());
 				return false;
 			}
+		} else if (arg == "--precompile-threads") {
+			if (!ParseUint32(value, options.config.precompile_threads) ||
+			    options.config.precompile_threads > 1024) {
+				::printf("invalid precompile thread count: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--restamp-sample") {
+			if (!ParseUint32(value, options.config.restamp_sample)) {
+				::printf("invalid restamp sample: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--flush-draws") {
 			if (!ParseUint32(value, options.config.flush_draws)) {
 				::printf("invalid draw count: %s\n", value.c_str());
@@ -514,6 +537,9 @@ static int Main(int argc, char* argv[]) {
 	if (!options.replay.empty()) {
 		RunReplay(options);
 		return 0;
+	}
+	if (options.config.precompile_shaders || options.config.restamp_shader_store) {
+		return RunPrecompile(options);
 	}
 	Run(options);
 

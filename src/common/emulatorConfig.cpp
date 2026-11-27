@@ -249,6 +249,10 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
+bool PrecompileShadersEnabled() {
+	return g_config->precompile_shaders || g_config->restamp_shader_store;
+}
+
 LogDirection GetShaderLogDirection() {
 	return g_config->shader_log_direction;
 }
