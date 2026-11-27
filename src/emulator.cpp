@@ -139,6 +139,61 @@ static void Execute(const std::filesystem::path& game_patch) {
 	std::quick_exit(0);
 }
 
+void RunReplay(const RunOptions& options) {
+	Common::Subsystems subsystems(true);
+	// The game's param.json sets the memory layout (flexible and direct sizes) the capture used.
+	auto config          = options.config;
+	config.splash_enabled = false;
+	Init(config, options.replay / "param.json", subsystems);
+	PrintSystemInfo();
+	// The loader installs the host exception handler when it maps a program; a replay loads none.
+	// Without it the first read of a page the GPU caches protect (an SRT walker load, a readback)
+	// is an unhandled fault instead of a resolved one.
+	if (!Common::HostException::InstallHandler(Loader::KytyExceptionHandler)) {
+		EXIT("Failed to install the host exception handler\n");
+	}
+	Libs::Graphics::FrameCapture::ReplayOptions replay;
+	replay.capture = options.replay;
+	replay.output  = options.replay_out.empty() ? options.replay / "replay" : options.replay_out;
+	replay.repeat  = options.replay_repeat;
+	std::thread([replay] { Libs::Graphics::FrameCapture::RunReplay(replay); }).detach();
+	Libs::Graphics::WindowRun();
+	std::quick_exit(0);
+}
+
+int RunPrecompile(const RunOptions& options) {
+	if (options.app0_dir.empty()) {
+		EXIT("--precompile-shaders and --restamp-shader-store need --game\n");
+	}
+	auto config                 = options.config;
+	config.splash_enabled       = false;
+	config.shader_cache_enabled = true;
+	const auto threads = config.precompile_threads != 0
+	                         ? size_t {config.precompile_threads}
+	                         : size_t {std::max(1u, std::thread::hardware_concurrency())};
+	// Before the renderer starts its workers.
+	Common::g_parallel_threads_override = threads;
+	if (config.restamp_shader_store) {
+		Libs::Graphics::PipelineCache::SetRestampMode(config.restamp_sample, config.restamp_strict);
+	} else {
+		Libs::Graphics::PipelineCache::SetPrecompileMode();
+	}
+	Common::Subsystems subsystems(true);
+	// The title's param.json names the cache; the renderer opens it as a game run would, on the
+	// same device, so every key matches.
+	Init(config, options.app0_dir / "sce_sys" / "param.json", subsystems);
+	auto* renderer = Libs::Graphics::AgcRenderer();
+	EXIT_IF(renderer == nullptr);
+	int code = 0;
+	{
+		Common::LockGuard lock(renderer->GetMutex());
+		auto&             cache = renderer->GetPipelineCache();
+		code = config.restamp_shader_store ? cache.Restamp() : cache.Precompile() ? 0 : 1;
+	}
+	std::fflush(stdout);
+	std::quick_exit(code);
+}
+
 void Run(const RunOptions& options) {
 	if (options.app0_dir.empty()) {
 		EXIT("app0 directory is required\n");

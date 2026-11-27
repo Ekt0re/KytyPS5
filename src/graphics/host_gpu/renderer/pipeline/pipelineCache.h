@@ -8,6 +8,8 @@
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -164,6 +166,16 @@ public:
 	void Post(Common::UniqueFunction<void>&& job);
 	// Runs the queued jobs and stops the thread; jobs posted later never run. Safe to call again.
 	void Finish() { m_thread = {}; }
+	// Finish(), then closes the file; the lock stays held (the file may be replaced meanwhile).
+	void CloseFile() {
+		Finish();
+		m_file.Close();
+	}
+	// CloseFile(), then releases the lock.
+	void Close() {
+		CloseFile();
+		m_lock.Release();
+	}
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -187,6 +199,27 @@ public:
 	// Finishes the queued writes and stops the store thread, then writes the driver cache if it
 	// changed.
 	void Save();
+
+	// --precompile-shaders (emulator.cpp), set before the cache exists: the recipes' modules are
+	// translated on the pipeline workers at their normal priority, and nothing is decoded for a
+	// game that never runs.
+	static void SetPrecompileMode();
+	// With SetPrecompileMode: waits until every module the recipes name is translated and stored
+	// and every known pipeline is created, printing progress, then saves the caches and prints a
+	// summary. SIGINT or SIGTERM ends it early with what is done saved. False if anything failed.
+	bool Precompile();
+	// --restamp-shader-store, set before the cache exists: a store written under another stamp
+	// is loaded if it agrees in everything else, and `sample` of its modules (0: all) are
+	// translated again from their recipes. `strict` (and any sample) keeps the all-or-nothing
+	// check; otherwise the carry-over is partial.
+	static void SetRestampMode(size_t sample, bool strict = false);
+	// With SetRestampMode. Strict: gives the store this build's stamp if every module translated
+	// again has the stored SPIR-V, and leaves it alone otherwise. Partial (the default): rewrites
+	// the store under this build's stamp with only the module records this build translates to
+	// exactly the stored record (SPIR-V, resource plan and module fields), and the pipelines whose
+	// stages all stayed; the rest is dropped and comes back from the recipes. 0 done, 4 refused
+	// (partial: nothing could be kept), 1 interrupted or failed.
+	int Restamp();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -261,6 +294,98 @@ private:
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
+	// Host values TranslateComputeAhead needs off the command thread.
+	uint32_t m_compute_subgroup_size     = 64;
+	uint32_t m_max_compute_shared_memory = 0;
+	// Translations ahead by program key, and the keys of programs that need none. Unlike the
+	// program cache, any thread may use it.
+	std::mutex                                                     m_ahead_mutex;
+	std::condition_variable                                        m_ahead_done;
+	std::unordered_map<ProgramKey, std::shared_ptr<AheadJob>, ProgramKeyHash> m_ahead;
+	// Queued, running and finished translations not taken yet, oldest first, and their number.
+	std::deque<std::shared_ptr<AheadJob>> m_ahead_pending;
+	std::atomic<bool>                     m_ahead_stop = false;
+	// Unoptimized pipelines replaced by their optimized builds (in-flight commands use them).
+	std::vector<vk::Pipeline>             m_replaced_pipelines;
+	// Set at destruction: background pipeline creations not started yet are dropped.
+	std::shared_ptr<std::atomic<bool>>    m_deferred_stop = std::make_shared<std::atomic<bool>>(false);
+	// Translations ahead finished and taken by the command thread.
+	std::atomic<uint32_t>                 m_ahead_finished = 0;
+	uint32_t                              m_ahead_taken    = 0;
+	// Recipes: the file, what it holds, the translations done and the pipelines still to create.
+	ShaderStoreWriter                           m_recipes;
+	std::unordered_set<uint64_t>                m_recipe_codes;
+	std::unordered_set<uint64_t>                m_recipe_modules;
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_recipe_pipeline_keys;
+	std::vector<GraphicsPipelineKey>            m_recipe_pipelines;
+	std::mutex                                  m_replay_mutex;
+	std::vector<ReplayedModule>                 m_replayed;
+	std::atomic<bool>                           m_replay_ready = false;
+	std::atomic<size_t>                         m_replay_left  = 0;
+	size_t                                      m_replay_merged = 0;
+	size_t                                      m_replay_dropped = 0;
+	// Modules this translator gives another id than their recipe; the id stands for the
+	// recorded ones in the recipes' pipeline keys.
+	size_t                                      m_replay_renamed = 0;
+	std::unordered_map<uint64_t, uint64_t>      m_recipe_aliases;
+	std::vector<std::string>                    m_replay_failures;
+	size_t                                      m_replay_total   = 0;
+	// Recipe pipelines whose stages no recipe gave.
+	size_t                                      m_replay_lacking = 0;
+	bool                                        m_replay_active  = false;
+	// Restamp(): the store's bytes and modules, and what the comparison found.
+	std::shared_ptr<const std::vector<uint8_t>> m_restamp_store;
+	std::filesystem::path                       m_restamp_path;
+	std::vector<uint8_t>                        m_restamp_stamp;
+	ModuleMap                                   m_restamp_modules;
+	bool                                        m_restamp_current   = false;
+	bool                                        m_restamp_loaded    = false;
+	size_t                                      m_restamp_stored    = 0;
+	size_t                                      m_restamp_uncovered = 0;
+	size_t                                      m_restamp_verified  = 0;
+	size_t                                      m_restamp_differing = 0;
+	size_t                                      m_restamp_failed    = 0;
+	// Partial restamp: the module ids whose record this build reproduced apart from the plan, those
+	// whose plan matched too, the count whose SPIR-V matched but not the module fields, the store's
+	// records in order (their frames in m_restamp_store) and this build's store header.
+	std::unordered_set<uint64_t>                m_restamp_identical;
+	size_t                                      m_restamp_spirv_only = 0;
+	std::unordered_set<uint64_t>                m_restamp_plan_identical;
+	size_t                                      m_restamp_plan_differing = 0;
+	std::vector<RestampRecord>                  m_restamp_records;
+	std::vector<std::span<const uint8_t>>       m_restamp_frames;
+	std::vector<uint8_t>                        m_restamp_header;
+	std::chrono::steady_clock::time_point       m_replay_start;
+	// Decode the store's records not asked for yet, in store order, at low priority.
+	struct StoreDecoders;
+	std::shared_ptr<StoreDecoders> m_store_decoders;
+	// Declared last, so its jobs end before anything they use is destroyed.
+	std::unique_ptr<PipelineWorkers> m_replayers;
+	PipelineWorkers m_workers;
+	PipelineWorkers m_translators;
+
+	// Creates the host pipeline of `pipeline`, whose layouts exist, on a worker. With
+	// `fast_first` (KYTY_FAST_PIPELINES) an unoptimized pipeline first, then the optimized one in
+	// the background, which Upgrade swaps in.
+	void StartCompile(Pipeline& pipeline, Common::UniqueFunction<vk::Pipeline, bool>&& create,
+	                  bool fast_first = false);
+	// Swaps in a finished optimized build; the unoptimized pipeline lives until destruction.
+	void Upgrade(Pipeline& pipeline);
+	// The same in the background: workers create it once nothing else waits, a draw at once.
+	void StartDeferredCompile(Pipeline& pipeline, Common::UniqueFunction<vk::Pipeline>&& create);
+	// A draw needs `pipeline`: a background creation not started yet goes before other work.
+	void Expedite(Pipeline& pipeline);
+	// Runs a translation ahead on a translator thread.
+	void TranslateAhead(AheadJob& job);
+	// Registers the job under `key` unless the key is known, and posts it.
+	void QueueAhead(std::shared_ptr<AheadJob> job, ProgramKey key);
+	// On the command thread, for a program key looked up for the first time: takes its
+	// translation ahead and the resource plan extracted from it, waiting for a running one, or
+	// returns false. Either way, later requests for the key are ignored.
+	bool TakeTranslation(const ProgramKey& key, ShaderRecompiler::TranslateResult& translated,
+	                     ShaderRecompiler::IR::ResourcePlan& plan);
+	// Marks the keys of the programs in the cache as needing no translation ahead.
+	void MarkProgramsKnown();
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
@@ -281,6 +406,27 @@ private:
 	                 const std::vector<uint32_t>& spirv);
 	void StorePipeline(const GraphicsPipelineKey& key);
 	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
+	// Shader recipes (pipelineSerialization.cpp): the inputs of every stored module's translation,
+	// kept across translator changes, so a start with a discarded store translates them again in
+	// the background.
+	struct RecipeJob;
+	void OpenRecipes(const std::filesystem::path& store_path);
+	// The command thread compiled `module` of a program without linked calls.
+	void RecordRecipe(const ProgramKey& key, const ShaderParams& params,
+	                  const ShaderRecompiler::CompileOptions& options,
+	                  ShaderRecompiler::IR::PushData::Window push_data, const ShaderModule& module);
+	void RecordRecipePipeline(const GraphicsPipelineKey& key);
+	void ReplayRecipe(RecipeJob& job);
+	bool TranslateRecipe(RecipeJob& job, ReplayedModule& replayed);
+	// Restamp(): compares the translation with the stored module of the recipe's id.
+	void VerifyRecipe(RecipeJob& job);
+	// Restamp() in partial mode, once every comparison is done.
+	int RestampPartial(std::chrono::steady_clock::time_point start, bool interrupted);
+	// On the command thread: adds the modules translated from recipes, then creates the recipes'
+	// pipelines whose stages all exist, in the background.
+	void MergeReplayed();
+	// Creates, in the background, the recipes' pipelines whose stages all exist.
+	void CreateRecipePipelines();
 	// Every module by id, with id 0 naming an absent stage.
 	[[nodiscard]] ModuleMap MapModules() const;
 	// False when a stage id of the key is not in `modules`.
