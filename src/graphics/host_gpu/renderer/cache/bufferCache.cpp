@@ -220,6 +220,7 @@ bool BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 template <bool async>
 void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total_size,
                                 bool fuse) {
+	EXIT_IF(parts.empty() || total_size == 0);
 	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& part: parts) {
 		for (auto& copy: part.copies) {
@@ -227,7 +228,11 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 		}
 	}
 
-	const auto record = [&](vk::CommandBuffer native) {
+	// The publication below takes `download` over (and with it a temporary buffer's owner) before
+	// `record` runs: the copy targets are taken here.
+	const auto download_handle = download.buffer->Handle();
+	const auto download_offset = download.offset;
+	const auto record = [&parts, download_handle, download_offset, total_size](vk::CommandBuffer native) {
 		// One barrier for all source buffers, then their copies, then one barrier for the bytes
 		// the host reads.
 		std::vector<vk::BufferMemoryBarrier> before(parts.size());
@@ -245,15 +250,15 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
 		                       static_cast<uint32_t>(before.size()), before.data(), 0, nullptr);
 		for (const auto& part: parts) {
-			native.copyBuffer(part.buffer->Handle(), download.buffer->Handle(),
+			native.copyBuffer(part.buffer->Handle(), download_handle,
 			                  static_cast<uint32_t>(part.copies.size()), part.copies.data());
 		}
 
 		auto after          = before.front();
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-		after.buffer        = download.buffer->Handle();
-		after.offset        = download.offset;
+		after.buffer        = download_handle;
+		after.offset        = download_offset;
 		after.size          = total_size;
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands |
@@ -265,7 +270,9 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 	    !async && std::all_of(parts.begin(), parts.end(), [&](const DownloadPart& part) {
 		    return CanDownloadDetached(part.buffer->CpuAddress(), part.copies);
 	    });
-	auto publish = [total_size, parts = std::move(parts), download = std::move(download)] {
+	// `record` reads `parts` by reference and may run after this point: the publication keeps
+	// its own copy of the addresses and offsets.
+	auto publish = [total_size, parts = parts, download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
 		for (const auto& part: parts) {
 			const auto buffer_address = part.buffer_address;
