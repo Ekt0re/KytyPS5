@@ -921,6 +921,13 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		# The whole suite again on direct memory in Vulkan dma-buf chunks (skips without a GPU).
+		add_test(NAME virtual_memory_allocation_vk_backing
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_vk_backing PROPERTIES
+			ENVIRONMENT "KYTY_VK_GUEST_BACKING=1")
+	endif()
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher

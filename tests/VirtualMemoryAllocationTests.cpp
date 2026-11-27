@@ -22,6 +22,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdint>
 #include <cstddef>
@@ -52,6 +53,7 @@
 #include <asm/prctl.h>
 #include <pthread.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -656,6 +658,154 @@ void TestSparseReadDuringDirectCommit() {
 	      "sparse read observed a gap while direct backing was committed");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+#if defined(__linux__)
+// KYTY_VK_GUEST_BACKING=1: direct memory in Vulkan dma-buf chunks. Guest views alias each other
+// and the backing alias across a chunk boundary, views start at any page offset, protection holds,
+// and a descriptor of the chunk (what the renderer imports) maps the same bytes.
+void TestVulkanGuestBackingViews() {
+	const char* test = "VulkanGuestBackingViews";
+	namespace Memory = Libs::LibKernel::Memory;
+	if (Memory::TestVulkanBackingChunks() == 0) {
+		std::printf("[host]    %-48s skipped (KYTY_VK_GUEST_BACKING off or unavailable)\n", test);
+		return;
+	}
+	constexpr uint64_t chunk    = 1ull << 30u;
+	constexpr uint64_t half     = 1ull << 20u;
+	constexpr uint64_t size     = half * 2;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        Memory::KernelAllocateDirectMemory(static_cast<int64_t>(chunk - half),
+	                                           static_cast<int64_t>(chunk + half), size,
+	                                           SceKernelMemoryPoolAlignment, SceKernelMtypeC,
+	                                           &physical),
+	        "KernelAllocateDirectMemory(across the first chunk boundary)");
+	Check(test, physical == static_cast<int64_t>(chunk - half), "allocation missed the boundary");
+	constexpr uint64_t base_a = 0x80400000000ull;
+	constexpr uint64_t base_b = 0x80500000000ull;
+	constexpr uint64_t base_c = 0x80600000000ull;
+	const auto map = [&](uint64_t base, uint64_t length, int64_t start, const char* action) {
+		void* address = reinterpret_cast<void*>(base);
+		CheckOk(test,
+		        Memory::KernelMapNamedDirectMemory(&address, length, SceKernelProtCpuRw,
+		                                           SceKernelMapFixed, start, 0x4000, "vk_backing"),
+		        action);
+	};
+	map(base_a, size, physical, "KernelMapNamedDirectMemory(view a)");
+	map(base_b, size, physical, "KernelMapNamedDirectMemory(view b)");
+	auto* a = reinterpret_cast<uint8_t*>(base_a);
+	auto* b = reinterpret_cast<uint8_t*>(base_b);
+	Check(test,
+	      Memory::BackingOffset(base_a) == static_cast<uint64_t>(physical) &&
+	          Memory::BackingOffset(base_b + half) == chunk,
+	      "views do not sit at their direct memory offsets");
+
+	std::memset(a, 0x11, size);
+	Check(test, b[0] == 0x11 && b[half - 1] == 0x11 && b[half] == 0x11 && b[size - 1] == 0x11,
+	      "second view misses writes on either side of the chunk boundary");
+	b[half + 16] = 0x77;
+	Check(test, a[half + 16] == 0x77, "first view misses a write through the second");
+	std::vector<uint8_t> bytes(size);
+	Check(test,
+	      Memory::TryReadBacking(base_a, bytes.data(), size) &&
+	          std::memcmp(bytes.data(), a, size) == 0,
+	      "backing alias differs from the guest view across the chunk boundary");
+
+	// A view that starts mid-chunk and spans the boundary.
+	map(base_c, 0x10000, physical + static_cast<int64_t>(half - 0x8000),
+	    "KernelMapNamedDirectMemory(view c, offset)");
+	auto* c = reinterpret_cast<uint8_t*>(base_c);
+	Check(test, c[0x8000 + 16] == 0x77 && c[0] == 0x11 && c[0xffff] == 0x11,
+	      "offset view across the boundary reads wrong bytes");
+	c[0x8000 + 17] = 0x55;
+	Check(test, a[half + 17] == 0x55, "write through the offset view is lost");
+
+	// Each half lies in one chunk; the whole range does not.
+	const auto alias = Memory::ContiguousBackingAlias(base_a, size);
+	Check(test, alias != 0, "range across chunks has no contiguous alias");
+	Memory::VulkanBackingChunk first;
+	Memory::VulkanBackingChunk second;
+	Memory::VulkanBackingChunk both;
+	Check(test,
+	      Memory::FindVulkanBackingChunk(alias, half, &first) && first.index == 0 &&
+	          first.offset == chunk - half && first.size == chunk,
+	      "first half is not in Vulkan chunk 0 (did the chunk fall back to a memfd?)");
+	Check(test,
+	      Memory::FindVulkanBackingChunk(alias + half, half, &second) && second.index == 1 &&
+	          second.offset == 0,
+	      "second half is not at the start of Vulkan chunk 1");
+	Check(test, !Memory::FindVulkanBackingChunk(alias, size, &both),
+	      "a range across chunks was reported as one chunk");
+
+	// What the renderer imports: a descriptor of chunk 1 maps the same memory.
+	const int fd = Memory::DupVulkanBackingChunk(1);
+	Check(test, fd >= 0, "DupVulkanBackingChunk failed");
+	auto* imported =
+	    static_cast<uint8_t*>(mmap(nullptr, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+	Check(test, imported != MAP_FAILED, "chunk descriptor can't be mapped");
+	Check(test, imported[16] == 0x77 && imported[17] == 0x55, "chunk mapping misses guest writes");
+	imported[32] = 0x99;
+	Check(test, a[half + 32] == 0x99 && b[half + 32] == 0x99, "guest views miss a chunk write");
+	munmap(imported, 0x10000);
+	close(fd);
+
+	// Protection across the boundary: a read-only page refuses a kernel write (no signal needed).
+	CheckOk(test, Memory::KernelMprotect(a + half - 0x4000, 0x8000, SceKernelProtCpuRead),
+	        "KernelMprotect(read-only across the boundary)");
+	int pipe_fds[2] = {-1, -1};
+	Check(test, pipe(pipe_fds) == 0, "pipe failed");
+	const uint8_t payload[4] = {1, 2, 3, 4};
+	Check(test, write(pipe_fds[1], payload, sizeof(payload)) == 4, "pipe write failed");
+	errno = 0;
+	Check(test, read(pipe_fds[0], a + half, sizeof(payload)) == -1 && errno == EFAULT,
+	      "a read-only page in chunk 1 accepted a write");
+	Check(test, a[half - 1] == 0x11 && a[half + 16] == 0x77, "read-only pages lost their bytes");
+	CheckOk(test, Memory::KernelMprotect(a + half - 0x4000, 0x8000, SceKernelProtCpuRw),
+	        "KernelMprotect(read-write)");
+	Check(test, read(pipe_fds[0], a + half, sizeof(payload)) == 4 && b[half + 3] == 4,
+	      "page stayed read-only after KernelMprotect(read-write)");
+	close(pipe_fds[0]);
+	close(pipe_fds[1]);
+
+	CheckOk(test, Memory::KernelMunmap(base_c, 0x10000), "KernelMunmap(c)");
+	CheckOk(test, Memory::KernelMunmap(base_b, size), "KernelMunmap(b)");
+	CheckOk(test, Memory::KernelMunmap(base_a, size), "KernelMunmap(a)");
+	CheckOk(test, Memory::KernelReleaseDirectMemory(physical, size), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok (%u chunks)\n", test, Memory::TestVulkanBackingChunks());
+}
+#endif
+
+#if defined(__linux__)
+// Host access probes without a signal: the kernel copies through a pipe, which reads and writes the
+// page like a guest access does. process_vm_readv/writev can't reach the dma-buf mappings of
+// KYTY_VK_GUEST_BACKING=1 at all, whatever their protection.
+bool ProbeHostRead(uint64_t address, uint64_t* value) {
+	int fds[2] = {-1, -1};
+	if (pipe(fds) != 0) {
+		return false;
+	}
+	const bool ok =
+	    write(fds[1], reinterpret_cast<const void*>(address), sizeof(*value)) ==
+	        static_cast<ssize_t>(sizeof(*value)) &&
+	    read(fds[0], value, sizeof(*value)) == static_cast<ssize_t>(sizeof(*value));
+	close(fds[0]);
+	close(fds[1]);
+	return ok;
+}
+
+bool ProbeHostWrite(uint64_t address, uint64_t value) {
+	int fds[2] = {-1, -1};
+	if (pipe(fds) != 0) {
+		return false;
+	}
+	const bool ok = write(fds[1], &value, sizeof(value)) == static_cast<ssize_t>(sizeof(value)) &&
+	                read(fds[0], reinterpret_cast<void*>(address), sizeof(value)) ==
+	                    static_cast<ssize_t>(sizeof(value));
+	close(fds[0]);
+	close(fds[1]);
+	return ok;
+}
+#endif
 
 std::counting_semaphore<2>* g_backing_reads_entered  = nullptr;
 std::counting_semaphore<2>* g_continue_backing_reads = nullptr;
@@ -2594,15 +2744,25 @@ void TestPartialUnmapPreservesHostPermissions() {
 	          right.Protect == PAGE_NOACCESS,
 	      "partial unmap removed the right survivor's read protection");
 #else
-	// Probe actual host access without taking a signal or changing the page protections.
-	uint64_t value = 0;
-	iovec local {&value, sizeof(value)};
-	iovec left {reinterpret_cast<void*>(base), sizeof(value)};
-	iovec right {reinterpret_cast<void*>(base + SceKernelPageSize * 2), sizeof(value)};
-	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value),
-	      "partial unmap removed read access to the left survivor");
-	Check(test, process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
-	      "partial unmap removed the right survivor's read protection");
+	// Probe actual host access without taking a signal or changing the page protections: a write
+	// to a pipe reads the page in the kernel. (Not process_vm_readv: it can't read the dma-buf
+	// mappings of KYTY_VK_GUEST_BACKING=1, whatever their protection.)
+	int pipe_fds[2] = {-1, -1};
+	Check(test, pipe(pipe_fds) == 0, "pipe failed");
+	uint64_t   value    = 0;
+	const auto readable = [&](uint64_t address) {
+		if (write(pipe_fds[1], reinterpret_cast<const void*>(address), sizeof(value)) !=
+		    static_cast<ssize_t>(sizeof(value))) {
+			return false;
+		}
+		return read(pipe_fds[0], &value, sizeof(value)) == static_cast<ssize_t>(sizeof(value));
+	};
+	const bool left_readable  = readable(base);
+	const bool right_readable = readable(base + SceKernelPageSize * 2);
+	close(pipe_fds[0]);
+	close(pipe_fds[1]);
+	Check(test, left_readable, "partial unmap removed read access to the left survivor");
+	Check(test, !right_readable, "partial unmap removed the right survivor's read protection");
 #endif
 
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
@@ -3855,15 +4015,11 @@ void TestFixedDirectReplacementPreservesAccess() {
 	const auto observe_old_mapping = [](uintptr_t start, size_t size) {
 		++observations;
 		uint64_t value = 0;
-		ssize_t bytes = -1;
-		std::thread reader([&] {
-			iovec local {&value, sizeof(value)};
-			iovec remote {reinterpret_cast<void*>(start), sizeof(value)};
-			bytes = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
-		});
+		bool     read  = false;
+		std::thread reader([&] { read = ProbeHostRead(start, &value); });
 		reader.join();
 		Check("FixedDirectReplacementPreservesAccess",
-		      size == SceKernelPageSize && bytes == sizeof(value) && value == 0x22,
+		      size == SceKernelPageSize && read && value == 0x22,
 		      "fixed replacement exposed an inaccessible or changed old mapping before mmap");
 	};
 	Check(test, ProtectGuestHostMemory(base, page, Mode::Read) &&
@@ -3885,12 +4041,9 @@ void TestFixedDirectReplacementPreservesAccess() {
 	                *reinterpret_cast<uint64_t*>(alias_base + page) == 0x22,
 	      "replacement lost aliasing or changed the previous backing");
 	uint64_t value = 0;
-	iovec local {&value, sizeof(value)};
-	iovec left {reinterpret_cast<void*>(base), sizeof(value)};
-	iovec right {reinterpret_cast<void*>(base + page * 2), sizeof(value)};
-	Check(test, process_vm_readv(getpid(), &local, 1, &left, 1, 0) == sizeof(value) &&
-	                value == 0x11 && process_vm_writev(getpid(), &local, 1, &left, 1, 0) == -1 &&
-	                process_vm_readv(getpid(), &local, 1, &right, 1, 0) == -1,
+	uint64_t ignored = 0;
+	Check(test, ProbeHostRead(base, &value) && value == 0x11 && !ProbeHostWrite(base, value) &&
+	                !ProbeHostRead(base + page * 2, &ignored),
 	      "middle replacement changed a neighboring page's bytes or host protection");
 	CheckOk(test, replace(page, page * 2, SceKernelProtCpuRead, "replacement_span"),
 	        "KernelMapNamedDirectMemory(multiple backing views)");
@@ -6689,6 +6842,9 @@ int main(int argc, char** argv) {
 		RunTest(TestSparseBackingReadPreservesResidency);
 		RunTest(TestCopySparseMemoryMappings);
 		RunTest(TestSparseReadDuringDirectCommit);
+#if defined(__linux__)
+		RunTest(TestVulkanGuestBackingViews);
+#endif
 		RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 		RunTest(TestFlexibleMemoryUsesSharedBacking);
 		RunTest(TestFlexibleMemoryReuseIsZeroFilled);
@@ -6746,6 +6902,9 @@ int main(int argc, char** argv) {
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestCopySparseMemoryMappings);
 	RunTest(TestSparseReadDuringDirectCommit);
+#if defined(__linux__)
+	RunTest(TestVulkanGuestBackingViews);
+#endif
 	RunTest(TestConcurrentBackingReads);
 	RunTest(TestBackingReadsSkipMappingLock);
 	RunTest(TestQueriesSkipOperationLock);

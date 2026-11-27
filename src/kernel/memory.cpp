@@ -1,4 +1,5 @@
 #include "kernel/memory.h"
+#include "kernel/vulkanGuestBacking.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -853,6 +854,49 @@ bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) {
 
 uint64_t ContiguousBackingAlias(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->ContiguousBackingAlias(vaddr, size);
+}
+
+bool VulkanBackingActive() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return g_guest_address_space != nullptr && g_guest_address_space->GetBacking().IsVulkanBacked();
+#else
+	return false;
+#endif
+}
+
+bool FindVulkanBackingChunk(uint64_t alias, uint64_t size, VulkanBackingChunk* out) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	if (out == nullptr || !VulkanBackingActive()) {
+		return false;
+	}
+	const auto& backing = g_guest_address_space->GetBacking();
+	const auto  base    = backing.GetBackingBase();
+	if (alias < base) {
+		return false;
+	}
+	if (!backing.FindVulkanChunk(alias - base, size, &out->index, &out->offset, &out->size)) {
+		return false;
+	}
+	const auto& info       = backing.GetVulkanAllocator()->GetInfo();
+	out->handle_type       = info.handle_type;
+	out->memory_type_index = info.memory_type_index;
+	std::memcpy(out->device_uuid, info.device_uuid.data(), sizeof(out->device_uuid));
+	return true;
+#else
+	(void)alias;
+	(void)size;
+	(void)out;
+	return false;
+#endif
+}
+
+int DupVulkanBackingChunk(uint32_t index) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return VulkanBackingActive() ? g_guest_address_space->GetBacking().DupVulkanChunk(index) : -1;
+#else
+	(void)index;
+	return -1;
+#endif
 }
 
 uint64_t BackingGeneration() {
@@ -2834,6 +2878,14 @@ uint64_t TestBackingBytesZeroed() {
 
 uint64_t TestGuestBackingSize() {
 	return g_guest_address_space->GetBackingSize();
+}
+
+uint32_t TestVulkanBackingChunks() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	return g_guest_address_space->GetBacking().TestChunkCount();
+#else
+	return 0;
+#endif
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

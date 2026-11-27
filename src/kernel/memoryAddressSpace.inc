@@ -197,6 +197,10 @@ public:
 			}
 		}
 #else
+		if (InitVulkanChunks()) {
+			ExcludeFromCoreDumps();
+			return;
+		}
 		m_fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
 #endif
 		if (m_fd < 0) {
@@ -251,9 +255,157 @@ public:
 		CloseHandle(m_handle);
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 		munmap(m_backing_base, m_size);
-		close(m_fd);
+		if (m_fd >= 0) {
+			close(m_fd);
+		}
+#if !defined(__APPLE__)
+		for (uint32_t i = 0; i < m_chunk_count; i++) {
+			if (const int fd = m_chunks[i].fd.load(std::memory_order_relaxed); fd >= 0) {
+				close(fd);
+			}
+		}
+		delete[] m_chunks;
+		delete m_vulkan;
+#endif
 #endif
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// KYTY_VK_GUEST_BACKING=1: see vulkanGuestBacking.h. The backing is cut into chunks (one
+	// Vulkan allocation is limited, 4 GiB on RADV) that are allocated when a guest page in them is
+	// first mapped: a Vulkan allocation is committed at once, where the memfd commits only what is
+	// touched (GTA VI touches 7-8 GB of its 12.7 GB). Until then the chunk's part of the alias is
+	// inaccessible; nothing reads it, since only mapped pages are read through the alias. A chunk
+	// Vulkan can't provide (driver refusal, too little GTT or system memory) gets a memfd of its
+	// own, so a failure never stops the game.
+	static constexpr uint64_t VulkanChunkSize = 1ull << 30u;
+
+	bool InitVulkanChunks() {
+		m_vulkan = VulkanGuestAllocator::Create();
+		if (m_vulkan == nullptr) {
+			return false;
+		}
+		if (m_vulkan->MaxAllocationSize() != 0 && m_vulkan->MaxAllocationSize() < VulkanChunkSize) {
+			std::printf("Vulkan guest backing: allocations are limited to %" PRIu64
+			            " MiB, below the %" PRIu64 " MiB chunk; memfd backing\n",
+			            m_vulkan->MaxAllocationSize() >> 20u, VulkanChunkSize >> 20u);
+			std::fflush(stdout);
+			delete m_vulkan;
+			m_vulkan = nullptr;
+			return false;
+		}
+		auto* alias = mmap(nullptr, m_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+		                   -1, 0);
+		if (alias == MAP_FAILED) {
+			delete m_vulkan;
+			m_vulkan = nullptr;
+			return false;
+		}
+		m_backing_base = static_cast<uint8_t*>(alias);
+		m_chunk_count  = static_cast<uint32_t>((m_size + VulkanChunkSize - 1u) / VulkanChunkSize);
+		m_chunks       = new Chunk[m_chunk_count];
+		std::printf("Vulkan guest backing: %" PRIu64 " MiB in %u chunks of up to %" PRIu64
+		            " MiB, allocated on first use\n",
+		            m_size >> 20u, m_chunk_count, VulkanChunkSize >> 20u);
+		std::fflush(stdout);
+		return true;
+	}
+
+	[[nodiscard]] uint64_t ChunkBytes(uint32_t index) const {
+		return std::min(VulkanChunkSize, m_size - uint64_t {index} * VulkanChunkSize);
+	}
+
+	// Allocates the chunk and maps it into the alias. Callers that map guest views hold the state
+	// lock exclusively; the mutex also orders it against ZeroRange and the renderer's lookups.
+	bool EnsureChunk(uint32_t index) {
+		auto& chunk = m_chunks[index];
+		if (chunk.fd.load(std::memory_order_acquire) >= 0) {
+			return true;
+		}
+		std::lock_guard lock(m_chunk_mutex);
+		if (chunk.fd.load(std::memory_order_relaxed) >= 0) {
+			return true;
+		}
+		const auto bytes  = ChunkBytes(index);
+		int        fd     = m_vulkan->Allocate(bytes);
+		bool       vulkan = fd >= 0;
+		if (!vulkan) {
+			fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
+			if (fd < 0 || ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
+				EXIT("direct-memory backing: memfd for chunk %u failed: %d\n", index, errno);
+			}
+			if (m_memfd_chunks++ == 0) {
+				std::printf("Vulkan guest backing: chunk %u falls back to a memfd (no zero-copy "
+				            "there)\n",
+				            index);
+				std::fflush(stdout);
+			}
+		}
+		if (mmap(m_backing_base + uint64_t {index} * VulkanChunkSize, bytes, PROT_READ | PROT_WRITE,
+		         MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+			EXIT("direct-memory backing: alias of chunk %u failed: %d\n", index, errno);
+		}
+		chunk.vulkan = vulkan;
+		chunk.fd.store(fd, std::memory_order_release);
+		if (vulkan) {
+			m_vulkan_bytes += bytes;
+			std::printf("Vulkan guest backing: chunk %u (%" PRIu64 " MiB) allocated, %" PRIu64
+			            " MiB in Vulkan memory\n",
+			            index, bytes >> 20u, m_vulkan_bytes >> 20u);
+			std::fflush(stdout);
+		}
+		return true;
+	}
+
+	// The file and file offset that hold backing byte `offset`, and how many bytes from there
+	// lie in that file. -1 for a chunk that was never allocated.
+	[[nodiscard]] int FileAt(uint64_t offset, uint64_t* file_offset, uint64_t* run) const {
+		if (m_chunks == nullptr) {
+			*file_offset = offset;
+			*run         = m_size - offset;
+			return m_fd;
+		}
+		const auto index = static_cast<uint32_t>(offset / VulkanChunkSize);
+		*file_offset     = offset % VulkanChunkSize;
+		*run             = ChunkBytes(index) - *file_offset;
+		return m_chunks[index].fd.load(std::memory_order_acquire);
+	}
+
+public:
+	[[nodiscard]] bool IsVulkanBacked() const { return m_vulkan != nullptr; }
+
+	[[nodiscard]] const VulkanGuestAllocator* GetVulkanAllocator() const { return m_vulkan; }
+
+	// The Vulkan chunk that holds all of [backing_offset, backing_offset + size), with the offset
+	// in it. False when the range spans chunks or its chunk is a memfd.
+	bool FindVulkanChunk(uint64_t backing_offset, uint64_t size, uint32_t* index,
+	                     uint64_t* chunk_offset, uint64_t* chunk_size) const {
+		if (m_chunks == nullptr || size == 0 || backing_offset >= m_size ||
+		    m_size - backing_offset < size) {
+			return false;
+		}
+		const auto i = static_cast<uint32_t>(backing_offset / VulkanChunkSize);
+		if ((backing_offset + size - 1u) / VulkanChunkSize != i ||
+		    m_chunks[i].fd.load(std::memory_order_acquire) < 0 || !m_chunks[i].vulkan) {
+			return false;
+		}
+		*index        = i;
+		*chunk_offset = backing_offset % VulkanChunkSize;
+		*chunk_size   = ChunkBytes(i);
+		return true;
+	}
+
+	// A new descriptor of a Vulkan chunk for the renderer's import, which takes ownership.
+	[[nodiscard]] int DupVulkanChunk(uint32_t index) const {
+		if (m_chunks == nullptr || index >= m_chunk_count || !m_chunks[index].vulkan) {
+			return -1;
+		}
+		const int fd = m_chunks[index].fd.load(std::memory_order_acquire);
+		return fd >= 0 ? fcntl(fd, F_DUPFD_CLOEXEC, 0) : -1;
+	}
+
+	[[nodiscard]] uint32_t TestChunkCount() const { return m_chunk_count; }
+#endif
 
 	KYTY_CLASS_NO_COPY(GuestBackingStore);
 
@@ -275,6 +427,21 @@ public:
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
 	void ZeroRange(uint64_t backing_offset, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		if (m_chunks != nullptr) {
+			// A chunk that was never allocated is zero when it is.
+			for (auto offset = backing_offset; offset < backing_offset + size;) {
+				uint64_t   file_offset = 0;
+				uint64_t   run         = 0;
+				const auto fd          = FileAt(offset, &file_offset, &run);
+				const auto bytes       = std::min(run, backing_offset + size - offset);
+				if (fd >= 0) {
+					std::memset(m_backing_base + offset, 0, bytes);
+				}
+				offset += bytes;
+			}
+		} else
+#endif
 		std::memset(m_backing_base + backing_offset, 0, size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		g_test_backing_bytes_zeroed += size;
@@ -399,8 +566,17 @@ public:
 		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
 			    auto* out = destination + (start - vaddr);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+			    // A dma-buf has no read(): its pages are all committed anyway, so the copy below
+			    // costs nothing extra. Runs may span chunks; each piece reads its own file.
 			    while (bytes != 0) {
-				    const auto read = pread(m_fd, out, bytes, static_cast<off_t>(offset));
+				    uint64_t   file_offset = 0;
+				    uint64_t   file_run    = 0;
+				    const auto fd          = FileAt(offset, &file_offset, &file_run);
+				    if (fd < 0 || (m_chunks != nullptr && m_chunks[offset / VulkanChunkSize].vulkan)) {
+					    break;
+				    }
+				    const auto read = pread(fd, out, std::min(bytes, file_run),
+				                            static_cast<off_t>(file_offset));
 				    if (read < 0 && errno == EINTR) {
 					    continue;
 				    }
@@ -700,6 +876,32 @@ private:
 
 	bool MapView(uint64_t vaddr, uint64_t size, uint64_t backing_offset, VirtualMemory::Mode mode,
 	             FailureReason* failure_reason) {
+#if !defined(__APPLE__)
+		if (m_chunks != nullptr) {
+			// One mapping per chunk the view spans.
+			for (uint64_t done = 0; done < size;) {
+				const auto offset = backing_offset + done;
+				EXIT_IF(offset >= m_size);
+				const auto index = static_cast<uint32_t>(offset / VulkanChunkSize);
+				EnsureChunk(index);
+				uint64_t   file_offset = 0;
+				uint64_t   run         = 0;
+				const auto fd          = FileAt(offset, &file_offset, &run);
+				const auto bytes       = std::min(run, size - done);
+				if (mmap(reinterpret_cast<void*>(vaddr + done), bytes, GetProtect(mode),
+				         MAP_SHARED | MAP_FIXED, fd, static_cast<off_t>(file_offset)) ==
+				    MAP_FAILED) {
+					if (done != 0) {
+						EXIT_IF(!UnmapViewPreservePlaceholder(reinterpret_cast<void*>(vaddr), done));
+					}
+					SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
+					return false;
+				}
+				done += bytes;
+			}
+			return true;
+		}
+#endif
 		if (mmap(reinterpret_cast<void*>(vaddr), size, GetProtect(mode), MAP_SHARED | MAP_FIXED,
 		         m_fd, static_cast<off_t>(backing_offset)) == MAP_FAILED) {
 			SetFailure(failure_reason, FailureReason::FixedMapViewFailed);
@@ -716,6 +918,18 @@ private:
 	}
 
 	int m_fd = -1;
+#if !defined(__APPLE__)
+	struct Chunk {
+		std::atomic<int> fd {-1};
+		bool             vulkan = false; // written before fd is published
+	};
+	VulkanGuestAllocator* m_vulkan       = nullptr;
+	Chunk*                m_chunks       = nullptr;
+	uint32_t              m_chunk_count  = 0;
+	uint32_t              m_memfd_chunks = 0;
+	uint64_t              m_vulkan_bytes = 0;
+	std::mutex            m_chunk_mutex;
+#endif
 #endif
 
 	uint8_t*                                                     m_backing_base = nullptr;
@@ -787,6 +1001,7 @@ public:
 	[[nodiscard]] uint64_t GetGranularity() const { return m_granularity; }
 	[[nodiscard]] uint64_t GetBackingBase() const { return m_backing->GetBackingBase(); }
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_backing->GetBackingSize(); }
+	[[nodiscard]] GuestBackingStore& GetBacking() const { return *m_backing; }
 
 	void ZeroBacking(uint64_t backing_offset, uint64_t size) {
 		m_backing->ZeroRange(backing_offset, size);
