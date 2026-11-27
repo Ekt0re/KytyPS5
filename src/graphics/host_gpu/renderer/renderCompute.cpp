@@ -435,6 +435,11 @@ private:
 		m_ring.Invalidate(0, m_ring.Size());
 		uint64_t refused = 0;
 		uint64_t empty   = 0;
+		// Slots older than one ring lap were overwritten by later dispatches; skip them, or the
+		// sequence check below never matches again and reporting stops for good.
+		if (m_sequence - m_reported > Slots) {
+			m_reported = m_sequence - Slots;
+		}
 		for (uint64_t sequence = m_reported; sequence < m_sequence; sequence++) {
 			const auto  slot  = static_cast<uint32_t>(sequence % Slots);
 			const auto* words = SlotWords(slot);
