@@ -397,7 +397,26 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto buffer_id = FindBuffer(vaddr, size);
 		auto&      buffer    = m_slot_buffers[buffer_id];
 		bool       migrate   = false;
-		if (IsRegionGpuModified(vaddr, size)) {
+		const bool gpu_modified = IsRegionGpuModified(vaddr, size);
+		// Diagnostic: a read fault that keeps repeating on one page without a download is a
+		// livelock (the page stays read-protected); logged at 256, 4096, 65536, ... repeats.
+		{
+			static uint64_t last_page = ~0ull;
+			static uint64_t repeats   = 0;
+			const auto      page      = vaddr / TRACKER_PAGE_SIZE;
+			repeats                   = page == last_page ? repeats + 1 : 0;
+			last_page                 = page;
+			if (repeats == 256 || (repeats >= 4096 && (repeats & (repeats - 1)) == 0)) {
+				std::printf("BufferCache: read fault repeats %" PRIu64 "x at 0x%016" PRIx64
+				            " (page 0x%016" PRIx64 "): gpu_modified=%d buffer 0x%016" PRIx64
+				            "+0x%" PRIx64 " zero_copy=%d readback_faults=%u gpu_ranges=%d\n",
+				            repeats, vaddr, page * TRACKER_PAGE_SIZE, gpu_modified ? 1 : 0,
+				            buffer.CpuAddress(), buffer.Size(), buffer.IsZeroCopy() ? 1 : 0,
+				            buffer.readback_faults,
+				            m_gpu_modified_ranges.Intersects(vaddr, size) ? 1 : 0);
+			}
+		}
+		if (gpu_modified) {
 			const auto start =
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
