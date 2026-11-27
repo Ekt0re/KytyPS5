@@ -54,7 +54,12 @@ bool BallotGuardsEnabled();
 // the default applies (DefaultLoopIterationLimit; tests change it with
 // SetLoopIterationLimitDefault). The limit is part of the emitted code but not of Profile: the
 // shader store key changes while it is away from DefaultLoopIterationLimit.
-inline constexpr uint32_t DefaultLoopIterationLimit = 1u << 16u;
+// Off by default (0): with 65,536 (PR #14) GTA VI livelocked at the start of 3D on the world and
+// intro saves (a guest thread read-faulted 1-3.6 M times per 10 s on a page no buffer download
+// resolves, 0 draws). Its shaders run loops past the cap, so a capped invocation ends early and the
+// game waits forever for a result that never comes. KYTY_SHADER_LOOP_LIMIT=65536 turns the guard on
+// for debugging GPU hangs.
+inline constexpr uint32_t DefaultLoopIterationLimit = 0u;
 void                      SetLoopIterationLimitDefault(uint32_t limit);
 uint32_t                  LoopIterationLimit();
 
