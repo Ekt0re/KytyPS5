@@ -116,7 +116,7 @@ static_assert(sizeof(PipelineStaticParameters) == 118 && sizeof(PipelineRenderin
 // hold: a store written with one of them changed must not serve a run without it. Each switch
 // away from its default changes the key; the defaults leave it as it was. A new switch of this
 // kind in the translator belongs here.
-uint64_t CodegenSwitchKey() {
+uint64_t CodegenSwitches() {
 	const auto env = [](const char* name) {
 		const char* value = std::getenv(name);
 		return value != nullptr ? value : "";
@@ -132,7 +132,11 @@ uint64_t CodegenSwitchKey() {
 	if (env("KYTY_EXEC_SELECTS")[0] == '0' || env("KYTY_EXEC_SELECT_ELIM")[0] == '0') {
 		switches |= 8u;
 	}
-	uint64_t key = switches * 0x9e3779b97f4a7c15ull;
+	return switches;
+}
+
+uint64_t CodegenSwitchKey() {
+	uint64_t key = CodegenSwitches() * 0x9e3779b97f4a7c15ull;
 	// Ballot guards change the SPIR-V of most modules but are not part of Profile (whose bytes
 	// stay those of stores written without them).
 	constexpr uint64_t BallotGuardsStamp = 0x62616c6c6f740001ull;
@@ -169,6 +173,13 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 }
 
 } // namespace
+
+// A store per set of switches: with one file, runs with and without a switch would discard each
+// other's store at every start.
+std::string ShaderStoreVariant() {
+	const auto switches = CodegenSwitches();
+	return switches == 0 ? std::string {} : fmt::format("-sw{:x}", switches);
+}
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
                              uint64_t kept) {
@@ -847,8 +858,12 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 	if (store_path.empty() || !RecipesEnabled()) {
 		return;
 	}
-	auto path = store_path;
-	path.replace_extension(".recipes");
+	// The recipes do not depend on the translator's switches: every store variant shares them.
+	auto name = Common::PathToString(store_path.stem());
+	if (const auto variant = ShaderStoreVariant(); !variant.empty() && name.ends_with(variant)) {
+		name.resize(name.size() - variant.size());
+	}
+	const auto path = store_path.parent_path() / (name + ".recipes");
 	const auto start = std::chrono::steady_clock::now();
 	Writer     header;
 	IoAll(header, RecipeMagic);

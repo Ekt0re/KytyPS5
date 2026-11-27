@@ -607,6 +607,9 @@ private:
 // The shader store of the running title; empty unless --shader-cache is on in a Release build
 // without debug dumps, which change the SPIR-V.
 std::filesystem::path ShaderStorePath();
+// "" by default, else a suffix naming the code-generation switches set in the environment
+// (KYTY_F16_STORE_CLAMP and the like), which the store's file name carries.
+std::string ShaderStoreVariant();
 // Host capabilities that change the emitted SPIR-V.
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
 

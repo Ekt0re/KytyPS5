@@ -214,7 +214,7 @@ std::filesystem::path ShaderStorePath() {
 	if (title_id.empty()) {
 		return {};
 	}
-	return std::filesystem::path("_PipelineCache") / (title_id + ".shaders");
+	return std::filesystem::path("_PipelineCache") / (title_id + ShaderStoreVariant() + ".shaders");
 }
 
 bool GraphicsPipelineKey::operator==(const GraphicsPipelineKey& other) const {
