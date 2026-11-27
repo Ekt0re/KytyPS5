@@ -1,4 +1,5 @@
 #include "loader/runtimeLinker.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -918,6 +919,8 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			// needs no readback. Otherwise the load retries once its fault is handled, or
 			// reads zero.
 			uint32_t value = 0;
+			const Libs::Graphics::ReadbackOrigin::Scope origin(
+			    Libs::Graphics::ReadbackOrigin::Origin::Srt);
 			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
 			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);

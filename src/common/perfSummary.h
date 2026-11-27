@@ -123,6 +123,36 @@ enum class Counter {
 	RecRecords,  // Commands queued for it.
 	RecDrains,   // Waits until it replayed everything queued (any thread, mostly the GPU thread).
 	RecDrainUs,  // Their microseconds.
+	// Readbacks by origin (who asked): ReadMemory requests run on the GPU thread, synchronous
+	// downloads they made (one GPU wait each) and microseconds from recording to the end of the wait.
+	// guest = guest-thread faults and reads, srt = SRT walker loads, pm4 = other command-thread read
+	// faults (the PM4 parser), cmdwr = command-thread write faults, args = indirect dispatch/draw
+	// arguments, shader = command-thread backing reads (ReadGuestMemory, shader constants),
+	// tex = color metadata and image heap reads, other = unmaps and the rest.
+	RbOGuestCalls,
+	RbOGuestWaits,
+	RbOGuestWaitUs,
+	RbOSrtCalls,
+	RbOSrtWaits,
+	RbOSrtWaitUs,
+	RbOPm4Calls,
+	RbOPm4Waits,
+	RbOPm4WaitUs,
+	RbOCmdwrCalls,
+	RbOCmdwrWaits,
+	RbOCmdwrWaitUs,
+	RbOArgsCalls,
+	RbOArgsWaits,
+	RbOArgsWaitUs,
+	RbOShaderCalls,
+	RbOShaderWaits,
+	RbOShaderWaitUs,
+	RbOTexCalls,
+	RbOTexWaits,
+	RbOTexWaitUs,
+	RbOOtherCalls,
+	RbOOtherWaits,
+	RbOOtherWaitUs,
 	Count
 };
 

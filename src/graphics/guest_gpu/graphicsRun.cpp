@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/assert.h"
 #include "common/compilePause.h"
@@ -1231,6 +1232,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	auto&      buffer_cache  = m_renderer.GetBufferCache();
 	const auto read_gpu_data = [&](uint64_t address, uint64_t size) {
 		if (GuestRange {address, size}.Valid() && buffer_cache.IsRegionGpuModified(address, size)) {
+			const ReadbackOrigin::Scope origin(ReadbackOrigin::Origin::Args);
 			buffer_cache.ReadMemory(address, size);
 		}
 	};

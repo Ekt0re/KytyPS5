@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1424,6 +1425,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		Common::DebugCounters::ScopedTimer timer(
 		    Common::DebugCounters::Counter::ColorMetadataReadbacks,
 		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
+		const ReadbackOrigin::Scope origin(ReadbackOrigin::Origin::Texture);
 		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
 	}
 	for (uint32_t slice = 0; slice < count; slice++) {

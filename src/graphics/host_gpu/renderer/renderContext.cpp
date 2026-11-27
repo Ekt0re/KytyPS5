@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -147,6 +148,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	Common::PerfSummary::Add(access == PageFaultAccess::Write
 	                             ? Common::PerfSummary::Counter::WriteFaults
 	                             : Common::PerfSummary::Counter::ReadFaults);
+	using ReadbackOrigin::Origin;
+	const ReadbackOrigin::Scope origin(GuestGpu::IsGpuThread()
+	                                       ? (access == PageFaultAccess::Write ? Origin::CmdWrite
+	                                                                           : Origin::Pm4)
+	                                       : Origin::Guest,
+	                                   true);
 	if (access == PageFaultAccess::Write) {
 		{
 			Common::DebugCounters::ScopedTimer buffer_timer(Counter::SyncFaultBufferNs);

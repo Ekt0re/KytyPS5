@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/command_processor/waitDiagnostics.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -67,6 +68,26 @@ bool DetailedSyncStats() noexcept {
 	return enabled && Common::DebugCounters::Enabled();
 }
 
+
+struct OriginCounters {
+	Common::PerfSummary::Counter calls, waits, wait_us;
+};
+
+OriginCounters CountersOf(ReadbackOrigin::Origin origin) noexcept {
+	using C = Common::PerfSummary::Counter;
+	using O = ReadbackOrigin::Origin;
+	switch (origin) {
+		case O::Guest: return {C::RbOGuestCalls, C::RbOGuestWaits, C::RbOGuestWaitUs};
+		case O::Srt: return {C::RbOSrtCalls, C::RbOSrtWaits, C::RbOSrtWaitUs};
+		case O::Pm4: return {C::RbOPm4Calls, C::RbOPm4Waits, C::RbOPm4WaitUs};
+		case O::CmdWrite: return {C::RbOCmdwrCalls, C::RbOCmdwrWaits, C::RbOCmdwrWaitUs};
+		case O::Args: return {C::RbOArgsCalls, C::RbOArgsWaits, C::RbOArgsWaitUs};
+		case O::Shader: return {C::RbOShaderCalls, C::RbOShaderWaits, C::RbOShaderWaitUs};
+		case O::Texture: return {C::RbOTexCalls, C::RbOTexWaits, C::RbOTexWaitUs};
+		default: break;
+	}
+	return {C::RbOOtherCalls, C::RbOOtherWaits, C::RbOOtherWaitUs};
+}
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -324,6 +345,9 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 	}();
 	Common::PerfSummary::Add(counters.count);
 	ScopedMicros path_total_timer(counters.total);
+	const auto   origin = CountersOf(ReadbackOrigin::Current());
+	Common::PerfSummary::Add(origin.waits);
+	ScopedMicros origin_timer(origin.wait_us);
 	if (path == ReadbackBatch::ReadbackPath::CopyQueue) {
 		// As a detached copy, but on the copy queue: it waits on the GPU for the submitted ticks
 		// only (on the universal queue it also queued behind the work submitted ahead of it),
@@ -543,7 +567,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	const auto origin =
+	    GuestGpu::IsGpuThread() ? ReadbackOrigin::Current() : ReadbackOrigin::Origin::Guest;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, origin] {
+		const ReadbackOrigin::Scope scope(origin);
+		Common::PerfSummary::Add(CountersOf(origin).calls);
 		using Common::PerfSummary::Counter;
 		Common::PerfSummary::ScopedMicros handler_timer(Counter::RbHandlerUs);
 		// Guest write faults on GPU-written pages come here too (InvalidateMemory).

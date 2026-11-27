@@ -57,6 +57,7 @@ constexpr std::array<const char*, N> g_names = {
     "f_handler_us", "f_invalidate_us", "f_protect_us", "f_lock_wait_us", "f_fast_skips",
     "f_storm_marked", "f_storm_kept", "f_storm_expired",
     "rec_records", "rec_drains", "rec_drain_us",
+    "rb_o_guest_calls", "rb_o_guest_waits", "rb_o_guest_wait_us", "rb_o_srt_calls", "rb_o_srt_waits", "rb_o_srt_wait_us", "rb_o_pm4_calls", "rb_o_pm4_waits", "rb_o_pm4_wait_us", "rb_o_cmdwr_calls", "rb_o_cmdwr_waits", "rb_o_cmdwr_wait_us", "rb_o_args_calls", "rb_o_args_waits", "rb_o_args_wait_us", "rb_o_shader_calls", "rb_o_shader_waits", "rb_o_shader_wait_us", "rb_o_tex_calls", "rb_o_tex_waits", "rb_o_tex_wait_us", "rb_o_other_calls", "rb_o_other_waits", "rb_o_other_wait_us",
 };
 
 struct Sample {

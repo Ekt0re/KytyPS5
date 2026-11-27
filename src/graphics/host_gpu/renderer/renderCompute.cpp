@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -272,6 +273,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		const ReadbackOrigin::Scope origin(ReadbackOrigin::Origin::Args);
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
