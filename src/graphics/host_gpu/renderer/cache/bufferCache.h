@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/readbackBatch.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/zeroCopyFence.h"
 
 #include <array>
 #include <atomic>
@@ -274,6 +275,8 @@ private:
 	void               FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ReleaseZeroCopyReads(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick);
 	void               WaitZeroCopyReads(uint64_t vaddr, uint64_t size);
+	// True (and the buffer dropped to VRAM) when CPU writes keep waiting for its reads.
+	[[nodiscard]] bool ZeroCopyKeepsWaiting(BufferId id);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -321,15 +324,10 @@ private:
 	// Guest ranges whose buffers are zero-copy; a buffer created over them imports guest memory.
 	RangeSet                                          m_zero_copy;
 	uint64_t                                          m_zero_copy_created = 0;
-	// Zero-copy read fences by buffer start: {end, tick}. Written on the GPU thread, read by
-	// faulting threads.
-	struct ZeroCopyFence {
-		uint64_t end  = 0;
-		uint64_t tick = 0;
-	};
-	std::mutex                                        m_zero_copy_fence_mutex;
-	std::map<uint64_t, ZeroCopyFence>                 m_zero_copy_fences;
-	std::atomic<bool>                                 m_any_zero_copy_fence {false};
+	ZeroCopyFences                                    m_zero_copy_fences;
+	// Ranges that went back to VRAM because the CPU kept waiting for their reads.
+	RangeSet                                          m_zero_copy_rejected;
+	uint32_t                                          m_zero_copy_rejected_logs = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

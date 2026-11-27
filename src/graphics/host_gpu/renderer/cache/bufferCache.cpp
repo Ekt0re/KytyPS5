@@ -835,6 +835,7 @@ bool BufferCache::ZeroCopyEnabled() const {
 }
 
 bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
+	Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::ZcResolveUs);
 	const auto vaddr = buffer.CpuAddress();
 	const auto size  = buffer.Size();
 	bool       any   = false;
@@ -851,12 +852,12 @@ bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
 		KYTY_PROFILER_BLOCK("BufferCache::ZeroCopyWait");
 		m_scheduler.Wait(std::min(buffer.last_write_tick, m_scheduler.CurrentTick()));
 	}
-	// Every write to this buffer has finished: its pages go back to the CPU, writable without a
-	// further fault (zero-copy pages never need CPU-dirty tracking, there is nothing to upload).
-	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-	// Writable pages are fenced again by the next submission that may read them by address.
-	QueueBdaSync(vaddr, size);
+	// Every write to this buffer has finished: its GPU-written pages are readable again. They stay
+	// write-watched, so a CPU write faults into the read fence (WaitZeroCopyReads) and queues the
+	// fence for readers by address; the rest of the buffer keeps its protection.
+	ReleaseGpuWrittenRuns(m_memory_tracker, vaddr, size, [](uint64_t, uint64_t bytes) {
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcStateKiB, bytes >> 10u);
+	});
 	return true;
 }
 
@@ -871,6 +872,7 @@ void BufferCache::ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t si
 	    buffer.last_write_tick != tick) {
 		return;
 	}
+	Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::ZcReleaseUs);
 	bool any = false;
 	m_memory_tracker.ForEachDownloadRange<false>(vaddr, size,
 	                                             [&](uint64_t address, uint64_t bytes) noexcept {
@@ -881,27 +883,36 @@ void BufferCache::ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t si
 	if (!any) {
 		return;
 	}
-	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
-	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-	QueueBdaSync(vaddr, size);
+	// Only the GPU-written runs change, and they stay write-watched (see ResolveZeroCopy).
+	ReleaseGpuWrittenRuns(m_memory_tracker, vaddr, size, [](uint64_t, uint64_t bytes) {
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcStateKiB, bytes >> 10u);
+	});
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReleases);
 }
 
-void BufferCache::FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr, uint64_t size) {
+void BufferCache::FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t /*vaddr*/,
+                                    uint64_t /*size*/) {
 	const auto tick = m_scheduler.CurrentTick();
-	// Clearing CPU-dirty state write-protects the pages: a CPU write faults into WaitZeroCopyReads.
-	// There is nothing to upload; guest memory is the buffer.
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	// One fence per buffer and tick: a CPU write after it faults and waits for this tick (which
+	// submits it), so later binds in the same tick find the pages still protected.
 	if (buffer.last_read_tick == tick) {
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcFenceSkips);
 		return;
 	}
+	Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::ZcFenceUs);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcFences);
 	buffer.last_read_tick = tick;
-	{
-		std::scoped_lock lock(m_zero_copy_fence_mutex);
-		m_zero_copy_fences[buffer.CpuAddress()] = {buffer.CpuAddress() + buffer.Size(), tick};
-		m_any_zero_copy_fence.store(true, std::memory_order_release);
-	}
+	// Clearing CPU-dirty state write-protects the pages the CPU wrote since; the others are
+	// protected already. Nothing to upload: guest memory is the buffer. The whole buffer, as later
+	// binds this tick may use other parts of it.
+	m_memory_tracker.ForEachUploadRange(
+	    buffer.CpuAddress(), buffer.Size(), false, [](uint64_t, uint64_t bytes) noexcept {
+		    Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcStateKiB, bytes >> 10u);
+	    },
+	    []() noexcept {});
+	buffer.read_waits =
+	    m_zero_copy_fences.Record(buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size(), tick)
+	        .waits;
 	if (buffer.read_release_tick != tick) {
 		buffer.read_release_tick = tick;
 		m_scheduler.DeferOperation([this, id, address = buffer.CpuAddress(), bytes = buffer.Size(),
@@ -910,45 +921,26 @@ void BufferCache::FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr,
 }
 
 void BufferCache::ReleaseZeroCopyReads(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick) {
-	// Drops the fence once its tick completed, unless a newer read replaced it.
-	{
-		std::scoped_lock lock(m_zero_copy_fence_mutex);
-		if (const auto it = m_zero_copy_fences.find(vaddr);
-		    it != m_zero_copy_fences.end() && it->second.tick == tick) {
-			m_zero_copy_fences.erase(it);
-		}
-	}
-	// The pages stay write-protected: lifting it here would let later CPU writes skip the fault
-	// that queues the next submission's fence for readers by address (SynchronizeBda). The first
-	// write after the read completes faults once and no longer waits.
+	// Drops the fence once its tick completed, unless a newer read replaced it. The pages stay
+	// write-protected: the first CPU write afterwards faults once and no longer waits, and its
+	// fault queues the next submission's fence for readers by address (SynchronizeBda).
+	m_zero_copy_fences.Release(vaddr, tick);
 	(void)id;
 	(void)size;
 }
 
 void BufferCache::WaitZeroCopyReads(uint64_t vaddr, uint64_t size) {
-	if (!m_any_zero_copy_fence.load(std::memory_order_acquire)) {
-		return;
-	}
-	uint64_t tick = 0;
-	{
-		std::scoped_lock lock(m_zero_copy_fence_mutex);
-		// Buffers never overlap, so the fences that meet the range are adjacent.
-		auto it = m_zero_copy_fences.lower_bound(vaddr + size);
-		while (it != m_zero_copy_fences.begin()) {
-			--it;
-			if (it->second.end <= vaddr) {
-				break;
-			}
-			tick = std::max(tick, it->second.tick);
-		}
-	}
+	const auto tick = m_zero_copy_fences.Find(vaddr, size);
 	// A completion operation that writes guest memory is ordered after the GPU work already, and
 	// waiting from it could wait for itself.
 	if (tick == 0 || CommandScheduler::InDeferredOperation() || m_scheduler.IsFree(tick)) {
 		return;
 	}
 	KYTY_PROFILER_BLOCK("BufferCache::ZeroCopyReadWait");
+	Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::ZcWaitUs);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcReadWaits);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReadWaits);
+	m_zero_copy_fences.CountWait(vaddr, size, tick);
 	// As RenderContext::WaitWriteBacks: only the GPU thread submits the current tick.
 	if (GuestGpu::IsGpuThread()) {
 		m_scheduler.Wait(tick);
@@ -957,6 +949,39 @@ void BufferCache::WaitZeroCopyReads(uint64_t vaddr, uint64_t size) {
 	} else {
 		m_scheduler.Wait(tick);
 	}
+}
+
+// Read-waits after which a zero-copy buffer goes back to VRAM; KYTY_ZERO_COPY_WAIT_THRESHOLD=<n>.
+static uint32_t ZeroCopyWaitThreshold() {
+	static const uint32_t threshold = [] {
+		const char* text  = std::getenv("KYTY_ZERO_COPY_WAIT_THRESHOLD");
+		const auto  value = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
+		return value != 0 ? static_cast<uint32_t>(value) : 16u;
+	}();
+	return threshold;
+}
+
+bool BufferCache::ZeroCopyKeepsWaiting(BufferId id) {
+	auto&      buffer = m_slot_buffers[id];
+	const auto waits  = buffer.read_waits; // as of its last fence
+	if (waits < ZeroCopyWaitThreshold()) {
+		return false;
+	}
+	// The CPU keeps rewriting memory the GPU is still reading: a VRAM copy (a snapshot per upload)
+	// is cheaper there than waiting. The range is not judged again.
+	const auto vaddr = buffer.CpuAddress();
+	const auto size  = buffer.Size();
+	if (m_zero_copy_rejected_logs++ < 32) {
+		std::printf("Zero-copy: buffer 0x%011llx+0x%llx made the CPU wait %u times; back to VRAM\n",
+		            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+		            waits);
+		std::fflush(stdout);
+	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ZcWaitDrops);
+	m_zero_copy_rejected.Add(vaddr, size);
+	DropZeroCopyBuffer(id);
+	m_zero_copy_fences.Forget(vaddr);
+	return true;
 }
 
 void BufferCache::JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
@@ -1014,7 +1039,8 @@ void BufferCache::MaybeMigrateToZeroCopy(BufferId id) {
 			return true;
 		});
 	}
-	if (images || size > MaxSize || LibKernel::Memory::ContiguousBackingAlias(vaddr, size) == 0) {
+	if (images || size > MaxSize || m_zero_copy_rejected.Intersects(vaddr, size) ||
+	    LibKernel::Memory::ContiguousBackingAlias(vaddr, size) == 0) {
 		buffer.zero_copy_judgment = 2;
 		return;
 	}
@@ -1306,7 +1332,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
 		id = FindBuffer(vaddr, end - vaddr);
 	}
-	if (m_slot_buffers[id].IsZeroCopy() && !ZeroCopyBackingValid(id)) {
+	if (m_slot_buffers[id].IsZeroCopy() && (!ZeroCopyBackingValid(id) || ZeroCopyKeepsWaiting(id))) {
 		id = FindBuffer(vaddr, end - vaddr);
 	}
 	auto& buffer = m_slot_buffers[id];

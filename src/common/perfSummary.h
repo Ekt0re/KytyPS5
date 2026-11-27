@@ -75,6 +75,16 @@ enum class Counter {
 	RbCqSubmits,      // Copy-queue submissions.
 	RbCqFenceUs,      // ... microseconds waiting for their fence (part of rb_path_cq_wait_us).
 	RbCqGpuBusy,      // Copy-queue downloads that found submitted graphics work unfinished.
+	// Zero-copy guest memory (KYTY_ZERO_COPY=1, BufferCache).
+	ZcResolveUs,  // Microseconds returning GPU-written zero-copy pages on a CPU fault (with waits).
+	ZcReleaseUs,  // ... returning them when their last write completed.
+	ZcFences,     // Read fences (one per buffer and tick).
+	ZcFenceSkips, // Binds that found this tick's fence already in place.
+	ZcFenceUs,    // Microseconds in read fences.
+	ZcReadWaits,  // CPU writes that waited for a GPU read in flight.
+	ZcWaitUs,     // ... their microseconds.
+	ZcWaitDrops,  // Buffers moved back to VRAM because the CPU kept waiting.
+	ZcStateKiB,   // KiB whose tracking state the zero-copy steps changed.
 	Count
 };
 

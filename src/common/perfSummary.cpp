@@ -41,6 +41,8 @@ constexpr std::array<const char*, N> g_names = {
     "rb_path_det", "rb_path_det_wait_us", "rb_path_det_total_us",
     "rb_path_flush", "rb_path_flush_wait_us", "rb_path_flush_total_us",
     "rb_cq_submits", "rb_cq_fence_us", "rb_cq_gpu_busy",
+    "zc_resolve_us", "zc_release_us", "zc_fences", "zc_fence_skips", "zc_fence_us",
+    "zc_read_waits", "zc_wait_us", "zc_wait_drops", "zc_state_kib",
 };
 
 struct Sample {

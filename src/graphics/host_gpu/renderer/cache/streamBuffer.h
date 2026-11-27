@@ -103,6 +103,8 @@ public:
 	// completion already lifts the write protection that read put on its pages.
 	uint64_t last_read_tick     = 0;
 	uint64_t read_release_tick  = 0;
+	// Zero-copy: recent CPU writes that waited for its reads, as of its last read fence.
+	uint32_t read_waits         = 0;
 	// Zero-copy: LibKernel::Memory::BackingGeneration() when the import was last known valid.
 	uint64_t backing_generation = 0;
 

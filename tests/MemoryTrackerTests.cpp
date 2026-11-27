@@ -2,6 +2,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/zeroCopyFence.h"
 
 #include <atomic>
 #include <chrono>
@@ -1252,6 +1253,81 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+// Zero-copy read fences: one per buffer and tick, looked up by range, released only by their own
+// tick, and the CPU writes that waited are counted per buffer (decaying with use).
+void TestZeroCopyFences() {
+  Libs::Graphics::ZeroCopyFences fences;
+  Check(fences.Find(0x1000, 0x10) == 0, "an empty registry reported a fence");
+  Check(fences.Record(0x1000, 0x3000, 5).fresh, "the first fence of a tick was skipped");
+  Check(!fences.Record(0x1000, 0x3000, 5).fresh, "a second fence in the same tick was not skipped");
+  Check(fences.Record(0x1000, 0x3000, 6).fresh, "a fence in a new tick was skipped");
+  Check(fences.Record(0x4000, 0x5000, 4).fresh, "a fence of another buffer was skipped");
+  Check(fences.Find(0x2ff0, 0x20) == 6 && fences.Find(0x3000, 0x1000) == 0 &&
+            fences.Find(0x0, 0x6000) == 6 && fences.Find(0x4800, 1) == 4,
+        "fence lookup missed or invented a meeting buffer");
+  fences.CountWait(0x1000, 1, 6);
+  fences.CountWait(0x1000, 1, 5); // an older tick than the fence's: not this fence's wait
+  Check(fences.Waits(0x1000) == 1 && fences.Waits(0x4000) == 0, "waits were not counted per buffer");
+  fences.Release(0x1000, 5);
+  Check(fences.Find(0x1000, 1) == 6, "an older tick released a newer fence");
+  fences.Release(0x1000, 6);
+  Check(fences.Find(0x1000, 1) == 0 && fences.Waits(0x1000) == 1,
+        "release did not drop the tick or lost the wait count");
+  for (uint32_t i = 0; i < 40; ++i) {
+    fences.CountWait(0x1000, 1, 0); // tick 0 never matches a live fence
+  }
+  for (uint64_t tick = 7; tick < 7 + 64; ++tick) {
+    fences.CountWait(0x1000, 1, tick - 1);
+    (void)fences.Record(0x1000, 0x3000, tick);
+  }
+  Check(fences.Waits(0x1000) < 64, "the wait count did not decay with use");
+  fences.Forget(0x1000);
+  Check(fences.Find(0x1000, 1) == 0 && fences.Waits(0x1000) == 0, "Forget kept the fence");
+}
+
+// A zero-copy write release changes only the GPU-written runs, which become readable and stay
+// write-watched; CPU-dirty and clean pages keep their protection.
+void TestZeroCopyPartialRelease() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  MarkGpuModified(tracker, address, page_size);
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size);
+  MarkGpuModified(tracker, address + page_size * 3, page_size);
+  const auto clean_protection = Protection(memory + page_size * 2);
+  ResetProtectionLog();
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  Libs::Graphics::ReleaseGpuWrittenRuns(tracker, address, page_size * 4,
+                                        [&](uint64_t run, uint64_t bytes) {
+                                          runs.emplace_back(run, bytes);
+                                        });
+  Check(runs.size() == 2 && runs[0].first == address && runs[0].second == page_size &&
+            runs[1].first == address + page_size * 3 && runs[1].second == page_size,
+        "release did not report exactly the GPU-written runs");
+  Check(!tracker.IsRegionGpuModified(address, page_size * 4) &&
+            Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size * 3) == PAGE_READONLY,
+        "released pages are not readable and write-watched");
+  Check(tracker.IsRegionCpuModified(address + page_size, page_size) &&
+            IsWritable(memory + page_size) &&
+            Protection(memory + page_size * 2) == clean_protection,
+        "release changed CPU-dirty or clean pages");
+  bool only_runs = !g_protection_log.empty();
+  for (const auto &call : g_protection_log) {
+    only_runs &= (call.address == address || call.address == address + page_size * 3) &&
+                 call.size == page_size;
+  }
+  Check(only_runs, "release changed protection outside the GPU-written runs");
+  ResetProtectionLog();
+  Libs::Graphics::ReleaseGpuWrittenRuns(tracker, address, page_size * 4,
+                                        [&](uint64_t, uint64_t) { Check(false, "a run reappeared"); });
+  Check(g_protection_calls == 0, "a second release changed protection");
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  Release(memory);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1279,6 +1355,8 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestZeroCopyFences();
+  TestZeroCopyPartialRelease();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();
