@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -211,8 +212,10 @@ struct DrawRenderState {
 class ShaderStoreWriter {
 public:
 	ShaderStoreWriter();
-	// Keeps the first `kept` bytes of the store at `path`, or starts it over with `header`.
-	void Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
+	// Keeps the first `kept` bytes of the store at `path`, or starts it over with `header`. False,
+	// with the file left as it is and nothing opened, when another writer holds the store
+	// (ShaderStoreLock).
+	bool Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
 	// Whether the store is open.
 	explicit operator bool() const { return !m_file.IsInvalid(); }
 	// Compresses `record` and appends it on the store thread, in call order.
@@ -224,6 +227,8 @@ public:
 private:
 	friend struct PipelineCacheTestAccess;
 
+	// Declared first, so it is released after the thread and the file are done.
+	ShaderStoreLock                          m_lock;
 	Common::File                             m_file;
 	std::mutex                               m_mutex;
 	std::condition_variable_any              m_ready;

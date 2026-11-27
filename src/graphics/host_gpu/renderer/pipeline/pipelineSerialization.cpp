@@ -193,9 +193,12 @@ std::string ShaderStoreVariant() {
 	return variant;
 }
 
-void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
+bool ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
                              uint64_t kept) {
 	Common::File::CreateDirectories(path.parent_path());
+	if (!m_lock.Acquire(path)) {
+		return false;
+	}
 	if (kept == 0) {
 		if (m_file.Create(path)) {
 			m_file.Write(header.data(), static_cast<uint32_t>(header.size()));
@@ -204,6 +207,7 @@ void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 		m_file.Truncate(kept);
 		m_file.Seek(kept);
 	}
+	return true;
 }
 
 ShaderStoreWriter::ShaderStoreWriter() {
@@ -417,7 +421,12 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	}
 	const auto parse_ms = MillisecondsSince(start) - read_ms;
 	// A damaged record ends the store; the records before it stay.
-	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
+	if (!m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader cache: {} is being written by another process (a precompile or another game of "
+		    "this stamp); this run reads it but stores nothing\n",
+		    Common::PathToString(path)));
+	}
 
 	const auto modules = MapModules();
 	// A key with a stage missing from the store keeps no pipeline.
@@ -1038,7 +1047,11 @@ void PipelineCache::OpenRecipes(const std::filesystem::path& store_path) {
 		}
 		jobs.push_back(std::move(variant.job));
 	}
-	m_recipes.Open(path, header.bytes, reusable ? bytes.size() - records.size() : 0);
+	if (!m_recipes.Open(path, header.bytes, reusable ? bytes.size() - records.size() : 0)) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader recipes: {} is being written by another process; this run records nothing\n",
+		    Common::PathToString(path)));
+	}
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader recipes: {} programs, {} modules, {} pipelines in {} ({:.1f} MB, {:.0f} ms); "
 	    "{} modules to translate again\n",
@@ -1322,7 +1335,8 @@ bool PipelineCache::Precompile() {
 	const auto start = Clock::now();
 	if (!m_store) {
 		Log::WriteToConsoleAndLog(
-		    "Shader precompile: no shader store (a Release build and a title id are needed)\n");
+		    "Shader precompile: no shader store (a Release build and a title id are needed, and no "
+		    "other process may be writing it)\n");
 		return false;
 	}
 	g_precompile_interrupted = 0;
@@ -1428,6 +1442,11 @@ int PipelineCache::Restamp() {
 		Log::WriteToConsoleAndLog(
 		    "Shader restamp: refused: no store, or one written for another device profile or "
 		    "store format\n");
+		return 4;
+	}
+	if (!m_store) {
+		Log::WriteToConsoleAndLog(
+		    "Shader restamp: refused: another process is writing the store\n");
 		return 4;
 	}
 	g_precompile_interrupted = 0;
