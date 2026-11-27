@@ -871,6 +871,10 @@ void PipelineCache::StartDeferredCompile(Pipeline&                              
 	    });
 	pipeline.compiling = deferred->Result();
 	pipeline.deferred  = deferred;
+	if (LazyShaderStore()) {
+		// Created by the first draw or dispatch that needs it (Resolve, Expedite).
+		return;
+	}
 	m_workers.Post(
 	    [deferred = std::move(deferred), stop = m_deferred_stop] {
 		    // No draw waits for it yet; one that does runs it itself or via Expedite.
@@ -1348,6 +1352,12 @@ void PipelineCache::InitializeDriverCache() {
 	}
 	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
+		return;
+	}
+	if (LazyShaderStore()) {
+		// Loading it costs a replay 1 GB or more; the driver's own disk cache still serves the
+		// pipelines a frame creates.
+		PipelineCacheLog("Vulkan pipeline cache: not used (lazy shader store)");
 		return;
 	}
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
