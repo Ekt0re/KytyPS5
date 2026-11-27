@@ -467,6 +467,9 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_kyty_full_emulator_test(descriptor_heap_tests "${KYTY_TESTS_DIR}/DescriptorHeapTests.cpp")
 add_kyty_full_emulator_test(shader_check "${KYTY_TESTS_DIR}/shaderCheck.cpp")
 
+add_executable(spvbench EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader/spvbench.cpp")
+target_link_libraries(spvbench Vulkan::Headers ${CMAKE_DL_LIBS})
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
