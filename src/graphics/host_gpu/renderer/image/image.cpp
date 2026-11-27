@@ -2,11 +2,13 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
 
@@ -126,12 +128,18 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
-                                   std::optional<ImageSubresourceRange> range) {
+                                   std::optional<ImageSubresourceRange> range,
+                                   bool                                 host_layout) {
+	namespace Perf = Common::PerfSummary;
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
+	}
+	const bool unified = UnifiedLayouts::Active();
+	if (!host_layout) {
+		destination_layout = UnifiedLayouts::Map(destination_layout, unified);
 	}
 
 	const bool partial =
@@ -139,6 +147,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
 
+	// With unified layouts, a read after a read of the same layout needs no barrier; the state
+	// collects both readers, so that the next writer waits for all of them.
+	vk::PipelineStageFlags2 merged_stage {};
+	vk::AccessFlags2        merged_access {};
 	Barriers barriers;
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
@@ -155,13 +167,15 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
 
-				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
-				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
-				const bool     repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
-				if (subresource_state.layout != destination_layout ||
-				    subresource_state.access_mask != destination_access || repeated_write) {
+				const auto need =
+				    UnifiedLayouts::Decide(subresource_state.layout, subresource_state.access_mask,
+				                           destination_layout, destination_access, unified);
+				if (need == UnifiedLayouts::Need::Merge) {
+					merged_stage |= subresource_state.pl_stage;
+					merged_access |= subresource_state.access_mask;
+					subresource_state.pl_stage |= destination_stage;
+					subresource_state.access_mask |= destination_access;
+				} else if (need == UnifiedLayouts::Need::Barrier) {
 					vk::ImageMemoryBarrier2 barrier {};
 					barrier.srcStageMask                    = subresource_state.pl_stage;
 					barrier.srcAccessMask                   = subresource_state.access_mask;
@@ -187,12 +201,14 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			subresource_states.clear();
 		}
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
+		const auto need = UnifiedLayouts::Decide(state.layout, state.access_mask,
+		                                         destination_layout, destination_access, unified);
+		if (need == UnifiedLayouts::Need::None) {
+			return {};
+		}
+		if (need == UnifiedLayouts::Need::Merge) {
+			state.pl_stage |= destination_stage;
+			state.access_mask |= destination_access;
 			return {};
 		}
 
@@ -215,18 +231,32 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	}
 
 	// Resident heaps sample their images in the read state; only leaving it invalidates them.
+	// A unified-layout read state can hold other readers too.
+	const auto read_layout = ReadLayout();
 	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
-		    return barrier.oldLayout == ReadLayout() &&
-		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
+		    return barrier.oldLayout == read_layout &&
+		           (unified ? static_cast<bool>(barrier.srcAccessMask &
+		                                        vk::AccessFlagBits2::eShaderRead)
+		                    : barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead);
 	    })) {
 		HeapChanged();
 	}
-	state = {destination_stage, destination_access, destination_layout};
+	if (!barriers.empty()) {
+		Perf::Add(Perf::Counter::ImageBarriers, barriers.size());
+		Perf::Add(Perf::Counter::LayoutTransitions,
+		          static_cast<uint64_t>(std::ranges::count_if(
+		              barriers, [](const vk::ImageMemoryBarrier2& barrier) {
+			              return barrier.oldLayout != barrier.newLayout;
+		              })));
+	}
+	state = {destination_stage | merged_stage, destination_access | merged_access,
+	         destination_layout};
 	return barriers;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+                    bool host_layout) {
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -239,7 +269,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
 	const auto barriers =
-	    GetBarriers(destination_layout, destination_access, destination_stage, range);
+	    GetBarriers(destination_layout, destination_access, destination_stage, range, host_layout);
 	if (barriers.empty()) {
 		return;
 	}
@@ -275,7 +305,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
-	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
+	command.copyBufferToImage(buffer, backing.image, UnifiedLayouts::TransferDst(),
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
@@ -313,7 +343,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
-	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
+	command.copyImageToBuffer(backing.image, UnifiedLayouts::TransferSrc(), buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
 	buffer_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
@@ -397,8 +427,8 @@ void Image::CopyImage(Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, levels, copies.data());
+	command.copyImage(source.backing.image, UnifiedLayouts::TransferSrc(), backing.image,
+	                  UnifiedLayouts::TransferDst(), levels, copies.data());
 }
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
@@ -445,8 +475,8 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
-		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-		                  vk::ImageLayout::eTransferDstOptimal, region);
+		command.copyImage(source.backing.image, UnifiedLayouts::TransferSrc(), backing.image,
+		                  UnifiedLayouts::TransferDst(), region);
 	} else {
 		vk::ImageResolve region {};
 		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, resolved_source_range.base_level,
@@ -455,8 +485,8 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
-		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
-		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
+		command.resolveImage(source.backing.image, UnifiedLayouts::TransferSrc(),
+		                     backing.image, UnifiedLayouts::TransferDst(), region);
 	}
 }
 
@@ -542,7 +572,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
 				command.pipelineBarrier2(dependency);
 				command.copyImageToBuffer(source.backing.image,
-				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
+				                          UnifiedLayouts::TransferSrc(), buffer.Handle(),
 				                          source_copy);
 				if (source_transform != target_transform) {
 					const TileManager::Result bytes {buffer.Handle(), 0, copy_size};
@@ -558,7 +588,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 					command.pipelineBarrier2(dependency);
 				}
 				command.copyBufferToImage(buffer.Handle(), backing.image,
-				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
+				                          UnifiedLayouts::TransferDst(), destination_copy);
 			}
 		}
 	}
@@ -591,8 +621,8 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	command.copyImage(source.backing.image, UnifiedLayouts::TransferSrc(), backing.image,
+	                  UnifiedLayouts::TransferDst(), copy_count, copies.data());
 }
 
 namespace ImageOps {

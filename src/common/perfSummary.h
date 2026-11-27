@@ -2,6 +2,7 @@
 #define KYTY_COMMON_PERF_SUMMARY_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 // KYTY_PERF_SUMMARY=1: a work-based performance summary on stdout, one "PerfSummary ..." line
@@ -33,6 +34,47 @@ enum class Counter {
 	HeapLookups,    // Texture lookups those made.
 	HeapRangeSkips, // Lookups saved because the image set changed only at other addresses.
 	DepthRecreates, // Depth images replaced by one of another format, layout or binding kind.
+	ImageBarriers,     // Image memory barriers of cached images (Image::GetBarriers).
+	LayoutTransitions, // Those that change the layout.
+	// Synchronous buffer readbacks (BufferCache::ReadMemory on the GPU thread), per phase.
+	RbCalls,      // ReadMemory requests the GPU thread ran.
+	RbBatches,    // Synchronous downloads (one or more buffers copied in one go).
+	RbSubmits,    // Queue submissions a synchronous download made (its copy, flushes).
+	RbFused,      // Downloads whose copy went into the same queue submission as the open work.
+	RbExtraBufs,  // Buffers a batch copied besides the one the request was for.
+	RbNeighbour,  // Downloads of a window next to one of the last 8 downloaded (prefetch potential).
+	RbHandlerUs,  // Microseconds in ReadMemory on the GPU thread (all phases).
+	RbFlushUs,    // ... submitting the open command buffer (a detached download's flush).
+	RbSubmitUs,   // ... recording and submitting the copy.
+	RbWaitUs,     // ... waiting for the copy (fence, tick and earlier publications).
+	RbCopyUs,     // ... copying the bytes into guest memory.
+	RbWriteCalls, // ReadMemory requests of guest write faults on GPU-written pages.
+	RbWriteUs,    // Their microseconds (part of rb_handler_us).
+	// KYTY_RB_QUEUE_PROBE=1, per synchronous download: how much GPU work is queued ahead of it.
+	RbQueueTicks,       // Submitted, unfinished ticks when it starts (sum).
+	RbProducerDone,     // Downloads whose buffers' last write had already finished.
+	RbProducerPending,  // Downloads whose producing tick was submitted and still running.
+	RbProducerOpen,     // Downloads whose producing tick is the open (unsubmitted) one.
+	RbAfterTicks,       // Pending: submitted ticks queued behind the producing tick (sum).
+	RbProducerWaitUs,   // Pending: microseconds until the producing tick finished.
+	// Synchronous downloads per path (ReadbackBatch::ReadbackPath): count, microseconds submitting
+	// and waiting for the copy (fused: with the open command buffer's submission), microseconds
+	// from recording the copy to the end of the wait (with flushes).
+	RbPathCq,         // Copy queue (KYTY_COPY_QUEUE): own queue, open command buffer stays open.
+	RbPathCqWaitUs,
+	RbPathCqTotalUs,
+	RbPathFused,      // Detached copy in the same submission as the open command buffer.
+	RbPathFusedWaitUs,
+	RbPathFusedTotalUs,
+	RbPathDetached,   // Detached copy in a submission of its own, then the open command buffer.
+	RbPathDetachedWaitUs,
+	RbPathDetachedTotalUs,
+	RbPathFlush,      // A write of the ranges is in the open command buffer: flush and wait.
+	RbPathFlushWaitUs,
+	RbPathFlushTotalUs,
+	RbCqSubmits,      // Copy-queue submissions.
+	RbCqFenceUs,      // ... microseconds waiting for their fence (part of rb_path_cq_wait_us).
+	RbCqGpuBusy,      // Copy-queue downloads that found submitted graphics work unfinished.
 	Count
 };
 
@@ -46,6 +88,35 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 		Detail::g_counters[static_cast<int>(counter)].fetch_add(value, std::memory_order_relaxed);
 	}
 }
+
+[[nodiscard]] inline bool Enabled() noexcept {
+	return Detail::g_enabled.load(std::memory_order_relaxed);
+}
+
+// Adds the microseconds of its lifetime to `counter` (no clock read while the summary is off).
+class ScopedMicros {
+public:
+	explicit ScopedMicros(Counter counter, bool active = true) noexcept
+	    : m_counter(counter), m_on(active && Enabled()) {
+		if (m_on) {
+			m_start = std::chrono::steady_clock::now();
+		}
+	}
+	~ScopedMicros() {
+		if (m_on) {
+			Add(m_counter, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                         std::chrono::steady_clock::now() - m_start)
+			                                         .count()));
+		}
+	}
+	ScopedMicros(const ScopedMicros&)            = delete;
+	ScopedMicros& operator=(const ScopedMicros&) = delete;
+
+private:
+	Counter                               m_counter;
+	bool                                  m_on;
+	std::chrono::steady_clock::time_point m_start {};
+};
 
 // Reads KYTY_PERF_SUMMARY and starts the reporter. Safe to call more than once.
 void Start();

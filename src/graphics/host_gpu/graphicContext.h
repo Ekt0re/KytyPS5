@@ -31,11 +31,16 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	// VK_EXT_external_memory_host: guest direct memory can back buffers without a copy.
 	bool                               external_memory_host_enabled          = false;
+	// VK_KHR_external_memory_fd (+ VK_EXT_external_memory_dma_buf): the guest backing's Vulkan
+	// chunks (KYTY_VK_GUEST_BACKING=1, Linux) can be imported. Enabled only with that backing.
+	bool                               external_memory_fd_enabled            = false;
+	bool                               external_memory_dma_buf_enabled       = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// Fragment shaders can run at the guest wave size (VK_EXT_subgroup_size_control).
 	bool                               fragment_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
+	bool                               unified_image_layouts_enabled         = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	// VK_KHR_pipeline_binary with maintenance5 (PipelineBinaryStore).
@@ -70,6 +75,12 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// KYTY_COPY_QUEUE (default 1; 0 = off): a queue of a compute/transfer family without graphics, for synchronous
+	// buffer readbacks that do not have to wait behind graphics work (null when the device has no
+	// such family; buffers are then exclusive to queue_family). With it, buffers are created
+	// VK_SHARING_MODE_CONCURRENT over both families. Only the GPU thread submits to it.
+	uint32_t                           copy_queue_family = static_cast<uint32_t>(-1);
+	vk::Queue                          copy_queue        = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

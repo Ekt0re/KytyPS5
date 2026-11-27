@@ -55,7 +55,7 @@ static void StartSyncStatsReporter() {
 			constexpr double MB = 1024.0 * 1024.0;
 			std::printf("SyncStats t=%" PRIu64 " flips/s=%.1f subs/s=%.0f draws/s=%.0f | "
 			            "faults r/s=%.0f w/s=%.0f all/s=%.0f fault_ms/s=%.1f (buf %.1f tex %.1f heap %.1f) | "
-			            "readbacks/s=%.0f detached/s=%.0f zc_releases/s=%.0f readback_ms/s=%.1f bufdown_MB/s=%.1f texdown_MB/s=%.1f | "
+			            "readbacks/s=%.0f detached/s=%.0f zc_releases/s=%.0f zc_read_waits/s=%.0f readback_ms/s=%.1f bufdown_MB/s=%.1f texdown_MB/s=%.1f | "
 			            "bufup_MB/s=%.1f reup_MB/s=%.1f unchanged_MB/s=%.1f stream_MB/s=%.1f "
 			            "bda_MB/s=%.1f texup_MB/s=%.1f | protect/s=%.0f protect_MB/s=%.1f "
 			            "protect_ms/s=%.1f | gpuwait_ms/s=%.0f gputhread_ms/s=%.0f\n",
@@ -63,7 +63,7 @@ static void StartSyncStatsReporter() {
 			            d(Counter::Draws), d(Counter::SyncReadFaults), d(Counter::SyncWriteFaults),
 			            d(Counter::GpuFaults), d(Counter::SyncFaultNs) / 1e6, d(Counter::SyncFaultBufferNs) / 1e6,
 			            d(Counter::SyncFaultTextureNs) / 1e6, d(Counter::SyncFaultHeapNs) / 1e6, d(Counter::SyncReadbacks), d(Counter::SyncDetachedReadbacks),
-			            d(Counter::ZeroCopyReleases), d(Counter::SyncReadbackNs) / 1e6, d(Counter::BufferDownloadBytes) / MB,
+			            d(Counter::ZeroCopyReleases), d(Counter::ZeroCopyReadWaits), d(Counter::SyncReadbackNs) / 1e6, d(Counter::BufferDownloadBytes) / MB,
 			            d(Counter::TextureDownloadBytes) / MB, d(Counter::BufferUploadBytes) / MB,
 			            d(Counter::SyncReuploadBytes) / MB, d(Counter::SyncUnchangedUploadBytes) / MB,
 			            d(Counter::SyncStreamBytes) / MB, d(Counter::SyncBdaUploadBytes) / MB,

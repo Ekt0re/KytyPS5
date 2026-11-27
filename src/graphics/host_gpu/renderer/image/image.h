@@ -6,6 +6,7 @@
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
 
 #include <atomic>
 #include <compare>
@@ -36,7 +37,8 @@ struct ImageUsage {
 };
 
 struct ImageBinding {
-	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
+	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined; // Per use (logical).
+	vk::ImageLayout  attachment_host_layout = vk::ImageLayout::eUndefined; // What Vulkan sees.
 	vk::AccessFlags2 attachment_access;
 	bool             is_bound      = false;
 	bool             is_target     = false;
@@ -55,12 +57,16 @@ public:
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// `destination_layout` is the layout the use needs; it is mapped with UnifiedLayouts::Host
+	// unless `host_layout` says it already is the layout to use.
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
-	                                   std::optional<ImageSubresourceRange> range);
+	                                   std::optional<ImageSubresourceRange> range,
+	                                   bool                                 host_layout = false);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
+	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer,
+	             bool host_layout = false);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -119,9 +125,10 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+	// The layout sampled images are in (GENERAL with unified layouts).
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
-		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+		return UnifiedLayouts::Host(info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		                                           : vk::ImageLayout::eShaderReadOnlyOptimal);
 	}
 	struct HeapChange {
 		GuestRange data;

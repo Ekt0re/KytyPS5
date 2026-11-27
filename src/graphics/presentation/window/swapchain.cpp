@@ -218,7 +218,9 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	copy.dstSubresource = copy.srcSubresource;
 	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
-	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
+	// The frame keeps per-use layouts; the cached source follows UnifiedLayouts.
+	command.copyImage(source.backing.image,
+	                  UnifiedLayouts::TransferSrc(), image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
 }
 

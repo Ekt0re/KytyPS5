@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
+#include "common/runtimeToggles.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -22,6 +23,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
+#include <numeric>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -171,57 +174,91 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		// The bytes are in guest memory already; only the write has to finish.
 		return ResolveZeroCopy(buffer, !async);
 	}
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+	std::vector<DownloadPart> parts;
+	uint64_t                  total_size = 0;
+	if (!CollectDownload(buffer, vaddr, size, parts, total_size)) {
+		return false;
+	}
+	DownloadParts<async>(parts, total_size, false);
+	return true;
+}
+
+bool BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                  std::vector<DownloadPart>& parts, uint64_t& total_size) {
+	const auto   buffer_address = buffer.CpuAddress();
+	DownloadPart part {&buffer, buffer_address, {}};
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
-			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    part.copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Start each packed range on its own 64-byte cache line.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    ForgetColorMetadataChecks(address, bytes);
 	    });
-	if (copies.empty()) {
+	if (part.copies.empty()) {
 		return false;
 	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes,
+	                           std::accumulate(part.copies.begin(), part.copies.end(), uint64_t {0},
+	                                           [](uint64_t sum, const vk::BufferCopy& copy) {
+		                                           return sum + Common::AlignUp(copy.size, 64);
+	                                           }));
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::BufferReadbacks);
 	if (DetailedSyncStats()) {
-		for (const auto& copy: copies) {
+		for (const auto& copy: part.copies) {
 			m_stats_downloaded.Add(buffer_address + copy.srcOffset, copy.size);
 		}
 	}
+	parts.push_back(std::move(part));
+	return true;
+}
 
+template <bool async>
+void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total_size,
+                                bool fuse) {
+	EXIT_IF(parts.empty() || total_size == 0);
 	auto download = m_download_buffer.MapDownload(total_size, 64);
-	for (auto& copy: copies) {
-		copy.dstOffset += download.offset;
+	for (auto& part: parts) {
+		for (auto& copy: part.copies) {
+			copy.dstOffset += download.offset;
+		}
 	}
 
-	const auto record = [&](vk::CommandBuffer native) {
-		vk::BufferMemoryBarrier before {};
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
+	// The publication below takes `download` over (and with it a temporary buffer's owner) before
+	// `record` runs: the copy targets are taken here.
+	const auto download_handle = download.buffer->Handle();
+	const auto download_offset = download.offset;
+	const auto record = [&parts, download_handle, download_offset, total_size](vk::CommandBuffer native) {
+		// One barrier for all source buffers, then their copies, then one barrier for the bytes
+		// the host reads.
+		std::vector<vk::BufferMemoryBarrier> before(parts.size());
+		for (size_t index = 0; index < parts.size(); ++index) {
+			auto& barrier               = before[index];
+			barrier.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+			barrier.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			barrier.buffer              = parts[index].buffer->Handle();
+			barrier.offset              = 0;
+			barrier.size                = parts[index].buffer->Size();
+		}
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
-		                       nullptr);
-		native.copyBuffer(buffer.Handle(), download.buffer->Handle(),
-		                  static_cast<uint32_t>(copies.size()), copies.data());
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
+		                       static_cast<uint32_t>(before.size()), before.data(), 0, nullptr);
+		for (const auto& part: parts) {
+			native.copyBuffer(part.buffer->Handle(), download_handle,
+			                  static_cast<uint32_t>(part.copies.size()), part.copies.data());
+		}
 
-		auto after          = before;
+		auto after          = before.front();
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
-		after.buffer        = download.buffer->Handle();
-		after.offset        = download.offset;
+		after.buffer        = download_handle;
+		after.offset        = download_offset;
 		after.size          = total_size;
 		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                       vk::PipelineStageFlagBits::eAllCommands |
@@ -229,51 +266,151 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		                       {}, 0, nullptr, 1, &after, 0, nullptr);
 	};
 	// Decided after MapDownload, which may submit the current command buffer while it waits.
-	const bool detached = !async && CanDownloadDetached(buffer_address, copies);
-	if (detached) {
-		// The barrier orders the copy after every submitted command, and no unsubmitted command
-		// writes these ranges: the copy reads what a flush and wait would have read.
-		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncDetachedReadbacks);
-		m_scheduler.SubmitDetached(record);
-	} else {
-		auto& command = m_scheduler.Current();
-		command.EndRendering();
-		record(command.Handle());
-	}
-	auto publish = [total_size, buffer_address, copies = std::move(copies),
-	                download = std::move(download)] {
+	const bool detached =
+	    !async && std::all_of(parts.begin(), parts.end(), [&](const DownloadPart& part) {
+		    return CanDownloadDetached(part.buffer->CpuAddress(), part.copies);
+	    });
+	// `record` reads `parts` by reference and may run after this point: the publication keeps
+	// its own copy of the addresses and offsets.
+	auto publish = [total_size, parts = parts, download = std::move(download)] {
 		download.buffer->Invalidate(download.offset, total_size);
-		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(
-			    buffer_address + copy.srcOffset,
-			    download.mapped + (copy.dstOffset - download.offset), copy.size);
+		for (const auto& part: parts) {
+			const auto buffer_address = part.buffer_address;
+			for (const auto& copy: part.copies) {
+				Libs::LibKernel::Memory::WriteBacking(
+				    buffer_address + copy.srcOffset,
+				    download.mapped + (copy.dstOffset - download.offset), copy.size);
+			}
 		}
 	};
 	if constexpr (async) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		record(command.Handle());
 		m_scheduler.DeferPriorityOperation(std::move(publish));
-	} else {
-		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::SyncReadbacks,
-		                                         Common::DebugCounters::Counter::SyncReadbackNs);
+		return;
+	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbBatches);
+	if (QueueProbe()) {
+		ProbeReadbackQueue(parts);
+	}
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::SyncReadbacks,
+	                                         Common::DebugCounters::Counter::SyncReadbackNs);
+	using Common::PerfSummary::Counter;
+	using Common::PerfSummary::ScopedMicros;
+	const bool copy_queue = detached && CopyQueue();
+	const auto path       = ReadbackBatch::ChooseReadbackPath(
+        {.detached   = detached,
+	           .copy_queue = copy_queue,
+	           .fuse       = fuse && m_detached_readback == DetachedReadback::Submit &&
+	                   m_scheduler.CanSubmitDetachedWithCurrent()});
+	struct PathCounters {
+		Counter count, wait, total;
+	};
+	const auto counters = [path]() -> PathCounters {
+		switch (path) {
+			case ReadbackBatch::ReadbackPath::CopyQueue:
+				return {Counter::RbPathCq, Counter::RbPathCqWaitUs, Counter::RbPathCqTotalUs};
+			case ReadbackBatch::ReadbackPath::Fused:
+				return {Counter::RbPathFused, Counter::RbPathFusedWaitUs, Counter::RbPathFusedTotalUs};
+			case ReadbackBatch::ReadbackPath::Detached:
+				return {Counter::RbPathDetached, Counter::RbPathDetachedWaitUs,
+				        Counter::RbPathDetachedTotalUs};
+			case ReadbackBatch::ReadbackPath::Flush: break;
+		}
+		return {Counter::RbPathFlush, Counter::RbPathFlushWaitUs, Counter::RbPathFlushTotalUs};
+	}();
+	Common::PerfSummary::Add(counters.count);
+	ScopedMicros path_total_timer(counters.total);
+	if (path == ReadbackBatch::ReadbackPath::CopyQueue) {
+		// As a detached copy, but on the copy queue: it waits on the GPU for the submitted ticks
+		// only (on the universal queue it also queued behind the work submitted ahead of it),
+		// and the open command buffer is not submitted.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncDetachedReadbacks);
 		const auto tick = m_scheduler.CurrentTick();
-		if (detached) {
-			// Nothing is deferred at the current tick: older publications land first, as in a
-			// flush and wait.
+		if (Common::PerfSummary::Enabled()) {
+			auto& master = m_scheduler.GetMasterSemaphore();
+			if (!master.IsFree(tick - 1)) {
+				master.Refresh();
+				if (!master.IsFree(tick - 1)) {
+					Common::PerfSummary::Add(Counter::RbCqGpuBusy);
+				}
+			}
+		}
+		{
+			ScopedMicros path_wait_timer(counters.wait);
+			(void)m_scheduler.SubmitOnCopyQueue(record);
+			ScopedMicros wait_timer(Counter::RbWaitUs);
 			m_scheduler.WaitPriorityOperations(tick - 1);
+		}
+		// KYTY_COPY_QUEUE_FLUSH=1: the open command buffer is still submitted (without a wait), as
+		// the detached path does.
+		if (CopyQueueFlush()) {
+			ScopedMicros flush_timer(Counter::RbFlushUs);
+			m_scheduler.Flush();
+			Common::PerfSummary::Add(Counter::RbSubmits);
+		}
+	} else if (detached) {
+		// The barrier orders the copy after every submitted command, and no unsubmitted command
+		// writes these ranges: the copy reads what a flush and wait would have read.
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncDetachedReadbacks);
+		// Nothing is deferred at the current tick (CanDownloadDetached): older publications land
+		// first, as in a flush and wait.
+		const auto tick = m_scheduler.CurrentTick();
+		// Batched: the copy and the open command buffer go to the GPU in one submission, the copy
+		// first, and only the copy is waited for. Unbatched: the copy's own submission and wait,
+		// then the open command buffer's submission.
+		// The fused path's wait counter includes submitting the open command buffer: its wait
+		// happens inside SubmitDetachedWithCurrent.
+		std::optional<ScopedMicros> fused_wait_timer;
+		if (path == ReadbackBatch::ReadbackPath::Fused) {
+			fused_wait_timer.emplace(counters.wait);
+		}
+		if (path == ReadbackBatch::ReadbackPath::Fused && m_scheduler.SubmitDetachedWithCurrent(record)) {
+			Common::PerfSummary::Add(Counter::RbFused);
+			ScopedMicros wait_timer(Counter::RbWaitUs);
+			m_scheduler.WaitPriorityOperations(tick - 1);
+		} else {
+			fused_wait_timer.reset();
+			{
+				ScopedMicros path_wait_timer(counters.wait);
+				m_scheduler.SubmitDetached(record);
+				ScopedMicros wait_timer(Counter::RbWaitUs);
+				m_scheduler.WaitPriorityOperations(tick - 1);
+			}
 			// The open command buffer is still submitted, without waiting for it, as a flush and
 			// wait would have: completions the guest waits for (flips, interrupts, image
 			// write-backs) keep the latency they had. Without this, GTA VI fell into a black
 			// 30 fps loop in 2 of 3 runs although every detached download read the same bytes
 			// as a flushed one (KYTY_DETACHED_READBACK=2 skips the submission, for comparison).
 			if (m_detached_readback == DetachedReadback::Submit) {
+				ScopedMicros flush_timer(Counter::RbFlushUs);
 				m_scheduler.Flush();
+				Common::PerfSummary::Add(Counter::RbSubmits);
 			}
-		} else {
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
 		}
-		publish();
+	} else {
+		// A write of these ranges is still in the open command buffer: the copy goes behind it,
+		// into the same submission.
+		{
+			ScopedMicros submit_timer(Counter::RbSubmitUs);
+			auto&        command = m_scheduler.Current();
+			command.EndRendering();
+			record(command.Handle());
+		}
+		const auto tick = m_scheduler.CurrentTick();
+		{
+			ScopedMicros flush_timer(Counter::RbFlushUs);
+			Common::PerfSummary::Add(Counter::RbSubmits);
+			m_scheduler.Flush();
+		}
+		ScopedMicros wait_timer(Counter::RbWaitUs);
+		ScopedMicros path_wait_timer(counters.wait);
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
 	}
-	return true;
+	ScopedMicros copy_timer(Counter::RbCopyUs);
+	publish();
 }
 
 bool BufferCache::CanDownloadDetached(uint64_t                        buffer_address,
@@ -320,12 +457,22 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                              BDA_PAGETABLE_SIZE),
+      m_guest_imports(graphics),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	// On by default (bb_ab2, world: readback ms/f -14%, gpu_cpu_us/op -19%);
+	// KYTY_BATCH_READBACK=0 turns it off.
+	if (const char* value = std::getenv("KYTY_BATCH_READBACK"); value != nullptr) {
+		m_batch_readback_env = value[0] != '0';
+	}
+	m_batch_readback = m_batch_readback_env;
+	if (const char* value = std::getenv("KYTY_BATCH_READBACK_PREFETCH"); value != nullptr) {
+		m_batch_prefetch = std::strtoull(value, nullptr, 10) * 1024;
+	}
 	// KYTY_DETACHED_READBACK=0 flushes and waits for every synchronous download, as before; 2
 	// reads detached without submitting the open command buffer afterwards.
 	if (const char* value = std::getenv("KYTY_DETACHED_READBACK"); value != nullptr) {
@@ -373,12 +520,14 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	WaitZeroCopyReads(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
 }
 
 void BufferCache::InvalidateWriteWindow(uint64_t vaddr, uint64_t size) {
+	WaitZeroCopyReads(vaddr, size);
 	m_memory_tracker.MarkCleanAsCpuModified(vaddr, size);
 	// Shader address reads see the window's CPU bytes only through these uploads.
 	QueueBdaSync(vaddr, size);
@@ -391,6 +540,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+		using Common::PerfSummary::Counter;
+		Common::PerfSummary::ScopedMicros handler_timer(Counter::RbHandlerUs);
+		// Guest write faults on GPU-written pages come here too (InvalidateMemory).
+		Common::PerfSummary::ScopedMicros write_timer(Counter::RbWriteUs, is_write);
+		Common::PerfSummary::Add(Counter::RbCalls);
+		if (is_write) {
+			Common::PerfSummary::Add(Counter::RbWriteCalls);
+		}
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -421,8 +578,21 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			    std::max(Common::AlignDown(vaddr, DownloadWindowSize), buffer.CpuAddress());
 			const auto end = std::min(std::max(start + DownloadWindowSize, vaddr + size),
 			                          buffer.CpuAddress() + buffer.Size());
-			if (DownloadBufferMemory<false>(buffer, start, end - start)) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+			if (Common::PerfSummary::Enabled() &&
+			    m_readback_neighbours.Note(Common::AlignDown(vaddr, DownloadWindowSize),
+			                               DownloadWindowSize)) {
+				Common::PerfSummary::Add(Common::PerfSummary::Counter::RbNeighbour);
+			}
+			bool downloaded = false;
+			if (!buffer.IsZeroCopy() && BatchReadback()) {
+				downloaded = DownloadWindowBatch(buffer_id, vaddr, size, {start, end});
+			} else {
+				downloaded = DownloadBufferMemory<false>(buffer, start, end - start);
+				if (downloaded) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				}
+			}
+			if (downloaded) {
 				// Buffers the CPU keeps faulting on may move to guest memory (zero-copy).
 				buffer.readback_faults++;
 				migrate = ZeroCopyEnabled() && !buffer.IsZeroCopy();
@@ -439,6 +609,137 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			MaybeMigrateToZeroCopy(buffer_id);
 		}
 	});
+}
+
+bool BufferCache::QueueProbe() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RB_QUEUE_PROBE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled && Common::PerfSummary::Enabled();
+}
+
+void BufferCache::ProbeReadbackQueue(const std::vector<DownloadPart>& parts) {
+	using Common::PerfSummary::Counter;
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const auto submitted = master.SubmittedTick();
+	const auto done      = master.KnownGpuTick();
+	Common::PerfSummary::Add(Counter::RbQueueTicks, submitted > done ? submitted - done : 0);
+	uint64_t producer = 0;
+	for (const auto& part: parts) {
+		producer = std::max(producer, part.buffer->probe_write_tick);
+	}
+	if (producer <= done) {
+		Common::PerfSummary::Add(Counter::RbProducerDone);
+		return;
+	}
+	if (producer > submitted) {
+		Common::PerfSummary::Add(Counter::RbProducerOpen);
+		return;
+	}
+	Common::PerfSummary::Add(Counter::RbProducerPending);
+	Common::PerfSummary::Add(Counter::RbAfterTicks, submitted - producer);
+	// The download waits for this anyway: timing it separately splits the wait into the part
+	// up to the producing work and the part for work queued behind it.
+	Common::PerfSummary::ScopedMicros timer(Counter::RbProducerWaitUs);
+	master.Wait(producer);
+}
+
+bool BufferCache::CopyQueue() {
+	if (!m_scheduler.HasCopyQueue()) {
+		return false;
+	}
+	if (!Common::RuntimeToggles::Enabled()) {
+		return true;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now >= m_copy_queue_next) {
+		m_copy_queue_next  = now + std::chrono::milliseconds(250);
+		const int toggle   = Common::RuntimeToggles::Find("copy_queue");
+		m_copy_queue       = toggle != 0;
+	}
+	return m_copy_queue;
+}
+
+bool BufferCache::CopyQueueFlush() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COPY_QUEUE_FLUSH");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool BufferCache::BatchReadback() {
+	if (!Common::RuntimeToggles::Enabled()) {
+		return m_batch_readback_env;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now >= m_batch_readback_next) {
+		m_batch_readback_next = now + std::chrono::milliseconds(250);
+		const int toggle      = Common::RuntimeToggles::Find("batch_readback");
+		m_batch_readback      = toggle < 0 ? m_batch_readback_env : toggle == 1;
+	}
+	return m_batch_readback;
+}
+
+bool BufferCache::DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_t size,
+                                      ReadbackBatch::Range first_window) {
+	using ReadbackBatch::Range;
+	auto& first = m_slot_buffers[first_id];
+	const Range first_range {first.CpuAddress(), first.CpuAddress() + first.Size()};
+	// The batch window: the aligned block around the access plus the prefetch on both sides.
+	const auto window = ReadbackBatch::AccessWindow(vaddr, size, DownloadWindowSize,
+	                                                m_batch_prefetch, {0, UINT64_MAX});
+	// The access's own buffer keeps its usual window, widened by the prefetch.
+	const auto own = window.Clamp(first_range);
+	const Range first_part {std::min(first_window.begin, own.Empty() ? first_window.begin : own.begin),
+	                        std::max(first_window.end, own.Empty() ? first_window.end : own.end)};
+	const auto pieces = ReadbackBatch::SplitByOwner<BufferId>(
+	    window, CACHING_PAGESIZE, first_id, first_part,
+	    [this](uint64_t address) -> std::optional<std::pair<BufferId, Range>> {
+		    if (!GuestRange {address, CACHING_PAGESIZE}.Valid()) {
+			    return std::nullopt;
+		    }
+		    const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+		    if (owner == nullptr || IsBufferInvalid(*owner)) {
+			    return std::nullopt;
+		    }
+		    const auto& buffer = m_slot_buffers[*owner];
+		    return std::pair {*owner, Range {buffer.CpuAddress(), buffer.CpuAddress() + buffer.Size()}};
+	    });
+	std::vector<DownloadPart> parts;
+	std::vector<Range>        windows;
+	uint64_t                  total_size = 0;
+	bool                      first_done = false;
+	for (const auto& piece: pieces) {
+		auto& buffer = m_slot_buffers[piece.id];
+		const bool is_first = piece.id == first_id;
+		// Zero-copy buffers resolve on their own fault; other buffers only when they hold
+		// GPU-written bytes in the window and the open command buffer does not write them (that
+		// would turn the whole batch into a flush and wait).
+		if (!is_first &&
+		    (buffer.IsZeroCopy() ||
+		     !m_memory_tracker.IsRegionGpuModified(piece.range.begin, piece.range.Size()) ||
+		     HasUnsubmittedWrite(piece.range.begin, piece.range.Size()))) {
+			continue;
+		}
+		if (CollectDownload(buffer, piece.range.begin, piece.range.Size(), parts, total_size)) {
+			windows.push_back(piece.range);
+			first_done = first_done || is_first;
+			if (!is_first) {
+				Common::PerfSummary::Add(Common::PerfSummary::Counter::RbExtraBufs);
+			}
+		}
+	}
+	if (parts.empty()) {
+		return false;
+	}
+	DownloadParts<false>(parts, total_size, true);
+	for (const auto& range: windows) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(range.begin, range.Size());
+	}
+	return first_done;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
@@ -528,7 +829,9 @@ bool BufferCache::ZeroCopyEnabled() const {
 		const char* text = std::getenv("KYTY_ZERO_COPY");
 		return text != nullptr && text[0] == '1';
 	}();
-	return enabled && m_graphics.external_memory_host_enabled;
+	// GuestBackingImports::Available() settles on first use and is cheap after that.
+	return enabled && (m_graphics.external_memory_host_enabled ||
+	                   const_cast<GuestBackingImports&>(m_guest_imports).Available());
 }
 
 bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
@@ -552,6 +855,8 @@ bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
 	// further fault (zero-copy pages never need CPU-dirty tracking, there is nothing to upload).
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	// Writable pages are fenced again by the next submission that may read them by address.
+	QueueBdaSync(vaddr, size);
 	return true;
 }
 
@@ -578,7 +883,80 @@ void BufferCache::ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t si
 	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	QueueBdaSync(vaddr, size);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReleases);
+}
+
+void BufferCache::FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto tick = m_scheduler.CurrentTick();
+	// Clearing CPU-dirty state write-protects the pages: a CPU write faults into WaitZeroCopyReads.
+	// There is nothing to upload; guest memory is the buffer.
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	if (buffer.last_read_tick == tick) {
+		return;
+	}
+	buffer.last_read_tick = tick;
+	{
+		std::scoped_lock lock(m_zero_copy_fence_mutex);
+		m_zero_copy_fences[buffer.CpuAddress()] = {buffer.CpuAddress() + buffer.Size(), tick};
+		m_any_zero_copy_fence.store(true, std::memory_order_release);
+	}
+	if (buffer.read_release_tick != tick) {
+		buffer.read_release_tick = tick;
+		m_scheduler.DeferOperation([this, id, address = buffer.CpuAddress(), bytes = buffer.Size(),
+		                            tick] { ReleaseZeroCopyReads(id, address, bytes, tick); });
+	}
+}
+
+void BufferCache::ReleaseZeroCopyReads(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick) {
+	// Drops the fence once its tick completed, unless a newer read replaced it.
+	{
+		std::scoped_lock lock(m_zero_copy_fence_mutex);
+		if (const auto it = m_zero_copy_fences.find(vaddr);
+		    it != m_zero_copy_fences.end() && it->second.tick == tick) {
+			m_zero_copy_fences.erase(it);
+		}
+	}
+	// The pages stay write-protected: lifting it here would let later CPU writes skip the fault
+	// that queues the next submission's fence for readers by address (SynchronizeBda). The first
+	// write after the read completes faults once and no longer waits.
+	(void)id;
+	(void)size;
+}
+
+void BufferCache::WaitZeroCopyReads(uint64_t vaddr, uint64_t size) {
+	if (!m_any_zero_copy_fence.load(std::memory_order_acquire)) {
+		return;
+	}
+	uint64_t tick = 0;
+	{
+		std::scoped_lock lock(m_zero_copy_fence_mutex);
+		// Buffers never overlap, so the fences that meet the range are adjacent.
+		auto it = m_zero_copy_fences.lower_bound(vaddr + size);
+		while (it != m_zero_copy_fences.begin()) {
+			--it;
+			if (it->second.end <= vaddr) {
+				break;
+			}
+			tick = std::max(tick, it->second.tick);
+		}
+	}
+	// A completion operation that writes guest memory is ordered after the GPU work already, and
+	// waiting from it could wait for itself.
+	if (tick == 0 || CommandScheduler::InDeferredOperation() || m_scheduler.IsFree(tick)) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("BufferCache::ZeroCopyReadWait");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReadWaits);
+	// As RenderContext::WaitWriteBacks: only the GPU thread submits the current tick.
+	if (GuestGpu::IsGpuThread()) {
+		m_scheduler.Wait(tick);
+	} else if (tick == m_scheduler.CurrentTick()) {
+		m_scheduler.Context().GetGpu().SendCommandSync([this, tick] { m_scheduler.Wait(tick); });
+	} else {
+		m_scheduler.Wait(tick);
+	}
 }
 
 void BufferCache::JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
@@ -672,6 +1050,7 @@ void BufferCache::DropZeroCopyBuffer(BufferId id) {
 	const auto vaddr  = buffer.CpuAddress();
 	const auto size   = buffer.Size();
 	(void)ResolveZeroCopy(buffer, true);
+	// Its read fence stays until its tick completes: a CPU write still waits for reads in flight.
 	m_zero_copy.Subtract(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	DeleteBuffer(id);
@@ -714,12 +1093,25 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		const auto         alias =
 		    length <= MaxZeroCopy ? LibKernel::Memory::ContiguousBackingAlias(overlap.begin, length) : 0;
 		if (alias != 0 && (alias & 0xfffu) == 0) {
-			id        = m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
-			                                  reinterpret_cast<void*>(alias), flags, length);
-			zero_copy = m_slot_buffers[id].IsZeroCopy();
+			// The backing's own Vulkan memory where it has some (KYTY_VK_GUEST_BACKING=1),
+			// otherwise a host-pointer import (VK_EXT_external_memory_host).
+			bool inserted = false;
+			if (const auto imported = m_guest_imports.Find(alias, length)) {
+				id       = m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
+				                                 reinterpret_cast<void*>(alias), imported->memory,
+				                                 imported->offset, imported->memory_size,
+				                                 imported->memory_type, imported->handle_type, flags,
+				                                 length);
+				inserted = true;
+			} else if (m_graphics.external_memory_host_enabled) {
+				id       = m_slot_buffers.insert(m_graphics, m_scheduler, overlap.begin,
+				                                 reinterpret_cast<void*>(alias), flags, length);
+				inserted = true;
+			}
+			zero_copy = inserted && m_slot_buffers[id].IsZeroCopy();
 			if (zero_copy) {
 				m_slot_buffers[id].backing_generation = generation;
-			} else {
+			} else if (inserted) {
 				m_slot_buffers.erase(id);
 			}
 		}
@@ -728,8 +1120,9 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		} else {
 			m_zero_copy.Subtract(overlap.begin, length);
 		}
-		if (++m_zero_copy_created <= 64 || !zero_copy) {
-			std::printf("Zero-copy: buffer 0x%011llx+0x%llx %s\n",
+		if (++m_zero_copy_created <= 64 || !zero_copy || (m_zero_copy_created & 255u) == 0) {
+			std::printf("Zero-copy: #%llu buffer 0x%011llx+0x%llx %s\n",
+			            static_cast<unsigned long long>(m_zero_copy_created),
 			            static_cast<unsigned long long>(overlap.begin),
 			            static_cast<unsigned long long>(length),
 			            zero_copy    ? "imports guest memory"
@@ -919,6 +1312,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
+	if (is_written) {
+		buffer.probe_write_tick = m_scheduler.CurrentTick();
+	}
+	if (!is_written && buffer.IsZeroCopy()) {
+		FenceZeroCopyRead(id, buffer, vaddr, end - vaddr);
+	}
 	if (is_written && buffer.IsZeroCopy() && buffer.release_tick != buffer.last_write_tick) {
 		static const bool release = [] {
 			const char* text = std::getenv("KYTY_ZERO_COPY_RELEASE");
@@ -1195,11 +1594,17 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			}
 			for (; it != m_buffers.end() && it->first < finish; ++it) {
 				auto& buffer = m_slot_buffers[it->second];
-				if (buffer.IsZeroCopy()) {
-					continue; // the GPU reads guest memory itself
-				}
 				const auto first = std::max(buffer.CpuAddress(), start);
 				const auto last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
+				if (buffer.IsZeroCopy()) {
+					// The GPU reads guest memory itself, through addresses too: the CPU's
+					// writes since the last submission are visible already, and further ones
+					// wait while this submission may still read them.
+					if (first < last) {
+						FenceZeroCopyRead(it->second, buffer, first, last - first);
+					}
+					continue;
+				}
 				if (first < last) {
 					// Reads follow every range's protection; a write in between re-queues its page.
 					m_memory_tracker.ForEachUploadRange(

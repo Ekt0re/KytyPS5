@@ -51,6 +51,7 @@
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <asm/prctl.h>
 #include <sys/syscall.h>
+#include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -612,7 +613,19 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 
 		if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) !=
 		    static_cast<ssize_t>(sizeof(probe))) {
-			return false;
+			// process_vm_readv can't read device mappings (direct memory in Vulkan dma-buf
+			// chunks, KYTY_VK_GUEST_BACKING=1); a pipe write reads them like any page.
+			int pipe_fds[2] = {-1, -1};
+			if (pipe2(pipe_fds, O_CLOEXEC) != 0) {
+				return false;
+			}
+			const bool readable =
+			    write(pipe_fds[1], reinterpret_cast<const void*>(current), 1) == 1;
+			close(pipe_fds[0]);
+			close(pipe_fds[1]);
+			if (!readable) {
+				return false;
+			}
 		}
 
 		const uint64_t next = (current & ~(page_size - 1)) + page_size;

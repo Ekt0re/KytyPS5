@@ -3,11 +3,14 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfSummary.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
 #include "graphics/host_gpu/renderer/recorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <type_traits>
 
@@ -87,7 +90,12 @@ CommandScheduler::~CommandScheduler() {
 	Shutdown();
 	if (m_detached_pool != nullptr) {
 		m_graphics.device.destroyFence(m_detached_fence, nullptr);
+		m_graphics.device.destroySemaphore(m_detached_timeline, nullptr);
 		m_graphics.device.destroyCommandPool(m_detached_pool, nullptr);
+	}
+	if (m_copy_pool != nullptr) {
+		m_graphics.device.destroyFence(m_copy_fence, nullptr);
+		m_graphics.device.destroyCommandPool(m_copy_pool, nullptr);
 	}
 }
 
@@ -112,6 +120,13 @@ vk::CommandBuffer CommandScheduler::BeginDetached() {
 		const vk::FenceCreateInfo fence {};
 		RequireVulkanSuccess(device.createFence(&fence, nullptr, &m_detached_fence),
 		                     "create detached fence");
+		vk::SemaphoreTypeCreateInfo type_info {};
+		type_info.semaphoreType = vk::SemaphoreType::eTimeline;
+		type_info.initialValue  = 0;
+		vk::SemaphoreCreateInfo semaphore {};
+		semaphore.pNext = &type_info;
+		RequireVulkanSuccess(device.createSemaphore(&semaphore, nullptr, &m_detached_timeline),
+		                     "create detached timeline semaphore");
 	}
 	// With the command recorder, earlier ticks may still wait on its thread for their submission:
 	// the copy must follow them on the queue.
@@ -132,6 +147,7 @@ void CommandScheduler::EndDetached() {
 	RequireVulkanSuccess(m_detached_command.end(), "end detached command buffer");
 	vk::Result result;
 	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbSubmitUs);
 		Common::LockGuard lock(m_graphics.queue_mutex);
 		vk::SubmitInfo    submit_info {};
 		submit_info.commandBufferCount = 1;
@@ -140,14 +156,129 @@ void CommandScheduler::EndDetached() {
 	}
 	RequireVulkanSuccess(result, "submit detached command buffer");
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
-	// The signal of a queue-submission fence also covers every batch submitted earlier on this
-	// queue.
-	RequireVulkanSuccess(
-	    m_graphics.device.waitForFences(1, &m_detached_fence, VK_TRUE, UINT64_MAX),
-	    "wait for detached fence");
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbSubmits);
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbWaitUs);
+		// The signal of a queue-submission fence also covers every batch submitted earlier on
+		// this queue.
+		RequireVulkanSuccess(
+		    m_graphics.device.waitForFences(1, &m_detached_fence, VK_TRUE, UINT64_MAX),
+		    "wait for detached fence");
+	}
 	RequireVulkanSuccess(m_graphics.device.resetFences(1, &m_detached_fence),
 	                     "reset detached fence");
 	RequireVulkanSuccess(m_detached_command.reset({}), "reset detached command buffer");
+}
+
+bool CommandScheduler::CanSubmitDetachedWithCurrent() const {
+	// The recorder ends and submits recorded buffers on its own thread, in its own order.
+	return !Recorder::Enabled() && !m_command.IsInvalid();
+}
+
+void CommandScheduler::EndDetachedWithCurrent() {
+	RequireVulkanSuccess(m_detached_command.end(), "end detached command buffer");
+	const DetachedPrefix prefix {m_detached_command, m_detached_timeline, ++m_detached_value};
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbSubmitUs);
+		(void)SubmitWith({}, &prefix);
+		BeginNext();
+	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbSubmits);
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbWaitUs);
+		// The detached batch comes first in the submission: its signal does not wait for the
+		// open command buffer behind it, but it does follow every batch submitted earlier.
+		vk::SemaphoreWaitInfo wait_info {};
+		wait_info.semaphoreCount = 1;
+		wait_info.pSemaphores    = &m_detached_timeline;
+		wait_info.pValues        = &prefix.value;
+		const auto result        = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+		if (result == vk::Result::eErrorDeviceLost) {
+			GpuBreadcrumbs::ReportDeviceLost(m_graphics, "detached readback wait");
+		}
+		RequireVulkanSuccess(result, "wait for detached timeline semaphore");
+	}
+	RequireVulkanSuccess(m_detached_command.reset({}), "reset detached command buffer");
+}
+
+bool CommandScheduler::HasCopyQueue() const noexcept {
+	return m_graphics.copy_queue != nullptr;
+}
+
+vk::CommandBuffer CommandScheduler::BeginCopyQueue() {
+	CheckActive();
+	auto& device = m_graphics.device;
+	if (m_copy_pool == nullptr) {
+		vk::CommandPoolCreateInfo create {};
+		create.queueFamilyIndex = m_graphics.copy_queue_family;
+		create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		RequireVulkanSuccess(device.createCommandPool(&create, nullptr, &m_copy_pool),
+		                     "create copy-queue command pool");
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_copy_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		RequireVulkanSuccess(device.allocateCommandBuffers(&allocate, &m_copy_command),
+		                     "allocate copy-queue command buffer");
+		const vk::FenceCreateInfo fence {};
+		RequireVulkanSuccess(device.createFence(&fence, nullptr, &m_copy_fence),
+		                     "create copy-queue fence");
+	}
+	// With the command recorder, earlier ticks may still wait on its thread for their submission:
+	// their timeline signals must be submitted before the copy waits on them.
+	if (Recorder::Enabled() && m_master.SubmittedTick() + 1 < m_master.CurrentTick()) {
+		Recorder::SyncAll();
+	}
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(m_copy_command.begin(&begin), "begin copy-queue command buffer");
+	return m_copy_command;
+}
+
+void CommandScheduler::EndCopyQueue() {
+	if (Recorder::IsDeferred(static_cast<VkCommandBuffer>(m_copy_command))) {
+		Recorder::Sync(m_copy_command);
+	}
+	RequireVulkanSuccess(m_copy_command.end(), "end copy-queue command buffer");
+	// Every tick handed out before the open one: the same work a detached copy on the universal
+	// queue would follow, as a GPU-side wait on the master timeline (free when it has finished).
+	const uint64_t                wait_value = m_master.CurrentTick() - 1;
+	const vk::Semaphore           wait_semaphore = m_master.Handle();
+	const vk::PipelineStageFlags  wait_stage     = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount = 1;
+	timeline_info.pWaitSemaphoreValues    = &wait_value;
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext              = &timeline_info;
+	submit_info.waitSemaphoreCount = 1;
+	submit_info.pWaitSemaphores    = &wait_semaphore;
+	submit_info.pWaitDstStageMask  = &wait_stage;
+	submit_info.commandBufferCount = 1;
+	submit_info.pCommandBuffers    = &m_copy_command;
+	vk::Result result;
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbSubmitUs);
+		result = m_graphics.copy_queue.submit(1, &submit_info, m_copy_fence);
+	}
+	if (result == vk::Result::eErrorDeviceLost) {
+		GpuBreadcrumbs::ReportDeviceLost(m_graphics, "copy-queue submit");
+	}
+	RequireVulkanSuccess(result, "submit copy-queue command buffer");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbSubmits);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbCqSubmits);
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbWaitUs);
+		Common::PerfSummary::ScopedMicros path_timer(Common::PerfSummary::Counter::RbCqFenceUs);
+		result = m_graphics.device.waitForFences(1, &m_copy_fence, VK_TRUE, UINT64_MAX);
+		if (result == vk::Result::eErrorDeviceLost) {
+			GpuBreadcrumbs::ReportDeviceLost(m_graphics, "copy-queue wait");
+		}
+		RequireVulkanSuccess(result, "wait for copy-queue fence");
+	}
+	RequireVulkanSuccess(m_graphics.device.resetFences(1, &m_copy_fence), "reset copy-queue fence");
+	RequireVulkanSuccess(m_copy_command.reset({}), "reset copy-queue command buffer");
 }
 
 void CommandScheduler::Shutdown() {
@@ -261,6 +392,7 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::StartOperation() {
+	UnifiedLayouts::Refresh();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		SealReleasesLocked();
@@ -429,7 +561,8 @@ struct DeferredSubmit {
 static_assert(std::is_trivially_copyable_v<DeferredSubmit>);
 
 vk::Result QueueSubmit(vk::Queue queue, const SubmitInfo& submit, const vk::CommandBuffer* buffers,
-                       uint32_t count) {
+                       uint32_t count, const vk::CommandBuffer* prefix_buffer = nullptr,
+                       vk::Semaphore prefix_semaphore = nullptr, uint64_t prefix_value = 0) {
 	vk::TimelineSemaphoreSubmitInfo timeline_info {};
 	timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
 	timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
@@ -446,7 +579,22 @@ vk::Result QueueSubmit(vk::Queue queue, const SubmitInfo& submit, const vk::Comm
 	submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
 	submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
 
-	return queue.submit(1, &submit_info, nullptr);
+	if (prefix_buffer == nullptr) {
+		return queue.submit(1, &submit_info, nullptr);
+	}
+	// Two batches in one submission: batches start in order, and the prefix's signal covers it
+	// and every batch submitted before it (not the batch behind it).
+	vk::TimelineSemaphoreSubmitInfo prefix_timeline {};
+	prefix_timeline.signalSemaphoreValueCount = 1;
+	prefix_timeline.pSignalSemaphoreValues    = &prefix_value;
+	std::array<vk::SubmitInfo, 2> batches {};
+	batches[0].pNext                = &prefix_timeline;
+	batches[0].commandBufferCount   = 1;
+	batches[0].pCommandBuffers      = prefix_buffer;
+	batches[0].signalSemaphoreCount = 1;
+	batches[0].pSignalSemaphores    = &prefix_semaphore;
+	batches[1]                      = submit_info;
+	return queue.submit(static_cast<uint32_t>(batches.size()), batches.data(), nullptr);
 }
 
 // Runs on the command recorder's thread once it ended the buffers.
@@ -470,6 +618,10 @@ void RunDeferredSubmit(const void* data, const VkCommandBuffer* buffers, uint32_
 } // namespace
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	return SubmitWith(submit, nullptr);
+}
+
+uint64_t CommandScheduler::SubmitWith(SubmitInfo submit, const DetachedPrefix* prefix) {
 	EXIT_IF(m_command.IsInvalid());
 
 	m_command.EndRendering();
@@ -492,6 +644,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		    return Recorder::IsDeferred(static_cast<VkCommandBuffer>(b));
 	    });
 	if (deferred) {
+		EXIT_IF(prefix != nullptr);
 		DeferredSubmit run {};
 		run.submit      = submit;
 		run.queue       = graphics.queue;
@@ -526,8 +679,12 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);
-		result = QueueSubmit(graphics.queue, submit, buffers.data(),
-		                     static_cast<uint32_t>(buffers.size()));
+		result = prefix == nullptr
+		             ? QueueSubmit(graphics.queue, submit, buffers.data(),
+		                           static_cast<uint32_t>(buffers.size()))
+		             : QueueSubmit(graphics.queue, submit, buffers.data(),
+		                           static_cast<uint32_t>(buffers.size()), &prefix->buffer,
+		                           prefix->semaphore, prefix->value);
 		m_master.MarkSubmitted(tick);
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);

@@ -143,6 +143,21 @@ bool                   TryReadBackingUncommitted(uint64_t vaddr, void* data, uin
 // Host address of the backing alias for a guest range that one contiguous run of direct memory
 // holds (no gaps, no private mappings), 0 otherwise. The alias stays mapped for the whole run.
 uint64_t               ContiguousBackingAlias(uint64_t vaddr, uint64_t size);
+// KYTY_VK_GUEST_BACKING=1 (Linux): direct memory lives in Vulkan allocations exported as fds,
+// one per chunk of the backing (see vulkanGuestBacking.h). The chunk that holds all of the
+// backing alias range [alias, alias + size), for importing it into the renderer's device.
+struct VulkanBackingChunk {
+	uint32_t index             = 0;
+	uint64_t offset            = 0; // of `alias` in the chunk
+	uint64_t size              = 0; // of the whole chunk
+	uint32_t handle_type       = 0; // VkExternalMemoryHandleTypeFlagBits
+	uint32_t memory_type_index = 0; // in the exporting device
+	uint8_t  device_uuid[16]   = {};
+};
+[[nodiscard]] bool     VulkanBackingActive();
+bool                   FindVulkanBackingChunk(uint64_t alias, uint64_t size, VulkanBackingChunk* out);
+// A new descriptor of a chunk (the caller owns it), -1 when it is not a Vulkan chunk.
+[[nodiscard]] int      DupVulkanBackingChunk(uint32_t index);
 // Changes whenever guest pages are bound to or unbound from the backing.
 uint64_t               BackingGeneration();
 // Whether pages of [vaddr, vaddr + size) were bound or unbound after `generation` (true when
@@ -297,6 +312,8 @@ bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
+// Vulkan chunks of the backing (0 without KYTY_VK_GUEST_BACKING), and the fd behind a guest page.
+uint32_t TestVulkanBackingChunks();
 uint64_t TestFlexibleBackingHighWater();
 uint64_t TestGuestFreeRangeVisits();
 uint64_t TestDirectMappingCount();

@@ -551,6 +551,13 @@ PreparedTexture RenderExecutor::PrepareTexture(const ShaderRecompiler::IR::Image
 	} else {
 		desc.info.UpdateSize();
 	}
+	if (const auto host_levels = static_cast<uint32_t>(std::bit_width(std::max(
+	        {desc.info.extent.width, desc.info.extent.height, desc.info.extent.depth})));
+	    desc.info.resources.levels > host_levels) {
+		desc.info.resources.levels = host_levels;
+		view_base                  = std::min(view_base, host_levels - 1u);
+		view_levels                = std::min(view_levels, host_levels - view_base);
+	}
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples, whatever
 	// their layout.
 	if (resource.heap && !m_context.IsMapped(address, desc.info.data.size)) {
@@ -933,12 +940,16 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-			EXIT_IF(resource.mip_count == 0u ||
-			        resource.mip_count != binding.desc.view_info.level_count);
+			const auto& view     = binding.desc.view_info;
+			const bool  host_cut = view.base_level + view.level_count ==
+			                       binding.desc.info.resources.levels;
+			EXIT_IF(resource.mip_count == 0u || view.level_count == 0u ||
+			        (resource.mip_count != view.level_count &&
+			         (resource.mip_count < view.level_count || !host_cut)));
 			binding.mip_views.reserve(resource.mip_count);
 			for (uint32_t mip = 0; mip < resource.mip_count; mip++) {
 				auto desc = binding.desc;
-				desc.view_info.base_level += mip;
+				desc.view_info.base_level += std::min(mip, view.level_count - 1u);
 				desc.view_info.level_count = 1;
 				// The shader selects the mip after applying the guest minimum LOD.
 				desc.view_info.min_lod = 0;
@@ -1090,11 +1101,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
-				image.Transit(layout,
+				image.Transit(image.binding.attachment_host_layout,
 				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
 				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
-				              {}, vk_buffer);
+				              {}, vk_buffer, true);
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite

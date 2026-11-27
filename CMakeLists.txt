@@ -530,6 +530,11 @@ add_executable(shader_store_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(shader_store_tests PRIVATE ${inc_headers})
 
+add_executable(readback_batch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackBatchTests.cpp"
+)
+target_include_directories(readback_batch_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -854,6 +859,7 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)
 	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -915,6 +921,18 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 	add_test(NAME trinity_mode
 		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --trinity-only)
+	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		# The whole suite again on direct memory in Vulkan dma-buf chunks (skips without a GPU).
+		add_test(NAME virtual_memory_allocation_vk_backing
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_vk_backing PROPERTIES
+			ENVIRONMENT "KYTY_VK_GUEST_BACKING=1")
+		# Chunked, but every chunk a memfd (the cap's fallback).
+		add_test(NAME virtual_memory_allocation_vk_backing_memfd
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_vk_backing_memfd PROPERTIES
+			ENVIRONMENT "KYTY_VK_GUEST_BACKING=1;KYTY_VK_GUEST_BACKING_MAX_MB=0")
+	endif()
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
@@ -987,6 +1005,7 @@ if(BUILD_TESTING)
 		vdecsw_tests
 		bit_array_tests
 		lru_cache_tests
+		readback_batch_tests
 		shader_store_tests
 		common_tests
 		shader_vertex_metadata_tests

@@ -9,9 +9,12 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
+#include "graphics/host_gpu/renderer/cache/readbackBatch.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -203,6 +206,41 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// One buffer's ranges of a download, packed into the download buffer at dstOffset.
+	struct DownloadPart {
+		Buffer*                     buffer;
+		uint64_t                    buffer_address;
+		std::vector<vk::BufferCopy> copies;
+	};
+	// Takes the GPU-modified ranges of [vaddr, vaddr + size) out of the dirty set into a new part
+	// (false when there is none). Not for zero-copy buffers.
+	[[nodiscard]] bool CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                   std::vector<DownloadPart>& parts, uint64_t& total_size);
+	// Copies the parts to the host in one command sequence and publishes them into guest memory:
+	// synchronously (before returning) or, `async`, at the tick's completion. `fuse`: a detached
+	// copy goes into the same submission as the open command buffer.
+	template <bool async>
+	void DownloadParts(std::vector<DownloadPart>& parts, uint64_t total_size, bool fuse);
+	// KYTY_BATCH_READBACK (default 1; 0 = off) or toggle batch_readback (re-read 4x per second): one synchronous
+	// download copies every buffer of the access's window, in the open command buffer's
+	// submission when it can run detached.
+	[[nodiscard]] bool BatchReadback();
+	// KYTY_COPY_QUEUE (default 1; the device then has a copy queue), overridden by toggle copy_queue when
+	// the toggle file has that line (re-read 4x per second): detached synchronous downloads copy
+	// on the copy queue (ReadbackBatch::ReadbackPath::CopyQueue).
+	[[nodiscard]] bool        CopyQueue();
+	// KYTY_COPY_QUEUE_FLUSH=1: a copy-queue download still submits the open command buffer.
+	[[nodiscard]] static bool CopyQueueFlush();
+	// KYTY_RB_QUEUE_PROBE=1 (with KYTY_PERF_SUMMARY): measures the GPU queue ahead of each
+	// synchronous download and waits for its producing tick first, timed on its own.
+	[[nodiscard]] static bool QueueProbe();
+	void                      ProbeReadbackQueue(const std::vector<DownloadPart>& parts);
+	// The batched download of a CPU access at [vaddr, vaddr + size) in buffer `first_id`, whose
+	// own window is `first_window`: that window and the GPU-written bytes of every other
+	// non-zero-copy buffer in the access's aligned window, in one copy sequence, then all those
+	// windows are returned to the CPU. True when the first buffer had bytes to copy.
+	[[nodiscard]] bool DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_t size,
+	                                       ReadbackBatch::Range first_window);
 	// GPU writes recorded in the current command buffer, or bound and not recorded yet. A
 	// synchronous download of ranges without such writes reads them in a detached submission
 	// behind the submitted work, without flushing the current command buffer.
@@ -229,12 +267,21 @@ private:
 	// False (and the buffer dropped) when the guest range moved to other backing.
 	[[nodiscard]] bool ZeroCopyBackingValid(BufferId id);
 	void               DropZeroCopyBuffer(BufferId id);
+	// Zero-copy reads: the GPU reads guest memory itself, and labels reach the guest before the host
+	// GPU is done, so the guest may rewrite memory a submitted read still uses (a VRAM copy was a
+	// snapshot). A GPU read write-protects the buffer's pages until its tick completes; a CPU write
+	// in between waits for that tick (any thread), then proceeds.
+	void               FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void               ReleaseZeroCopyReads(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick);
+	void               WaitZeroCopyReads(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	// Declared before the buffers, so it outlives the zero-copy buffers bound to its memory.
+	GuestBackingImports                               m_guest_imports;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
@@ -254,6 +301,15 @@ private:
 	bool                                              m_address_writes_pending = false;
 	enum class DetachedReadback { Off, Submit, NoSubmit };
 	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;
+	// KYTY_BATCH_READBACK (default 1), overridden by the batch_readback toggle when present.
+	bool                                              m_batch_readback_env = true;
+	bool                                              m_batch_readback     = true;
+	std::chrono::steady_clock::time_point             m_batch_readback_next {};
+	bool                                              m_copy_queue = true;
+	std::chrono::steady_clock::time_point             m_copy_queue_next {};
+	// KYTY_BATCH_READBACK_PREFETCH=KiB: a batch also copies this much on both sides of the window.
+	uint64_t                                          m_batch_prefetch = 0;
+	ReadbackBatch::NeighbourHistory                   m_readback_neighbours;
 	// Statistics only (KYTY_SYNC_STATS): bytes last downloaded, and hashes of uploaded pages.
 	RangeSet                                          m_stats_downloaded;
 	std::unordered_map<uint64_t, uint64_t>            m_stats_upload_hashes;
@@ -265,6 +321,15 @@ private:
 	// Guest ranges whose buffers are zero-copy; a buffer created over them imports guest memory.
 	RangeSet                                          m_zero_copy;
 	uint64_t                                          m_zero_copy_created = 0;
+	// Zero-copy read fences by buffer start: {end, tick}. Written on the GPU thread, read by
+	// faulting threads.
+	struct ZeroCopyFence {
+		uint64_t end  = 0;
+		uint64_t tick = 0;
+	};
+	std::mutex                                        m_zero_copy_fence_mutex;
+	std::map<uint64_t, ZeroCopyFence>                 m_zero_copy_fences;
+	std::atomic<bool>                                 m_any_zero_copy_fence {false};
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

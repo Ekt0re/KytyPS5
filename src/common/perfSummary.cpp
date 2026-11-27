@@ -30,7 +30,17 @@ constexpr std::array<const char*, N> g_names = {
     "read_faults",   "buf_readbacks", "tex_readbacks", "tex_lookups",     "buf_lookups",
     "desc_writes",   "heap_desc_writes", "pipe_lookups", "pipe_created",  "amm_maps",
     "amm_unmaps",    "gpu_unmaps",  "heap_rebinds", "heap_lookups",       "heap_range_skips",
-    "depth_recreates",
+    "depth_recreates", "barriers",    "layout_transitions",
+     "rb_calls",  "rb_batches",  "rb_submits",          "rb_fused",
+    "rb_extra_bufs", "rb_neighbour", "rb_handler_us", "rb_flush_us",   "rb_submit_us",
+    "rb_wait_us",    "rb_copy_us",    "rb_write_calls", "rb_write_us",
+    "rb_queue_ticks", "rb_prod_done", "rb_prod_pending", "rb_prod_open", "rb_after_ticks",
+    "rb_prod_wait_us",
+    "rb_path_cq", "rb_path_cq_wait_us", "rb_path_cq_total_us",
+    "rb_path_fused", "rb_path_fused_wait_us", "rb_path_fused_total_us",
+    "rb_path_det", "rb_path_det_wait_us", "rb_path_det_total_us",
+    "rb_path_flush", "rb_path_flush_wait_us", "rb_path_flush_total_us",
+    "rb_cq_submits", "rb_cq_fence_us", "rb_cq_gpu_busy",
 };
 
 struct Sample {
@@ -212,6 +222,15 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 	    (to.proc_cpu_ms - from.proc_cpu_ms) / frames,
 	    static_cast<double>(to.proc_minflt - from.proc_minflt) / frames,
 	    static_cast<double>(to.proc_majflt - from.proc_majflt) / frames);
+	// Per synchronous download: handler time per ReadMemory request and submits per download.
+	if (const auto calls = count(Counter::RbCalls); calls != 0) {
+		add(" rb_per_fault_us=%.1f", static_cast<double>(count(Counter::RbHandlerUs)) /
+		                                 static_cast<double>(calls));
+	}
+	if (const auto batches = count(Counter::RbBatches); batches != 0) {
+		add(" rb_submits/batch=%.2f", static_cast<double>(count(Counter::RbSubmits)) /
+		                                  static_cast<double>(batches));
+	}
 	// Per draw or dispatch ("op").
 	if (ops != 0) {
 		add(" | gpu_cpu_us/op=%.1f", gpu_ms * 1e3 / static_cast<double>(ops));

@@ -8,11 +8,19 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "kernel/memory.h"
 
+#include <array>
 #include <bit>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <vk_mem_alloc.h>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+#include <unistd.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -72,6 +80,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size  = size;
 	buffer_info.usage = flags;
+	// KYTY_COPY_QUEUE: readback copies read these buffers on the copy queue too, without queue
+	// family ownership transfers (buffers have no compressed layout, so this costs nothing).
+	const std::array<uint32_t, 2> families {graphics.queue_family, graphics.copy_queue_family};
+	if (graphics.copy_queue != nullptr) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = static_cast<uint32_t>(families.size());
+		buffer_info.pQueueFamilyIndices   = families.data();
+	}
 
 	const bool              with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
@@ -178,13 +194,51 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t c
 	}
 	// The host's own pages, coherent with the CPU. Not exposed through Mapped(): guest code owns
 	// these bytes and the cache must not treat them as an upload or download staging area.
-	m_coherent = true;
+	m_coherent  = true;
+	m_zero_copy = true;
+}
+
+Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, uint64_t cpu_address,
+               void* host_pointer, vk::DeviceMemory memory, uint64_t memory_offset,
+               uint64_t memory_size, uint32_t memory_type,
+               vk::ExternalMemoryHandleTypeFlagBits handle_type, vk::BufferUsageFlags flags,
+               uint64_t size)
+    : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(MemoryUsage::DeviceLocal),
+      m_cpu_address(cpu_address), m_size(size),
+      m_host_pointer(reinterpret_cast<uint64_t>(host_pointer)) {
+	EXIT_IF(memory == nullptr || size == 0);
+	const auto                         device = graphics.device;
+	vk::ExternalMemoryBufferCreateInfo external_info {.handleTypes = handle_type};
+	vk::BufferCreateInfo buffer_info {.pNext = &external_info, .size = size, .usage = flags};
+	if (device.createBuffer(&buffer_info, nullptr, &m_buffer) != vk::Result::eSuccess) {
+		m_buffer = nullptr;
+		return;
+	}
+	const auto requirements = device.getBufferMemoryRequirements(m_buffer);
+	if ((requirements.memoryTypeBits & (1u << memory_type)) == 0 ||
+	    requirements.alignment == 0 || memory_offset % requirements.alignment != 0 ||
+	    memory_offset > memory_size || requirements.size > memory_size - memory_offset ||
+	    device.bindBufferMemory(m_buffer, memory, memory_offset) != vk::Result::eSuccess) {
+		device.destroyBuffer(m_buffer);
+		m_buffer = nullptr;
+		return;
+	}
+	if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+		vk::BufferDeviceAddressInfo address_info {};
+		address_info.buffer = m_buffer;
+		m_device_address    = device.getBufferAddress(address_info);
+	}
+	// Guest memory itself, HOST_COHERENT and CPU-cached; see the host-pointer constructor.
+	m_coherent  = true;
+	m_zero_copy = true;
 }
 
 Buffer::~Buffer() {
-	if (m_imported != nullptr) {
+	if (m_zero_copy) {
 		m_graphics->device.destroyBuffer(m_buffer);
-		m_graphics->device.freeMemory(m_imported);
+		if (m_imported != nullptr) {
+			m_graphics->device.freeMemory(m_imported);
+		}
 		return;
 	}
 	if (m_buffer != nullptr) {
@@ -280,6 +334,108 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+}
+
+GuestBackingImports::~GuestBackingImports() {
+	for (const auto memory: m_memory) {
+		if (memory != nullptr) {
+			m_graphics->device.freeMemory(memory);
+		}
+	}
+}
+
+bool GuestBackingImports::Available() {
+	if (m_available < 0) {
+		m_available = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+		if (m_graphics->external_memory_fd_enabled && LibKernel::Memory::VulkanBackingActive()) {
+			m_available = 1;
+		}
+#endif
+	}
+	return m_available == 1;
+}
+
+std::optional<GuestBackingImports::Range> GuestBackingImports::Find(uint64_t alias, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	LibKernel::Memory::VulkanBackingChunk chunk;
+	if (!Available() || !LibKernel::Memory::FindVulkanBackingChunk(alias, size, &chunk)) {
+		return std::nullopt;
+	}
+	const auto handle_type = static_cast<vk::ExternalMemoryHandleTypeFlagBits>(chunk.handle_type);
+	if (handle_type == vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT &&
+	    !m_graphics->external_memory_dma_buf_enabled) {
+		m_available = 0;
+		return std::nullopt;
+	}
+	if (m_memory.empty()) {
+		// The backing's device must be this one: memory types and UUIDs only match there.
+		vk::PhysicalDeviceIDProperties id {};
+		vk::PhysicalDeviceProperties2  properties {.pNext = &id};
+		m_graphics->physical_device.getProperties2(&properties);
+		if (std::memcmp(id.deviceUUID.data(), chunk.device_uuid, sizeof(chunk.device_uuid)) != 0) {
+			std::printf("Zero-copy: the guest backing lives on another GPU; host pointers only\n");
+			std::fflush(stdout);
+			m_available = 0;
+			return std::nullopt;
+		}
+	}
+	if (chunk.index >= m_memory.size()) {
+		m_memory.resize(chunk.index + 1u, nullptr);
+		m_types.resize(chunk.index + 1u, 0);
+		m_failed.resize(chunk.index + 1u, 0);
+	}
+	if (m_memory[chunk.index] == nullptr && m_failed[chunk.index] == 0) {
+		const auto device = m_graphics->device;
+		const int  fd     = LibKernel::Memory::DupVulkanBackingChunk(chunk.index);
+		vk::MemoryFdPropertiesKHR fd_properties {};
+		uint32_t                  type = UINT32_MAX;
+		if (fd >= 0 &&
+		    device.getMemoryFdPropertiesKHR(handle_type, fd, &fd_properties) == vk::Result::eSuccess &&
+		    fd_properties.memoryTypeBits != 0) {
+			type = (fd_properties.memoryTypeBits & (1u << chunk.memory_type_index)) != 0
+			           ? chunk.memory_type_index
+			           : static_cast<uint32_t>(std::countr_zero(fd_properties.memoryTypeBits));
+		} else if (fd >= 0 && handle_type == vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd) {
+			type = chunk.memory_type_index; // no properties query for opaque fds
+		}
+		vk::DeviceMemory memory = nullptr;
+		if (type != UINT32_MAX) {
+			vk::ImportMemoryFdInfoKHR   import_info {.handleType = handle_type, .fd = fd};
+			vk::MemoryAllocateFlagsInfo allocate_flags {
+			    .pNext = &import_info, .flags = vk::MemoryAllocateFlagBits::eDeviceAddress};
+			vk::MemoryAllocateInfo allocate_info {
+			    .pNext = &allocate_flags, .allocationSize = chunk.size, .memoryTypeIndex = type};
+			if (device.allocateMemory(&allocate_info, nullptr, &memory) != vk::Result::eSuccess) {
+				memory = nullptr;
+			}
+		}
+		if (memory == nullptr) {
+			// A successful import owns the descriptor; a failed one leaves it to us.
+			if (fd >= 0) {
+				close(fd);
+			}
+			m_failed[chunk.index] = 1;
+			std::printf("Zero-copy: importing guest backing chunk %u failed; it stays in VRAM\n",
+			            chunk.index);
+		} else {
+			m_memory[chunk.index] = memory;
+			m_types[chunk.index]  = type;
+			std::printf("Zero-copy: imported guest backing chunk %u (%" PRIu64 " MiB, type %u)\n",
+			            chunk.index, chunk.size >> 20u, type);
+		}
+		std::fflush(stdout);
+	}
+	if (m_memory[chunk.index] == nullptr) {
+		return std::nullopt;
+	}
+	return Range {m_memory[chunk.index], chunk.offset, chunk.size, m_types[chunk.index],
+	              handle_type};
+#else
+	(void)alias;
+	(void)size;
+	return std::nullopt;
+#endif
 }
 
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,

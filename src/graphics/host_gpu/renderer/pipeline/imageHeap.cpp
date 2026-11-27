@@ -521,6 +521,12 @@ void ImageHeap::Release(uint32_t entry) {
 	const auto index = entry & ElementMask;
 	if (index == 0u || --m_elements[index].refs != 0u) return;
 	auto& element = m_elements[index];
+	if (element.image) {
+		if (const auto found = m_by_serial.find(element.serial); found != m_by_serial.end()) {
+			std::erase(found->second, index);
+			if (found->second.empty()) m_by_serial.erase(found);
+		}
+	}
 	Mark(index, State::Stale);
 	if (index < m_users.size()) m_users[index].clear();
 	auto& textures = m_context.GetTextureCache();
@@ -562,16 +568,23 @@ void ImageHeap::Mark(uint32_t index, State state) {
 // Calls fn with each selected element of an image in m_changes, sorted by serial; true if any.
 template <typename Fn>
 bool ImageHeap::ForEachChanged(Fn&& fn) {
-	bool found = false;
-	for (uint32_t index = 1; !m_changes.empty() && index < m_elements.size(); ++index) {
-		const auto& element = m_elements[index];
-		if (element.refs != 0u && element.image &&
-		    std::ranges::binary_search(m_changes, element.serial, {}, &Image::HeapChange::serial)) {
-			fn(index);
-			found = true;
+	m_changed.clear();
+	for (const auto& change: m_changes) {
+		const auto found = m_by_serial.find(change.serial);
+		if (found == m_by_serial.end()) continue;
+		for (const auto index: found->second) {
+			const auto& element = m_elements[index];
+			if (element.refs != 0u && element.image && element.serial == change.serial) {
+				m_changed.push_back(index);
+			}
 		}
 	}
-	return found;
+	std::ranges::sort(m_changed);
+	m_changed.erase(std::ranges::unique(m_changed).begin(), m_changed.end());
+	for (const auto index: m_changed) {
+		fn(index);
+	}
+	return !m_changed.empty();
 }
 
 // Moves the slots of every view off marked elements; pending draws keep reading those. Only the
@@ -738,6 +751,17 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	});
 	if (!m_changes.empty()) g_stats.Add(HeapStats::ChangedScans);
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	// Elements hold their image's read layout, which a unified layouts switch changes.
+	if (const auto epoch = UnifiedLayouts::Epoch(); epoch != m_layout_epoch) {
+		m_layout_epoch = epoch;
+		for (uint32_t index = 1; index < m_elements.size(); ++index) {
+			const auto& element = m_elements[index];
+			if (element.refs != 0u && element.image && element.state == State::Live) {
+				Mark(index, State::Stale);
+				stale = true;
+			}
+		}
+	}
 	g_stats.Lap(HeapStats::TDcc);
 	const auto resolve = [&](const Element& element) {
 		const auto& key = element.key;
@@ -951,8 +975,21 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			auto& element = m_elements[index];
 			// Pinned before the refresh, so a CPU write after it reports a change.
 			image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+			// A stale element resolved again leaves its old image's list, and an element already
+			// listed under this serial is not added twice (repoint storms re-resolve the same
+			// elements over and over).
+			if (element.image && element.serial != image.serial) {
+				if (const auto old = m_by_serial.find(element.serial); old != m_by_serial.end()) {
+					std::erase(old->second, index);
+					if (old->second.empty()) m_by_serial.erase(old);
+				}
+			}
 			element.image      = binding.image_id;
 			element.serial     = image.serial;
+			if (auto& list = m_by_serial[image.serial];
+			    std::ranges::find(list, index) == list.end()) {
+				list.push_back(index);
+			}
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
 			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back({index});

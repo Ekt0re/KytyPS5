@@ -212,10 +212,13 @@ private:
 	std::vector<uint32_t>                             m_marked; // Referenced since marked.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
 	uint64_t                                          m_held_serial = 0; // Image::serials.
+	uint32_t m_layout_epoch = 0; // UnifiedLayouts::Epoch() the elements were written in.
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.
 	std::vector<std::pair<size_t, size_t>>            m_runs;
 	std::vector<uint32_t>                             m_scratch;
 	std::vector<Image::HeapChange>                    m_changes;
+	std::unordered_map<uint64_t, std::vector<uint32_t>> m_by_serial;
+	std::vector<uint32_t>                             m_changed;
 	std::vector<std::pair<uint32_t, vk::DescriptorImageInfo>> m_writes;
 	vk::DescriptorSetLayout                           m_layout = nullptr;
 	vk::DescriptorPool                                m_pool   = nullptr;
