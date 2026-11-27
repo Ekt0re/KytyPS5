@@ -99,6 +99,10 @@ public:
 	uint64_t probe_write_tick   = 0;
 	// Zero-copy: the tick whose completion already returns this buffer's pages to the CPU.
 	uint64_t release_tick       = 0;
+	// Zero-copy: the newest tick that records a GPU read of this buffer, and the tick whose
+	// completion already lifts the write protection that read put on its pages.
+	uint64_t last_read_tick     = 0;
+	uint64_t read_release_tick  = 0;
 	// Zero-copy: LibKernel::Memory::BackingGeneration() when the import was last known valid.
 	uint64_t backing_generation = 0;
 

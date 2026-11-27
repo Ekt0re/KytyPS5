@@ -520,12 +520,14 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	WaitZeroCopyReads(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
 }
 
 void BufferCache::InvalidateWriteWindow(uint64_t vaddr, uint64_t size) {
+	WaitZeroCopyReads(vaddr, size);
 	m_memory_tracker.MarkCleanAsCpuModified(vaddr, size);
 	// Shader address reads see the window's CPU bytes only through these uploads.
 	QueueBdaSync(vaddr, size);
@@ -853,6 +855,8 @@ bool BufferCache::ResolveZeroCopy(Buffer& buffer, bool wait) {
 	// further fault (zero-copy pages never need CPU-dirty tracking, there is nothing to upload).
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	// Writable pages are fenced again by the next submission that may read them by address.
+	QueueBdaSync(vaddr, size);
 	return true;
 }
 
@@ -879,7 +883,80 @@ void BufferCache::ReleaseZeroCopyWrites(BufferId id, uint64_t vaddr, uint64_t si
 	}
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	QueueBdaSync(vaddr, size);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReleases);
+}
+
+void BufferCache::FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto tick = m_scheduler.CurrentTick();
+	// Clearing CPU-dirty state write-protects the pages: a CPU write faults into WaitZeroCopyReads.
+	// There is nothing to upload; guest memory is the buffer.
+	m_memory_tracker.ForEachUploadRange(
+	    vaddr, size, false, [](uint64_t, uint64_t) noexcept {}, []() noexcept {});
+	if (buffer.last_read_tick == tick) {
+		return;
+	}
+	buffer.last_read_tick = tick;
+	{
+		std::scoped_lock lock(m_zero_copy_fence_mutex);
+		m_zero_copy_fences[buffer.CpuAddress()] = {buffer.CpuAddress() + buffer.Size(), tick};
+		m_any_zero_copy_fence.store(true, std::memory_order_release);
+	}
+	if (buffer.read_release_tick != tick) {
+		buffer.read_release_tick = tick;
+		m_scheduler.DeferOperation([this, id, address = buffer.CpuAddress(), bytes = buffer.Size(),
+		                            tick] { ReleaseZeroCopyReads(id, address, bytes, tick); });
+	}
+}
+
+void BufferCache::ReleaseZeroCopyReads(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick) {
+	// Drops the fence once its tick completed, unless a newer read replaced it.
+	{
+		std::scoped_lock lock(m_zero_copy_fence_mutex);
+		if (const auto it = m_zero_copy_fences.find(vaddr);
+		    it != m_zero_copy_fences.end() && it->second.tick == tick) {
+			m_zero_copy_fences.erase(it);
+		}
+	}
+	// The pages stay write-protected: lifting it here would let later CPU writes skip the fault
+	// that queues the next submission's fence for readers by address (SynchronizeBda). The first
+	// write after the read completes faults once and no longer waits.
+	(void)id;
+	(void)size;
+}
+
+void BufferCache::WaitZeroCopyReads(uint64_t vaddr, uint64_t size) {
+	if (!m_any_zero_copy_fence.load(std::memory_order_acquire)) {
+		return;
+	}
+	uint64_t tick = 0;
+	{
+		std::scoped_lock lock(m_zero_copy_fence_mutex);
+		// Buffers never overlap, so the fences that meet the range are adjacent.
+		auto it = m_zero_copy_fences.lower_bound(vaddr + size);
+		while (it != m_zero_copy_fences.begin()) {
+			--it;
+			if (it->second.end <= vaddr) {
+				break;
+			}
+			tick = std::max(tick, it->second.tick);
+		}
+	}
+	// A completion operation that writes guest memory is ordered after the GPU work already, and
+	// waiting from it could wait for itself.
+	if (tick == 0 || CommandScheduler::InDeferredOperation() || m_scheduler.IsFree(tick)) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("BufferCache::ZeroCopyReadWait");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::ZeroCopyReadWaits);
+	// As RenderContext::WaitWriteBacks: only the GPU thread submits the current tick.
+	if (GuestGpu::IsGpuThread()) {
+		m_scheduler.Wait(tick);
+	} else if (tick == m_scheduler.CurrentTick()) {
+		m_scheduler.Context().GetGpu().SendCommandSync([this, tick] { m_scheduler.Wait(tick); });
+	} else {
+		m_scheduler.Wait(tick);
+	}
 }
 
 void BufferCache::JoinZeroCopy(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score) {
@@ -973,6 +1050,7 @@ void BufferCache::DropZeroCopyBuffer(BufferId id) {
 	const auto vaddr  = buffer.CpuAddress();
 	const auto size   = buffer.Size();
 	(void)ResolveZeroCopy(buffer, true);
+	// Its read fence stays until its tick completes: a CPU write still waits for reads in flight.
 	m_zero_copy.Subtract(vaddr, size);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	DeleteBuffer(id);
@@ -1236,6 +1314,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
 	if (is_written) {
 		buffer.probe_write_tick = m_scheduler.CurrentTick();
+	}
+	if (!is_written && buffer.IsZeroCopy()) {
+		FenceZeroCopyRead(id, buffer, vaddr, end - vaddr);
 	}
 	if (is_written && buffer.IsZeroCopy() && buffer.release_tick != buffer.last_write_tick) {
 		static const bool release = [] {
@@ -1513,11 +1594,17 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 			}
 			for (; it != m_buffers.end() && it->first < finish; ++it) {
 				auto& buffer = m_slot_buffers[it->second];
-				if (buffer.IsZeroCopy()) {
-					continue; // the GPU reads guest memory itself
-				}
 				const auto first = std::max(buffer.CpuAddress(), start);
 				const auto last   = std::min(buffer.CpuAddress() + buffer.Size(), finish);
+				if (buffer.IsZeroCopy()) {
+					// The GPU reads guest memory itself, through addresses too: the CPU's
+					// writes since the last submission are visible already, and further ones
+					// wait while this submission may still read them.
+					if (first < last) {
+						FenceZeroCopyRead(it->second, buffer, first, last - first);
+					}
+					continue;
+				}
 				if (first < last) {
 					// Reads follow every range's protection; a write in between re-queues its page.
 					m_memory_tracker.ForEachUploadRange(

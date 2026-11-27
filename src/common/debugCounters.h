@@ -62,6 +62,7 @@ enum class Counter {
 	SyncReadbacks,     // Synchronous buffer downloads.
 	SyncReadbackNs,    // Time the GPU thread spends in them, including the GPU wait.
 	SyncDetachedReadbacks, // Of those, read behind submitted work without a flush.
+	ZeroCopyReadWaits, // CPU writes that waited for a GPU read of zero-copy memory in flight.
 	ZeroCopyReleases,  // Zero-copy buffers returned to the CPU when their last write completed.
 	SyncReuploadBytes, // Buffer uploads of bytes the CPU last got from a GPU download.
 	SyncUnchangedUploadBytes, // Buffer uploads of 4 KiB pages identical to their last upload.
