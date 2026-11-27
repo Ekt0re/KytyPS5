@@ -33,6 +33,8 @@ enum class Counter {
 	HeapLookups,    // Texture lookups those made.
 	HeapRangeSkips, // Lookups saved because the image set changed only at other addresses.
 	DepthRecreates, // Depth images replaced by one of another format, layout or binding kind.
+	ImageBarriers,     // Image memory barriers of cached images (Image::GetBarriers).
+	LayoutTransitions, // Those that change the layout.
 	Count
 };
 

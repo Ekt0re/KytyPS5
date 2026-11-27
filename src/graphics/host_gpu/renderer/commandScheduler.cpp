@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
 #include "graphics/host_gpu/renderer/recorder.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -261,6 +262,7 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::StartOperation() {
+	UnifiedLayouts::Refresh();
 	{
 		std::lock_guard lock(m_operation_mutex);
 		SealReleasesLocked();

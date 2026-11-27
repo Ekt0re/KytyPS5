@@ -55045,6 +55045,7 @@ void CheckSampledDepthResource() {
 
 void CheckImageTransitionState(RenderContext &renderer) {
   constexpr const char *name = "ImageTransitionState";
+  UnifiedLayouts::Set(false); // The pinned per-use checks below.
   auto &context = renderer.GetGraphics();
   CommandScheduler scheduler(renderer, context);
   const auto MakeInfo = [](vk::Format format, uint32_t levels,
@@ -55248,6 +55249,112 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                       (vk::ImageAspectFlagBits::eDepth |
                                        vk::ImageAspectFlagBits::eStencil),
           "depth/stencil transition did not use the full image aspect");
+
+  // VK_KHR_unified_image_layouts: everything but presentation, video and feedback loops maps
+  // to GENERAL; reads of one layout merge into the state, writes keep their barriers.
+  {
+    namespace UL = UnifiedLayouts;
+    Require(name, "unified map",
+            UL::Map(vk::ImageLayout::eTransferDstOptimal, true) == vk::ImageLayout::eGeneral &&
+                UL::Map(vk::ImageLayout::eDepthStencilReadOnlyOptimal, true) ==
+                    vk::ImageLayout::eGeneral &&
+                UL::Map(vk::ImageLayout::eColorAttachmentOptimal, true) ==
+                    vk::ImageLayout::eGeneral &&
+                UL::Map(vk::ImageLayout::ePresentSrcKHR, true) == vk::ImageLayout::ePresentSrcKHR &&
+                UL::Map(vk::ImageLayout::eUndefined, true) == vk::ImageLayout::eUndefined &&
+                UL::Map(vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT, true) ==
+                    vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                UL::Map(vk::ImageLayout::eTransferDstOptimal, false) ==
+                    vk::ImageLayout::eTransferDstOptimal,
+            "unified layout mapping diverged");
+    Require(name, "unified decide",
+            UL::Decide(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+                       vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eTransferRead, true) ==
+                    UL::Need::Merge &&
+                UL::Decide(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+                           vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eTransferRead,
+                           false) == UL::Need::Barrier &&
+                UL::Decide(vk::ImageLayout::eGeneral,
+                           vk::AccessFlagBits2::eColorAttachmentRead |
+                               vk::AccessFlagBits2::eColorAttachmentWrite,
+                           vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, true) ==
+                    UL::Need::Barrier &&
+                UL::Decide(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead,
+                           vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, true) ==
+                    UL::Need::Barrier &&
+                UL::Decide(vk::ImageLayout::eUndefined, vk::AccessFlagBits2::eNone,
+                           vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderRead, true) ==
+                    UL::Need::Barrier,
+            "unified barrier decisions diverged");
+
+    UL::Set(true);
+    Image unified(context, scheduler, MakeInfo(vk::Format::eR8Unorm, 2, 3));
+    barriers = unified.GetBarriers(vk::ImageLayout::eTransferDstOptimal,
+                                   vk::AccessFlagBits2::eTransferWrite,
+                                   vk::PipelineStageFlagBits2::eTransfer, {});
+    Require(name, "unified first use",
+            barriers.size() == 1 && barriers[0].oldLayout == vk::ImageLayout::eUndefined &&
+                barriers[0].newLayout == vk::ImageLayout::eGeneral &&
+                unified.backing.state.layout == vk::ImageLayout::eGeneral,
+            "first unified use did not move UNDEFINED to GENERAL");
+    barriers = unified.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                                   vk::AccessFlagBits2::eShaderRead, graphics_stage, {});
+    Require(name, "unified write->read",
+            barriers.size() == 1 && barriers[0].oldLayout == vk::ImageLayout::eGeneral &&
+                barriers[0].newLayout == vk::ImageLayout::eGeneral &&
+                barriers[0].srcAccessMask == vk::AccessFlagBits2::eTransferWrite &&
+                unified.ReadLayout() == vk::ImageLayout::eGeneral,
+            "unified read after write lost its memory barrier");
+    Require(name, "unified read->read",
+            unified
+                .GetBarriers(vk::ImageLayout::eTransferSrcOptimal,
+                             vk::AccessFlagBits2::eTransferRead,
+                             vk::PipelineStageFlagBits2::eTransfer, {})
+                .empty() &&
+                unified.backing.state.access_mask ==
+                    (vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead) &&
+                unified.backing.state.pl_stage ==
+                    (graphics_stage | vk::PipelineStageFlagBits2::eTransfer),
+            "a read after a read of one unified layout emitted a barrier or lost a reader");
+    barriers = unified.GetBarriers(vk::ImageLayout::eColorAttachmentOptimal,
+                                   vk::AccessFlagBits2::eColorAttachmentWrite, graphics_stage,
+                                   ImageSubresourceRange{1, 1, 0, 1});
+    Require(name, "unified partial write waits for all readers",
+            barriers.size() == 1 && barriers[0].oldLayout == vk::ImageLayout::eGeneral &&
+                barriers[0].newLayout == vk::ImageLayout::eGeneral &&
+                barriers[0].srcAccessMask ==
+                    (vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead) &&
+                barriers[0].srcStageMask ==
+                    (graphics_stage | vk::PipelineStageFlagBits2::eTransfer),
+            "a write after merged reads did not wait for every reader");
+    barriers = unified.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                                   vk::AccessFlagBits2::eShaderRead, graphics_stage,
+                                   ImageSubresourceRange{0, 2, 0, 3});
+    Require(name, "unified full read after partial write",
+            barriers.size() == 1 && barriers[0].subresourceRange.baseMipLevel == 1 &&
+                barriers[0].srcAccessMask == vk::AccessFlagBits2::eColorAttachmentWrite &&
+                unified.backing.subresource_states.empty() &&
+                unified.backing.state.layout == vk::ImageLayout::eGeneral &&
+                static_cast<bool>(unified.backing.state.access_mask &
+                                  vk::AccessFlagBits2::eTransferRead),
+            "the merged readers of untouched subresources were lost");
+    barriers = unified.GetBarriers(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+                                   graphics_stage, {});
+    Require(name, "unified write after merged full read",
+            barriers.size() == 1 &&
+                static_cast<bool>(barriers[0].srcAccessMask &
+                                  vk::AccessFlagBits2::eTransferRead) &&
+                static_cast<bool>(barriers[0].srcStageMask &
+                                  vk::PipelineStageFlagBits2::eTransfer),
+            "a write after a normalized merged read missed a reader");
+    barriers = unified.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                                   vk::AccessFlagBits2::eShaderRead, graphics_stage, {}, true);
+    Require(name, "unified exact layout",
+            barriers.size() == 1 &&
+                barriers[0].newLayout == vk::ImageLayout::eShaderReadOnlyOptimal,
+            "an exact host layout was remapped");
+    UL::Set(false);
+  }
 
   HW::Context registers{};
   HW::UserConfig user_config{};

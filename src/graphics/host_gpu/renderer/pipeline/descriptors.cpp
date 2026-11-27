@@ -1090,11 +1090,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						EXIT("sampling a writable depth/stencil attachment aspect\n");
 					}
 				}
-				image.Transit(layout,
+				image.Transit(image.binding.attachment_host_layout,
 				              image.binding.attachment_access | vk::AccessFlagBits2::eShaderRead |
 				                  (image.binding.shader_write ? vk::AccessFlagBits2::eShaderWrite
 				                                              : vk::AccessFlags2 {}),
-				              {}, vk_buffer);
+				              {}, vk_buffer, true);
 			} else if (image.binding.force_general && !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite

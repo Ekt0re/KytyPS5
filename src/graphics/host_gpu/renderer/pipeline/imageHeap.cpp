@@ -738,6 +738,17 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	});
 	if (!m_changes.empty()) g_stats.Add(HeapStats::ChangedScans);
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	// Elements hold their image's read layout, which a unified layouts switch changes.
+	if (const auto epoch = UnifiedLayouts::Epoch(); epoch != m_layout_epoch) {
+		m_layout_epoch = epoch;
+		for (uint32_t index = 1; index < m_elements.size(); ++index) {
+			const auto& element = m_elements[index];
+			if (element.refs != 0u && element.image && element.state == State::Live) {
+				Mark(index, State::Stale);
+				stale = true;
+			}
+		}
+	}
 	g_stats.Lap(HeapStats::TDcc);
 	const auto resolve = [&](const Element& element) {
 		const auto& key = element.key;

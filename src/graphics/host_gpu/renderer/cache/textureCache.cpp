@@ -1873,11 +1873,11 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		native_range.layerCount     = 1;
 	}
 	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		command.Handle().clearColorImage(image.backing.image, UnifiedLayouts::TransferDst(),
 		                                 &clear.color, 1, &native_range);
 	} else {
 		command.Handle().clearDepthStencilImage(image.backing.image,
-		                                        vk::ImageLayout::eTransferDstOptimal,
+		                                        UnifiedLayouts::TransferDst(),
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
@@ -1900,7 +1900,7 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 	              {}, command);
 	vk::RenderingAttachmentInfo attachment {};
 	attachment.imageView   = image.FindView(view);
-	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.imageLayout = UnifiedLayouts::Host(vk::ImageLayout::eColorAttachmentOptimal);
 	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
 	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
 	if (clear != nullptr) {

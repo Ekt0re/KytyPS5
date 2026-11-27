@@ -36,6 +36,7 @@ struct GraphicContext {
 	bool                               fragment_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
+	bool                               unified_image_layouts_enabled         = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	// VK_KHR_pipeline_binary with maintenance5 (PipelineBinaryStore).

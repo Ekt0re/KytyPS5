@@ -212,6 +212,7 @@ private:
 	std::vector<uint32_t>                             m_marked; // Referenced since marked.
 	std::vector<std::pair<uint64_t, ImageId>>         m_away; // Serial, image: not read layout.
 	uint64_t                                          m_held_serial = 0; // Image::serials.
+	uint32_t m_layout_epoch = 0; // UnifiedLayouts::Epoch() the elements were written in.
 	std::deque<std::pair<uint64_t, uint32_t>>         m_retired; // Tick, element.
 	std::vector<std::pair<size_t, size_t>>            m_runs;
 	std::vector<uint32_t>                             m_scratch;

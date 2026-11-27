@@ -149,7 +149,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 
 	vk::RenderingAttachmentInfo depth_attachment {};
 	depth_attachment.imageView               = destination_view;
-	depth_attachment.imageLayout             = ColorToMsDepthLayout;
+	depth_attachment.imageLayout             = UnifiedLayouts::Host(ColorToMsDepthLayout);
 	depth_attachment.loadOp                  = vk::AttachmentLoadOp::eClear;
 	depth_attachment.storeOp                 = vk::AttachmentStoreOp::eStore;
 	depth_attachment.clearValue.depthStencil = {0.0f, 0};
@@ -162,7 +162,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 
 	vk::DescriptorImageInfo descriptor_image {};
 	descriptor_image.imageView   = source_view;
-	descriptor_image.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+	descriptor_image.imageLayout = UnifiedLayouts::Host(vk::ImageLayout::eShaderReadOnlyOptimal);
 	vk::WriteDescriptorSet descriptor_write {};
 	descriptor_write.dstBinding      = 0;
 	descriptor_write.descriptorCount = 1;

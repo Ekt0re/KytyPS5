@@ -8,6 +8,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
+#include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
 #include "graphics/host_gpu/renderer/recorder.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -409,13 +410,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
 	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT,
 	                   vk::PhysicalDeviceMaintenance5FeaturesKHR,
-	                   vk::PhysicalDevicePipelineBinaryFeaturesKHR>
+	                   vk::PhysicalDevicePipelineBinaryFeaturesKHR,
+	                   vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8, maintenance5,
-	       pipeline_binary] = supported;
+	       pipeline_binary, unified_layouts] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	graphics.external_memory_host_enabled = add(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
@@ -436,6 +438,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!add(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceProvokingVertexFeaturesEXT>();
+	}
+	// Cached images stay in GENERAL (UnifiedLayouts); KYTY_UNIFIED_LAYOUTS=0 keeps per-use layouts.
+	if (!add(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>();
 	}
 	if (!add(VK_KHR_MAINTENANCE_8_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
@@ -577,6 +583,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.attachment_feedback_loop_enabled = feedback_layout.attachmentFeedbackLoopLayout &&
 	                                            feedback_dynamic.attachmentFeedbackLoopDynamicState;
 	graphics.maintenance8_enabled             = maintenance8.maintenance8;
+	graphics.unified_image_layouts_enabled    = unified_layouts.unifiedImageLayouts;
 	graphics.ray_query_enabled                = ray_query_enabled;
 	// A coarser alignment rounds the range up past the guest's last byte.
 	graphics.robust_buffer_access_enabled =
@@ -601,6 +608,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
+	UnifiedLayouts::Configure(graphics.unified_image_layouts_enabled);
+	LOGF("Vulkan unified image layouts: %s%s\n",
+	     graphics.unified_image_layouts_enabled ? "supported" : "unsupported",
+	     graphics.unified_image_layouts_enabled
+	         ? (UnifiedLayouts::Active() ? ", on" : ", off (KYTY_UNIFIED_LAYOUTS=0)")
+	         : "");
 	if (graphics.mesh_shader_enabled) {
 		LOGF("Vulkan MeshEXT: invocations=%u vertices=%u primitives=%u shared=%u\n",
 		     graphics.mesh_shader_properties.maxMeshWorkGroupInvocations,
@@ -710,7 +723,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE},
 	    vk::PhysicalDeviceMaintenance5FeaturesKHR {.maintenance5 = VK_TRUE},
 	    vk::PhysicalDevicePipelineBinaryFeaturesKHR {.pipelineBinaries = VK_TRUE},
-	    vk::DevicePipelineBinaryInternalCacheControlKHR {.disableInternalCache = VK_TRUE}};
+	    vk::DevicePipelineBinaryInternalCacheControlKHR {.disableInternalCache = VK_TRUE},
+	    vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR {.unifiedImageLayouts = VK_TRUE}};
 	// The driver's internal pipeline cache is turned off where it can be: NVIDIA's keeps it per
 	// executable and its captured binaries then depend on it, so a rebuilt or renamed emulator got
 	// VK_PIPELINE_COMPILE_REQUIRED for every stored pipeline. Without it the stored binaries are
@@ -766,6 +780,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		create.unlink<vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT>();
 	}
 	if (!graphics.maintenance8_enabled) create.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
+	if (!graphics.unified_image_layouts_enabled) {
+		create.unlink<vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>();
+	}
 	if (graphics.device_clock_period_ps == 0u) {
 		create.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
 	}
