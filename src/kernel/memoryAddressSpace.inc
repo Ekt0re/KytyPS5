@@ -211,8 +211,35 @@ public:
 			EXIT("direct-memory backing: writable alias failed: %d\n", errno);
 		}
 		m_backing_base = static_cast<uint8_t*>(backing);
+#if !defined(__APPLE__)
+		ExcludeFromCoreDumps();
+#endif
 #endif
 	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	// A core dump reads every dumpable mapping, and reading shared memory that was never written
+	// allocates it: a crash with 12 GB of committed guest memory first grew by all of it (through
+	// the alias and the guest views), ran into the memory limit or the machine's memory, and
+	// wrote a core of several GB. Shared anonymous mappings (bit 1 of the filter) are left out of
+	// the dump; the emulator's own memory stays in. KYTY_COREDUMP_GUEST_MEMORY=1 keeps the default.
+	static void ExcludeFromCoreDumps() {
+		if (const char* keep = std::getenv("KYTY_COREDUMP_GUEST_MEMORY");
+		    keep != nullptr && *keep != '\0' && *keep != '0') {
+			return;
+		}
+		unsigned filter = 0;
+		FILE*    file   = std::fopen("/proc/self/coredump_filter", "r+");
+		if (file == nullptr) {
+			return;
+		}
+		if (std::fscanf(file, "%x", &filter) == 1 && (filter & 0x2u) != 0) {
+			std::rewind(file);
+			std::fprintf(file, "0x%x", filter & ~0x2u);
+		}
+		std::fclose(file);
+	}
+#endif
 
 	// Guest views outlive the alias and the handle; the address-space owner releases them.
 	~GuestBackingStore() {
@@ -288,6 +315,41 @@ public:
 		ReadSparseBacking(vaddr, data, size, [](uint64_t, uint8_t* destination, uint64_t bytes) {
 			std::memset(destination, 0, bytes);
 		});
+		return true;
+	}
+
+	// The same bytes as TryReadBacking, read through the file where the host can: a file read
+	// of shared memory that was never written returns zeros without allocating it, where a copy
+	// from the mapping commits every page it touches. For readers of whole address spaces (frame
+	// capture); small hot reads keep TryReadBacking, which needs no system call.
+	bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) const {
+		if (data == nullptr || !IsBacked(vaddr, size)) {
+			return false;
+		}
+		auto* destination = static_cast<uint8_t*>(data);
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t bytes) {
+			    auto* out = destination + (start - vaddr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+			    while (bytes != 0) {
+				    const auto read = pread(m_fd, out, bytes, static_cast<off_t>(offset));
+				    if (read < 0 && errno == EINTR) {
+					    continue;
+				    }
+				    if (read <= 0) {
+					    break;
+				    }
+				    out += read;
+				    offset += static_cast<uint64_t>(read);
+				    bytes -= static_cast<uint64_t>(read);
+			    }
+#endif
+			    std::memcpy(out, m_backing_base + offset, bytes);
+		    },
+		    [&](uint64_t start, uint64_t bytes) {
+			    std::memset(destination + (start - vaddr), 0, bytes);
+		    });
 		return true;
 	}
 
@@ -680,6 +742,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryReadBackingUncommitted(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->TryReadBackingUncommitted(vaddr, data, size);
 	}
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {

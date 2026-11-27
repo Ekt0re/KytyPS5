@@ -141,7 +141,7 @@ bool AllZero(std::span<const uint8_t> bytes) {
 
 // Guest memory as the guest wrote it, without faulting on pages the GPU caches protect.
 bool ReadGuest(uint64_t address, uint8_t* data, uint64_t size) {
-	if (Memory::TryReadBacking(address, data, size)) return true;
+	if (Memory::TryReadBackingUncommitted(address, data, size)) return true;
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 	const iovec local {data, size};
 	const iovec remote {reinterpret_cast<void*>(address), size};

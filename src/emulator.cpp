@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/profiler.h"
@@ -152,6 +153,12 @@ void RunReplay(const RunOptions& options) {
 	config.splash_enabled = false;
 	Init(config, options.replay / "param.json", subsystems);
 	PrintSystemInfo();
+	// The loader installs the host exception handler when it maps a program; a replay loads none.
+	// Without it the first read of a page the GPU caches protect (an SRT walker load, a readback)
+	// is an unhandled fault instead of a resolved one.
+	if (!Common::HostException::InstallHandler(Loader::KytyExceptionHandler)) {
+		EXIT("Failed to install the host exception handler\n");
+	}
 	Libs::Graphics::FrameCapture::ReplayOptions replay;
 	replay.capture = options.replay;
 	replay.output  = options.replay_out.empty() ? options.replay / "replay" : options.replay_out;
