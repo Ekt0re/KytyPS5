@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <span>
@@ -101,6 +102,26 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Guest memory that GPU work recorded on a guest queue since that queue's last synchronisation
+	// point (a partial flush, ACQUIRE_MEM, WAIT_REG_MEM, a memory semaphore, RELEASE_MEM, a flip,
+	// the end of a submission) may write. On the console that work can still be running when the
+	// queue's command processor reads its next packet's indirect arguments, so those reads see
+	// memory as it was before it. Other queues' packets do not stall this one.
+	void SetGuestQueue(uint32_t queue) noexcept { m_guest_queue = queue; }
+	void NoteGuestSync() noexcept {
+		auto& window = m_sync_windows[m_guest_queue];
+		window.writes.Clear();
+		window.generation++;
+	}
+	[[nodiscard]] bool WrittenSinceGuestSync(uint64_t vaddr, uint64_t size) const {
+		const auto it = m_sync_windows.find(m_guest_queue);
+		return it != m_sync_windows.end() && it->second.writes.Intersects(vaddr, size);
+	}
+	[[nodiscard]] uint32_t GuestQueue() const noexcept { return m_guest_queue; }
+	[[nodiscard]] uint64_t SyncGeneration() const {
+		const auto it = m_sync_windows.find(m_guest_queue);
+		return it != m_sync_windows.end() ? it->second.generation : 0;
+	}
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
@@ -123,6 +144,10 @@ public:
 	void RecordPendingWrites();
 	// A program with address writes is bound; its writes can reach any range.
 	void NoteAddressWrites() noexcept { m_address_writes_pending = true; }
+	// Called on the GPU thread when a guest CPU write faults into GPU-written memory.
+	void SetCpuWriteListener(std::function<void(uint64_t, uint64_t)> listener) {
+		m_cpu_write_listener = std::move(listener);
+	}
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -196,6 +221,13 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	RangeSet                                          m_pending_writes;
+	struct SyncWindow {
+		RangeSet writes;
+		uint64_t generation = 0;
+	};
+	std::map<uint32_t, SyncWindow>                    m_sync_windows;
+	uint32_t                                          m_guest_queue = 0;
+	std::function<void(uint64_t, uint64_t)>           m_cpu_write_listener;
 	RangeSet                                          m_unsubmitted_writes;
 	uint64_t                                          m_unsubmitted_tick       = 0;
 	uint64_t                                          m_address_write_tick     = 0;

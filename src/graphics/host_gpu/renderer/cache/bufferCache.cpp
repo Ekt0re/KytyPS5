@@ -399,6 +399,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 			QueueBdaSync(vaddr, size);
+			if (m_cpu_write_listener) {
+				m_cpu_write_listener(vaddr, size);
+			}
 		}
 	});
 }
@@ -655,6 +658,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_pending_writes.Add(vaddr, size);
+		m_sync_windows[m_guest_queue].writes.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -864,6 +868,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}
 	const auto end = vaddr + size;
+	m_sync_windows[m_guest_queue].writes.Add(vaddr, size);
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {
 		--it;

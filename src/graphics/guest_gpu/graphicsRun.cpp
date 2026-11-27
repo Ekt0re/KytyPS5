@@ -327,6 +327,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		EXIT("unsupported wait_reg_mem operation: 0x%08" PRIx32 "\n", wait_op);
 	}
 
+	NoteGuestSync();
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		SuspendPm4();
 	}
@@ -337,7 +338,12 @@ template void CommandProcessor::WaitRegMem<uint32_t>(uint32_t, const uint32_t*, 
 template void CommandProcessor::WaitRegMem<uint64_t>(uint32_t, const uint64_t*, uint64_t, uint64_t,
                                                      uint32_t);
 
+void CommandProcessor::NoteGuestSync() {
+	m_renderer.GetBufferCache().NoteGuestSync();
+}
+
 void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) {
+	NoteGuestSync();
 	if (signal) {
 		*counter = write ? 1u : *counter + 1u;
 	} else if (*counter == 0) {
@@ -369,6 +375,8 @@ void CommandProcessor::WriteData(uint64_t dst, const uint32_t* src, uint32_t dw_
 		return;
 	}
 
+	m_renderer.GetRenderExecutor().ForgetIndirectArgs(
+	    dst, write_one_address ? 4u : uint64_t {dw_num} * 4u);
 	// Completion labels can be reused immediately; memcpy may write a destination twice.
 	auto* output = reinterpret_cast<volatile uint32_t*>(dst);
 	for (uint32_t i = 0; i < dw_num; i++) {
@@ -439,6 +447,9 @@ void CommandProcessor::DmaData(uint8_t dst_sel, uint64_t dst_address_or_offset, 
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
+	if (!dst_gds) {
+		m_renderer.GetRenderExecutor().ForgetIndirectArgs(dst_address_or_offset, num_bytes);
+	}
 	if (src_sel == 2) {
 		buffer_cache.FillBuffer(
 		    dst_address_or_offset, num_bytes,
@@ -619,6 +630,8 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	}
 	execution.m_suspended     = false;
 	execution.m_made_progress = false;
+	// GPU writes recorded from here on belong to this queue's indirect-argument window.
+	m_renderer.GetBufferCache().SetGuestQueue(static_cast<uint32_t>(m_interrupt_event_id));
 
 	struct ExecutionScope {
 		explicit ExecutionScope(Pm4Execution& execution) { g_current_execution = &execution; }
@@ -626,8 +639,12 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	} execution_scope(execution);
 
 	ProcessPm4(execution);
-	return execution.m_buffer_stack.empty() ? Pm4ProcessResult::Complete
-	                                        : Pm4ProcessResult::Blocked;
+	if (execution.m_buffer_stack.empty()) {
+		// The end of a submission closes the indirect-argument window.
+		NoteGuestSync();
+		return Pm4ProcessResult::Complete;
+	}
+	return Pm4ProcessResult::Blocked;
 }
 
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
@@ -1084,6 +1101,7 @@ void CommandProcessor::WaitFlipDone(const uint64_t* label) {
 void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address,
                                   uint64_t data, uint32_t interrupt_context_id,
                                   bool gl2_writeback) {
+	NoteGuestSync();
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::ReleaseMem()\n"
 		     "\t data_sel           = %" PRIu32 "\n"
@@ -1180,7 +1198,7 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: break;
+		case 0x00000010: NoteGuestSync(); break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
 		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
 		case 0x00000016:
@@ -1245,6 +1263,7 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	if (graphics_debug_dump_enabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
+	NoteGuestSync();
 	m_renderer.GetOcclusionQueries().Publish();
 
 	auto& command = CurrentBuffer();

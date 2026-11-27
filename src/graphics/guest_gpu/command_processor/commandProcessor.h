@@ -89,6 +89,10 @@ public:
 	void ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector, void* address, uint64_t data,
 	                uint32_t interrupt_context_id, bool gl2_writeback);
 	void WriteBackImages();
+	// A partial flush, ACQUIRE_MEM, WAIT_REG_MEM, memory semaphore, RELEASE_MEM, flip or the end of
+	// a submission: this queue's earlier GPU work is done as far as later indirect argument reads
+	// go.
+	void NoteGuestSync();
 	void Flip(int handle, int index, int flip_mode, int64_t flip_arg);
 	void PrepareCpuFlip(uint64_t request_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,

@@ -764,6 +764,43 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	ResetBindings();
 }
 
+// KYTY_INDIRECT_ARGS_WINDOW=0 reads indirect arguments from memory as recorded, as before.
+static bool IndirectArgsWindowEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_INDIRECT_ARGS_WINDOW");
+		return text == nullptr || text[0] != '0';
+	}();
+	return enabled;
+}
+
+// Every 10 s: how many indirect dispatches took an earlier read of their arguments.
+static void NoteIndirectArgsReuse() {
+	static uint64_t count       = 0;
+	static auto     last_report = std::chrono::steady_clock::now();
+	count++;
+	const auto now = std::chrono::steady_clock::now();
+	if (count == 1 || now - last_report >= std::chrono::seconds {10}) {
+		std::printf("Indirect dispatch: %llu read their arguments as fetched before writes since the "
+		            "last guest sync point\n",
+		            static_cast<unsigned long long>(count));
+		std::fflush(stdout);
+		last_report = now;
+	}
+}
+
+void RenderExecutor::ForgetIndirectArgs(uint64_t vaddr, uint64_t size) {
+	// The write is in guest memory, which every queue reads.
+	const uint64_t first = vaddr >= sizeof(vk::DispatchIndirectCommand)
+	                           ? vaddr - sizeof(vk::DispatchIndirectCommand) + 1u
+	                           : 0u;
+	for (auto& [queue, window]: m_indirect_args) {
+		auto it = window.reads.lower_bound(first);
+		while (it != window.reads.end() && it->first < vaddr + size) {
+			it = window.reads.erase(it);
+		}
+	}
+}
+
 void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
                                       bool async_compute) {
 	EXIT_IF(args_addr == 0 || (args_addr & 3u) != 0 ||
@@ -771,10 +808,52 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetCommandScheduler().StartOperation();
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
+	auto&                       cache = m_context.GetBufferCache();
+	if (m_indirect_sequence == 0) {
+		// A fault reports the first write to a page only; later writes there do not fault.
+		cache.SetCpuWriteListener([this](uint64_t vaddr, uint64_t size) {
+			const auto begin = vaddr & ~uint64_t {0xffff};
+			const auto end   = (vaddr + size + 0xffffu) & ~uint64_t {0xffff};
+			ForgetIndirectArgs(begin, end - begin);
+		});
+	}
+	const uint64_t sequence = m_indirect_sequence++;
+	auto&          window   = m_indirect_args[cache.GuestQueue()];
+	if (window.generation != cache.SyncGeneration() || window.reads.size() >= 1024u) {
+		window.reads.clear();
+		window.generation = cache.SyncGeneration();
+	}
+	// GPU work recorded since this queue's last sync point may write these arguments. The
+	// console's command processor reads them when it reaches this packet, while that work can
+	// still be running: GTA VI copies twice into one destination whose first bytes are both
+	// copies' arguments (shader 0xe119767e79e995c9, async compute, no sync packet between), and
+	// the second copy reads them before the first one's waves write. The newest read of the same
+	// address from before the window's writes is what the console reads.
+	const bool                  overwritten = cache.WrittenSinceGuestSync(args_addr, sizeof(args));
+	const IndirectArgsRead*     earlier     = nullptr;
+	vk::DispatchIndirectCommand guest {};
+	const bool guest_known = LibKernel::Memory::TryReadBacking(args_addr, &guest, sizeof(guest));
+	if (overwritten && guest_known && IndirectArgsWindowEnabled()) {
+		const auto it = window.reads.find(args_addr);
+		// A CPU read is stale once the CPU wrote other counts. A GPU read's guest bytes are stale
+		// by nature; a CPU write over GPU-written memory faults and drops it (SetCpuWriteListener).
+		// The guard's ring (65,536 slots, at most one per indirect dispatch) may reuse an old slot.
+		if (it != window.reads.end() &&
+		    (it->second.known ? std::memcmp(&it->second.guest, &guest, sizeof(guest)) == 0
+		                      : sequence - it->second.sequence < 32768u)) {
+			earlier = &it->second;
+			NoteIndirectArgsReuse();
+		}
+	}
 	// Known only when the CPU wrote the arguments; a compute pass can produce them instead.
-	const bool args_known =
-	    !m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
-	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args));
+	bool args_known = false;
+	if (earlier != nullptr) {
+		args_known = earlier->known;
+		args       = earlier->counts;
+	} else {
+		args_known = !cache.HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+		             LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args));
+	}
 	if (args_known && (args.x == 0 || args.y == 0 || args.z == 0)) {
 		return;
 	}
@@ -815,12 +894,32 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
 	EXIT_IF((args_offset & 3u) != 0);
 	DispatchArgsGuard::Result dispatch_args {args_buffer->Handle(), args_offset, UINT32_MAX};
-	if (!args_known && DispatchArgsGuard::Enabled()) {
+	if (earlier != nullptr && !earlier->known) {
+		// The guard slot the earlier dispatch read its arguments from.
+		dispatch_args = {earlier->buffer, earlier->offset, UINT32_MAX};
+	} else if (!args_known && DispatchArgsGuard::Enabled()) {
 		buffer.EndRendering();
 		dispatch_args = GetDispatchArgsGuard(m_context).Record(
 		    buffer.Handle(), args_buffer->Handle(), args_offset, args_buffer->Size(),
 		    program.shader_hash);
 	}
+	// The newest read before the window's writes reached these arguments: later dispatches in the
+	// window reuse it. A GPU read is kept only when it went through the guard's slot; the guest
+	// buffer itself changes under the window's writes.
+	if (earlier == nullptr && !overwritten && guest_known) {
+		if (args_known) {
+			window.reads[args_addr] = {
+			    .known = true, .counts = args, .guest = guest, .sequence = sequence};
+		} else if (dispatch_args.slot != UINT32_MAX) {
+			window.reads[args_addr] = {.buffer   = dispatch_args.buffer,
+			                           .offset   = dispatch_args.offset,
+			                           .guest    = guest,
+			                           .sequence = sequence};
+		} else {
+			window.reads.erase(args_addr);
+		}
+	}
+	const bool direct = earlier != nullptr && earlier->known;
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
@@ -830,12 +929,16 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	}
 	LogAddressWrites(input_info.stage, 0, 0, 0);
 	RecordDispatch(buffer, pipeline,
-	               [args = dispatch_args.buffer, offset = dispatch_args.offset,
-	                graphics = &m_context.GetGraphics(),
+	               [args = dispatch_args.buffer, offset = dispatch_args.offset, direct,
+	                counts   = args, graphics = &m_context.GetGraphics(),
 	                cs_hash  = program.shader_hash](vk::CommandBuffer command, vk::Pipeline handle) {
 		               command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
 		               const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'C', cs_hash);
-		               command.dispatchIndirect(args, offset);
+		               if (direct) {
+			               command.dispatch(counts.x, counts.y, counts.z);
+		               } else {
+			               command.dispatchIndirect(args, offset);
+		               }
 		               GpuBreadcrumbs::End(*graphics, command, crumb);
 	               });
 	vk_buffer = buffer.Handle();
