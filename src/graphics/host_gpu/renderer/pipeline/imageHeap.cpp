@@ -975,9 +975,21 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 			auto& element = m_elements[index];
 			// Pinned before the refresh, so a CPU write after it reports a change.
 			image.heap_refs.fetch_add(1u, std::memory_order_relaxed);
+			// A stale element resolved again leaves its old image's list, and an element already
+			// listed under this serial is not added twice (repoint storms re-resolve the same
+			// elements over and over).
+			if (element.image && element.serial != image.serial) {
+				if (const auto old = m_by_serial.find(element.serial); old != m_by_serial.end()) {
+					std::erase(old->second, index);
+					if (old->second.empty()) m_by_serial.erase(old);
+				}
+			}
 			element.image      = binding.image_id;
 			element.serial     = image.serial;
-			m_by_serial[image.serial].push_back(index);
+			if (auto& list = m_by_serial[image.serial];
+			    std::ranges::find(list, index) == list.end()) {
+				list.push_back(index);
+			}
 			binding.layout     = image.ReadLayout();
 			binding.image_view = textures.FindTexture(binding.image_id, binding.desc);
 			if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) m_dcc.push_back({index});
