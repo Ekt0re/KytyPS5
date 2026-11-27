@@ -141,6 +141,12 @@ uint64_t CodegenSwitchKey() {
 	// stay those of stores written without them).
 	constexpr uint64_t BallotGuardsStamp = 0x62616c6c6f740001ull;
 	if (ShaderRecompiler::Spirv::BallotGuardsEnabled()) key ^= BallotGuardsStamp;
+	// The loop iteration limit is a constant in every module with a loop (0: no guard at all).
+	if (const auto limit = ShaderRecompiler::Spirv::LoopIterationLimit();
+	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
+		constexpr uint64_t LoopLimitStamp = 0x6c6f6f706c696d00ull;
+		key ^= LoopLimitStamp ^ (uint64_t {limit} * 0xff51afd7ed558ccdull);
+	}
 	return key;
 }
 
@@ -178,7 +184,13 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 // other's store at every start.
 std::string ShaderStoreVariant() {
 	const auto switches = CodegenSwitches();
-	return switches == 0 ? std::string {} : fmt::format("-sw{:x}", switches);
+	auto variant = switches == 0 ? std::string {} : fmt::format("-sw{:x}", switches);
+	// A loop iteration limit away from the default (KYTY_SHADER_LOOP_LIMIT) gets its own file too.
+	if (const auto limit = ShaderRecompiler::Spirv::LoopIterationLimit();
+	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
+		variant += fmt::format("-loop{}", limit);
+	}
+	return variant;
 }
 
 void ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const uint8_t> header,
