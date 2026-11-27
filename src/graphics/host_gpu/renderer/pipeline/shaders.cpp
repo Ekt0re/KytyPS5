@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -505,8 +506,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
-	const auto   result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info,
-	                                                            nullptr, &pipeline);
+	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
+	const auto result =
+	    PipelineBinaryStore::Get().CreateGraphics(graphics, driver_cache, pipeline_info, &pipeline);
 	if (result != vk::Result::eSuccess) {
 		ExitPipelineFailure("vkCreateGraphicsPipelines", result, stages);
 	}
@@ -545,8 +547,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
-	const auto   result =
-	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline);
+	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
+	const auto result =
+	    PipelineBinaryStore::Get().CreateCompute(graphics, driver_cache, info, &pipeline);
 	if (result != vk::Result::eSuccess) {
 		const ShaderModule* modules[] = {&module};
 		ExitPipelineFailure("vkCreateComputePipelines", result, modules);

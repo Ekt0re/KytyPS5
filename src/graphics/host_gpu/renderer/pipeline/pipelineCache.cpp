@@ -1,6 +1,7 @@
 #include "common/compilePause.h"
 #include "common/shaderCompileStatus.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 
 #include "common/assert.h"
@@ -1285,6 +1286,7 @@ PipelineCache::~PipelineCache() {
 		}
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	PipelineBinaryStore::Get().Close();
 }
 
 void PipelineCache::InitializeDriverCache() {
@@ -1297,6 +1299,10 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	// Our own pipeline binaries: the driver's cache alone does not keep them across builds or past
+	// its size (PipelineBinaryStore).
+	PipelineBinaryStore::Get().Open(m_graphics,
+	                                std::filesystem::path("_PipelineCache") / (title_id + ".binaries"));
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {

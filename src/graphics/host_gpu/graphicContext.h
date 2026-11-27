@@ -36,6 +36,10 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
+	// VK_KHR_pipeline_binary with maintenance5 (PipelineBinaryStore).
+	bool                               pipeline_binary_enabled               = false;
+	// The driver's internal pipeline cache is off (VkDevicePipelineBinaryInternalCacheControlKHR).
+	bool                               pipeline_binary_internal_cache_disabled = false;
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               ray_query_enabled                     = false;
 	// KYTY_GPU_BREADCRUMBS diagnostics: VK_AMD_buffer_marker, VK_EXT_device_fault.

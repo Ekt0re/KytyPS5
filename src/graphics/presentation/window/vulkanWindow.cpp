@@ -406,12 +406,15 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
 	                   vk::PhysicalDeviceRayQueryFeaturesKHR,
 	                   vk::PhysicalDeviceCooperativeMatrixFeaturesKHR,
-	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT>
+	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT,
+	                   vk::PhysicalDeviceMaintenance5FeaturesKHR,
+	                   vk::PhysicalDevicePipelineBinaryFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
-	       acceleration_structure, ray_query, cooperative_matrix, float8] = supported;
+	       acceleration_structure, ray_query, cooperative_matrix, float8, maintenance5,
+	       pipeline_binary] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
@@ -480,9 +483,23 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	if (!fsr || !add(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceShaderFloat8FeaturesEXT>();
 	}
+	// Our own pipeline binaries (PipelineBinaryStore) need both; capture takes the flags2 struct.
+	const bool pipeline_binary_extensions =
+	    HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	if (pipeline_binary_extensions) {
+		add(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+		add(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	} else {
+		supported.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
+		supported.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
+	graphics.pipeline_binary_enabled = pipeline_binary_extensions && maintenance5.maintenance5 &&
+	                                   pipeline_binary.pipelineBinaries;
+	LOGF("Vulkan pipeline binaries: %s\n", graphics.pipeline_binary_enabled ? "true" : "false");
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	const bool ray_query_enabled =
 	    acceleration_structure.accelerationStructure && ray_query.rayQuery;
@@ -677,7 +694,37 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
 	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
-	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE}};
+	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE},
+	    vk::PhysicalDeviceMaintenance5FeaturesKHR {.maintenance5 = VK_TRUE},
+	    vk::PhysicalDevicePipelineBinaryFeaturesKHR {.pipelineBinaries = VK_TRUE},
+	    vk::DevicePipelineBinaryInternalCacheControlKHR {.disableInternalCache = VK_TRUE}};
+	// The driver's internal pipeline cache is turned off where it can be: NVIDIA's keeps it per
+	// executable and its captured binaries then depend on it, so a rebuilt or renamed emulator got
+	// VK_PIPELINE_COMPILE_REQUIRED for every stored pipeline. Without it the stored binaries are
+	// complete (PipelineBinaryStore). KYTY_PIPELINE_BINARY_INTERNAL_CACHE=1 keeps it.
+	bool disable_internal_cache = false;
+	if (graphics.pipeline_binary_enabled) {
+		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDevicePipelineBinaryPropertiesKHR>
+		    binary_properties;
+		physical_device.getProperties2(&binary_properties.get<vk::PhysicalDeviceProperties2>());
+		const auto& binary = binary_properties.get<vk::PhysicalDevicePipelineBinaryPropertiesKHR>();
+		const char* keep   = std::getenv("KYTY_PIPELINE_BINARY_INTERNAL_CACHE");
+		disable_internal_cache = binary.pipelineBinaryInternalCache &&
+		                         binary.pipelineBinaryInternalCacheControl &&
+		                         !(keep != nullptr && keep[0] == '1');
+		graphics.pipeline_binary_internal_cache_disabled = disable_internal_cache;
+		LOGF("Vulkan pipeline binaries: internal cache %s, control %s -> %s\n",
+		     binary.pipelineBinaryInternalCache ? "true" : "false",
+		     binary.pipelineBinaryInternalCacheControl ? "true" : "false",
+		     disable_internal_cache ? "disabled" : "kept");
+	}
+	if (!graphics.pipeline_binary_enabled) {
+		create.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
+		create.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+	}
+	if (!disable_internal_cache) {
+		create.unlink<vk::DevicePipelineBinaryInternalCacheControlKHR>();
+	}
 	if (!graphics.device_fault_enabled) create.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
