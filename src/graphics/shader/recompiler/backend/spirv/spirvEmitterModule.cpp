@@ -844,7 +844,7 @@ void DefineModule(EmitterState& state) {
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	// Scalar-branch guards (subgroup_vote) are ballots unless KYTY_BALLOT_GUARDS=0.
+	// Scalar-branch guards (subgroup_vote) are ballots on NVIDIA or with KYTY_BALLOT_GUARDS=1.
 	const bool guard_ballots = state.program.info.subgroup_vote && BallotGuardsEnabled();
 	if (state.lane_count == 2 || state.program.info.subgroup_ballot || guard_ballots) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);

@@ -37,6 +37,15 @@ struct Profile {
 
 inline constexpr Profile DefaultProfile {};
 
+// Scalar-branch guards as ballots compared with zero instead of OpGroupNonUniformAny/All votes.
+// NVIDIA's compiler spends ~45 ms on each vote and little on a ballot (KytyPS5 #2469); RADV/ACO
+// compiles both alike, so the device picks the default (SetBallotGuardsDefault, on for NVIDIA's
+// proprietary driver) and KYTY_BALLOT_GUARDS=0/1 overrides it. Not part of Profile, so a store
+// written without ballots keeps its header; the shader store header changes its stamp instead
+// while ballots are on.
+void SetBallotGuardsDefault(bool enabled);
+bool BallotGuardsEnabled();
+
 // KYTY_RT_OFF=1: BVH node tests always miss (an empty scene). Not part of Profile, so the shader
 // store header stays; the pipeline cache neither loads nor stores BVH modules while it is set.
 bool BvhIntersectAlwaysMisses();

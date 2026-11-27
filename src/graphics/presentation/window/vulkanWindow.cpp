@@ -20,6 +20,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -539,6 +540,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	EXIT_NOT_IMPLEMENTED(!(properties11.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote));
 	graphics.physical_device_properties = properties2.properties;
 	graphics.driver_id                  = driver_properties.driverID;
+	ShaderRecompiler::Spirv::SetBallotGuardsDefault(graphics.driver_id ==
+	                                                vk::DriverId::eNvidiaProprietary);
 	// RADV: the VkPipelineCache file already keeps every pipeline (no size cap), and capturing
 	// binaries bypasses it, so each store miss compiles from scratch. Opt-in there.
 	if (graphics.pipeline_binary_enabled && graphics.driver_id == vk::DriverId::eMesaRadv) {

@@ -38167,7 +38167,7 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
-// Scalar-branch guards are a ballot compared with zero unless KYTY_BALLOT_GUARDS=0 restores
+// Scalar-branch guards are a ballot compared with zero with KYTY_BALLOT_GUARDS=1, otherwise
 // OpGroupNonUniformAny/All (`vote`).
 void SetScalarBranchGuardSpirv(TestCase *test, const char *vote) {
   if (ShaderRecompiler::Spirv::Emitter::BallotGuardsEnabled()) {

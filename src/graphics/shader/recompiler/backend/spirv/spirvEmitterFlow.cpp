@@ -490,16 +490,8 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 
 } // namespace
 
-// KYTY_BALLOT_GUARDS=0: scalar-branch guards are OpGroupNonUniformAny/All again (an A/B switch for
-// EmitConditionRef). The shader store is keyed to the executable, not to this switch, so it keeps
-// serving modules built with the other setting: move _PipelineCache/<title>.shaders aside before
-// comparing the two in a run.
 bool BallotGuardsEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_BALLOT_GUARDS");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
+	return Spirv::BallotGuardsEnabled();
 }
 
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
@@ -1074,3 +1066,27 @@ void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+namespace {
+std::atomic<bool> g_ballot_guards_default {false};
+} // namespace
+
+void SetBallotGuardsDefault(bool enabled) {
+	g_ballot_guards_default.store(enabled, std::memory_order_relaxed);
+}
+
+bool BallotGuardsEnabled() {
+	// -1: no KYTY_BALLOT_GUARDS, the device default decides.
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_BALLOT_GUARDS");
+		if (value == nullptr || value[0] == 0) {
+			return -1;
+		}
+		return value[0] == '0' ? 0 : 1;
+	}();
+	return forced >= 0 ? forced == 1 : g_ballot_guards_default.load(std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

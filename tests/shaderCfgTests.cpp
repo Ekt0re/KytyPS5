@@ -13737,7 +13737,8 @@ void TestSpirvConditionVotes() {
     IR::CollectShaderInfo(compiled.program, options.input_info);
     const auto binary = Spirv::EmitProgram(compiled.program, options.input_info);
     CheckSpirvBinaryValidates(binary);
-    // KYTY_BALLOT_GUARDS (on unless "0") emits each vote as one ballot compared with zero.
+    // Ballot guards (KYTY_BALLOT_GUARDS=1; the device default is off here) emit each vote as one
+    // ballot compared with zero.
     const bool ballot_guards = Spirv::Emitter::BallotGuardsEnabled();
     const uint32_t votes = ballot_guards ? 0u : 3u;
     // A 64-wide wave on 32-wide invocations already requires the ballot capability.

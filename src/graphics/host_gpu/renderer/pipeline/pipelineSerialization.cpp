@@ -91,8 +91,13 @@ std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	if (stamp == 0) {
 		return {};
 	}
+	// Ballot guards change the SPIR-V of most modules but are not part of Profile (whose bytes
+	// stay those of stores written without them): a different stamp keeps the two apart.
+	constexpr uint64_t BallotGuardsStamp = 0x62616c6c6f740001ull;
+	const uint64_t     keyed_stamp =
+	    ShaderRecompiler::Spirv::BallotGuardsEnabled() ? stamp ^ BallotGuardsStamp : stamp;
 	Writer header;
-	IoAll(header, stamp, SpirvProfile(graphics),
+	IoAll(header, keyed_stamp, SpirvProfile(graphics),
 	      graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize);
 	return std::move(header.bytes);
 }
