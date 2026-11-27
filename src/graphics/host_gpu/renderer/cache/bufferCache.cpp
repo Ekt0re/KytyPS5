@@ -403,8 +403,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 64 * MiB),
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache) {
+	// On by default (bb_ab2, world: readback ms/f -14%, gpu_cpu_us/op -19%);
+	// KYTY_BATCH_READBACK=0 turns it off.
 	if (const char* value = std::getenv("KYTY_BATCH_READBACK"); value != nullptr) {
-		m_batch_readback_env = value[0] == '1';
+		m_batch_readback_env = value[0] != '0';
 	}
 	m_batch_readback = m_batch_readback_env;
 	if (const char* value = std::getenv("KYTY_BATCH_READBACK_PREFETCH"); value != nullptr) {

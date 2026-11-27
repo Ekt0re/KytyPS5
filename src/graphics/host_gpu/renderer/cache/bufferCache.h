@@ -220,7 +220,7 @@ private:
 	// copy goes into the same submission as the open command buffer.
 	template <bool async>
 	void DownloadParts(std::vector<DownloadPart>& parts, uint64_t total_size, bool fuse);
-	// KYTY_BATCH_READBACK=1 or toggle batch_readback (re-read 4x per second): one synchronous
+	// KYTY_BATCH_READBACK (default 1; 0 = off) or toggle batch_readback (re-read 4x per second): one synchronous
 	// download copies every buffer of the access's window, in the open command buffer's
 	// submission when it can run detached.
 	[[nodiscard]] bool BatchReadback();
@@ -285,9 +285,9 @@ private:
 	bool                                              m_address_writes_pending = false;
 	enum class DetachedReadback { Off, Submit, NoSubmit };
 	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;
-	// KYTY_BATCH_READBACK (default 0), overridden by the batch_readback toggle when present.
-	bool                                              m_batch_readback_env = false;
-	bool                                              m_batch_readback     = false;
+	// KYTY_BATCH_READBACK (default 1), overridden by the batch_readback toggle when present.
+	bool                                              m_batch_readback_env = true;
+	bool                                              m_batch_readback     = true;
 	std::chrono::steady_clock::time_point             m_batch_readback_next {};
 	// KYTY_BATCH_READBACK_PREFETCH=KiB: a batch also copies this much on both sides of the window.
 	uint64_t                                          m_batch_prefetch = 0;

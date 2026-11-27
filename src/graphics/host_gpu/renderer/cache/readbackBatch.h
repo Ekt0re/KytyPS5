@@ -8,7 +8,7 @@
 #include <optional>
 #include <vector>
 
-// Planning of batched buffer readbacks (KYTY_BATCH_READBACK=1 or toggle batch_readback): which
+// Planning of batched buffer readbacks (on by default; KYTY_BATCH_READBACK=0 or toggle batch_readback=0 turns it off): which
 // parts of which buffers one synchronous download copies, so that one CPU access costs one
 // submission and one wait however many buffers its window touches. Pure logic, no Vulkan.
 namespace Libs::Graphics::ReadbackBatch {
