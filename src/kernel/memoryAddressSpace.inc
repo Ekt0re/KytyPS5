@@ -327,14 +327,30 @@ public:
 			return true;
 		}
 		const auto bytes  = ChunkBytes(index);
-		int        fd     = m_vulkan->Allocate(bytes);
-		bool       vulkan = fd >= 0;
+		// A Vulkan chunk is committed whole where the memfd commits what is touched, so only the
+		// first KYTY_VK_GUEST_BACKING_MAX_MB (default 4096) of mapped chunks are Vulkan memory:
+		// GTA VI maps its heavy chunks first, and zero-copy buffers came from chunks 0-3, 6, 7.
+		static const uint64_t cap = [] {
+			const char* text  = std::getenv("KYTY_VK_GUEST_BACKING_MAX_MB");
+			const auto  value = text != nullptr ? std::strtoull(text, nullptr, 10) : 4096ull;
+			return value << 20u;
+		}();
+		const bool over_cap = m_vulkan_bytes + bytes > cap;
+		int        fd       = over_cap ? -1 : m_vulkan->Allocate(bytes);
+		bool       vulkan   = fd >= 0;
+		if (over_cap && !m_cap_logged) {
+			m_cap_logged = true;
+			std::printf("Vulkan guest backing: %" PRIu64 " MiB cap reached, further chunks are "
+			            "memfds (KYTY_VK_GUEST_BACKING_MAX_MB)\n",
+			            cap >> 20u);
+			std::fflush(stdout);
+		}
 		if (!vulkan) {
 			fd = static_cast<int>(syscall(SYS_memfd_create, "KytyDirectMemory", 0));
 			if (fd < 0 || ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
 				EXIT("direct-memory backing: memfd for chunk %u failed: %d\n", index, errno);
 			}
-			if (m_memfd_chunks++ == 0) {
+			if (m_memfd_chunks++ == 0 && !over_cap) {
 				std::printf("Vulkan guest backing: chunk %u falls back to a memfd (no zero-copy "
 				            "there)\n",
 				            index);
@@ -928,6 +944,7 @@ private:
 	uint32_t              m_chunk_count  = 0;
 	uint32_t              m_memfd_chunks = 0;
 	uint64_t              m_vulkan_bytes = 0;
+	bool                  m_cap_logged   = false;
 	std::mutex            m_chunk_mutex;
 #endif
 #endif

@@ -723,31 +723,44 @@ void TestVulkanGuestBackingViews() {
 	// Each half lies in one chunk; the whole range does not.
 	const auto alias = Memory::ContiguousBackingAlias(base_a, size);
 	Check(test, alias != 0, "range across chunks has no contiguous alias");
-	Memory::VulkanBackingChunk first;
-	Memory::VulkanBackingChunk second;
-	Memory::VulkanBackingChunk both;
-	Check(test,
-	      Memory::FindVulkanBackingChunk(alias, half, &first) && first.index == 0 &&
-	          first.offset == chunk - half && first.size == chunk,
-	      "first half is not in Vulkan chunk 0 (did the chunk fall back to a memfd?)");
-	Check(test,
-	      Memory::FindVulkanBackingChunk(alias + half, half, &second) && second.index == 1 &&
-	          second.offset == 0,
-	      "second half is not at the start of Vulkan chunk 1");
-	Check(test, !Memory::FindVulkanBackingChunk(alias, size, &both),
-	      "a range across chunks was reported as one chunk");
+	// KYTY_VK_GUEST_BACKING_MAX_MB=0: every chunk is a memfd of its own; nothing to import.
+	const char* cap      = std::getenv("KYTY_VK_GUEST_BACKING_MAX_MB");
+	const bool  all_memfd = cap != nullptr && std::strcmp(cap, "0") == 0;
+	Memory::VulkanBackingChunk none;
+	if (all_memfd) {
+		Check(test,
+		      !Memory::FindVulkanBackingChunk(alias, half, &none) &&
+		          Memory::DupVulkanBackingChunk(0) < 0 && Memory::DupVulkanBackingChunk(1) < 0,
+		      "a memfd chunk was reported as Vulkan memory");
+	}
+	if (!all_memfd) {
+		Memory::VulkanBackingChunk first;
+		Memory::VulkanBackingChunk second;
+		Memory::VulkanBackingChunk both;
+		Check(test,
+		      Memory::FindVulkanBackingChunk(alias, half, &first) && first.index == 0 &&
+		          first.offset == chunk - half && first.size == chunk,
+		      "first half is not in Vulkan chunk 0 (did the chunk fall back to a memfd?)");
+		Check(test,
+		      Memory::FindVulkanBackingChunk(alias + half, half, &second) && second.index == 1 &&
+		          second.offset == 0,
+		      "second half is not at the start of Vulkan chunk 1");
+		Check(test, !Memory::FindVulkanBackingChunk(alias, size, &both),
+		      "a range across chunks was reported as one chunk");
 
-	// What the renderer imports: a descriptor of chunk 1 maps the same memory.
-	const int fd = Memory::DupVulkanBackingChunk(1);
-	Check(test, fd >= 0, "DupVulkanBackingChunk failed");
-	auto* imported =
-	    static_cast<uint8_t*>(mmap(nullptr, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-	Check(test, imported != MAP_FAILED, "chunk descriptor can't be mapped");
-	Check(test, imported[16] == 0x77 && imported[17] == 0x55, "chunk mapping misses guest writes");
-	imported[32] = 0x99;
-	Check(test, a[half + 32] == 0x99 && b[half + 32] == 0x99, "guest views miss a chunk write");
-	munmap(imported, 0x10000);
-	close(fd);
+		// What the renderer imports: a descriptor of chunk 1 maps the same memory.
+		const int fd = Memory::DupVulkanBackingChunk(1);
+		Check(test, fd >= 0, "DupVulkanBackingChunk failed");
+		auto* imported = static_cast<uint8_t*>(
+		    mmap(nullptr, 0x10000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
+		Check(test, imported != MAP_FAILED, "chunk descriptor can't be mapped");
+		Check(test, imported[16] == 0x77 && imported[17] == 0x55,
+		      "chunk mapping misses guest writes");
+		imported[32] = 0x99;
+		Check(test, a[half + 32] == 0x99 && b[half + 32] == 0x99, "guest views miss a chunk write");
+		munmap(imported, 0x10000);
+		close(fd);
+	}
 
 	// Protection across the boundary: a read-only page refuses a kernel write (no signal needed).
 	CheckOk(test, Memory::KernelMprotect(a + half - 0x4000, 0x8000, SceKernelProtCpuRead),

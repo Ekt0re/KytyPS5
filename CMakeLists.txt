@@ -927,6 +927,11 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
 		set_tests_properties(virtual_memory_allocation_vk_backing PROPERTIES
 			ENVIRONMENT "KYTY_VK_GUEST_BACKING=1")
+		# Chunked, but every chunk a memfd (the cap's fallback).
+		add_test(NAME virtual_memory_allocation_vk_backing_memfd
+			COMMAND $<TARGET_FILE:virtual_memory_allocation_tests>)
+		set_tests_properties(virtual_memory_allocation_vk_backing_memfd PROPERTIES
+			ENVIRONMENT "KYTY_VK_GUEST_BACKING=1;KYTY_VK_GUEST_BACKING_MAX_MB=0")
 	endif()
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
