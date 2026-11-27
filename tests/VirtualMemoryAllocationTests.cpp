@@ -2824,6 +2824,94 @@ void TestDirectReleaseUnmapsGpuRuns() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+std::vector<std::pair<uint64_t, size_t>> g_gpu_fresh_maps;
+
+void ObserveGpuFreshMap(uint64_t address, size_t size) {
+	g_gpu_fresh_maps.emplace_back(address, size);
+}
+
+// A map over a free or reserved range does not wait for the GPU thread; a map that replaces
+// memory the guest and the GPU could use does.
+void TestFreshMapsDoNotWaitForGpu() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test     = "FreshMapsDoNotWaitForGpu";
+	constexpr uint64_t page     = SceKernelPageSize;
+	int64_t            physical = -1;
+	CheckOk(test,
+	        KernelAllocateDirectMemory(0, KernelGetDirectMemorySize(), 4 * page, page,
+	                                   SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* reserve = nullptr;
+	CheckOk(test, KernelReserveVirtualRange(&reserve, 4 * page, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(reserve);
+	using Fresh     = std::vector<std::pair<uint64_t, size_t>>;
+	g_gpu_range_events.clear();
+	g_gpu_fresh_maps.clear();
+	TestSetGpuRangeCallback(ObserveGpuRange);
+	TestSetGpuFreshMapCallback(ObserveGpuFreshMap);
+
+	// Direct memory over a reserved span, the way a game commits a heap page by page.
+	void* address = reinterpret_cast<void*>(base);
+	CheckOk(test,
+	        KernelMapDirectMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed, physical,
+	                              page),
+	        "KernelMapDirectMemory(reserved)");
+	Check(test, g_gpu_fresh_maps == Fresh {{base, page}},
+	      "a direct map over a reserved span waited for the GPU thread");
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {true, base, page}},
+	      "a direct map over a reserved span did not drop and map its range on the GPU");
+
+	// The same addresses again, now live: the GPU may hold data for them and use them.
+	g_gpu_range_events.clear();
+	g_gpu_fresh_maps.clear();
+	CheckOk(test,
+	        KernelMapDirectMemory(&address, page, SceKernelProtCpuRw, SceKernelMapFixed,
+	                              physical + page, page),
+	        "KernelMapDirectMemory(live direct)");
+	Check(test, g_gpu_fresh_maps.empty(), "a direct map over live memory did not wait for the GPU");
+	Check(test,
+	      g_gpu_range_events ==
+	          std::vector<GpuRangeEvent> {{false, base, page}, {true, base, page}},
+	      "a direct map over live memory did not unmap and map its range on the GPU");
+
+	// Flexible memory over the rest of the reservation, then over itself.
+	g_gpu_range_events.clear();
+	void* flexible = reinterpret_cast<void*>(base + 2 * page);
+	CheckOk(test, KernelMapFlexibleMemory(&flexible, page, SceKernelProtCpuRw, SceKernelMapFixed),
+	        "KernelMapFlexibleMemory(reserved)");
+	Check(test, g_gpu_fresh_maps == Fresh {{base + 2 * page, page}},
+	      "a flexible map over a reserved span waited for the GPU thread");
+	g_gpu_fresh_maps.clear();
+	CheckOk(test, KernelMapFlexibleMemory(&flexible, page, SceKernelProtCpuRw, SceKernelMapFixed),
+	        "KernelMapFlexibleMemory(live flexible)");
+	Check(test, g_gpu_fresh_maps.empty(),
+	      "a flexible map over live memory did not wait for the GPU");
+	Check(test,
+	      !g_gpu_range_events.empty() &&
+	          g_gpu_range_events.back() == GpuRangeEvent {true, base + 2 * page, page} &&
+	          std::ranges::count(g_gpu_range_events,
+	                             GpuRangeEvent {false, base + 2 * page, page}) >= 2,
+	      "a flexible map over live memory did not unmap its range on the GPU");
+
+	// A map the kernel places itself lands in free space.
+	g_gpu_fresh_maps.clear();
+	void* placed = nullptr;
+	CheckOk(test, KernelMapDirectMemory(&placed, page, SceKernelProtCpuRw, 0, physical + 2 * page, page),
+	        "KernelMapDirectMemory(free)");
+	Check(test, g_gpu_fresh_maps == Fresh {{reinterpret_cast<uint64_t>(placed), page}},
+	      "a direct map into free space waited for the GPU thread");
+
+	TestSetGpuFreshMapCallback(nullptr);
+	TestSetGpuRangeCallback(nullptr);
+	CheckOk(test, KernelMunmap(reinterpret_cast<uint64_t>(placed), page), "KernelMunmap(placed)");
+	CheckOk(test, KernelMunmap(base, 4 * page), "KernelMunmap(reservation)");
+	CheckOk(test, KernelReleaseDirectMemory(physical, 4 * page), "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestDirectReleaseContracts() {
 	const char* test = "DirectReleaseContracts";
 	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(0, 0),
@@ -6608,6 +6696,7 @@ int main(int argc, char** argv) {
 	RunTest(TestBatchMappingOperationsAndPartialFailure);
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseUnmapsGpuRuns);
+	RunTest(TestFreshMapsDoNotWaitForGpu);
 	RunTest(TestDirectReleaseContracts);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);

@@ -29,6 +29,10 @@ public:
 
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
+	// Commands sent to the GPU thread that it has not started yet.
+	[[nodiscard]] uint32_t PendingCommands() const noexcept {
+		return m_pending_commands.load(std::memory_order_acquire);
+	}
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 

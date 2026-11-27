@@ -278,6 +278,9 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
+// Called for a map the GPU thread is not waited for (the range was free or reserved); the range
+// callback then sees its unmap and map.
+void     TestSetGpuFreshMapCallback(void (*callback)(uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
