@@ -224,6 +224,10 @@ private:
 	// download copies every buffer of the access's window, in the open command buffer's
 	// submission when it can run detached.
 	[[nodiscard]] bool BatchReadback();
+	// KYTY_RB_QUEUE_PROBE=1 (with KYTY_PERF_SUMMARY): measures the GPU queue ahead of each
+	// synchronous download and waits for its producing tick first, timed on its own.
+	[[nodiscard]] static bool QueueProbe();
+	void                      ProbeReadbackQueue(const std::vector<DownloadPart>& parts);
 	// The batched download of a CPU access at [vaddr, vaddr + size) in buffer `first_id`, whose
 	// own window is `first_window`: that window and the GPU-written bytes of every other
 	// non-zero-copy buffer in the access's aligned window, in one copy sequence, then all those

@@ -50,6 +50,13 @@ enum class Counter {
 	RbCopyUs,     // ... copying the bytes into guest memory.
 	RbWriteCalls, // ReadMemory requests of guest write faults on GPU-written pages.
 	RbWriteUs,    // Their microseconds (part of rb_handler_us).
+	// KYTY_RB_QUEUE_PROBE=1, per synchronous download: how much GPU work is queued ahead of it.
+	RbQueueTicks,       // Submitted, unfinished ticks when it starts (sum).
+	RbProducerDone,     // Downloads whose buffers' last write had already finished.
+	RbProducerPending,  // Downloads whose producing tick was submitted and still running.
+	RbProducerOpen,     // Downloads whose producing tick is the open (unsubmitted) one.
+	RbAfterTicks,       // Pending: submitted ticks queued behind the producing tick (sum).
+	RbProducerWaitUs,   // Pending: microseconds until the producing tick finished.
 	Count
 };
 

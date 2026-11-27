@@ -291,6 +291,9 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 		return;
 	}
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbBatches);
+	if (QueueProbe()) {
+		ProbeReadbackQueue(parts);
+	}
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::SyncReadbacks,
 	                                         Common::DebugCounters::Counter::SyncReadbackNs);
 	using Common::PerfSummary::Counter;
@@ -541,6 +544,41 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			MaybeMigrateToZeroCopy(buffer_id);
 		}
 	});
+}
+
+bool BufferCache::QueueProbe() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_RB_QUEUE_PROBE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled && Common::PerfSummary::Enabled();
+}
+
+void BufferCache::ProbeReadbackQueue(const std::vector<DownloadPart>& parts) {
+	using Common::PerfSummary::Counter;
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const auto submitted = master.SubmittedTick();
+	const auto done      = master.KnownGpuTick();
+	Common::PerfSummary::Add(Counter::RbQueueTicks, submitted > done ? submitted - done : 0);
+	uint64_t producer = 0;
+	for (const auto& part: parts) {
+		producer = std::max(producer, part.buffer->probe_write_tick);
+	}
+	if (producer <= done) {
+		Common::PerfSummary::Add(Counter::RbProducerDone);
+		return;
+	}
+	if (producer > submitted) {
+		Common::PerfSummary::Add(Counter::RbProducerOpen);
+		return;
+	}
+	Common::PerfSummary::Add(Counter::RbProducerPending);
+	Common::PerfSummary::Add(Counter::RbAfterTicks, submitted - producer);
+	// The download waits for this anyway: timing it separately splits the wait into the part
+	// up to the producing work and the part for work queued behind it.
+	Common::PerfSummary::ScopedMicros timer(Counter::RbProducerWaitUs);
+	master.Wait(producer);
 }
 
 bool BufferCache::BatchReadback() {
@@ -1093,6 +1131,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
+	if (is_written) {
+		buffer.probe_write_tick = m_scheduler.CurrentTick();
+	}
 	if (is_written && buffer.IsZeroCopy() && buffer.release_tick != buffer.last_write_tick) {
 		static const bool release = [] {
 			const char* text = std::getenv("KYTY_ZERO_COPY_RELEASE");

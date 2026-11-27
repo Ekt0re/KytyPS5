@@ -34,6 +34,8 @@ constexpr std::array<const char*, N> g_names = {
      "rb_calls",  "rb_batches",  "rb_submits",          "rb_fused",
     "rb_extra_bufs", "rb_neighbour", "rb_handler_us", "rb_flush_us",   "rb_submit_us",
     "rb_wait_us",    "rb_copy_us",    "rb_write_calls", "rb_write_us",
+    "rb_queue_ticks", "rb_prod_done", "rb_prod_pending", "rb_prod_open", "rb_after_ticks",
+    "rb_prod_wait_us",
 };
 
 struct Sample {
