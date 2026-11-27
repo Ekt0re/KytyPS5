@@ -17,11 +17,14 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/memAccount.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <fmt/format.h>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -52,6 +55,22 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	Common::MemAccount::SetExternal("vk", [this] {
+		if (allocator == nullptr) return std::string("none");
+		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(allocator, budgets);
+		uint64_t device_bytes = 0;
+		uint64_t host_bytes   = 0;
+		for (uint32_t i = 0; i < physical_device_memory_properties.memoryHeapCount; i++) {
+			const bool dev = static_cast<bool>(
+			    physical_device_memory_properties.memoryHeaps[i].flags &
+			    vk::MemoryHeapFlagBits::eDeviceLocal);
+			(dev ? device_bytes : host_bytes) += budgets[i].usage;
+		}
+		return fmt::format("device={:.0f}MiB host={:.0f}MiB",
+		                   static_cast<double>(device_bytes) / 1048576.0,
+		                   static_cast<double>(host_bytes) / 1048576.0);
+	});
 	return true;
 }
 
@@ -59,6 +78,7 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	Common::MemAccount::ClearExternal("vk");
 	BdaGuard::Shutdown(); // Buffers KYTY_BDA_GUARD=2 kept alive.
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;

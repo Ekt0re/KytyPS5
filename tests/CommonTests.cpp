@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/memAccount.h"
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -477,6 +478,89 @@ TEST(Thread, ReservesTheFastestCoreAndRestoresTheProcessAffinity) {
 	EXPECT_TRUE(CPU_EQUAL(&restored, &reserved));
 }
 #endif
+
+TEST(MemAccount, ParseProcStatusAndZramFootprint) {
+	const auto memory = Common::MemAccount::ParseProcStatus(
+	    "VmRSS:\t 1000 kB\nVmSwap:\t 1000 kB\nVmHWM:\t 1200 kB\n"
+	    "RssAnon:\t 600 kB\nRssFile:\t 300 kB\nRssShmem:\t 100 kB\n");
+	EXPECT_TRUE(memory.available);
+	EXPECT_EQ(memory.rss, 1000u * 1024u);
+	EXPECT_EQ(memory.swap, 1000u * 1024u);
+	EXPECT_EQ(memory.peak_rss, 1200u * 1024u);
+	EXPECT_EQ(memory.rss_anon, 600u * 1024u);
+	EXPECT_EQ(memory.rss_file, 300u * 1024u);
+	EXPECT_EQ(memory.rss_shmem, 100u * 1024u);
+	EXPECT_FALSE(Common::MemAccount::ParseProcStatus("no matching keys").available);
+
+	const auto zram = Common::MemAccount::ParseZramMmStat("8000 2000 2400 0 3000 5 0 0 0\n");
+	EXPECT_TRUE(zram.known);
+	EXPECT_EQ(zram.orig, 8000u);
+	EXPECT_EQ(zram.compressed, 2400u);
+	Common::MemAccount::ProcessMemory p;
+	p.available = true;
+	p.rss       = 1000;
+	p.swap      = 1000;
+	EXPECT_EQ(Common::MemAccount::Footprint(p, zram), 1300u);
+	EXPECT_EQ(Common::MemAccount::Footprint(p, {}), 2000u);
+	EXPECT_FALSE(Common::MemAccount::ParseZramMmStat("garbage").known);
+}
+
+TEST(MemAccount, FormatLineAndGrowthCoverInjectedAndUnavailableFigures) {
+	Common::MemAccount::Sample sample;
+	sample.process.available        = true;
+	sample.process.rss              = 3ull << 30;
+	sample.process.private_bytes    = 2ull << 30;
+	sample.process.swap             = 1ull << 30;
+	sample.process.peak_rss         = 4ull << 30;
+	sample.process.rss_shmem        = 1ull << 30;
+	sample.process.sys_commit_used  = 10ull << 30;
+	sample.process.sys_commit_total = 32ull << 30;
+	sample.heap                     = {.known = true, .in_use = 512ull << 20, .free_held = 64ull << 20};
+	sample.owners                   = {{"shader-store", 256ull << 20, 42}};
+	sample.zram                     = {.known = true, .orig = 4ull << 30, .compressed = 1ull << 30};
+	sample.guest_committed          = 16ull << 30;
+	sample.external                 = {{"vk", "device=800MiB host=128MiB"}};
+
+	const auto line = Common::MemAccount::FormatLine(sample, "now");
+	EXPECT_NE(line.find("[mem] now "), std::string::npos) << line;
+	EXPECT_NE(line.find("rss=3072MiB private=2048MiB swap=1024MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("counted=256MiB unaccounted=2816MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("shader-store=256MiB(42)"), std::string::npos) << line;
+	EXPECT_NE(line.find("heap-in-use=512MiB heap-free-held=64MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("footprint=3328MiB zram=4096MiB->1024MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("sys-commit=10240MiB/32768MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("guest: committed=16384MiB touched=1024MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("vk: device=800MiB host=128MiB"), std::string::npos) << line;
+
+	Common::MemAccount::Sample unavailable;
+	const auto                 na_line = Common::MemAccount::FormatLine(unavailable, "na");
+	EXPECT_NE(na_line.find("rss=not-available"), std::string::npos) << na_line;
+
+	const std::vector<std::pair<std::string, uint64_t>> before {
+	    {"heap-in-use", 100ull << 20}, {"shader-store", 10ull << 20}};
+	const std::vector<std::pair<std::string, uint64_t>> after {
+	    {"heap-in-use", 400ull << 20}, {"shader-store", 30ull << 20}};
+	EXPECT_EQ(Common::MemAccount::FormatGrowth(before, after, 2),
+	          "heap-in-use +300MiB, shader-store +20MiB");
+	EXPECT_EQ(Common::MemAccount::FormatGrowth(after, before), "nothing");
+}
+
+TEST(MemAccount, LimitGuardDropsThenStopsOnlyWhileOver) {
+	using Action = Common::MemAccount::LimitGuard::Action;
+	Common::MemAccount::LimitGuard off(0);
+	EXPECT_EQ(off.Step(0, 1000), Action::None);
+	EXPECT_EQ(off.Step(20000, 1000), Action::None);
+
+	Common::MemAccount::LimitGuard guard(100, 10000);
+	EXPECT_EQ(guard.Step(1000, 100), Action::None);
+	EXPECT_EQ(guard.Step(2000, 101), Action::DropCaches);
+	EXPECT_EQ(guard.Step(11999, 101), Action::None);
+	// Dropping back under resets the grace timer.
+	EXPECT_EQ(guard.Step(12000, 90), Action::None);
+	EXPECT_EQ(guard.Step(13000, 150), Action::DropCaches);
+	EXPECT_EQ(guard.Step(22999, 150), Action::None);
+	EXPECT_EQ(guard.Step(23000, 150), Action::Stop);
+}
 
 } // namespace
 

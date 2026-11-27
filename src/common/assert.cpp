@@ -1,5 +1,6 @@
 #include "common/assert.h"
 
+#include "common/memAccount.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
@@ -20,6 +21,7 @@ thread_local std::jmp_buf* g_dbg_recover = nullptr;
 	if (auto* recover = std::exchange(g_dbg_recover, nullptr); recover != nullptr) {
 		std::longjmp(*recover, 1);
 	}
+	MemAccount::NoteExitReason("fatal");
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 	std::_Exit(321);

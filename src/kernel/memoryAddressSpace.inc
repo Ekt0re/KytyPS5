@@ -219,6 +219,7 @@ public:
 		ExcludeFromCoreDumps();
 #endif
 #endif
+		Common::MemAccount::NoteGuestBacking(m_size);
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)

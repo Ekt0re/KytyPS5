@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/memAccount.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
