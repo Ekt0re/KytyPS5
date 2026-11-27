@@ -38042,6 +38042,33 @@ TestCase SimpleLoop() {
            O::S_BRANCH, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// A loop whose exit test never passes in practice (s0 reaches -1 only after 2^32 - 1 rounds)
+// stores its count every round. The loop guard (Spirv::LoopIterationLimit) ends the invocation
+// when the header is entered once more than the limit, so the last stored count is the limit.
+// Without the guard the dispatch would run 2^32 rounds and store 0 at the wrap.
+TestCase LoopIterationLimitEndsEndlessLoop() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeSMovB32(0, InlineU32(0)),
+      EncodeSopc(0x06, 0, 193u), // s_cmp_eq_u32 s0, -1
+      EncodeSopp(0x05, 5),       // s_cbranch_scc1 -> s_endpgm
+      EncodeSop2(0x00, 0, 0, InlineU32(1)),
+      EncodeVop1(0x01, 0, 0),
+  };
+  AppendBufferStoreDword(&code, 0, 30);
+  code.push_back(EncodeSopp(0x02, 0xfff9u)); // s_branch -> s_cmp_eq_u32
+  AppendEnd(&code);
+  TestCase test{"LoopIterationLimitEndsEndlessLoop",
+                code,
+                {},
+                {ShaderRecompiler::Spirv::LoopIterationLimit()},
+                {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
+                 O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_BRANCH, O::S_ENDPGM}};
+  test.required_spirv = {"OpLoopMerge", "OpUGreaterThan"};
+  return test;
+}
+
 TestCase SharedReturnKeepsSelectedValues() {
   using O = ShaderOpcode;
 
@@ -52419,6 +52446,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
+  if (ShaderRecompiler::Spirv::LoopIterationLimit() != 0) {
+    AddCase(LoopIterationLimitEndsEndlessLoop);
+  }
   AddCase(SharedReturnKeepsSelectedValues);
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);

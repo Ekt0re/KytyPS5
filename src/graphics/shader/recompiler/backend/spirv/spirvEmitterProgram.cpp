@@ -3,6 +3,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <functional>
@@ -95,6 +96,46 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
+// After a loop header's merge instruction: count the iteration and leave the shader when the
+// budget (Spirv::LoopIterationLimit) is spent. The header's own branch follows in the block this
+// opens.
+void EmitLoopFuelGuard(EmitterState& state) {
+	if (state.loop_fuel_variable == 0) {
+		return;
+	}
+	const auto guard  = state.builder.AllocateId();
+	const auto spent  = state.builder.AllocateId();
+	const auto resume = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, guard);
+	EmitLabel(state, guard);
+	const auto used = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), used, state.loop_fuel_variable);
+	const auto next = EmitAddU32(state, used, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, state.loop_fuel_variable, next);
+	const auto over = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThan, TypeBool(state), over, next,
+	                          ConstantU32(state, LoopIterationLimit()));
+	// Guest loops branch on scalar conditions, so the invocations of a subgroup enter the same
+	// headers and their counts agree, but the branch has to be visibly subgroup-uniform too: with
+	// a per-invocation return here, the loop's subgroup shuffles read wrong values on NVIDIA
+	// (ScalarBufferFromLoopReadlane64). So the subgroup leaves together when any active invocation
+	// is over the limit, through a ballot compared with zero as in the scalar-branch guards.
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), over);
+	const auto words = Binary(state, spv::OpINotEqual, TypeBoolVector(state, 4), ballot,
+	                          ConstantU32CompositeZero(state, 4));
+	const auto any   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAny, TypeBool(state), any, words);
+	state.builder.AddFunction(spv::OpSelectionMerge, resume, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, any, spent, resume);
+	EmitLabel(state, spent);
+	state.builder.AddFunction(spv::OpReturn);
+	EmitLabel(state, resume);
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	const auto& term       = block->terminator;
 	const auto  emit_merge = [&]() {
@@ -104,6 +145,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 			if (merge != nullptr && cont != nullptr) {
 				ctx.state.builder.AddFunction(spv::OpLoopMerge, merge->Definition(),
 				                              cont->Definition(), spv::LoopControlMaskNone);
+				EmitLoopFuelGuard(ctx.state);
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
 		           term.merge_block != nullptr) {
@@ -342,8 +384,9 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
-		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
+		// After the terminator: a loop header's guard moves its branch into a later block.
+		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 	}
 	PatchStructuredPhis(ctx, structured);
 }
@@ -708,6 +751,17 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (!state.program.dispatcher_fallback && LoopIterationLimit() != 0 &&
+	    std::ranges::any_of(program.blocks, [](const IR::Block* block) {
+		    const auto& term = block->terminator;
+		    return term.loop_header && term.merge_block != nullptr &&
+		           term.continue_block != nullptr;
+	    })) {
+		state.loop_fuel_variable = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_fuel_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -737,6 +791,9 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	if (state.loop_fuel_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_fuel_variable, ConstantU32(state, 0));
+	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
@@ -764,3 +821,28 @@ void EmitProgram(EmitterState& state) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+namespace {
+
+std::atomic<uint32_t> g_loop_iteration_limit_default {DefaultLoopIterationLimit};
+
+} // namespace
+
+void SetLoopIterationLimitDefault(uint32_t limit) {
+	g_loop_iteration_limit_default.store(limit, std::memory_order_relaxed);
+}
+
+uint32_t LoopIterationLimit() {
+	// -1: no KYTY_SHADER_LOOP_LIMIT, the default decides.
+	static const int64_t forced = [] {
+		const char* text = std::getenv("KYTY_SHADER_LOOP_LIMIT");
+		return text != nullptr && text[0] != '\0'
+		           ? static_cast<int64_t>(static_cast<uint32_t>(std::strtoul(text, nullptr, 0)))
+		           : int64_t {-1};
+	}();
+	return forced >= 0 ? static_cast<uint32_t>(forced)
+	                   : g_loop_iteration_limit_default.load(std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

@@ -46,6 +46,18 @@ inline constexpr Profile DefaultProfile {};
 void SetBallotGuardsDefault(bool enabled);
 bool BallotGuardsEnabled();
 
+// A guest loop that takes its bound or its next node from memory never ends when that memory
+// holds something else (a pass that was left out, a buffer not written yet), and one endless
+// invocation hangs the host GPU until the driver resets it. Each invocation therefore leaves the
+// shader once its subgroup has run this many loop iterations, all its loops together (structured
+// loops only). KYTY_SHADER_LOOP_LIMIT=<n> changes the limit and 0 removes the guard; without it
+// the default applies (DefaultLoopIterationLimit; tests change it with
+// SetLoopIterationLimitDefault). The limit is part of the emitted code but not of Profile: the
+// shader store key changes while it is away from DefaultLoopIterationLimit.
+inline constexpr uint32_t DefaultLoopIterationLimit = 1u << 16u;
+void                      SetLoopIterationLimitDefault(uint32_t limit);
+uint32_t                  LoopIterationLimit();
+
 // KYTY_RT_OFF=1: BVH node tests always miss (an empty scene). Not part of Profile, so the shader
 // store header stays; the pipeline cache neither loads nor stores BVH modules while it is set.
 bool BvhIntersectAlwaysMisses();

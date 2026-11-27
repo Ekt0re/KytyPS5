@@ -14097,6 +14097,43 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 #include "ShaderRayTracingTests.inc"
 
+// The loop guard (Spirv::LoopIterationLimit). The structural fixtures run without it, since it adds
+// a counter, a selection and a return to every loop header; here one loop is emitted both ways.
+void TestSpirvLoopIterationGuard() {
+  using namespace ShaderRecompiler;
+  if (std::getenv("KYTY_SHADER_LOOP_LIMIT") != nullptr) {
+    return; // The variable overrides the default this test switches.
+  }
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 128),       // s0 = 0
+      EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 2),         // break when scc == 0
+      EncodeSop2(0x00, 0, 0, 129), // s_add_u32 s0, s0, 1
+      EncodeSopp(0x02, 0xfffcu),   // continue/backedge
+      EncodeSopp(0x01),
+  };
+  const auto options = MakeCompileOptions(ShaderType::Compute);
+  const auto plain = RecompileForTest(shader, options).spirv;
+  Spirv::SetLoopIterationLimitDefault(1000);
+  const auto guarded = RecompileForTest(shader, options).spirv;
+  Spirv::SetLoopIterationLimitDefault(0);
+  CheckSpirvBinaryValidates(plain);
+  CheckSpirvBinaryValidates(guarded);
+  const auto count = [](const std::vector<uint32_t> &binary, spv::Op op) {
+    return SpirvInstructionOpcodeCount(binary, op);
+  };
+  Check(count(plain, spv::OpLoopMerge) == 1 && count(guarded, spv::OpLoopMerge) == 1 &&
+            MeasureSpirv(guarded).function_variables ==
+                MeasureSpirv(plain).function_variables + 1 &&
+            count(guarded, spv::OpUGreaterThan) == count(plain, spv::OpUGreaterThan) + 1 &&
+            count(guarded, spv::OpGroupNonUniformBallot) ==
+                count(plain, spv::OpGroupNonUniformBallot) + 1 &&
+            count(guarded, spv::OpSelectionMerge) == count(plain, spv::OpSelectionMerge) + 1 &&
+            count(guarded, spv::OpReturn) == count(plain, spv::OpReturn) + 1 &&
+            SpirvContainsCapability(guarded, spv::CapabilityGroupNonUniformBallot),
+        "loop guard: expected one counter, one ballot-guarded return per loop header");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -14104,6 +14141,10 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // The fixtures measure the translator's own control flow and size; the loop guard has its own
+  // test (TestSpirvLoopIterationGuard).
+  ShaderRecompiler::Spirv::SetLoopIterationLimitDefault(0);
+  TestSpirvLoopIterationGuard();
   TestVop3FloatConversionDecode();
   TestRayTracingInstructions();
   TestShaderBufferResourceSize();
