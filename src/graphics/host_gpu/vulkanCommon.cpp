@@ -4,6 +4,8 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cstdlib>
+#include <vector>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -124,6 +126,21 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 }
 
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	// KYTY_PIPELINE_COLD_SALT=<n> (default 0, off), for measuring driver compile times: the SPIR-V
+	// id bound is raised by n before the module is created. The module stays valid and means the
+	// same, but its bytes differ, so the driver's own disk cache cannot serve the pipelines built
+	// from it. Use a new n for every run that should be cold, and KYTY_PIPELINE_BINARIES=0 with it:
+	// the binary store's key covers the module too, so it would only grow by a full set per run.
+	static const uint32_t salt = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_COLD_SALT");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	std::vector<uint32_t> salted;
+	if (salt != 0 && code.size() > 5 && code[0] == 0x07230203u) {
+		salted.assign(code.begin(), code.end());
+		salted[3] += salt;
+		code = salted;
+	}
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();
 	create_info.pCode       = code.data();
