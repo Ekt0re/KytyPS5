@@ -698,12 +698,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	queue_create_infos[0] = vk::DeviceQueueCreateInfo {
 	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = &queue_priority};
 	uint32_t queue_create_count = 1;
-	// KYTY_COPY_QUEUE=1: a second queue for synchronous buffer readbacks, from a family with
-	// compute or transfer but without graphics (RADV: the compute family). Without one (or
-	// without the switch) everything stays on the one universal queue.
+	// A second queue for synchronous buffer readbacks, from a family with compute or transfer but
+	// without graphics (RADV: the compute family). On by default (xq_ab1, world: readback
+	// ms/f -9%, gpu_cpu_us/op -17%); KYTY_COPY_QUEUE=0 turns it off. Without such a family
+	// everything stays on the one universal queue.
 	graphics.copy_queue_family = static_cast<uint32_t>(-1);
 	if (const char* copy_queue = std::getenv("KYTY_COPY_QUEUE");
-	    copy_queue != nullptr && copy_queue[0] == '1') {
+	    copy_queue == nullptr || copy_queue[0] != '0') {
 		uint32_t family_count = 0;
 		physical_device.getQueueFamilyProperties(&family_count, nullptr);
 		std::vector<vk::QueueFamilyProperties> families(family_count);

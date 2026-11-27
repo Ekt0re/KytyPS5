@@ -224,7 +224,7 @@ private:
 	// download copies every buffer of the access's window, in the open command buffer's
 	// submission when it can run detached.
 	[[nodiscard]] bool BatchReadback();
-	// KYTY_COPY_QUEUE=1 (the device then has a copy queue), overridden by toggle copy_queue when
+	// KYTY_COPY_QUEUE (default 1; the device then has a copy queue), overridden by toggle copy_queue when
 	// the toggle file has that line (re-read 4x per second): detached synchronous downloads copy
 	// on the copy queue (ReadbackBatch::ReadbackPath::CopyQueue).
 	[[nodiscard]] bool        CopyQueue();
