@@ -604,6 +604,13 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	});
 	RetainModuleSpirv(module, result.spirv);
 	m_compiled[static_cast<size_t>(key.stage)]++;
+	// Diagnostic for scripts/pipeline-ab.py and compile-report.py: which modules a run compiles
+	// instead of loading, and their SPIR-V size.
+	std::printf("ShaderModule: stage=%s hash=%016llx id=%016llx spirv_words=%zu spirv_xxh=%016llx\n",
+	            stage, static_cast<unsigned long long>(key.hash), static_cast<unsigned long long>(id),
+	            result.spirv.size(),
+	            static_cast<unsigned long long>(
+	                XXH3_64bits(result.spirv.data(), result.spirv.size() * 4u)));
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
 	            m_compiled[static_cast<size_t>(ShaderType::Vertex)],

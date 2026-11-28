@@ -641,6 +641,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
+	const auto create_start = std::chrono::steady_clock::now();
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
 	const auto result =
 	    PipelineBinaryStore::Get().CreateGraphics(graphics, driver_cache, pipeline_info, &pipeline);
@@ -663,6 +664,16 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		ExitPipelineFailure("vkCreateGraphicsPipelines", result, stages);
 	}
 	NamePipeline(graphics, pipeline, stages);
+	// Diagnostic for scripts/pipeline-ab.py and compile-report.py: slow driver creations.
+	if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	        std::chrono::steady_clock::now() - create_start).count(); ms >= 200) {
+		std::string ids;
+		for (const auto* stage: stages) {
+			if (stage != nullptr) ids += fmt::format(" {:016x}", stage->id);
+		}
+		std::printf("GraphicsPipeline: modules=%s driver_ms=%lld (%s)\n", ids.c_str(),
+		            static_cast<long long>(ms), PipelineBinaryStore::LastSource());
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -736,6 +747,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
+	const auto create_start = std::chrono::steady_clock::now();
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
 	const auto result =
 	    PipelineBinaryStore::Get().CreateCompute(graphics, driver_cache, info, &pipeline);
@@ -760,6 +772,13 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	}
 	const auto* stage = &module;
 	NamePipeline(graphics, pipeline, {&stage, 1});
+	// Diagnostic for scripts/pipeline-ab.py and compile-report.py: slow driver creations.
+	if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	        std::chrono::steady_clock::now() - create_start).count(); ms >= 200) {
+		std::printf("ComputePipeline: module=%016llx driver_ms=%lld (%s)\n",
+		            static_cast<unsigned long long>(module.id), static_cast<long long>(ms),
+		            PipelineBinaryStore::LastSource());
+	}
 	return pipeline;
 }
 
