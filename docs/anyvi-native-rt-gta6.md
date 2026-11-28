@@ -7,11 +7,13 @@ Status on 28 November 2026: measured and studied, nothing traces natively yet. T
 ## Short version
 
 - **No GTA VI walk traces natively.** The tree's ray query pass (`RayQueryTraversal.cpp`) rejects all
-  95 BVH walks of the 14 tracing programs a run records. With `--native-rt` the SPIR-V of every compute
-  module is byte-identical to the run without it.
-- **The host mirror could read GTA VI's TLASes.** They are `PSR_BVHL` version 10 headers with
-  properties `0x02020024`, which `Format()` in `gpu_bvh_mirror.comp` accepts. The recognizer is the only
-  gate that is closed.
+  95 BVH walks of the 14 tracing programs a run records. Translated offline with ray queries on and off,
+  the 2,396 compute modules `shader_check` emits are byte-identical. Nine of the 14 tracing programs are
+  among them; the other five cannot be emitted offline (see Reproduce).
+- **The host mirror's TLAS header check passes for GTA VI.** GTA VI's TLASes are `PSR_BVHL` version 10
+  headers with properties `0x02020024`, which `Format()` in `gpu_bvh_mirror.comp` accepts. The BLAS
+  headers and the instance record layout were not checked against the mirror, so they may be further
+  gates.
 - **simnJS/KytyPS5-GTA's recognizer would trace one program of the 14.** That is `9d22ec1f658c72a8`
   (reflections), 4 sites. Porting it means porting simnJS's whole native-forms stack, for one program.
 - **Native RT cannot reduce the `CS_RaytracingResolve` compile time.** None of the 1,487 resolve
@@ -62,15 +64,23 @@ All run in waves of 32 except `aca98a59` (64).
 
 ## What the walks look like
 
-**64-bit walks** (`12d153e6` read in full; the other five have the same loads):
+**64-bit walks** (only `12d153e6` was read; the other five were not):
 - The TLAS header address is the qword at `[s[4:5] + 0x10]`. The walk reads the header's `+0x18`
   (properties), `+0x30` (instance array offset) and `+0x70` (instance count). That is the format-10
   layout.
 - One loop per walk takes TLAS and BLAS nodes. The node address is a 64-bit add, with carry, of the
   node to a base that was shifted by 3 before the loop. It is not `IAdd32(node, low(header >> 3))`.
 - A short per-lane stack lives in LDS and overflows to memory through FLAT.
-- An instance leaf loads the instance node at `+0`, `+40`, `+116`, `+120` and `+124`, and a 64-byte
-  matrix through a V# (four `BUFFER_LOAD_DWORDX4`).
+- **The instance step reads the instance array through a buffer V#**, not by device address:
+  - The V# is built before the loop: base = header + `[header + 0x30]`, stride `0x80` (`s33 | 0x00800000`),
+    records = `[header + 0x70]`.
+  - The instance node's qword gives index `>> 3`, and the flags are tested with `0xda000000`.
+  - Four `BUFFER_LOAD_DWORDX4` read the record's first 64 bytes: the 3x4 matrix; at `+48` BLAS `>> 3` in
+    54 bits, with flags in the top 10 bits of `+52`; and at `+56` the BLAS root node.
+- After the loop, the hit is resolved through FLAT loads:
+  - from the record (`index << 7` into the instance array): `+48`, `+112`, `+116`, `+120`;
+  - from the BLAS header: `+40` and `+124`, which give the primitive record (BLAS + `[+40]` +
+    4 * (primitive - `[+124]`)).
 
 **32-bit walks** (`27eed256` read):
 - The header is at `[s[4:5] + 0x30]` or `+0x10`. The TLAS walk is wave-uniform: scalar loads and SCC
@@ -78,7 +88,23 @@ All run in waves of 32 except `aca98a59` (64).
 - Inside it are a BLAS loop and a loop over leaf records through `S_BUFFER_LOAD`, each with its own
   intersection.
 
-**TLASes seen in a run** (`KYTY_RT_HEADER_PROBE=1`, run `simnrt-on1`):
+**TLASes seen in a run** (`KYTY_RT_HEADER_PROBE=1`, run `simnrt-on1`). Each program's user data table at
+`s[4:5]` (`s[2:3]` for `8a937270`) points to several TLASes:
+
+| Program | Table offset → TLAS (instances) |
+| --- | --- |
+| `0e56209e` | `+0x10` → 1,227; `+0x30` → 3,243 |
+| `12d153e6` | `+0x10` → 1,227; `+0x30` → 3,243; `+0x60` → 1 |
+| `55b2b9b4` | `+0x10` → 1,227; `+0x40` → 3,243 |
+| `6b1826ae`, `95b4ea51` | `+0x20` → 1,227; `+0x40` → 3,243; `+0x60` → 1 |
+| `cdc9b2f7` | `+0x30`/`+0x98` → 1,227; `+0x40`/`+0xb8` → 3,243; `+0xd8` → 1 |
+| `27eed256` | `+0x30` → 13 |
+| `48abbbc3`, `757d1ed1`, `9acddb6d`, `b27252f1` | `+0x10` → 1,227; `+0x30` → 3,243; `+0x50` → 13 |
+| `8a937270` | `s[2:3] + 0x10` → 3,243 |
+| `9d22ec1f` | `+0x10` → 1,227; `+0x40` → 3,243; `+0x70` → 1 |
+
+Which of them each walk traces was read only for `12d153e6` (`+0x10`) and `27eed256` (`+0x30`).
+`aca98a59` did not run in this session.
 
 | Header | Version | Properties | Instances (+0x70) | Instance array (+0x30) |
 | --- | --- | --- | --- | --- |
@@ -126,9 +152,14 @@ that compiles each program as `CheckNativeWalks` does.
       at `+56` exactly once.
     - `6b18` and `95b4` stop at the node-address check itself (401).
     - `cdc9` also stops at 355 (a ray component with no header phi).
-- **Not tested:** simnJS's post-tracking pass on the four programs that stop in resource tracking
-  (`0e56`, `6b18`, `95b4`, `aca9`, and `9d22`). The probe gives no user data, so it is not known whether
-  that pass would take anything there.
+- **Not tested: simnJS's post-tracking ray query pass.** The probe gives no user data or flattened
+  SRT, which that pass needs to find the TLAS slot, so it was not meaningfully exercised for any of the
+  14. Five programs (`0e56`, `6b18`, `95b4`, `aca9`, `9d22`) stop in resource tracking. The other nine
+  compile to the end with no ray query, but that does not show the pass would reject them in the game.
+- **The nearest simnJS form for the 64-bit walks is its format-10 flat walk.** These walks fail it at
+  431/435 because they read the instance record (BLAS `>> 3` at `+48`, root at `+56`) through a buffer
+  V# over the instance array, while the flat form expects device-address loads at those offsets.
+  Accepting the V# path is an edit to `Match(tracked = false)` and its rewrite, not a new form.
 
 ## sce::Psr
 
@@ -151,22 +182,45 @@ that compiles each program as `CheckNativeWalks` does.
 
 ## What a port would need
 
-1. **The recognizer.** Each GTA VI walk shape needs its own form: the 64-bit flat walk with GTA VI's
-   instance node layout, and the wave-uniform 32-bit TLAS > BLAS > records walk. Neither the tree's
-   pass nor simnJS's covers them. simnJS's flat form is the nearest for the 64-bit walks: they pass its
-   node-address path, then fail on the instance root offset.
-2. **The instance record layout of Psr format 10 in GTA VI.** This means the root link, flags, mask
-   and BLAS offsets that the leaf code loads (`+0`, `+40`, `+116`, `+120`, `+124`). The mirror would
-   need them too (`gpu_bvh_mirror.comp`, format 10: BLAS >> 3 at `+48`).
+1. **The recognizer.** Neither the tree's pass nor simnJS's covers GTA VI's walk shapes, except simnJS
+   for one program (`9d22ec1f`).
+   - **64-bit walks:** simnJS's format-10 flat form is the nearest. They pass its node-address path
+     (except `6b18` and `95b4`), then fail because they read the instance record through a buffer V#
+     over the instance array, not by device address. Taking that path is an edit to
+     `Match(tracked = false)` and its rewrite. It sits on top of the whole native-forms stack (`f138efcd`
+     and the commits before it, `93d1d90c`, `6aa0a34c`).
+   - **32-bit walks:** the wave-uniform TLAS > BLAS > records walk needs a form of its own.
+2. **The instance record layout of Psr format 10 in GTA VI.**
+   - **Read so far (64-bit walk, through the V#):** BLAS `>> 3` at `+48` (54 bits, flags in the top 10 bits
+     of `+52`), root at `+56`, and the 3x4 matrix in the first 48 bytes.
+   - **Read after the hit:** `+112`, `+116`, `+120`, and the BLAS header's `+40` and `+124`.
+   - **Not identified:** which bits are the mask and the facing flags.
+   - The mirror reads format-10 records with BLAS `>> 3` at `+48` (`gpu_bvh_mirror.comp`); whether it reads
+     the root at `+56` the same way was not checked.
 3. **The BLAS headers.** They were not probed. Static BLASes ship prebuilt in `pack/core_bvh4`
    (compressed in the RPF, so they could not be read offline).
 4. **Psr build replacement** is not needed to trace, because the mirror reads the BVH the guest built.
    simnJS's TLAS and BLAS replacements (`4fab383e`, `54aab65a`, `0f9b3d09`) would need GTA VI's
    revision accepted and its user data layouts. Only the refit kernels are known to match.
 
+## The `--native-rt` run
+
+Run `simnrt-on1` used a cold `build\run-simn-rt` and this tree with `--native-rt` and the probe.
+- The guest clock was held about 1,100 s for compiles, and the run never reached the world.
+- At 1,193 s the game's own watchdog fired: `mov dword [0]` at `0x908bd3a40`, a 30 s main-loop stall
+  (crash report `run-simn-rt\_Logs\crash_20261128_114047.txt`).
+- There was no device loss and no refused indirect dispatch.
+- In the same hour, three other cold runs on the same base without the flag (`simncpu-cold1`,
+  `simnc-off1`, `sp-pop`) also did not reach the world within 1,200 s, but did not crash.
+- With one run against three, the watchdog cannot be laid on `--native-rt`.
+
 ## Reproduce
 
 - **Offline A/B.** Use `shader_check` with `SHADER_CHECK_RAY_QUERY=0` or `1` and `SHADER_CHECK_SPIRV`,
   over capsules from a `.recipes` (v1) file. This tree's `shader_check` cannot specialize images from
-  anyvi's `.recipes2` variants.
+  anyvi's `.recipes2` variants. The v1 capsules of `48ab`, `757d`, `9acd`, `9d22` and `b272` exit 2,
+  because the extractor misreads them.
+- **Evidence and tools:** `build\research\simn-rt-gta6`. It holds the probe outputs, the simnJS study
+  patch, the fingerprint tool and list, the shaders.rpf scan, and the dumps of `12d153e6` and
+  `27eed256`.
 - **Run.** Pass `--native-rt` and `KYTY_RT_HEADER_PROBE=1`, then read the `[RT]` lines in stdout.
