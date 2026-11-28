@@ -6,6 +6,7 @@
 #include <atomic>
 #include <bit>
 #include <charconv>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
