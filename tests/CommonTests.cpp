@@ -562,6 +562,7 @@ TEST(MemAccount, LimitGuardDropsThenStopsOnlyWhileOver) {
 	EXPECT_EQ(guard.Step(13000, 150), Action::DropCaches);
 	EXPECT_EQ(guard.Step(22999, 150), Action::None);
 	EXPECT_EQ(guard.Step(23000, 150), Action::Stop);
+}
 
 TEST(GuestPark, RegistryCountsThreadsAndFlagsFirstAtEachPc) {
 	Common::GuestPark::Registry registry;
@@ -587,6 +588,7 @@ TEST(GuestPark, RegistryCountsThreadsAndFlagsFirstAtEachPc) {
 		(void)registry.Add(0x3000 + i * 4, 0, static_cast<int32_t>(100 + i), "fill");
 	}
 	EXPECT_EQ(registry.Count(), 3u + Common::GuestPark::Registry::kCapacity);
+}
 
 TEST(Config, ParseTraceCallsFilterHandlesOffAllAndNamedLibraries) {
 	const auto off = Config::ParseTraceCallsFilter("");
