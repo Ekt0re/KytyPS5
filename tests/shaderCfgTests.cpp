@@ -14392,8 +14392,15 @@ void TestSpirvLoopIterationGuard() {
   Spirv::SetLoopIterationLimitDefault(1000);
   const auto guarded = RecompileForTest(shader, options).spirv;
   if (options.shader_hash != 0) {
-    options.shader_hash ^= 1;
-    Check(RecompileForTest(shader, options).spirv == plain,
+    // Another hash, compiled with and without the limit: the guard must leave it alone. (The
+    // hash itself may reach the module, so it is not compared with `plain`.)
+    auto other = options;
+    other.shader_hash ^= 1;
+    const auto other_limited = RecompileForTest(shader, other).spirv;
+    Spirv::SetLoopIterationLimitDefault(0);
+    const auto other_plain = RecompileForTest(shader, other).spirv;
+    Spirv::SetLoopIterationLimitDefault(1000);
+    Check(other_limited == other_plain,
           "loop guard: unrelated shader changed when a single hash was selected");
   }
   Spirv::SetLoopIterationLimitDefault(0);
