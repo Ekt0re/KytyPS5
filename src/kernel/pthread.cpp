@@ -430,6 +430,7 @@ struct PthreadPrivate {
 	std::condition_variable cond_cv;
 	std::atomic<uint64_t> pending_signal_mask {0};
 	GuestWaitState        wait;
+	Common::FpEnv         creator_fp_env {Common::GuestFpEnv}; // creator's state at create time
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uintptr_t guest_host_gs8;
 	uintptr_t guest_host_gs10;
@@ -3222,6 +3223,23 @@ static void* RunThread(void* arg) {
 
 	thread->unique_id = Common::Thread::GetThreadIdUnique();
 
+	// A new thread gets GuestFpEnv (above). Say so when its creator ran with another state (the
+	// console may hand on the creator's) and when the setup changed it: one line per site.
+	if (Common::FpControlFirstDeviation(Common::FpCheckSite::ThreadCreator,
+	                                    thread->creator_fp_env)) {
+		LOGF("[fpenv] site=thread-creator thread=%d creator mxcsr=0x%04x x87=0x%04x, the thread "
+		     "starts with mxcsr=0x%04x x87=0x%04x\n",
+		     thread->unique_id, thread->creator_fp_env.mxcsr, thread->creator_fp_env.control,
+		     Common::GuestFpEnv.mxcsr, Common::GuestFpEnv.control);
+	}
+	if (const auto env = Common::ReadFpEnv();
+	    Common::FpControlFirstDeviation(Common::FpCheckSite::ThreadStart, env)) {
+		LOGF("[fpenv] site=thread-start thread=%d mxcsr=0x%04x x87=0x%04x before the entry point, "
+		     "expected mxcsr=0x%04x x87=0x%04x\n",
+		     thread->unique_id, env.mxcsr, env.control, Common::GuestFpEnv.mxcsr,
+		     Common::GuestFpEnv.control);
+	}
+
 	Loader::RuntimeLinker::CreateThreadTls();
 	g_pthread_self = thread;
 	SetCurrentGuestWaitState(&thread->wait);
@@ -3318,6 +3336,7 @@ int KYTY_SYSV_ABI PthreadCreate(Pthread* thread, const PthreadAttr* attr,
 		created_thread->pending_signal_mask.store(0, std::memory_order_relaxed);
 		created_thread->detached        = created_thread->attr->detached;
 		created_thread->unique_id       = -1;
+		created_thread->creator_fp_env  = Common::ReadFpEnv();
 		created_thread->state           = PthreadState::Running;
 
 		result =

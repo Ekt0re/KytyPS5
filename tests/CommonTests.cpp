@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/faultReport.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
 #include "common/guestPark.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
@@ -642,6 +643,30 @@ TEST(Libs, CallRingWrapsAroundAndIteratesOldestFirst) {
 		seen++;
 	});
 	EXPECT_EQ(seen, Libs::kCallRingSize);
+}
+
+TEST(FpEnv, ControlComparisonIgnoresStickyFlagsAndReservedBits) {
+	const Common::FpEnv guest = Common::GuestFpEnv;
+	Common::FpEnv        dirty = guest;
+	dirty.mxcsr |= 0x3fu;   // sticky exception flags
+	dirty.control |= 0x00c0u; // reserved + infinity-control bits
+	EXPECT_TRUE(Common::SameFpControl(guest, dirty));
+	dirty.mxcsr ^= 1u << 15u; // flush-to-zero
+	EXPECT_FALSE(Common::SameFpControl(guest, dirty));
+	dirty = guest;
+	dirty.control ^= 0x0400u; // rounding
+	EXPECT_FALSE(Common::SameFpControl(guest, dirty));
+	EXPECT_STREQ(Common::FpCheckSiteName(Common::FpCheckSite::ThreadStart), "thread-start");
+	EXPECT_STREQ(Common::FpCheckSiteName(Common::FpCheckSite::SignalHandler), "signal-handler");
+}
+
+TEST(FpEnv, ReadWriteRoundTripsTheGuestControlState) {
+	const auto saved = Common::ReadFpEnv();
+	Common::WriteFpEnv(Common::GuestFpEnv);
+	const auto now = Common::ReadFpEnv();
+	EXPECT_TRUE(Common::SameFpControl(now, Common::GuestFpEnv));
+	Common::WriteFpEnv(saved);
+	EXPECT_TRUE(Common::SameFpControl(Common::ReadFpEnv(), saved));
 }
 
 } // namespace

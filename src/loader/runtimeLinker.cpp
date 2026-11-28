@@ -57,6 +57,7 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <sys/uio.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 #endif
@@ -865,8 +866,35 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 	}
 }
 
+// The FP control state guest code faulted with, when it is not the one guest threads start with
+// (one line per thread; a fault in emulator code is not asked).
+static void CheckGuestFaultFpEnv(const Common::HostException::ExceptionInfo& info) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	const auto* context = static_cast<const ucontext_t*>(info.native_context);
+	if (context == nullptr || context->uc_mcontext.fpregs == nullptr) {
+		return;
+	}
+	const Common::FpEnv env {context->uc_mcontext.fpregs->mxcsr, context->uc_mcontext.fpregs->cwd};
+	if (!Common::FpControlFirstDeviation(Common::FpCheckSite::GuestFault, env) ||
+	    Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(info.exception_address) ==
+	        nullptr) {
+		return;
+	}
+	const auto* program =
+	    Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(info.exception_address);
+	std::printf("[fpenv] site=guest-fault thread=%d pc=%s+0x%016" PRIx64
+	            " mxcsr=0x%04x x87=0x%04x expected mxcsr=0x%04x x87=0x%04x (first on this thread)\n",
+	            Libs::LibKernel::PthreadGetthreadid(), program->file_name.filename().string().c_str(),
+	            info.exception_address - program->base_vaddr, env.mxcsr, env.control,
+	            Common::GuestFpEnv.mxcsr, Common::GuestFpEnv.control);
+#else
+	(void)info;
+#endif
+}
+
 bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+	CheckGuestFaultFpEnv(exception_info);
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {

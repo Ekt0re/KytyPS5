@@ -5,7 +5,11 @@
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
 #include <cctype>
+#include <cinttypes>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
@@ -200,6 +204,44 @@ void LogFailedCall(const char* library, const char* function, const uint64_t (&a
 	            static_cast<unsigned long long>(args[2]), static_cast<unsigned long long>(args[3]),
 	            static_cast<unsigned long long>(args[4]), static_cast<unsigned long long>(args[5]),
 	            static_cast<unsigned long long>(result));
+}
+
+namespace {
+std::atomic<uint64_t>                       g_float_return_calls {0};
+std::mutex                                  g_float_return_mutex;
+std::unordered_map<const void*, uint64_t>   g_float_return_logged;
+
+bool RateLimited(uint64_t count) {
+	return count <= 4 || (count & (count - 1)) == 0;
+}
+} // namespace
+
+uint64_t FloatReturnCalls() {
+	return g_float_return_calls.load(std::memory_order_relaxed);
+}
+
+void NoteFloatReturn(const void* fn_key, const char* library, const char* function, double value) {
+	const auto calls = g_float_return_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (value == 0.0 || !std::isfinite(value)) {
+		uint64_t count = 0;
+		{
+			std::scoped_lock lock(g_float_return_mutex);
+			count = ++g_float_return_logged[fn_key];
+		}
+		if (RateLimited(count) && count <= 64) {
+			LOGF("[fp-return] thread=%d %s::%s returned %g (this result #%" PRIu64
+			     ", float-returning library calls so far %" PRIu64 ")\n",
+			     Common::Thread::GetThreadIdUnique(), library, function, value, count, calls);
+		}
+	}
+}
+
+void ReportCallFpEnv(Common::FpCheckSite site, const char* library, const char* function,
+                     Common::FpEnv env, Common::FpEnv expected) {
+	LOGF("[fpenv] site=%s thread=%d mxcsr=0x%04x x87=0x%04x expected mxcsr=0x%04x x87=0x%04x "
+	     "call=%s::%s (first on this thread)\n",
+	     Common::FpCheckSiteName(site), Common::Thread::GetThreadIdUnique(), env.mxcsr,
+	     env.control, expected.mxcsr, expected.control, library, function);
 }
 
 void InitAll(Loader::SymbolDatabase* s) {

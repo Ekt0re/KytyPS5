@@ -1,5 +1,7 @@
 #include "common/hostException.h"
 
+#include "common/fpEnv.h"
+
 #include <atomic>
 #include <cstdio>
 
@@ -219,8 +221,31 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 		info.access_violation_vaddr = reinterpret_cast<uint64_t>(signal_info->si_addr);
 	}
 
+	// The state sigreturn gives back to interrupted guest code: an instruction emulator that
+	// writes the saved registers must not change its control part. One line per thread.
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+	const auto* fp_state = context->uc_mcontext.fpregs;
+	const FpEnv fp_saved = fp_state != nullptr ? FpEnv {fp_state->mxcsr, fp_state->cwd} : FpEnv {};
+#endif
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && !defined(__APPLE__)
+		if (fp_state != nullptr) {
+			const FpEnv fp_now {fp_state->mxcsr, fp_state->cwd};
+			if (FpControlFirstDeviation(FpCheckSite::FaultReturn, fp_now, fp_saved)) {
+				char      line[160];
+				const int length = std::snprintf(
+				    line, sizeof(line),
+				    "[fpenv] site=fault-return signal=%d pc=0x%016llx mxcsr=0x%04x->0x%04x "
+				    "x87=0x%04x->0x%04x (first on this thread)\n",
+				    signal_number, static_cast<unsigned long long>(info.exception_address),
+				    fp_saved.mxcsr, fp_now.mxcsr, fp_saved.control, fp_now.control);
+				if (length > 0) {
+					(void)!::write(STDOUT_FILENO, line, static_cast<size_t>(length));
+				}
+			}
+		}
+#endif
 		return;
 	}
 

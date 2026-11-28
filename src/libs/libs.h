@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_LIBS_H_
 
 #include "common/abi.h"
+#include "common/fpEnv.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -120,6 +121,30 @@ const CallRing& GetThreadCallRing();
 [[gnu::noinline]] void LogFailedCall(const char* library, const char* function,
                                      const uint64_t (&args)[6], uint64_t result);
 
+// One `[fpenv]` line: the FP control state `env` differs from `expected` at `site` in a call of
+// library::function (Common::FpControlFirstDeviation decides it is the first on the thread).
+[[gnu::noinline]] void ReportCallFpEnv(Common::FpCheckSite site, const char* library,
+                                       const char* function, Common::FpEnv env,
+                                       Common::FpEnv expected);
+// A library function declared to return float or double returned: counted, and the first zero or
+// non-finite result of each is logged (`[fp-return]`) because a stub returning 0.0 to a caller
+// that divides by it gives the guest an infinity.
+[[gnu::noinline]] void NoteFloatReturn(const void* fn_key, const char* library,
+                                       const char* function, double value);
+
+inline void CheckCallEntryFpEnv(const char* library, const char* function, Common::FpEnv env) {
+	if (Common::FpControlFirstDeviation(Common::FpCheckSite::LibraryEntry, env)) {
+		ReportCallFpEnv(Common::FpCheckSite::LibraryEntry, library, function, env,
+		                Common::GuestFpEnv);
+	}
+}
+inline void CheckCallExitFpEnv(const char* library, const char* function, Common::FpEnv before) {
+	const auto after = Common::ReadFpEnv();
+	if (Common::FpControlFirstDeviation(Common::FpCheckSite::LibraryChanged, after, before)) {
+		ReportCallFpEnv(Common::FpCheckSite::LibraryChanged, library, function, after, before);
+	}
+}
+
 template <size_t N>
 struct FixedString {
 	char data[N] {};
@@ -170,48 +195,82 @@ struct LibThunkHelper {
 	static uint64_t Addr() { return reinterpret_cast<uint64_t>(Fn); }
 };
 
+// Around a library call when KYTY_TRACE_CALLS or KYTY_FP_ENV_CHECK=1 is on: the call trace and
+// failed-call log, the FP control state on entry and on return, float results. With both off the
+// export points at the original function (Addr) and the call costs nothing.
 template <auto Fn, FixedString Library, FixedString Name, typename Ret, typename... Args>
 struct LibThunkHelper<Fn, Library, Name, Ret (KYTY_SYSV_ABI*)(Args...)> {
 	static KYTY_SYSV_ABI Ret Call(Args... args) {
-		if (!g_trace_calls_enabled) {
+		const bool trace    = g_trace_calls_enabled;
+		const bool fp_check = Common::FpEnvCheckEnabled();
+		if (!trace && !fp_check) {
 			return Fn(args...);
 		}
-		uint64_t raw_args[6] {};
-		size_t   arg_idx = 0;
-		(PushSysvIntArg(raw_args, arg_idx, args), ...);
-		const auto guest_ret = reinterpret_cast<uint64_t>(__builtin_return_address(0));
-		auto&      record    = RecordThreadCallEntry(Library.data, Name.data, raw_args, guest_ret);
-		const bool trace_all = g_trace_all || MatchesTraceFilter(Library.data);
+		Common::FpEnv fp_before {};
+		if (fp_check) {
+			fp_before = Common::ReadFpEnv();
+			CheckCallEntryFpEnv(Library.data, Name.data, fp_before);
+		}
+		uint64_t    raw_args[6] {};
+		CallRecord* record    = nullptr;
+		bool        trace_all = false;
+		if (trace) {
+			size_t arg_idx = 0;
+			(PushSysvIntArg(raw_args, arg_idx, args), ...);
+			const auto guest_ret = reinterpret_cast<uint64_t>(__builtin_return_address(0));
+			record    = &RecordThreadCallEntry(Library.data, Name.data, raw_args, guest_ret);
+			trace_all = g_trace_all || MatchesTraceFilter(Library.data);
+		}
 		if constexpr (std::is_void_v<Ret>) {
 			Fn(args...);
-			record.completed = true;
-			if (trace_all) {
-				LogFilteredCall(Library.data, Name.data, raw_args, 0);
+			if (fp_check) {
+				CheckCallExitFpEnv(Library.data, Name.data, fp_before);
+			}
+			if (trace) {
+				record->completed = true;
+				if (trace_all) {
+					LogFilteredCall(Library.data, Name.data, raw_args, 0);
+				}
 			}
 		} else {
-			Ret      ret        = Fn(args...);
-			uint64_t raw_result = 0;
-			const bool failed   = IsFailureReturn(ret, raw_result);
-			record.result       = raw_result;
-			record.completed    = true;
-			if (trace_all) {
-				LogFilteredCall(Library.data, Name.data, raw_args, raw_result);
+			Ret ret = Fn(args...);
+			if (fp_check) {
+				CheckCallExitFpEnv(Library.data, Name.data, fp_before);
 			}
-			if (failed && ShouldLogFailedCall(reinterpret_cast<const void*>(&Call), raw_result)) {
-				LogFailedCall(Library.data, Name.data, raw_args, raw_result);
+			if (trace) {
+				uint64_t   raw_result = 0;
+				const bool failed     = IsFailureReturn(ret, raw_result);
+				record->result        = raw_result;
+				record->completed     = true;
+				if (trace_all) {
+					LogFilteredCall(Library.data, Name.data, raw_args, raw_result);
+				}
+				if (failed &&
+				    ShouldLogFailedCall(reinterpret_cast<const void*>(&Call), raw_result)) {
+					LogFailedCall(Library.data, Name.data, raw_args, raw_result);
+				}
+			}
+			if constexpr (std::is_floating_point_v<Ret>) {
+				if (fp_check) {
+					NoteFloatReturn(reinterpret_cast<const void*>(&Call), Library.data, Name.data,
+					                static_cast<double>(ret));
+				}
 			}
 			return ret;
 		}
 	}
 
-	// Read during InitAll, after g_trace_calls_enabled is set: off, the export is the function itself.
+	// Read during InitAll, after g_trace_calls_enabled is set: with both switches off the export is
+	// the function itself, not this thunk.
 	static uint64_t Addr() {
-		return g_trace_calls_enabled ? reinterpret_cast<uint64_t>(&Call) : reinterpret_cast<uint64_t>(Fn);
+		return (g_trace_calls_enabled || Common::FpEnvCheckEnabled())
+		           ? reinterpret_cast<uint64_t>(&Call)
+		           : reinterpret_cast<uint64_t>(Fn);
 	}
 };
 
 // Variadic guest exports keep their original address: their arguments cannot be captured by the
-// fixed-width thunk.
+// fixed-width thunk and there is no fixed signature to wrap.
 template <auto Fn, FixedString Library, FixedString Name, typename Ret, typename... Args>
 struct LibThunkHelper<Fn, Library, Name, Ret (KYTY_SYSV_ABI*)(Args..., ...)> {
 	static uint64_t Addr() { return reinterpret_cast<uint64_t>(Fn); }

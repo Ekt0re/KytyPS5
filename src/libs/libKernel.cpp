@@ -45,10 +45,12 @@
 #include <csignal>
 #include <pthread.h>
 #include <sys/ucontext.h>
+#include <unistd.h>
 #else
 #include <csignal>
 #include <pthread.h>
 #include <ucontext.h>
+#include <unistd.h>
 #endif
 
 namespace Libs {
@@ -947,6 +949,24 @@ static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
 		auto* handler = reinterpret_cast<exception_handler_func_t>(g_exception_handlers[signum]);
 		if (handler != nullptr) {
 			auto ctx = CreateSignalUcontextFromHost(host_ctx);
+			// Linux starts a signal handler with the default FP state (MXCSR 0x1f80: no
+			// flush-to-zero, no denormals-are-zero); every other guest entry runs with
+			// GuestFpEnv. sigreturn restores the interrupted thread's own state afterwards.
+			// The state change is a fix; the entry report is opt-in.
+			if (const auto env = Common::ReadFpEnv();
+			    Common::FpControlFirstDeviation(Common::FpCheckSite::SignalHandler, env)) {
+				char      line[192];
+				const int length = std::snprintf(
+				    line, sizeof(line),
+				    "[fpenv] site=signal-handler signal=%d mxcsr=0x%04x x87=0x%04x at handler "
+				    "entry, set to mxcsr=0x%04x x87=0x%04x (first on this thread)\n",
+				    signum, env.mxcsr, env.control, Common::GuestFpEnv.mxcsr,
+				    Common::GuestFpEnv.control);
+				if (length > 0) {
+					(void)!::write(STDOUT_FILENO, line, static_cast<size_t>(length));
+				}
+			}
+			Common::WriteFpEnv(Common::GuestFpEnv);
 			if (IsGuestCodeAddress(ctx.uc_mcontext.mc_rip)) {
 				handler(signum, &ctx);
 				ApplySignalUcontextToHost(host_ctx, ctx);
