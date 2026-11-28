@@ -137,7 +137,7 @@ uint64_t CodegenSwitches() {
 		switches |= 8u;
 	}
 	// IndirectFormattedStoresEnabled (ShaderIR.h).
-	if (ShaderRecompiler::IR::IndirectFormattedStoresEnabled()) switches |= uint64_t {1} << 64u;
+	if (ShaderRecompiler::IR::IndirectFormattedStoresEnabled()) switches |= 32u;
 	return switches;
 }
 
