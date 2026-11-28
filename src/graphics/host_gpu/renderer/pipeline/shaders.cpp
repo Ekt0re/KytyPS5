@@ -714,7 +714,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		}
 	} else if (graphics.compute_subgroup_size_control_enabled &&
 	           wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+		// A wave64 program emitted as halves needs the 32-lane subgroup it was emitted for.
+		comp_subgroup_size.requiredSubgroupSize =
+		    wave_size == 64u && !graphics.SupportsComputeWave64() ? 32u : wave_size;
 		comp_subgroup_size.pNext                = const_cast<void*>(comp_shader_stage_info.pNext);
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}

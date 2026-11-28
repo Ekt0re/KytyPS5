@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <span>
@@ -134,7 +135,21 @@ struct GraphicContext {
 	}
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
+		// KYTY_COMPUTE_WAVE64_HALVES=1 (diagnostic): run wave64 compute programs as two 32-lane
+		// halves on a required 32-lane subgroup, as on NVIDIA, also where native wave64 exists.
+		if (ComputeWave64HalvesForced() && compute_subgroup_size_control_enabled &&
+		    min_subgroup_size <= 32u && max_subgroup_size >= 32u) {
+			return false;
+		}
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+	}
+
+	[[nodiscard]] static bool ComputeWave64HalvesForced() noexcept {
+		static const bool forced = [] {
+			const char* value = std::getenv("KYTY_COMPUTE_WAVE64_HALVES");
+			return value != nullptr && value[0] == '1';
+		}();
+		return forced;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

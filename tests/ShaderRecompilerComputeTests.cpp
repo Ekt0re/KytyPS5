@@ -33815,7 +33815,7 @@ TestCase VectorFractF16CapturedAndEdges() {
                   O::V_AND_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_FRACT_F16 v9, v7", inputs.size()}};
   test.ir_counts = {{" = FPFract32 ", inputs.size()}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 ", " UnpackHalf2x16 "};
+  test.required_spirv = {" Fract ", " UnpackHalf2x16 "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -33889,7 +33889,7 @@ TestCase VectorFractF16Modifiers() {
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.decoded_counts = {{"V_FRACT_F16", 10}};
   test.ir_counts = {{" = FPFract32 ", 10}};
-  test.required_spirv = {" Fract ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract "};
   return test;
 }
 
@@ -33927,7 +33927,7 @@ TestCase VectorCosF16CapturedSdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPCos ", 6}};
-  test.required_spirv = {" Fract ", " Cos ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", " Cos "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -33973,7 +33973,7 @@ TestCase VectorSinF16SdwaAndEdges() {
                           "v4.sdwa(sel=5,sext=0)",
                           1}};
   test.ir_counts = {{" = FPSin ", 9}};
-  test.required_spirv = {" Fract ", " Sin ", " PackHalf2x16 "};
+  test.required_spirv = {" Fract ", " Sin "};
   test.forbidden_spirv = {"OpCapability Float16"};
   return test;
 }
@@ -45990,7 +45990,7 @@ template <bool d16, bool sparse> TestCase ImageLoadPackedUnorm() {
                       : std::vector<u32>{0x3f800000u, green, 0u, 0u};
   test.expected.resize(words);
   test.required_spirv = {"OpImageFetch %v4uint", "OpBitFieldUExtract", "OpConvertUToF"};
-  if constexpr (d16) test.required_spirv.emplace_back("PackHalf2x16");
+  // D16 results are packed with integer round-to-nearest-even code (no PackHalf2x16).
   test.forbidden_spirv = {"OpTypeSampler", "OpImageGather"};
   return test;
 }
@@ -46873,7 +46873,7 @@ TestCase ImageD16GatherPacksHalfPairs() {
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
   test.decoded_counts = {{"d16=1", 1}};
-  test.required_spirv = {"OpImageGather", "PackHalf2x16"};
+  test.required_spirv = {"OpImageGather"};
   return test;
 }
 

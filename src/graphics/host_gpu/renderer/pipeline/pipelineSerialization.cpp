@@ -144,6 +144,8 @@ uint64_t CodegenSwitches() {
 	if (ShaderRecompiler::IR::FiniteBufferDescriptorsEnabled()) switches |= uint64_t {1} << 32u;
 	// F16PackNativeEnabled (ShaderIR.h).
 	if (ShaderRecompiler::IR::F16PackNativeEnabled()) switches |= 16u;
+	// GraphicContext::ComputeWave64HalvesForced.
+	if (env("KYTY_COMPUTE_WAVE64_HALVES")[0] == '1') switches |= 32u;
 	return switches;
 }
 
