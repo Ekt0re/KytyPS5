@@ -538,6 +538,10 @@ add_executable(subgroup_size_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SubgroupSizeTests.cpp"
 )
 target_include_directories(subgroup_size_tests PRIVATE ${inc_headers})
+add_executable(dispatch_limits_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DispatchLimitsTests.cpp"
+)
+target_include_directories(dispatch_limits_tests PRIVATE ${inc_headers})
 add_executable(driver_cache_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DriverCacheFileTests.cpp"
 )
@@ -935,6 +939,7 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME wait_diagnostics COMMAND $<TARGET_FILE:wait_diagnostics_tests>)
 	add_test(NAME subgroup_size COMMAND $<TARGET_FILE:subgroup_size_tests>)
+	add_test(NAME dispatch_limits COMMAND $<TARGET_FILE:dispatch_limits_tests>)
 	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
 	add_test(NAME pipeline_create_stats COMMAND $<TARGET_FILE:pipeline_create_stats_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
