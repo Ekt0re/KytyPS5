@@ -834,7 +834,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 			    (graphics.StorageMinAlignment() - 1);
 			size = Libs::LibKernel::Memory::TryClampRangeSize(
-			    address, std::min({size, uint64_t {256} * 1024 * 1024, limit}));
+			    address, std::min(std::min(size, uint64_t {256} * 1024 * 1024), limit));
 		} else if (size >= (uint64_t {1} << 30u) || allow_unmapped) {
 			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size, true);
 		}
