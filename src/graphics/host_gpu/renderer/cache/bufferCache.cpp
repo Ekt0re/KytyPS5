@@ -236,6 +236,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_BLOCK("BufferCache::DownloadBufferMemory");
 	if (buffer.IsZeroCopy()) {
 		// The bytes are in guest memory already; only the write has to finish.
 		return ResolveZeroCopy(buffer, !async);
@@ -766,6 +767,7 @@ std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> BufferCache::Track(uint
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_BLOCK("BufferCache::InvalidateMemory");
 	const auto started = Common::FaultStats::NowNs();
 	WaitZeroCopyReads(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
@@ -787,9 +789,11 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
+	KYTY_PROFILER_BLOCK("BufferCache::ReadMemory(caller)");
 	const auto origin =
 	    GuestGpu::IsGpuThread() ? ReadbackOrigin::Current() : ReadbackOrigin::Origin::Guest;
 	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, origin] {
+		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory(gpu)");
 		const ReadbackOrigin::Scope scope(origin);
 		Common::PerfSummary::Add(CountersOf(origin).calls);
 		using Common::PerfSummary::Counter;
@@ -1067,6 +1071,7 @@ size_t BufferCache::CollectPiggybackDownloads(std::vector<DownloadPart>& parts,
 
 bool BufferCache::DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_t size,
                                       ReadbackBatch::Range first_window) {
+	KYTY_PROFILER_BLOCK("BufferCache::DownloadWindowBatch");
 	using ReadbackBatch::Range;
 	auto& first = m_slot_buffers[first_id];
 	const Range first_range {first.CpuAddress(), first.CpuAddress() + first.Size()};
@@ -1775,6 +1780,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
+		KYTY_PROFILER_BLOCK("ObtainBuffer::Stream");
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncStreamBytes, size);
@@ -1788,15 +1794,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, end - vaddr)) {
+		KYTY_PROFILER_BLOCK("ObtainBuffer::Find");
 		id = FindBuffer(vaddr, end - vaddr);
 	}
 	RefreshZeroCopyPolicy();
 	if (m_slot_buffers[id].IsZeroCopy() && (!ZeroCopyBackingValid(id) || ZeroCopyKeepsWaiting(id))) {
+		KYTY_PROFILER_BLOCK("ObtainBuffer::FindZeroCopy");
 		id = FindBuffer(vaddr, end - vaddr);
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
+	if (is_written) {
+		KYTY_PROFILER_BLOCK("ObtainBuffer::SyncWritten");
+		(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
+	} else {
+		(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
+	}
 	if (is_written) {
 		buffer.probe_write_tick    = m_scheduler.CurrentTick();
 		buffer.readback_write_tick = m_scheduler.CurrentTick();
@@ -1818,6 +1831,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	if (is_written) {
+		KYTY_PROFILER_BLOCK("ObtainBuffer::NoteWrite");
 		m_gpu_modified_ranges.Add(vaddr, size);
 		m_pending_writes.Add(vaddr, size);
 		m_sync_windows[m_guest_queue].writes.Add(vaddr, size);
@@ -2068,6 +2082,7 @@ void BufferCache::QueueBdaSync(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {
+	KYTY_PROFILER_FUNCTION();
 	const auto queued = [this] {
 		std::lock_guard lock(m_bda_sync_mutex);
 		return std::exchange(m_bda_sync, {});

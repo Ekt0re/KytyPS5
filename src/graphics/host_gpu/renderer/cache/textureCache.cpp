@@ -2432,6 +2432,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	if (!MayHaveImages(address, size)) {
 		return;
 	}
+	KYTY_PROFILER_BLOCK("TextureCache::InvalidateMemory");
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);

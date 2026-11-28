@@ -281,6 +281,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		KYTY_PROFILER_BLOCK("BindSharedMemory::ReadArgs");
 		const ReadbackOrigin::Scope origin(ReadbackOrigin::Origin::Args);
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),

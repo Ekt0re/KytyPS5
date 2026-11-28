@@ -7,6 +7,7 @@
 #include "common/faultStats.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -127,6 +128,7 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	KYTY_PROFILER_BLOCK("RenderContext::HandleFault");
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
@@ -350,6 +352,7 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
+	KYTY_PROFILER_BLOCK("RenderContext::PrepareBda");
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	m_fault_process_pending = true;
