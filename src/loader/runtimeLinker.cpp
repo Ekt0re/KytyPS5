@@ -774,13 +774,28 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 		}
 		r += "\n";
 	}
-	if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+	// As many of the 32 words at rsp as are readable: rsp near the top of a stack would otherwise
+	// leave out every word, the caller's return address among them.
+	int stack_words = 0;
+	while (stack_words < 32 &&
+	       IsReadableRange(info->rsp + static_cast<uint64_t>(stack_words) * sizeof(uint64_t),
+	                       sizeof(uint64_t))) {
+		stack_words++;
+	}
+	if (stack_words != 0) {
+		auto*      rt    = Common::Singleton<RuntimeLinker>::Instance();
 		const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		r += "stack:";
-		for (int i = 0; i < 32; i++) {
+		for (int i = 0; i < stack_words; i++) {
 			r += fmt::format("{}{:016x}", (i % 4 == 0) ? "\n " : " ", stack[i]);
 		}
 		r += "\n";
+		// Words that point into a guest module: return addresses, read without the extended dump.
+		for (int i = 0; i < stack_words; i++) {
+			if (rt->FindProgramByAddr(stack[i]) != nullptr) {
+				r += fmt::format(" [rsp+0x{:x}] {}\n", i * 8, FormatGuestModuleOffset(rt, stack[i]));
+			}
+		}
 	}
 	if (extended_guest_dump) {
 		auto* rt = Common::Singleton<RuntimeLinker>::Instance();

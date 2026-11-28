@@ -1162,11 +1162,13 @@ uint64_t AvailableHostMemory() {
 
 // A driver compiling a large pipeline holds hundreds of MB while it runs, and a loading frame
 // starts dozens at once over the pools (PPSA38500's ray tracing ones pushed a 32 GB host into
-// the OOM killer). Under 2.5 GiB of available memory a job waits while another compiles; one
-// always runs, so compiles only queue up, none is skipped.
+// the OOM killer). Under 2.5 GiB of available memory a background job waits, at most 2 s, while
+// another compiles; one always runs, so compiles only queue up, none is skipped. Jobs a command
+// waits for never wait here: a long stall trips the guest's own watchdogs (PPSA38500 stops
+// itself after about 30 s without progress).
 void AwaitCompileMemory() {
 	constexpr uint64_t Headroom = 2560ull << 20;
-	for (uint32_t wait = 0; wait < 600 && g_running_jobs.load(std::memory_order_relaxed) != 0 &&
+	for (uint32_t wait = 0; wait < 40 && g_running_jobs.load(std::memory_order_relaxed) != 0 &&
 	                        AvailableHostMemory() < Headroom;
 	     wait++) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1184,12 +1186,15 @@ PipelineWorkers::PipelineWorkers(size_t threads) {
 			// Once stop is requested the wait returns false only when the queue is empty.
 			while (m_ready.wait(lock, stop,
 			                    [this] { return !m_jobs.empty() || !m_background.empty(); })) {
-				auto& queue = m_jobs.empty() ? m_background : m_jobs;
-				const auto job = std::move(queue.front());
+				const bool background = m_jobs.empty();
+				auto&      queue      = background ? m_background : m_jobs;
+				const auto job        = std::move(queue.front());
 				queue.pop();
 				Common::ShaderCompileStatus::RemoveQueued();
 				lock.unlock();
-				AwaitCompileMemory();
+				if (background) {
+					AwaitCompileMemory();
+				}
 				g_running_jobs.fetch_add(1, std::memory_order_relaxed);
 				job();
 				g_running_jobs.fetch_sub(1, std::memory_order_relaxed);
