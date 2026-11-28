@@ -823,6 +823,26 @@ template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
 	EmitLdsLaneSync(ctx.state, mem);
+	// KYTY_FINITE_BUFFER_DESCRIPTORS: an atomic on a root with planned candidates selects its
+	// descriptor at run time like the other buffer accesses (EmitBufferAccess), with each
+	// candidate's own offset and bounds. Every other atomic keeps the path below unchanged.
+	if (mem.kind == IR::ResourceKind::Buffer && IR::FiniteBufferDescriptorsEnabled()) {
+		const auto& root = ctx.state.program.info.buffers[mem.resource];
+		if (root.indirect_root == mem.resource && !root.indirect_resources.empty()) {
+			return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+				return EmitBufferAccess(
+				    ctx, inst, mem, 1u,
+				    [&](const IR::MemoryInfo& selected, const MemoryResourceAccess& resource) {
+					    if (resource.object_pointer == 0u) return ConstantU32(ctx.state, 0u);
+					    const auto index = DwordIndex(ctx, inst, selected, resource.byte_offset);
+					    return EmitValueOrZeroIfCondition(
+					        ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
+						        return operation(EmitMemoryElementPointer(ctx.state, resource, index));
+					        });
+				    });
+			});
+		}
+	}
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		auto index = DwordIndex(ctx, inst, mem);
 		if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
@@ -1885,7 +1905,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
         const auto resource =
             PrepareStorageBufferResourceAccess(state, selected, state.storage_buffers[3]);
         if (resource.object_pointer == 0u) return ConstantU64(state, 0);
-        const auto byte_address = ByteAddress(ctx, inst, selected);
+        const auto byte_address = ByteAddress(ctx, inst, selected, resource.byte_offset);
         const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
 		                           ConstantU32(state, 3u));
         return EmitValueOrDefaultIfCondition(
