@@ -1289,8 +1289,13 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const bool depth_writes =
 	    static_cast<bool>(m_targets.depth.image_id) &&
 	    static_cast<bool>(m_targets.depth.AttachmentWriteAspects());
+	// state.deferrable (KYTY_DEFER_NEW_TARGETS, off by default) deliberately lets depth writers
+	// into targets not seen redrawn be skipped during a presented-frame stall in mode 1: an opt-in
+	// trade of possible depth/shadow holes for not stalling (see GetGraphicsPrograms).
 	const bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
 	                       (async_mode >= 2 || !depth_writes || state.deferrable);
+	// Counted only for the draws the switch made skippable (depth writers in mode 1).
+	const bool deferred_by_switch = state.deferrable && depth_writes && async_mode < 2;
 	// A draw that waits may start with an unoptimized pipeline (KYTY_FAST_PIPELINES).
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
 	                                                                  false, !skippable);
@@ -1426,7 +1431,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		record(vk_buffer, pipeline.pipeline);
 	} else {
 		m_context.GetCommandScheduler().Split(
-		    [this, record, skippable, stall_deferrable = state.deferrable, &occlusion_queries,
+		    [this, record, skippable, stall_deferrable = deferred_by_switch, &occlusion_queries,
 		     occlusion_query, pending = pipeline.Pending()](vk::CommandBuffer command) {
 			    if (skippable && !pending.Ready()) {
 				    occlusion_queries.End(command, occlusion_query);

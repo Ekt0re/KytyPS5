@@ -1742,13 +1742,15 @@ bool PipelineCache::NoteTargetDraw(uint64_t address, uint64_t frame) {
 	}
 	constexpr size_t MaxTargets = 4096;
 	const bool redrawn = std::popcount(static_cast<unsigned>(history.seen & 0x3fu)) >= 3;
-	while (m_target_history.size() > MaxTargets) {
-		const auto oldest = std::min_element(
-		    m_target_history.begin(), m_target_history.end(),
-		    [](const auto& left, const auto& right) {
-			    return left.second.frame < right.second.frame;
-		    });
-		m_target_history.erase(oldest);
+	// Over the limit: drop in one pass every target not drawn in the last 8 frames (its history
+	// has shifted out anyway), instead of a full scan for the single oldest on every new address.
+	if (m_target_history.size() > MaxTargets) {
+		std::erase_if(m_target_history, [frame](const auto& entry) {
+			return entry.second.frame + 8u < frame;
+		});
+		if (m_target_history.size() > MaxTargets) {
+			m_target_history.clear();
+		}
 	}
 	return redrawn;
 }
@@ -2306,8 +2308,12 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	const bool tess_active       = inputs.tess_active;
 	const auto color_output_mask = inputs.color_output_mask;
 	// Upstream already skips ordinary new-target geometry in async mode. After a presented-frame
-	// stall, let the same path take a target that would otherwise wait (for example a depth writer
-	// in mode 1). Full-screen and memory-writing draws remain protected in renderDraw.cpp.
+	// stall, let the same path take a target that would otherwise wait: in mode 1 that means depth
+	// and stencil writers. This is an explicit opt-in risk (KYTY_DEFER_NEW_TARGETS): a skipped
+	// shadow-map or depth pre-pass draw is not redone, and a target the heuristic calls "not
+	// redrawn" may keep the hole until the game draws it again. Full-screen and memory-writing
+	// draws remain protected in renderDraw.cpp. It does nothing without KYTY_ASYNC_PIPELINES=1 and
+	// nothing more at mode >= 2, where depth writers are skippable anyway.
 	const uint32_t stall_ms = DeferNewTargetsOnStallMs();
 	if (stall_ms != 0 && AsyncPipelineMode() != 0) {
 		const auto& context       = command.GetRegisters();
