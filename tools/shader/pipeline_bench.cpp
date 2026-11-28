@@ -184,6 +184,8 @@ bool g_robust = false;
 bool g_uab = false;
 // --emu-ext: the emulator's other device extensions and their features.
 bool g_emu_ext = false;
+// --app <name>: VkApplicationInfo application and engine name (the emulator passes "Kyty").
+std::string g_app;
 // --cache empty|<file> (Device::cache).
 std::string g_cache;
 // --reserve all|low (ReserveAddressSpace).
@@ -200,7 +202,10 @@ bool CreateDevice(Device& out) {
 	g_create_instance = reinterpret_cast<PFN_vkCreateInstance>(
 	    g_get_instance_proc(VK_NULL_HANDLE, "vkCreateInstance"));
 	VkApplicationInfo app {VK_STRUCTURE_TYPE_APPLICATION_INFO};
-	app.pApplicationName = "pipeline_bench";
+	app.pApplicationName = g_app.empty() ? "pipeline_bench" : g_app.c_str();
+	app.pEngineName      = g_app.empty() ? nullptr : g_app.c_str();
+	app.applicationVersion = 1;
+	app.engineVersion      = 1;
 	app.apiVersion       = VK_API_VERSION_1_3;
 	VkInstanceCreateInfo instance_info {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
 	instance_info.pApplicationInfo = &app;
@@ -531,7 +536,7 @@ std::vector<Module> LoadModules(const Options& options) {
 		if (!module.compute) continue;
 		module.name = files[i].second.filename().string();
 		// The id bound, raised by the salt: other bytes, the same module.
-		module.words[3] += options.salt;
+		module.words[3] += options.salt + static_cast<uint32_t>(modules.size()) * 1000u;
 		modules.push_back(std::move(module));
 	}
 	return modules;
@@ -770,6 +775,7 @@ int main(int argc, char** argv) {
 		else if (arg == "--robust") g_robust = true;
 		else if (arg == "--uab") g_uab = true;
 		else if (arg == "--emu-ext") g_emu_ext = true;
+		else if (arg == "--app") g_app = next, i++;
 		else if (arg == "--cache") g_cache = next, i++;
 		else if (arg == "--reserve") g_reserve = next, i++;
 		else if (arg == "--counter") options.counter = next, i++;
