@@ -186,6 +186,13 @@ bool g_uab = false;
 bool g_emu_ext = false;
 // --app <name>: VkApplicationInfo application and engine name (the emulator passes "Kyty").
 std::string g_app;
+// --disk-cache <dir>: threads mode keeps the driver disk cache in this folder, across runs.
+std::string g_disk_cache;
+// --subgroup <n>, --dispatch-base (Create).
+uint32_t g_subgroup      = 0;
+bool     g_dispatch_base = false;
+// --emu-features: the emulator's core and 1.1-1.3 features only.
+bool g_emu_features = false;
 // --cache empty|<file> (Device::cache).
 std::string g_cache;
 // --reserve all|low (ReserveAddressSpace).
@@ -362,6 +369,68 @@ bool CreateDevice(Device& out) {
 		}
 	}
 	g_vkGetPhysicalDeviceFeatures2(physical, &features);
+	if (g_emu_features) {
+		// --emu-features: the core, 1.1, 1.2 and 1.3 features exactly as vulkanWindow.cpp enables
+		// them (FSR off), instead of every supported one.
+		const auto s  = features.features;
+		const auto s11 = f11;
+		const auto s12 = f12;
+		const auto s13 = f13;
+		features.features = {};
+		auto& f = features.features;
+		f.fragmentStoresAndAtomics             = VK_TRUE;
+		f.samplerAnisotropy                    = VK_TRUE;
+		f.robustBufferAccess                   = VK_TRUE;
+		f.depthBounds                          = s.depthBounds;
+		f.depthClamp                           = s.depthClamp;
+		f.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+		f.shaderStorageImageReadWithoutFormat  = s.shaderStorageImageReadWithoutFormat;
+		f.shaderStorageImageMultisample        = s.shaderStorageImageMultisample;
+		f.shaderImageGatherExtended            = VK_TRUE;
+		f.shaderResourceMinLod                 = VK_TRUE;
+		f.independentBlend                     = VK_TRUE;
+		f.dualSrcBlend                         = VK_TRUE;
+		f.tessellationShader                   = VK_TRUE;
+		f.drawIndirectFirstInstance            = VK_TRUE;
+		f.multiDrawIndirect                    = VK_TRUE;
+		f.sampleRateShading                    = VK_TRUE;
+		f.depthBiasClamp                       = VK_TRUE;
+		f.shaderClipDistance                   = VK_TRUE;
+		f.shaderCullDistance                   = VK_TRUE;
+		f.largePoints                          = VK_TRUE;
+		f.multiViewport                        = VK_TRUE;
+		f.fillModeNonSolid                     = VK_TRUE;
+		f.vertexPipelineStoresAndAtomics       = VK_TRUE;
+		f.occlusionQueryPrecise                = s.occlusionQueryPrecise;
+		f.shaderInt64                          = VK_TRUE;
+		f.shaderFloat64                        = s.shaderFloat64;
+		f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, s11.pNext};
+		f11.storageBuffer16BitAccess = VK_TRUE;
+		f11.shaderDrawParameters     = VK_TRUE;
+		f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, s12.pNext};
+		f12.samplerMirrorClampToEdge                     = VK_TRUE;
+		f12.storageBuffer8BitAccess                      = VK_TRUE;
+		f12.shaderBufferInt64Atomics                     = VK_TRUE;
+		f12.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
+		f12.shaderStorageBufferArrayNonUniformIndexing   = VK_TRUE;
+		f12.shaderStorageImageArrayNonUniformIndexing    = VK_TRUE;
+		f12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+		f12.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
+		f12.descriptorBindingPartiallyBound              = VK_TRUE;
+		f12.timelineSemaphore                            = VK_TRUE;
+		f12.bufferDeviceAddress                          = VK_TRUE;
+		f12.shaderOutputViewportIndex                    = VK_TRUE;
+		f12.shaderOutputLayer                            = VK_TRUE;
+		f12.shaderSharedInt64Atomics                     = s12.shaderSharedInt64Atomics;
+		f12.samplerFilterMinmax                          = s12.samplerFilterMinmax;
+		f12.drawIndirectCount                            = s12.drawIndirectCount;
+		f12.hostQueryReset                               = s12.hostQueryReset;
+		f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES, s13.pNext};
+		f13.synchronization2    = VK_TRUE;
+		f13.dynamicRendering    = VK_TRUE;
+		f13.robustImageAccess   = s13.robustImageAccess;
+		f13.subgroupSizeControl = s13.subgroupSizeControl;
+	}
 	// Features that change how the driver compiles or need a capture/replay set-up stay off.
 	features.features.robustBufferAccess          = g_robust ? features.features.robustBufferAccess : VK_FALSE;
 	acceleration.accelerationStructureCaptureReplay = VK_FALSE;
@@ -609,6 +678,15 @@ Sample Create(const Device& device, const Module& module, size_t index,
 	info.stage.module = shader;
 	info.stage.pName  = "main";
 	info.layout       = layout;
+	// --subgroup <n>: a required subgroup size, as the emulator sets when the module's wave size
+	// is in the device's range; --dispatch-base: VK_PIPELINE_CREATE_DISPATCH_BASE_BIT (GDS users).
+	VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup {
+	    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+	if (g_subgroup != 0) {
+		subgroup.requiredSubgroupSize = g_subgroup;
+		info.stage.pNext              = &subgroup;
+	}
+	if (g_dispatch_base) info.flags |= VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
 	VkPipeline pipeline = VK_NULL_HANDLE;
 	const auto cpu      = GetCurrentProcessorNumber();
 	sample.performance  = cpu < performance.size() && performance[cpu];
@@ -686,7 +764,7 @@ int RunParent(const Options& options, int argc, char** argv) {
 	std::fflush(stdout);
 	const int64_t begin = Now();
 	if (options.procs == 0) {
-		const auto cache = DiskCache(options.salt, 0);
+		const auto cache = g_disk_cache.empty() ? DiskCache(options.salt, 0) : std::filesystem::path(g_disk_cache);
 		std::filesystem::create_directories(cache);
 		SetEnvironmentVariableW(L"__GL_SHADER_DISK_CACHE_PATH", cache.wstring().c_str());
 		SetThrottle(GetCurrentProcess(), options.throttle);
@@ -704,7 +782,7 @@ int RunParent(const Options& options, int argc, char** argv) {
 		}
 		for (auto& t: threads) t.join();
 		std::error_code error;
-		std::filesystem::remove_all(cache, error);
+		if (g_disk_cache.empty()) std::filesystem::remove_all(cache, error);
 	} else {
 		const auto name = "pipeline_bench_" + std::to_string(GetCurrentProcessId()) + "_" +
 		                  std::to_string(options.salt);
@@ -776,6 +854,10 @@ int main(int argc, char** argv) {
 		else if (arg == "--uab") g_uab = true;
 		else if (arg == "--emu-ext") g_emu_ext = true;
 		else if (arg == "--app") g_app = next, i++;
+		else if (arg == "--disk-cache") g_disk_cache = next, i++;
+		else if (arg == "--subgroup") g_subgroup = std::strtoul(next, nullptr, 10), i++;
+		else if (arg == "--dispatch-base") g_dispatch_base = true;
+		else if (arg == "--emu-features") g_emu_features = true;
 		else if (arg == "--cache") g_cache = next, i++;
 		else if (arg == "--reserve") g_reserve = next, i++;
 		else if (arg == "--counter") options.counter = next, i++;
