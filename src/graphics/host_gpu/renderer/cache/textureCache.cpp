@@ -297,6 +297,17 @@ bool TextureCache::ReleaseIdleImages(GuestRange requested) {
 	return true;
 }
 
+bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const noexcept {
+	// KYTY_IMAGE_PAGE_COUNTS=0 takes the texture cache lock for every lookup again. By default
+	// CPU write invalidations and texel buffer image lookups on pages without a registered image
+	// return without the lock (most write faults land on such pages).
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_PAGE_COUNTS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return !enabled || MayCoverImages(address, size);
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	const auto& data  = image.info.data;
@@ -2411,9 +2422,11 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
-	// Images register their pages before they are tracked, so a write to an uncovered page has
-	// nothing to invalidate and does not need the cache lock.
-	if (!MayCoverImages(address, size)) return;
+	// Images register their pages before they are tracked, so CPU writes to pages without one
+	// have nothing to invalidate. Most write faults land there and need not wait for the lock.
+	if (!MayHaveImages(address, size)) {
+		return;
+	}
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);

@@ -191,6 +191,9 @@ private:
 
 		std::unique_ptr<std::atomic<Leaf*>[]> m_leaves;
 	};
+	// Whether a page of the range has a registered image, without the lock (an image registers its
+	// pages before it is tracked). True when the page counts are switched off.
+	[[nodiscard]] bool MayHaveImages(uint64_t address, uint64_t size) const noexcept;
 
 	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
