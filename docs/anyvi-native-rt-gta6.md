@@ -103,7 +103,14 @@ All run in waves of 32 except `aca98a59` (64).
 | `8a937270` | `s[2:3] + 0x10` → 3,243 |
 | `9d22ec1f` | `+0x10` → 1,227; `+0x40` → 3,243; `+0x70` → 1 |
 
-Which of them each walk traces was read only for `12d153e6` (`+0x10`) and `27eed256` (`+0x30`).
+**One program traces several TLASes.** `12d153e6`'s five walks load their headers from three
+offsets:
+- walk 1 from `+0x10` (1,227 instances);
+- walk 2 from `+0x30` (3,243);
+- walks 4 and 5 from `+0x60` (1 instance);
+- walk 3 was not traced to its load.
+
+`27eed256` uses `+0x30`. The other programs were not read walk by walk.
 `aca98a59` did not run in this session.
 
 | Header | Version | Properties | Instances (+0x70) | Instance array (+0x30) |
@@ -123,8 +130,15 @@ then aborts in `CheckRayQueryTraversal` at "recognized loop: the traversal loop 
 query" (`RayQueryTraversalGpuTests.inc:456`).
 
 The anyvi build fails the same way. Its ray tracing sources are identical to origin/main's, so the
-failure is not caused by the coverage commit. On this tree the pass no longer drives even the walk it
-was written for. That holds for any game, not only GTA VI, and should be bisected from upstream's
+failure is not caused by the coverage commit.
+
+Only the first fixture (the 64-bit flat loop) was reached, because the test aborts there. The nested
+and shared-stack fixtures were not run, so it is shown only that the flat form no longer matches its
+own fixture.
+
+The base reject table below was recorded on this pass. The line at which it now rejects the fixture is
+not known. The 64-bit rows agree with simnJS's tree, where the same walks pass the node-address check
+and then fail elsewhere. The 32-bit rows have no such cross-check. Bisect this from upstream's
 `e141b44a` before any recognizer work.
 
 `--ray-tracing-only` passes.
@@ -212,7 +226,11 @@ that compiles each program as `CheckNativeWalks` does.
      the root at `+56` the same way was not checked.
 3. **The BLAS headers.** They were not probed. Static BLASes ship prebuilt in `pack/core_bvh4`
    (compressed in the RPF, so they could not be read offline).
-4. **Psr build replacement** is not needed to trace, because the mirror reads the BVH the guest built.
+4. **Several TLASes per program.** Both recognizers assume one TLAS per program: the tree's pass keeps
+   only walks with `tlas == program.info.ray_query_tlas`, and simnJS keeps "walks that read one TLAS,
+   with one layout". `12d153e6` walks three TLASes, so either would drive only some of its walks. That
+   filter is probably why simnJS kept 4 of the 7 walks it found in `9d22ec1f` (not verified).
+5. **Psr build replacement** is not needed to trace, because the mirror reads the BVH the guest built.
    simnJS's TLAS and BLAS replacements (`4fab383e`, `54aab65a`, `0f9b3d09`) would need GTA VI's
    revision accepted and its user data layouts. Only the refit kernels are known to match.
 
