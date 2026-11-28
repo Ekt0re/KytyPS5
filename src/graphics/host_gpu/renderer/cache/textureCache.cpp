@@ -309,6 +309,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	    .address = data.address, .size = static_cast<uint32_t>(data.size), .id = id};
 	ForEachPage(data.address, data.size, [this, &entry](uint64_t page) {
 		m_image_page_table[page].entries.push_back(entry);
+		m_registered_pages.Add(page, 1);
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
@@ -331,6 +332,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 			EXIT("TextureCache: image missing from page owner index\n");
 		}
 		entries.erase(entry);
+		m_registered_pages.Add(page, -1);
 	});
 	m_lru_cache.Free(image.lru_id);
 	m_total_used_memory -= image.AccountedSize();
@@ -2247,7 +2249,15 @@ uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
 	return tick;
 }
 
+bool TextureCache::MayCoverImages(uint64_t address, uint64_t size) const noexcept {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) return true;
+	return m_registered_pages.Any(pages.first, pages.last_exclusive);
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size, bool full_write) {
+	// A GPU write to pages no image covers changes no image state: skip the lock and the page walk.
+	if (!MayCoverImages(address, size)) return;
 	// A GPU buffer write also refreshes the images it overlaps at other addresses (after
 	// middletooth-glitch/KytyPS5 96a411672e, 9757165f56, 98a6e4cd3e, 7f3bfa1bdb):
 	// - an image without GPU writes of its own takes the buffer's bytes on its next use, so it
@@ -2363,6 +2373,9 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+	// Images register their pages before they are tracked, so a write to an uncovered page has
+	// nothing to invalidate and does not need the cache lock.
+	if (!MayCoverImages(address, size)) return;
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);

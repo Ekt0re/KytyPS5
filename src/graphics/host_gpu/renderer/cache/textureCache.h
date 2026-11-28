@@ -15,9 +15,12 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_set>
@@ -136,6 +139,54 @@ private:
 	static_assert(sizeof(Bucket) == 64);
 
 	using ImagePageTable = MultiLevelPageTable<Bucket, 20, 44, 14>;
+
+	// Number of registered images covering each page. Written under m_lock, read without it: a
+	// write to pages no image covers has nothing to invalidate, so it need not take the lock.
+	// Leaves are allocated on first registration to keep the sparse 24-bit page space cheap.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts(): m_leaves(std::make_unique<std::atomic<Leaf*>[]>(kLeafCount)) {}
+		~RegisteredPageCounts() {
+			for (size_t i = 0; i < kLeafCount; i++) {
+				delete m_leaves[i].load(std::memory_order_relaxed);
+			}
+		}
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void Add(size_t page, int32_t delta) {
+			auto& slot = m_leaves[page >> kLeafBits];
+			auto* leaf = slot.load(std::memory_order_relaxed);
+			if (leaf == nullptr) {
+				leaf = new Leaf {};
+				slot.store(leaf, std::memory_order_release);
+			}
+			(*leaf)[page & (kLeafSize - 1)].fetch_add(static_cast<uint32_t>(delta),
+			                                          std::memory_order_release);
+		}
+
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept {
+			for (auto page = first; page < last_exclusive; page++) {
+				const auto* leaf = m_leaves[page >> kLeafBits].load(std::memory_order_acquire);
+				if (leaf == nullptr) {
+					// Skip to the next leaf.
+					page = ((page >> kLeafBits) + 1) * kLeafSize - 1;
+					continue;
+				}
+				if ((*leaf)[page & (kLeafSize - 1)].load(std::memory_order_acquire) != 0) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+	private:
+		static constexpr size_t kLeafBits  = 10;
+		static constexpr size_t kLeafSize  = size_t {1} << kLeafBits;
+		static constexpr size_t kLeafCount = ImagePageTable::kPageCount / kLeafSize;
+		using Leaf                         = std::array<std::atomic<uint32_t>, kLeafSize>;
+
+		std::unique_ptr<std::atomic<Leaf*>[]> m_leaves;
+	};
 
 	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
@@ -314,6 +365,9 @@ private:
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
+	// False only for a valid range whose pages have no registered image. An invalid range keeps the
+	// original path so it still fails its usual validation.
+	[[nodiscard]] bool MayCoverImages(uint64_t address, uint64_t size) const noexcept;
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	[[nodiscard]] bool DownloadQueuedImages();
@@ -328,6 +382,7 @@ private:
 	ResolveCache&                                     m_resolve_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                              m_registered_pages;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;

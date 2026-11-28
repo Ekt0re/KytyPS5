@@ -450,6 +450,15 @@ struct TextureCacheTestAccess {
     return count;
   }
 
+  static bool RegisteredPagesAny(const TextureCache &cache, uint64_t address,
+                                 uint64_t size) {
+    TextureCache::ImagePageTable::PageRange pages{};
+    if (!TextureCache::ImagePageTable::TryGetPageRange(address, size, pages)) {
+      return false;
+    }
+    return cache.m_registered_pages.Any(pages.first, pages.last_exclusive);
+  }
+
   static ImageId InsertImage(TextureCache &cache, const ImageInfo &info) {
     std::lock_guard lock(cache.m_lock);
     return cache.InsertImage(info);
@@ -3576,6 +3585,65 @@ public:
     }
     Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
             "resolve cache release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Writes to pages no image covers leave the texture cache untouched, and the per-page counts
+  // follow overlapping registrations.
+  void CheckRegisteredPageSkips() {
+    constexpr const char *name = "RegisteredPageSkips";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t size = 0x200000;
+    constexpr uint64_t page = size_t {1} << TextureCache::ImagePageTable::kPageBits;
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "registered-page allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x33, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "registered-page mapping failed");
+    {
+      RenderContext context(m_runtime_context);
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      auto &scheduler = context.GetCommandScheduler();
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, size);
+      auto &cache = context.GetTextureCache();
+      const auto linear = [](uint64_t offset) {
+        return MakeLinearDesc(base + offset, 0x4000, vk::Format::eR8G8B8A8Unorm,
+                              Prospero::BufferFormat::k8_8_8_8UNorm,
+                              Prospero::ImageType::kColor2D, {64, 64, 1}, 1, 4, 1);
+      };
+      const auto first = TextureCacheTestAccess::InsertImage(cache, linear(0).info);
+      const auto second = TextureCacheTestAccess::InsertImage(cache, linear(0x1000).info);
+      Require(name, "covered pages", TextureCacheTestAccess::RegisteredPagesAny(cache, base, 0x1000),
+          "a registered image left its page uncounted");
+      Require(name, "uncovered page",
+          !TextureCacheTestAccess::RegisteredPagesAny(cache, base + page, 0x1000),
+          "an unregistered page was counted");
+      cache.InvalidateMemory(base + page, 0x1000);
+      cache.InvalidateMemoryFromGPU(base + page, 0x1000);
+      Require(name, "uncovered writes are inert",
+          TextureCacheTestAccess::Contains(cache, first) &&
+              TextureCacheTestAccess::Contains(cache, second) &&
+              !TextureCacheTestAccess::RegisteredPagesAny(cache, base + page, 0x1000),
+          "a write to an uncovered page changed the cache");
+      TextureCacheTestAccess::DeleteImage(cache, second);
+      Require(name, "one owner left",
+          TextureCacheTestAccess::RegisteredPagesAny(cache, base, 0x1000),
+          "removing one of two overlapping images cleared the page");
+      TextureCacheTestAccess::DeleteImage(cache, first);
+      Require(name, "no owners", !TextureCacheTestAccess::RegisteredPagesAny(cache, base, 0x1000),
+          "the last unregistration left a page counted");
+      context.UnmapMemory(base, size);
+      scheduler.Finish();
+    }
+    Require(name, "release", LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "registered-page release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -61014,6 +61082,11 @@ int main(int argc, char **argv) {
     vulkan.CheckResidentImageHeap();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--registered-pages-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckRegisteredPageSkips();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
@@ -62471,6 +62544,7 @@ int main(int argc, char **argv) {
   vulkan.CheckStreamBufferRing();
   vulkan.CheckStreamCopyWindow();
   vulkan.CheckResolveCache();
+  vulkan.CheckRegisteredPageSkips();
   vulkan.CheckImageAllocationPressure();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
