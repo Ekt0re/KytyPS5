@@ -7700,6 +7700,7 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
 
 void TestIndirectFormattedStoreTypedIr() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   using F = Libs::Graphics::Prospero::BufferFormat;
   const auto run = [](ValueOpcode opcode, uint32_t bits, uint32_t components,
                       uint32_t dwords, F format, uint32_t swizzle) {
@@ -7726,12 +7727,14 @@ void TestIndirectFormattedStoreTypedIr() {
     for (uint32_t word = 0; word < words.size(); ++word) {
       program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
                                      .component_index = word, .component_count = 4u});
-      words[word] = Value(&block->AppendNewInst(ValueOpcode::ReadConstBuffer,
-          {table, offset}, MemoryFlags{.index = static_cast<uint32_t>(word)}));
+      auto &read = block->AppendNewInst(ValueOpcode::ReadConstBuffer, {table, offset});
+      read.SetFlags(MemoryFlags{.index = static_cast<uint32_t>(word)});
+      words[word] = Value(&read);
     }
     const auto handle = Value(&block->AppendNewInst(
         ValueOpcode::GetBufferResource, {words[0], words[1], words[2], words[3]}));
-    Value data = bits == 16u ? Value(uint16_t{42u}) : Value(42u);
+    // StoreBufferU32 takes one packed dword, also for two 16-bit components.
+    Value data = Value(42u);
     if (opcode == ValueOpcode::StoreBufferU32x2)
       data = Value(&block->AppendNewInst(ValueOpcode::CompositeConstructU32x2,
                                         {Value(42u), Value(43u)}));
@@ -7742,8 +7745,8 @@ void TestIndirectFormattedStoreTypedIr() {
                                    .data_bits = bits, .component_count = components,
                                    .formatted = true, .idxen = true, .coherent = true});
     block->AppendNewInst(opcode,
-        {handle, lane, Value(0u), Value(0u), data, Value(true)},
-        MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+        {handle, lane, Value(0u), Value(0u), data, Value(true)})
+        .SetFlags(MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
     ShaderComputeInputInfo compute{};
     TrackResources(program, {}, {}, {.compute = &compute});
     Check(program.info.buffers.size() == 1u && program.info.buffers[0].written,
@@ -7758,8 +7761,9 @@ void TestIndirectFormattedStoreTypedIr() {
       descriptors[first + 3] = uint32_t(format) << 12u | swizzle;
     }
     const auto address = reinterpret_cast<uint64_t>(descriptors.data());
+    // The table V#: base (48 bits) with the 16-byte stride in word 1, two records, dst_sel.
     const std::array<uint32_t, 16> user_data{static_cast<uint32_t>(address),
-        static_cast<uint32_t>(address >> 32u), 16u << 16u, 2u, 0x5204u};
+        (static_cast<uint32_t>(address >> 32u) & 0xffffu) | (16u << 16u), 2u, 0x5204u};
     const SrtRuntime runtime{.user_data = user_data,
                              .read_specialization_memory = ReadHostTestMemory};
     ResourceSnapshot snapshot;
@@ -7767,7 +7771,7 @@ void TestIndirectFormattedStoreTypedIr() {
     Check(MaterializeResources(plan, runtime, snapshot, specialization),
           "indirect formatted typed-IR store did not materialize");
     ApplyResourceSpecialization(program, specialization);
-    TranslateResult translated;
+    ShaderRecompiler::TranslateResult translated;
     translated.program = std::move(program);
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.user_data = user_data;
@@ -7775,7 +7779,7 @@ void TestIndirectFormattedStoreTypedIr() {
     CheckSpirvBinaryValidates(compiled.spirv);
   };
   run(ValueOpcode::StoreBufferU32x3, 32u, 3u, 3u, F::k32_32_32_32Float,
-      Libs::Graphics::DstSel(4, 5, 6, 1));
+      Libs::Graphics::DstSel(4, 5, 6, 7));
   run(ValueOpcode::StoreBufferU32, 16u, 2u, 1u, F::k16_16Float,
       Libs::Graphics::DstSel(4, 5, 0, 1));
   run(ValueOpcode::StoreBufferU32x2, 16u, 4u, 2u, F::k16_16_16_16Float,
