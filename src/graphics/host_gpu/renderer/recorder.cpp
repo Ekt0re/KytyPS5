@@ -380,7 +380,16 @@ bool Queue(VkCommandBuffer buffer) {
 	if (remember && buffer == t_queued && epoch == t_queued_epoch) {
 		return true;
 	}
-	if (g_ring == nullptr || !IsOpen(buffer)) {
+	if (g_ring == nullptr) {
+		return false;
+	}
+	if (!IsOpen(buffer)) {
+		// A buffer the GPU thread records itself (begun elsewhere, with pNext, or while paused) may
+		// come from a pool the recorder is still using for queued commands: let those finish
+		// first (a pool must not be used by two threads at once). Free when nothing is queued.
+		if (IsProducer()) {
+			g_ring->Drain();
+		}
 		return false;
 	}
 	if (IsProducer()) {
@@ -856,6 +865,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BeginCommandBuffer(VkCommandBuffer buffer, const 
 		Close(buffer);
 	}
 	if (info->pNext != nullptr || info->pInheritanceInfo != nullptr || !IsProducer()) {
+		DrainForDestroy(); // the producer only: same pool rule as in Queue
 		return g_real.vkBeginCommandBuffer(buffer, info);
 	}
 	const bool paused = Paused();
@@ -888,6 +898,7 @@ VKAPI_ATTR VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer buffer) {
 		Close(buffer);
 	}
 	ForgetDirect(buffer);
+	DrainForDestroy(); // the producer only: same pool rule as in Queue
 	return g_real.vkEndCommandBuffer(buffer);
 }
 
