@@ -25,6 +25,11 @@ namespace Common::PerfSummary {
 namespace {
 
 constexpr auto N = static_cast<size_t>(Counter::Count);
+constexpr auto G = static_cast<size_t>(Gauge::Count);
+
+constexpr std::array<const char*, G> g_gauge_names = {"park_mb_peak", "vram_mb_peak"};
+// The highest level of each gauge since the start (for the total line).
+std::array<std::atomic<uint64_t>, G> g_gauge_run_peaks {};
 
 // Names follow the Counter order.
 constexpr std::array<const char*, N> g_names = {
@@ -32,7 +37,8 @@ constexpr std::array<const char*, N> g_names = {
     "read_faults",   "buf_readbacks", "tex_readbacks", "tex_lookups",     "buf_lookups",
     "desc_writes",   "heap_desc_writes", "pipe_lookups", "pipe_created",  "amm_maps",
     "amm_unmaps",    "gpu_unmaps",  "heap_rebinds", "heap_lookups",       "heap_range_skips",
-    "depth_recreates", "barriers",    "layout_transitions",
+    "depth_recreates", "depth_recreate_us", "img_created", "img_destroyed", "park_hits",
+    "park_misses",   "park_cap_evicts", "barriers",    "layout_transitions",
      "rb_calls",  "rb_batches",  "rb_submits",          "rb_fused",
     "rb_extra_bufs", "rb_neighbour", "rb_handler_us", "rb_flush_us",   "rb_submit_us",
     "rb_wait_us",    "rb_copy_us",    "rb_write_calls", "rb_write_us",
@@ -56,6 +62,7 @@ constexpr std::array<const char*, N> g_names = {
 struct Sample {
 	std::chrono::steady_clock::time_point time;
 	std::array<uint64_t, N>               counters {};
+	std::array<uint64_t, G>               gauges {};
 	double   gpu_cpu_ms       = 0.0;
 	double   rec_cpu_ms       = 0.0; // The recording thread (KYTY_RECORDER=1).
 	uint64_t gpu_instr_user   = 0;
@@ -179,6 +186,15 @@ Sample Take() {
 	for (size_t i = 0; i < N; i++) {
 		s.counters[i] = Detail::g_counters[i].load(std::memory_order_relaxed);
 	}
+	// A gauge's peak restarts with each sample.
+	for (size_t i = 0; i < G; i++) {
+		s.gauges[i]     = Detail::g_gauge_peaks[i].exchange(0, std::memory_order_relaxed);
+		auto& run_peak  = g_gauge_run_peaks[i];
+		auto  seen      = run_peak.load(std::memory_order_relaxed);
+		while (seen < s.gauges[i] &&
+		       !run_peak.compare_exchange_weak(seen, s.gauges[i], std::memory_order_relaxed)) {
+		}
+	}
 	TakeHost(s);
 	return s;
 }
@@ -206,6 +222,9 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 	add("%s secs=%.1f", tag, secs);
 	for (size_t i = 0; i < N; i++) {
 		add(" %s=%" PRIu64, g_names[i], to.counters[i] - from.counters[i]);
+	}
+	for (size_t i = 0; i < G; i++) {
+		add(" %s=%" PRIu64, g_gauge_names[i], to.gauges[i]);
 	}
 #if defined(__linux__)
 	add(" gpu_cpu_ms=%.0f", gpu_ms);
@@ -327,7 +346,10 @@ void PrintTotal() {
 	if (g_total_printed.exchange(true)) {
 		return;
 	}
-	const auto now  = Take();
+	auto now = Take();
+	for (size_t i = 0; i < G; i++) {
+		now.gauges[i] = g_gauge_run_peaks[i].load(std::memory_order_relaxed);
+	}
 	const auto secs = std::chrono::duration<double>(now.time - g_first.time).count();
 	char       tag[48];
 	std::snprintf(tag, sizeof(tag), "total t=%.0f", secs);

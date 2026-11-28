@@ -42,6 +42,12 @@ enum class Counter {
 	HeapLookups,    // Texture lookups those made.
 	HeapRangeSkips, // Lookups saved because the image set changed only at other addresses.
 	DepthRecreates, // Depth images replaced by one of another format, layout or binding kind.
+	DepthRecreateUs,   // Microseconds those replacements took on the GPU thread.
+	ImagesCreated,     // Cached images created (a Vulkan image each).
+	ImagesDestroyed,   // Cached images destroyed (their Vulkan image released at tick end).
+	ParkHits,          // Depth replacements that took a parked image back (no image created).
+	ParkMisses,        // Depth replacements with parking on that found no parked image of the shape.
+	ParkCapEvictions,  // Parked images destroyed because the pool was at its image or MiB cap.
 	ImageBarriers,     // Image memory barriers of cached images (Image::GetBarriers).
 	LayoutTransitions, // Those that change the layout.
 	// Synchronous buffer readbacks (BufferCache::ReadMemory on the GPU thread), per phase.
@@ -120,10 +126,28 @@ enum class Counter {
 	Count
 };
 
+// Levels rather than counts: each summary line reports the highest level set in its interval
+// (the total line: in the whole run).
+enum class Gauge {
+	ParkedMiB, // Memory of the texture cache's parked images.
+	DeviceMiB, // Device-local memory the emulator uses (VK_EXT_memory_budget), at each suspend point.
+	Count
+};
+
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
+inline std::atomic<uint64_t> g_gauge_peaks[static_cast<int>(Gauge::Count)] {};
 } // namespace Detail
+
+inline void SetGauge(Gauge gauge, uint64_t value) noexcept {
+	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+		auto& peak = Detail::g_gauge_peaks[static_cast<int>(gauge)];
+		auto  seen = peak.load(std::memory_order_relaxed);
+		while (seen < value && !peak.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+		}
+	}
+}
 
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	if (Detail::g_enabled.load(std::memory_order_relaxed)) {

@@ -353,6 +353,18 @@ struct TextureCacheTestAccess {
   static void SetShareDepthStencil(TextureCache &cache, bool share) {
     cache.m_share_depth_stencil = share;
   }
+  static void SetParkImages(TextureCache &cache, bool park) {
+    cache.m_park_images = park;
+  }
+  static size_t ParkedCount(const TextureCache &cache) {
+    return cache.m_parked_images.size();
+  }
+  static uint64_t ParkedBytes(const TextureCache &cache) {
+    return cache.m_parked_bytes;
+  }
+  static bool SameParkedShape(const ImageInfo &parked, const ImageInfo &wanted) {
+    return TextureCache::SameParkedShape(parked, wanted);
+  }
   // Suspend points that collect nothing.
   static void SkipFrames(TextureCache &cache, uint64_t frames) {
     cache.m_gc_tick += frames;
@@ -8375,6 +8387,113 @@ public:
                                 sizeof(d16s8_values)) == 0,
                 "the depth_split switch did not keep the previous conversion");
         texture_cache.UnmapMemory(base + d16s8_offset, 0x2000);
+      }
+
+      {
+        // Parked images: a depth conversion keeps the image it replaces, and converting back takes
+        // that image (same slot, same Vulkan image, a new serial) with the converted contents.
+        constexpr uint64_t park_offset = 0x360000;
+        constexpr uint64_t park_stencil_offset = 0x361000;
+        constexpr std::array<uint16_t, 4> park_values{0x1111u, 0x5555u, 0x9999u, 0xeeeeu};
+        std::memcpy(memory + park_offset, park_values.data(), sizeof(park_values));
+        std::memset(memory + park_stencil_offset, 0x5a, 4);
+        TextureCacheTestAccess::SetShareDepthStencil(texture_cache, false);
+        TextureCacheTestAccess::SetParkImages(texture_cache, true);
+        auto park_d16s8 = MakeLinearDesc(
+            base + park_offset, sizeof(park_values), vk::Format::eD16UnormS8Uint,
+            Prospero::BufferFormat::k16UNorm, Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 2,
+            1);
+        park_d16s8.type = BindingType::DepthTarget;
+        park_d16s8.info.stencil = {base + park_stencil_offset, 4};
+        park_d16s8.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        park_d16s8.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        auto park_d16 = park_d16s8;
+        park_d16.info.stencil = {};
+        park_d16.info.pixel_format = vk::Format::eD16Unorm;
+        park_d16.view_info.format = vk::Format::eD16Unorm;
+        park_d16.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        const auto read_park_depth = [&](ImageId id) {
+          auto readback = CreateHostBuffer(name, 4 * sizeof(u32),
+                                           vk::BufferUsageFlagBits::eTransferDst,
+                                           std::vector<u32>(4, 0));
+          auto &image = texture_cache.GetImage(id);
+          image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                        vk::AccessFlagBits2::eTransferRead, {},
+                        scheduler.Current().Handle());
+          const vk::BufferImageCopy copy{
+              0, 4, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, {4, 1, 1}};
+          scheduler.Current().Handle().copyImageToBuffer(
+              image.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+              readback.buffer, 1, &copy);
+          vk::BufferMemoryBarrier barrier{};
+          barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+          barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+          barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+          barrier.buffer = readback.buffer;
+          barrier.size = readback.size;
+          scheduler.Current().Handle().pipelineBarrier(
+              vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+              nullptr, 1, &barrier, 0, nullptr);
+          scheduler.Finish();
+          auto words = ReadBuffer(name, readback, 4);
+          DestroyBuffer(&readback);
+          return words;
+        };
+        const auto first_d16s8 = texture_cache.FindImage(park_d16s8);
+        (void)texture_cache.FindDepthTarget(first_d16s8, park_d16s8);
+        texture_cache.MarkGpuWritten(first_d16s8);
+        const auto first_serial = texture_cache.GetImage(first_d16s8).serial;
+        const auto first_vk = texture_cache.GetImage(first_d16s8).backing.image;
+        auto to_d16 = park_d16;
+        const auto first_d16 = texture_cache.FindImage(to_d16);
+        Require(name, "conversion parks the replaced image",
+                first_d16 != first_d16s8 &&
+                    !TextureCacheTestAccess::Contains(texture_cache, first_d16s8) &&
+                    TextureCacheTestAccess::Owner(texture_cache, first_d16s8) != nullptr &&
+                    TextureCacheTestAccess::ParkedCount(texture_cache) == 1 &&
+                    TextureCacheTestAccess::ParkedBytes(texture_cache) != 0,
+                "the D16S8 image a D16 target replaced was not parked");
+        (void)texture_cache.FindDepthTarget(first_d16, to_d16);
+        texture_cache.MarkGpuWritten(first_d16);
+        auto back_d16s8 = park_d16s8;
+        const auto back_id = texture_cache.FindImage(back_d16s8);
+        const auto &back = texture_cache.GetImage(back_id);
+        Require(name, "conversion back takes the parked image",
+                back_id == first_d16s8 && back.backing.image == first_vk &&
+                    back.serial != first_serial && back.registered &&
+                    back.heap_refs.load() == 0u && !back.binding.needs_rebind &&
+                    !TextureCacheTestAccess::Contains(texture_cache, first_d16) &&
+                    TextureCacheTestAccess::ParkedCount(texture_cache) == 1,
+                "converting back to D16S8 created an image instead of reusing the parked one");
+        (void)texture_cache.FindDepthTarget(back_id, back_d16s8);
+        const auto back_words = read_park_depth(back_id);
+        Require(name, "parked image round trip keeps depth values",
+                std::memcmp(back_words.data(), park_values.data(), sizeof(park_values)) == 0,
+                "the reused D16S8 image lost the depth values");
+        texture_cache.MarkGpuWritten(back_id);
+        auto again_d16 = park_d16;
+        const auto again_id = texture_cache.FindImage(again_d16);
+        Require(name, "second conversion takes the parked D16 image",
+                again_id == first_d16 &&
+                    TextureCacheTestAccess::ParkedCount(texture_cache) == 1,
+                "converting to D16 again created an image instead of reusing the parked one");
+        // A shape that differs (another extent) never takes a parked image.
+        Require(name, "parked shape match",
+                !TextureCacheTestAccess::SameParkedShape(texture_cache.GetImage(again_id).info,
+                                               [&] {
+                                                 auto other = again_d16.info;
+                                                 other.extent.width = 2;
+                                                 return other;
+                                               }()),
+                "a parked image matched another shape");
+        texture_cache.UnmapMemory(base + park_offset, 0x2000);
+        Require(name, "unmap discards parked images",
+                TextureCacheTestAccess::ParkedCount(texture_cache) == 0 &&
+                    TextureCacheTestAccess::ParkedBytes(texture_cache) == 0,
+                "unmapping the range kept its parked images");
+        TextureCacheTestAccess::SetParkImages(texture_cache, false);
       }
 
       {

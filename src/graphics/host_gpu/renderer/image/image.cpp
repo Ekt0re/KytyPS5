@@ -782,6 +782,26 @@ Image::~Image() {
 	ReleaseBacking();
 }
 
+void Image::ResetForReuse(const ImageInfo& image_info) {
+	EXIT_IF(registered || !stencil_ids.empty());
+	info                 = image_info;
+	serial               = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	usage                = {};
+	binding              = {};
+	track_addr           = 0;
+	track_addr_end       = 0;
+	depth_id             = {};
+	stencil_subresources = {0, info.resources.levels, 0, info.resources.layers};
+	tick_accessed_last   = 0;
+	lru_id               = 0;
+	heap_refs.store(0u, std::memory_order_relaxed);
+	m_maybe_cpu_hash  = 0;
+	m_cpu_dirty       = !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
+	m_maybe_cpu_dirty = false;
+	m_gpu_modified    = false;
+	m_buffer_modified = false;
+}
+
 void Image::ReleaseBacking() {
 	for (const auto& cached: views) {
 		m_graphics.device.destroyImageView(cached.view, nullptr);

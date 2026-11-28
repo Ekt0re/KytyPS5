@@ -238,7 +238,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	while (info.pixel_format != vk::Format::eUndefined &&
 	       m_slot_images[id].backing.image == nullptr) {
 		m_slot_images.erase(id);
-		if (!ReleaseIdleImages(info.data)) {
+		if (!ReleaseParkedImages() && !ReleaseIdleImages(info.data)) {
 			EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 			     info.extent.width, info.extent.height, info.extent.depth,
 			     static_cast<int>(info.pixel_format), info.IsVolume() ? 1u : info.resources.layers,
@@ -248,6 +248,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	}
 	RegisterImage(id);
 	LogLargeImageExtent(info);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ImagesCreated);
 	return id;
 }
 
@@ -337,10 +338,20 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 void TextureCache::DeleteImage(ImageId id) {
-	auto& image = m_slot_images[id];
-	if (!image.registered) {
+	if (!m_slot_images[id].registered) {
 		return;
 	}
+	DetachImage(id);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ImagesDestroyed);
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
+	} else {
+		m_slot_images.erase(id);
+	}
+}
+
+void TextureCache::DetachImage(ImageId id) {
+	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		std::erase(m_slot_images[image.depth_id].stencil_ids, id);
 	} else {
@@ -358,11 +369,6 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
-	} else {
-		m_slot_images.erase(id);
-	}
 }
 
 void TextureCache::FreeImage(ImageId id) {
@@ -766,6 +772,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		return cached_id;
 	}
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::DepthRecreates);
+	const Common::PerfSummary::ScopedMicros recreate_time(
+	    Common::PerfSummary::Counter::DepthRecreateUs);
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
@@ -781,9 +789,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.guest_format = cached.info.guest_format;
 		info.metadata     = cached.info.metadata;
 	}
-	info.htile_initial_clear  = false;
-	const auto replacement_id = InsertImage(info);
-	auto&      replacement    = m_slot_images[replacement_id];
+	info.htile_initial_clear = false;
+	ImageId replacement_id   = UnparkImage(info);
+	if (!replacement_id) {
+		replacement_id = InsertImage(info);
+	}
+	auto& replacement = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
@@ -827,8 +838,130 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
 		           cached.backing.samples, replacement.backing.samples);
 	}
-	FreeImage(cached_id);
+	RetireImage(cached_id);
 	return replacement_id;
+}
+
+bool TextureCache::SameParkedShape(const ImageInfo& parked, const ImageInfo& wanted) {
+	// Everything the Vulkan image (format, extent, levels, layers, samples, usage and create
+	// flags) and the guest layout derive from.
+	return parked.data == wanted.data && parked.stencil == wanted.stencil &&
+	       parked.metadata.kind == wanted.metadata.kind &&
+	       parked.metadata.range == wanted.metadata.range &&
+	       parked.metadata.compression == wanted.metadata.compression &&
+	       parked.metadata.stencil_compressed == wanted.metadata.stencil_compressed &&
+	       parked.pixel_format == wanted.pixel_format &&
+	       parked.guest_format == wanted.guest_format && parked.type == wanted.type &&
+	       parked.extent == wanted.extent && parked.resources == wanted.resources &&
+	       parked.pitch == wanted.pitch && parked.bytes_per_block == wanted.bytes_per_block &&
+	       parked.samples == wanted.samples && parked.tile_mode == wanted.tile_mode &&
+	       parked.bgra16 == wanted.bgra16 && parked.mip_layout == wanted.mip_layout &&
+	       parked.tiled_slice_stride == wanted.tiled_slice_stride &&
+	       parked.first_tail_level == wanted.first_tail_level;
+}
+
+void TextureCache::RetireImage(ImageId id) {
+	auto&      image = m_slot_images[id];
+	const auto bytes = image.AccountedSize();
+	// Multisample images and stencil associations are rare here and keep the plain path.
+	if (!m_park_images || !image.registered || image.depth_id || image.backing.image == nullptr ||
+	    image.backing.samples != 1 || image.info.pixel_format == vk::Format::eUndefined ||
+	    bytes == 0 || bytes > m_park_max_bytes || m_park_max_count == 0) {
+		FreeImage(id);
+		return;
+	}
+	// As FreeImage, except that the slot, its Vulkan image and its views stay.
+	image.ClearGpuModified();
+	DetachImage(id);
+	m_parked_images.push_back({.id = id, .gc_tick = m_gc_tick, .bytes = bytes});
+	m_parked_bytes += bytes;
+	while (m_parked_images.size() > m_park_max_count || m_parked_bytes > m_park_max_bytes) {
+		const auto oldest = m_parked_images.front();
+		m_parked_images.erase(m_parked_images.begin());
+		DiscardParkedImage(oldest);
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::ParkCapEvictions);
+		// The first 16 cap hits, then every 1024th.
+		++m_park_cap_hits;
+		if (m_park_cap_hits <= 16 || m_park_cap_hits % 1024 == 0) {
+			LOGF("TextureCache: parked image pool at its cap (%" PRIu64 " images, %" PRIu64
+			     " MiB; KYTY_PARK_MAX=%" PRIu64 ", KYTY_PARK_MB=%" PRIu64 "): %" PRIu64
+			     " cap evictions\n",
+			     static_cast<uint64_t>(m_parked_images.size()), m_parked_bytes >> 20u,
+			     m_park_max_count, m_park_max_bytes >> 20u, m_park_cap_hits);
+		}
+	}
+	Common::PerfSummary::SetGauge(Common::PerfSummary::Gauge::ParkedMiB, m_parked_bytes >> 20u);
+}
+
+ImageId TextureCache::UnparkImage(const ImageInfo& info) {
+	if (!m_park_images) {
+		return {};
+	}
+	// Newest first: a conversion back most often wants the image parked last.
+	for (auto it = m_parked_images.rbegin(); it != m_parked_images.rend(); ++it) {
+		const auto id = it->id;
+		auto&      image = m_slot_images[id];
+		if (!SameParkedShape(image.info, info)) {
+			continue;
+		}
+		m_parked_bytes -= it->bytes;
+		m_parked_images.erase(std::next(it).base());
+		image.ResetForReuse(info);
+		RegisterImage(id);
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::ParkHits);
+		return id;
+	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ParkMisses);
+	return {};
+}
+
+void TextureCache::DiscardParkedImage(const ParkedImage& parked) {
+	m_parked_bytes -= parked.bytes;
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::ImagesDestroyed);
+	// Recorded or in-flight work may still use it.
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferRelease([this, id = parked.id] { m_slot_images.erase(id); });
+	} else {
+		m_slot_images.erase(parked.id);
+	}
+}
+
+void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
+	std::erase_if(m_parked_images, [&](const ParkedImage& parked) {
+		const auto& data    = m_slot_images[parked.id].info.data;
+		const bool  discard = size == 0 ? m_gc_tick - parked.gc_tick > m_park_max_frames
+		                                : data.address < address + size && address < data.End();
+		if (discard) {
+			DiscardParkedImage(parked);
+		}
+		return discard;
+	});
+}
+
+void TextureCache::DiscardAllParkedImages() {
+	for (const auto& parked: std::exchange(m_parked_images, {})) {
+		DiscardParkedImage(parked);
+	}
+}
+
+bool TextureCache::ReleaseParkedImages() {
+	if (m_parked_images.empty()) {
+		return false;
+	}
+	auto parked = std::exchange(m_parked_images, {});
+	if (m_scheduler.Active()) {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+	LOGF("TextureCache: image allocation failed: releasing %" PRIu64 " parked images (%" PRIu64
+	     " MiB)\n",
+	     static_cast<uint64_t>(parked.size()), m_parked_bytes >> 20u);
+	for (const auto& image: parked) {
+		m_slot_images[image.id].ReleaseBacking();
+		DiscardParkedImage(image);
+	}
+	return true;
 }
 
 namespace BcAlias {
@@ -2300,6 +2433,7 @@ bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
 
 void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
+	DiscardParkedImages(address, size);
 	m_surface_metas.erase(m_surface_metas.lower_bound(address),
 	                      m_surface_metas.lower_bound(address + size));
 	Common::SmallVector<ImageId, 16> deleted_images;
@@ -2317,8 +2451,17 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	m_share_depth_stencil = ShareDepthStencilDefault() && !Common::RuntimeToggles::Get("depth_split");
+	m_park_images = ParkImagesDefault() || Common::RuntimeToggles::Get("park_images");
+	if (m_park_images) {
+		DiscardParkedImages(0, 0);
+	} else {
+		DiscardAllParkedImages();
+	}
+	Common::PerfSummary::SetGauge(Common::PerfSummary::Gauge::ParkedMiB, m_parked_bytes >> 20u);
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		Common::PerfSummary::SetGauge(Common::PerfSummary::Gauge::DeviceMiB,
+		                              m_total_used_memory >> 20u);
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
