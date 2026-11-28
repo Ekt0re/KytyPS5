@@ -1357,14 +1357,14 @@ private:
 		// mapping they asked for last (labels, query results, WRITE_DATA): remember, per thread,
 		// the last shared mapping that held the whole range until the mappings change.
 		struct LastShared {
-			const void* space      = nullptr;
+			uint64_t    space      = 0;
 			uint64_t    generation = 0;
 			uint64_t    begin      = 0;
 			uint64_t    end        = 0;
 		};
 		thread_local LastShared last;
-		const auto generation = m_mapped_generation.load(std::memory_order_relaxed);
-		if (last.space == this && last.generation == generation && vaddr >= last.begin &&
+		const auto generation = m_mapped_generation;
+		if (last.space == m_address_space_id && last.generation == generation && vaddr >= last.begin &&
 		    vaddr + size <= last.end) {
 			return false;
 		}
@@ -1381,7 +1381,7 @@ private:
 				return true;
 			}
 			if (region.vaddr <= vaddr && vaddr + size <= region.vaddr + region.size) {
-				last = {this, generation, region.vaddr, region.vaddr + region.size};
+				last = {m_address_space_id, generation, region.vaddr, region.vaddr + region.size};
 			}
 		}
 		return false;
@@ -1409,7 +1409,7 @@ private:
 	}
 
 	void AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
-		m_mapped_generation.fetch_add(1, std::memory_order_relaxed);
+		++m_mapped_generation;
 		m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type});
 	}
 
@@ -1422,7 +1422,7 @@ private:
 			const auto original_end = original.vaddr + original.size;
 			const auto part_end     = std::min(end, original_end);
 			m_mapped.erase(it);
-			m_mapped_generation.fetch_add(1, std::memory_order_relaxed);
+			++m_mapped_generation;
 			if (original.vaddr < current) {
 				AddMappedUnlocked(original.vaddr, current - original.vaddr, original.type);
 			}
@@ -1715,7 +1715,9 @@ private:
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
 	// Advances on every change of m_mapped (under the exclusive lock; read under either).
-	std::atomic<uint64_t>                       m_mapped_generation {1};
+	uint64_t                                   m_mapped_generation = 0;
+	inline static std::atomic<uint64_t>        s_next_address_space_id {1};
+	const uint64_t m_address_space_id = s_next_address_space_id.fetch_add(1, std::memory_order_relaxed);
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;
