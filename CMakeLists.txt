@@ -551,6 +551,11 @@ add_executable(pipeline_create_stats_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PipelineCreateStatsTests.cpp"
 )
 target_include_directories(pipeline_create_stats_tests PRIVATE ${inc_headers})
+add_executable(buffer_probe_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BufferProbeTests.cpp"
+)
+target_link_libraries(buffer_probe_tests common kyty_test_gtest)
+target_include_directories(buffer_probe_tests PRIVATE ${inc_headers})
 
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
@@ -942,6 +947,7 @@ if(BUILD_TESTING)
 	add_test(NAME dispatch_limits COMMAND $<TARGET_FILE:dispatch_limits_tests>)
 	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
 	add_test(NAME pipeline_create_stats COMMAND $<TARGET_FILE:pipeline_create_stats_tests>)
+	add_test(NAME buffer_probe COMMAND $<TARGET_FILE:buffer_probe_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)
 	add_test(NAME skip_taint COMMAND $<TARGET_FILE:skip_taint_tests>)
@@ -1113,6 +1119,7 @@ if(BUILD_TESTING)
 		wait_diagnostics_tests
 		driver_cache_file_tests
 		pipeline_create_stats_tests
+		buffer_probe_tests
 		lru_cache_tests
 		readback_batch_tests
 		skip_taint_tests
