@@ -1412,8 +1412,8 @@ void TestIndexedRawByteBounds(bool broad_conversion) {
   Check(materialize(4u, 4096u, identity, false, 4u) == broad_conversion,
         "indexed byte-bound conversion did not match the switch state");
   if (broad_conversion) {
-    Check(snapshot.buffers.size() == 3u &&
-              std::ranges::all_of(std::span(snapshot.buffers).subspan(1), [](const auto& buffer) {
+    Check(snapshot.buffers.size() == 2u &&
+              std::ranges::all_of(snapshot.buffers, [](const auto& buffer) {
                 return buffer.dwords[2] == 1024u && (buffer.dwords[3] >> 28u) == 0u;
               }),
           "exact byte bounds were not converted to record bounds for every candidate");
@@ -1424,13 +1424,13 @@ void TestIndexedRawByteBounds(bool broad_conversion) {
         "zero-stride byte bounds were converted");
   Check(!materialize(6u, 4098u, identity, false, 4u),
         "misaligned records were accepted after byte-bound conversion");
-  Check(!materialize(4u, 4096u, identity ^ 1u, false, 4u),
+  Check(!materialize(4u | (1u << 15u), 4096u, identity, false, 4u),
         "swizzled byte bounds were converted");
   Check(!materialize(4u, 4096u, identity, true, 4u),
         "broad ADD_TID byte bounds were converted");
   Check(materialize(1u, 4096u, identity, false, 1u) &&
-            snapshot.buffers.size() == 3u &&
-            std::ranges::all_of(std::span(snapshot.buffers).subspan(1), [](const auto& buffer) {
+            snapshot.buffers.size() == 2u &&
+            std::ranges::all_of(snapshot.buffers, [](const auto& buffer) {
               return buffer.dwords[2] == 4096u && (buffer.dwords[3] >> 28u) == 0u;
             }),
         "legacy stride-one byte bounds changed");
