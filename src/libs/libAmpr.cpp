@@ -694,6 +694,15 @@ static bool ShouldLogAmprEbusyLocked(std::string_view op, uint64_t command_buffe
 	return n <= 32u || (n & (n - 1u)) == 0;
 }
 
+// KYTY_AMPR_LOG=1 also prints each lifecycle operation. Read once, off for unset, empty or "0".
+static bool AmprLifecycleLogEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_AMPR_LOG");
+		return env != nullptr && env[0] != '\0' && env[0] != '0';
+	}();
+	return enabled;
+}
+
 static void LogAmprEbusyLocked(const char* op, uint64_t command_buffer, CommandBufferState& state,
                                uint64_t record_size, uint32_t num_commands, bool is_record_space,
                                int rc = LibKernel::KERNEL_ERROR_EBUSY) {
@@ -701,7 +710,17 @@ static void LogAmprEbusyLocked(const char* op, uint64_t command_buffer, CommandB
 	                              command_buffer, state, is_record_space)) {
 		return;
 	}
-	LOGF("[ampr][ebusy] op=%s cb=0x%" PRIx64 " buf=0x%" PRIx64
+	if (!AmprLifecycleLogEnabled()) {
+		// Switched off: upstream's line, unchanged.
+		LOGF("[ampr][ebusy] op=%s cb=0x%016" PRIx64 " buf=0x%016" PRIx64
+		     " tid=%d size=0x%" PRIx64 " write_offset=0x%" PRIx64 " record_size=0x%" PRIx64
+		     " num_commands=%u commands=%zu\n",
+		     op != nullptr ? op : "?", command_buffer, state.buffer,
+		     Common::Thread::GetThreadIdUnique(), state.size, state.write_offset, record_size,
+		     num_commands, state.commands.size());
+		return;
+	}
+	LOGF("[ampr][ebusy] op=%s cb=0x%016" PRIx64 " buf=0x%016" PRIx64
 	     " tid=%d size=0x%" PRIx64 " write_offset=0x%" PRIx64 " record_size=0x%" PRIx64
 	     " num_commands=%u commands=%zu last_submit_seq=%" PRIu64 " last_reset_seq=%" PRIu64
 	     " last_setbuf_seq=%" PRIu64 " rc=0x%08x\n",
@@ -720,15 +739,6 @@ static void LogAmprEbusyLocked(const char* op, uint64_t command_buffer, CommandB
 		     i + 1, count, ev.seq, ev.op != nullptr ? ev.op : "?", ev.tid, ev.write_offset,
 		     ev.size, ev.num_commands, static_cast<uint32_t>(ev.rc));
 	}
-}
-
-// KYTY_AMPR_LOG=1 also prints each lifecycle operation. Read once, off for unset, empty or "0".
-static bool AmprLifecycleLogEnabled() {
-	static const bool enabled = [] {
-		const char* env = std::getenv("KYTY_AMPR_LOG");
-		return env != nullptr && env[0] != '\0' && env[0] != '0';
-	}();
-	return enabled;
 }
 
 static uint64_t NextAmprSeq() {
@@ -1586,12 +1596,16 @@ static int KYTY_SYSV_ABI CommandBufferSetBuffer(void* command_buffer, void* buff
 	if (AmprLifecycleLogEnabled()) {
 		const auto seq = NextAmprSeq();
 		const auto tid = Common::Thread::GetThreadIdUnique();
-		auto&      state = g_command_buffers[command_buffer_addr];
-		state.last_setbuf_seq = seq;
-		RecordLifecycleEventLocked(state, "SetBuffer", seq, tid, 0u, OK);
-		LOGF("[ampr][life] seq=%" PRIu64 " op=SetBuffer cb=0x%" PRIx64 " buf=0x%" PRIx64
-		     " tid=%d write_offset=0x%" PRIx64 " size=0x%" PRIx64 " rc=0x0\n",
-		     seq, command_buffer_addr, state.buffer, tid, state.write_offset, state.size);
+		// find, not operator[]: logging must not create a state entry.
+		if (const auto it = g_command_buffers.find(command_buffer_addr);
+		    it != g_command_buffers.end()) {
+			auto& state           = it->second;
+			state.last_setbuf_seq = seq;
+			RecordLifecycleEventLocked(state, "SetBuffer", seq, tid, 0u, OK);
+			LOGF("[ampr][life] seq=%" PRIu64 " op=SetBuffer cb=0x%" PRIx64 " buf=0x%" PRIx64
+			     " tid=%d write_offset=0x%" PRIx64 " size=0x%" PRIx64 " rc=0x0\n",
+			     seq, command_buffer_addr, state.buffer, tid, state.write_offset, state.size);
+		}
 	}
 
 	return OK;
@@ -1657,8 +1671,11 @@ static void* KYTY_SYSV_ABI CommandBufferClearBuffer(void* command_buffer) {
 		return nullptr;
 	}
 
-	const auto off = ReadCommandBufferUnchecked<uint32_t>(command_buffer_addr +
-	                                                      COMMAND_BUFFER_OFFSET_OFFSET);
+	// Read only for the log line: switched off, the guest header is not touched here.
+	const auto off = AmprLifecycleLogEnabled()
+	                     ? ReadCommandBufferUnchecked<uint32_t>(command_buffer_addr +
+	                                                            COMMAND_BUFFER_OFFSET_OFFSET)
+	                     : 0u;
 	if (!WriteVisibleCommandBufferPointersLocked(command_buffer_addr, 0, 0)) {
 		return nullptr;
 	}
