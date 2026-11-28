@@ -1296,10 +1296,42 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	// state.deferrable (KYTY_DEFER_NEW_TARGETS, off by default) deliberately lets depth writers
 	// into targets not seen redrawn be skipped during a presented-frame stall in mode 1: an opt-in
 	// trade of possible depth/shadow holes for not stalling (see GetGraphicsPrograms).
-	const bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
-	                       (async_mode >= 2 || !depth_writes || state.deferrable);
+	bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
+	                 (async_mode == 2 || !depth_writes || state.deferrable);
 	// Counted only for the draws the switch made skippable (depth writers in mode 1).
-	const bool deferred_by_switch = state.deferrable && depth_writes && async_mode < 2;
+	const bool deferred_by_switch = state.deferrable && depth_writes && async_mode != 2;
+	// KYTY_ASYNC_PIPELINES=3 (after simnJS e8d094827, "compile the pipelines of UI, layer and
+	// small draws without skipping them"): mode 1, but a draw the game may make only once into a
+	// cached layer is never skipped, since it would be lost for good: draws of pipelines of at
+	// most 12000 SPIR-V words in all (a few milliseconds of driver time), draws without depth test
+	// or write whose vertex stages total at most 8000 words (UI and 2D layers), draws whose color
+	// targets are all at most 1024 pixels wide and high (glyph atlases, cached layers), draws to a
+	// linear image (the CPU reads those back) and draws a guest occlusion query counts. A draw
+	// that finds its pipeline compiling waits up to 20 ms for it once before it is skipped.
+	if (skippable && async_mode == 3) {
+		const auto& dc           = buffer.GetRegisters().GetDepthControl();
+		size_t      vertex_words = 0;
+		for (const auto& stage: vertex_stages) {
+			if (stage.stage.module != nullptr) vertex_words += stage.stage.module->spirv_words;
+		}
+		const size_t pixel_words = state.ps_active && state.ps_input_info.stage.module != nullptr
+		                               ? state.ps_input_info.stage.module->spirv_words
+		                               : 0;
+		const bool depth_used = static_cast<bool>(m_targets.depth.image_id) &&
+		                        (dc.z_enable || dc.z_write_enable);
+		bool small_targets = m_targets.color_count != 0;
+		bool linear        = static_cast<bool>(m_targets.depth.image_id) &&
+		              !m_targets.depth.desc.info.IsTiled();
+		for (uint32_t i = 0; i < m_targets.color_count; i++) {
+			const auto& extent = m_targets.colors[i].desc.info.extent;
+			small_targets      = small_targets && extent.width <= 1024 && extent.height <= 1024;
+			linear             = linear || !m_targets.colors[i].desc.info.IsTiled();
+		}
+		if (vertex_words + pixel_words <= 12000 || (!depth_used && vertex_words <= 8000) ||
+		    small_targets || linear) {
+			skippable = false;
+		}
+	}
 	// A draw that waits may start with an unoptimized pipeline (KYTY_FAST_PIPELINES).
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
 	                                                                  false, !skippable);
@@ -1377,6 +1409,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	buffer.BeginRendering(rendering);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	// KYTY_ASYNC_PIPELINES=3: a skipped draw would count no samples.
+	if (async_mode == 3 && occlusion_query >= 0) skippable = false;
 	const auto&    last_vertex = vertex_stages.back().stage;
 	const uint64_t vs_hash = last_vertex.module != nullptr ? last_vertex.module->info.shader_hash : 0;
 	const uint64_t ps_hash = state.ps_active && state.ps_input_info.stage.module != nullptr
@@ -1431,6 +1465,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		GpuBreadcrumbs::End(*graphics, command, crumb);
 		occlusion_queries.End(command, occlusion_query);
 	};
+	if (!pipeline.pipeline && skippable && async_mode == 3) {
+		PipelineCache::GraceWait(pipeline, std::chrono::milliseconds {20});
+	}
 	if (pipeline.pipeline) {
 		record(vk_buffer, pipeline.pipeline);
 	} else {

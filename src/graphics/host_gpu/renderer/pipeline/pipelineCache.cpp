@@ -1872,6 +1872,24 @@ PipelineCache::Pipeline& PipelineCache::Resolve(Pipeline& pipeline, bool wait) {
 	return pipeline;
 }
 
+void PipelineCache::GraceWait(Pipeline& pipeline, std::chrono::milliseconds limit) {
+	// A background creation no worker started would not progress while this waits.
+	if (pipeline.grace_waited || !pipeline.compiling.valid() ||
+	    (pipeline.deferred != nullptr && !pipeline.deferred->Claimed())) {
+		return;
+	}
+	pipeline.grace_waited = true;
+	const auto start      = std::chrono::steady_clock::now();
+	bool       ready      = false;
+	{
+		const Common::CompilePause::Scope compile_pause;
+		ready = pipeline.compiling.wait_for(limit) == std::future_status::ready;
+	}
+	NotePipelineWait(
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	if (ready) Resolve(pipeline, false);
+}
+
 PipelineCache::PipelineCache(GraphicContext& graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
                              const std::filesystem::path& shader_store,
