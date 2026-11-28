@@ -349,6 +349,7 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kPageBits == 20);
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 44);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 14);
+  static constexpr uint64_t ImagePageSize = size_t {1} << TextureCache::ImagePageTable::kPageBits;
 
   static uint64_t GcTick(const TextureCache &cache) { return cache.m_gc_tick; }
   static void SetShareDepthStencil(TextureCache &cache, bool share) {
@@ -3594,7 +3595,7 @@ public:
     constexpr const char *name = "RegisteredPageSkips";
     constexpr uintptr_t base = 0x0000000206000000ull;
     constexpr uint64_t size = 0x200000;
-    constexpr uint64_t page = size_t {1} << TextureCache::ImagePageTable::kPageBits;
+    constexpr uint64_t page = TextureCacheTestAccess::ImagePageSize;
     EnsureRuntimeContext();
     int64_t physical = -1;
     Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
