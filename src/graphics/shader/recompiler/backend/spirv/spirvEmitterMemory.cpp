@@ -5,13 +5,45 @@
 
 #include <algorithm>
 #include <bit>
+#include <initializer_list>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
 uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 	return Binary(state, spv::OpLogicalAnd, TypeBool(state), lhs, rhs);
+}
+
+uint32_t SubwordAccessType(EmitterState& state, const MemoryResourceAccess& resource,
+                           uint32_t bits) {
+	// Physical pointers declare their pointee type even when the module has no storage-buffer
+	// descriptors to initialize the descriptor-backed scalar type cache.
+	if (resource.physical_address) {
+		return state.builder.Type(spv::OpTypeInt, resource.element_bits, 0u);
+	}
+	return state.storage_buffers[bits == 8u ? 0 : 1].element_type;
+}
+
+// Vulkan requires an explicit Aligned operand on PhysicalStorageBuffer accesses. The alignment
+// follows the element size, and a coherent access keeps its volatile bit.
+std::vector<uint32_t> MemoryAccessOperands(const MemoryResourceAccess& resource) {
+	if (!resource.physical_address) {
+		return {static_cast<uint32_t>(resource.memory_access)};
+	}
+	return {static_cast<uint32_t>(spv::MemoryAccessAlignedMask | resource.memory_access),
+	        std::max(resource.element_bits / 8u, 1u)};
+}
+
+void AddMemoryAccessFunction(EmitterState& state, spv::Op opcode,
+                             std::initializer_list<uint32_t> operands,
+                             const MemoryResourceAccess& resource) {
+	std::vector<uint32_t> words {opcode};
+	words.insert(words.end(), operands.begin(), operands.end());
+	const auto access = MemoryAccessOperands(resource);
+	words.insert(words.end(), access.begin(), access.end());
+	state.builder.AddFunction(words);
 }
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
@@ -353,8 +385,9 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 		                                                    buffer.indirect_mapping_offset);
 		const auto word = [&](uint32_t index) {
 			const auto value = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, entry,
-			                          ConstantU32(state, index));
+			// OpCompositeExtract's member index is a literal, not an id: passing ConstantU32
+			// here emits the constant's id (for example 20) as the component index.
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, entry, index);
 			return value;
 		};
 		const auto bda_low = word(0u);
@@ -500,8 +533,7 @@ uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& res
                           uint32_t index) {
 	const auto value   = ctx.state.builder.AllocateId();
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
-	ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), value, pointer,
-	                              resource.memory_access);
+	AddMemoryAccessFunction(ctx.state, spv::OpLoad, {TypeU32(ctx.state), value, pointer}, resource);
 	return value;
 }
 
@@ -510,10 +542,10 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 	uint32_t value;
 	if (resource.element_bits < 32u) {
 		const auto loaded = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpLoad,
-		                              ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, loaded,
-		                              EmitMemoryElementPointer(ctx.state, resource, index),
-		                              resource.memory_access);
+		AddMemoryAccessFunction(ctx.state, spv::OpLoad,
+		    {SubwordAccessType(ctx.state, resource, bits), loaded,
+		        EmitMemoryElementPointer(ctx.state, resource, index)},
+		    resource);
 		value = Unary(ctx.state, spv::OpUConvert, TypeU32(ctx.state), loaded);
 	} else {
 		const auto word = LoadWordInBounds(ctx, resource, index);
@@ -610,11 +642,10 @@ void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           uint32_t bits, uint32_t data) {
 	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
 	if (resource.element_bits < 32u) {
-		ctx.state.builder.AddFunction(
-		    spv::OpStore, pointer,
-		    Unary(ctx.state, spv::OpUConvert,
-		          ctx.state.storage_buffers[bits == 8u ? 0 : 1].element_type, data),
-		    resource.memory_access);
+		AddMemoryAccessFunction(ctx.state, spv::OpStore,
+		    {pointer,
+		        Unary(ctx.state, spv::OpUConvert, SubwordAccessType(ctx.state, resource, bits), data)},
+		    resource);
 		return;
 	}
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
@@ -669,9 +700,8 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	ctx.state.builder.AddFunction(spv::OpStore,
-	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
-	                              resource.memory_access);
+	AddMemoryAccessFunction(ctx.state, spv::OpStore,
+	    {EmitMemoryElementPointer(ctx.state, resource, index), data}, resource);
 }
 
 template <typename Fn>

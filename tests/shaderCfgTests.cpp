@@ -30,6 +30,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
+#include "spirv-tools/libspirv.h"
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
 #include "SrtWalkerTestMemory.h"
@@ -14304,6 +14305,7 @@ void TestIndirectBufferRuntimeTableCompilesAndValidates() {
 
   constexpr uint32_t kRows = ShaderRecompiler::IR::MaxIndirectBufferCandidates + 904u;
   std::vector<std::array<uint32_t, 4>> table_rows(kRows);
+  // The 8-bit class exercises descriptor-free physical subword loads and stores.
   const std::array<F, 4> formats{F::k8UInt, F::k32Float, F::k8_8_8_8UNorm,
                                   F::k32_32_32_32Float};
   const std::array<uint32_t, 4> strides{16u, 16u, 32u, 64u};
@@ -14357,7 +14359,24 @@ void TestIndirectBufferRuntimeTableCompilesAndValidates() {
                               const spv_position_t &position, const char *message) {
     std::fprintf(stderr, "runtime-table SPIR-V line %u: %s\n", position.line, message);
   });
-  Check(tools.Validate(compiled.spirv.data(), compiled.spirv.size()),
+  auto *context = spvContextCreate(SPV_ENV_VULKAN_1_3);
+  spv_diagnostic diagnostic = nullptr;
+  const auto validation = spvValidateBinary(context, compiled.spirv.data(), compiled.spirv.size(),
+                                            &diagnostic);
+  if (diagnostic != nullptr) {
+    std::fprintf(stderr, "runtime-table diagnostic index=%zu line=%zu column=%zu: %s\n",
+                 diagnostic->position.index, diagnostic->position.line,
+                 diagnostic->position.column, diagnostic->error);
+    const auto index = std::min(diagnostic->position.index, compiled.spirv.size());
+    std::fprintf(stderr, "runtime-table diagnostic words at %zu:", index);
+    for (size_t word = index; word < std::min(compiled.spirv.size(), index + 12u); ++word) {
+      std::fprintf(stderr, " %08x", compiled.spirv[word]);
+    }
+    std::fputc('\n', stderr);
+  }
+  spvDiagnosticDestroy(diagnostic);
+  spvContextDestroy(context);
+  Check(validation == SPV_SUCCESS,
         "runtime-table indirect buffer shader failed Vulkan 1.3 validation");
   Check(compiled.spirv.size() < 20'000u,
         "runtime-table indirect buffer shader exceeded the compact word bound");

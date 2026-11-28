@@ -148,6 +148,12 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
 	} else if (bits == 64u) {
 		buffer = &state.storage_buffers[3];
 	}
+	// Modules whose buffers all became runtime-table roots never define a storage-buffer
+	// descriptor, so the element-type cache can still be empty when an LDS/scratch access
+	// needs a StorageBuffer pointer. Declare the pointee type before emitting the pointer.
+	if (buffer->element_type == 0) {
+		StorageBufferType(state, *buffer, bits);
+	}
 	if (buffer->element_pointer_type == 0) {
 		buffer->element_pointer_type =
 		    TypePointer(state, spv::StorageClassStorageBuffer, buffer->element_type);
