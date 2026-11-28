@@ -469,6 +469,9 @@ add_kyty_full_emulator_test(shader_check "${KYTY_TESTS_DIR}/shaderCheck.cpp")
 
 add_executable(driver_repro EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader/driver_repro.cpp")
 target_link_libraries(driver_repro Vulkan::Headers ${CMAKE_DL_LIBS})
+if(WIN32)
+	target_link_libraries(driver_repro shell32)
+endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"

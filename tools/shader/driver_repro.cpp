@@ -8,6 +8,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <shellapi.h> // CommandLineToArgvW; WIN32_LEAN_AND_MEAN leaves it out
 #else
 #include <cerrno>
 #include <csignal>
