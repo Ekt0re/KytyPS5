@@ -214,6 +214,16 @@ Run `simnrt-on1` used a cold `build\run-simn-rt` and this tree with `--native-rt
   `simnc-off1`, `sp-pop`) also did not reach the world within 1,200 s, but did not crash.
 - With one run against three, the watchdog cannot be laid on `--native-rt`.
 
+Run `simnrt-on2` used the same folder, now with a shader store, and `--native-rt` without the probe.
+- It ran the full 1,225 s with no crash, no device loss and no refused dispatch.
+- It did not reach the world milestone either: the guest clock was held 785 s, and it ended at 2 fps
+  while still compiling.
+- Its 62 `[RT]` summaries count 15,998 dispatches that walked a guest BVH and none that traced. Most
+  were `27eed256`, `9d22ec1f`, `55b2b9b4` and `cdc9b2f7`.
+- The end screenshot (`build\screenshots\simnrt-on2-end.png`, on the deck by the sea) has lit shade and
+  a lit interior. That is expected, because with no walk recognized the modules are byte-identical to
+  the run without `--native-rt`.
+
 ## Reproduce
 
 - **Offline A/B.** Use `shader_check` with `SHADER_CHECK_RAY_QUERY=0` or `1` and `SHADER_CHECK_SPIRV`,
