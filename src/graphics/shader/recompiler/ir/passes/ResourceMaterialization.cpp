@@ -2106,6 +2106,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 					        program, base.source, i, 4u, 4u, observed, snapshot, snapshot.buffers,
 					        specialization.buffers,
 					        [&](DescriptorValue& value) {
+						        if (FiniteBufferDescriptorsEnabled() &&
+						            !source->indirect_descriptor->sources.empty()) {
+							        reject_reason = nullptr;
+							        return true;
+						        }
 						        reject_reason = NormalizeIndirectBuffer(
 						            value, source->indirect_descriptor->indexed, base,
 						            program.stage == ShaderType::Compute);

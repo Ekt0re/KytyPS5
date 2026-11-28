@@ -420,6 +420,7 @@ uint32_t StorageBufferRuntimeStride(EmitterState& state, const IR::MemoryInfo& m
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index);
+bool     EmptyIndirectBufferCandidate(const EmitterState& state, uint32_t resource);
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
 bool IsRuntimeTableIndirectBuffer(const EmitterState& state, uint32_t resource);
 

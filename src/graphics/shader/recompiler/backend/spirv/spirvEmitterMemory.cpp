@@ -358,9 +358,7 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 		mem.resource = resource;
 		if (mem.kind == IR::ResourceKind::Buffer) {
 			const auto& buffer = state.program.info.buffers[resource];
-			if (buffer.packed_stride == 0u &&
-			    buffer.source < state.program.descriptor_sources.size() &&
-			    state.program.descriptor_sources[buffer.source].indirect_descriptor) {
+			if (EmptyIndirectBufferCandidate(state, resource)) {
 				// Empty candidates still carry the format/swizzle needed for OOB loads.
 				return emit(mem, MemoryResourceAccess{});
 			}
@@ -434,7 +432,7 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 	}
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
-	const auto empty_root = shared && buffer.packed_stride == 0u;
+	const auto empty_root      = shared && EmptyIndirectBufferCandidate(state, root_resource);
 	const auto selected_access = [&]() {
 		if (shared) {
 			const auto root_slot = buffer.descriptor_index;
@@ -513,8 +511,12 @@ uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 
 uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadWordPrepared(ctx, inst, mem, resource);
+		return EmitBufferAccess(
+		    ctx, inst, mem, 1u,
+		    [&](const IR::MemoryInfo& selected, const MemoryResourceAccess& resource) {
+			    if (resource.object_pointer == 0u) return ConstantU32(ctx.state, 0u);
+			    return LoadWordPrepared(ctx, inst, selected, resource);
+		    });
 	});
 }
 
@@ -563,8 +565,12 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
 uint32_t LoadSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem,
                      uint32_t bits) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
-		return LoadSubwordPrepared(ctx, inst, mem, resource, bits);
+		return EmitBufferAccess(
+		    ctx, inst, mem, 1u,
+		    [&](const IR::MemoryInfo& selected, const MemoryResourceAccess& resource) {
+			    if (resource.object_pointer == 0u) return ConstantU32(ctx.state, 0u);
+			    return LoadSubwordPrepared(ctx, inst, selected, resource, bits);
+		    });
 	});
 }
 
@@ -1870,23 +1876,47 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto& mem   = ctx.Memory(inst);
+	const auto  mem      = ctx.Memory(inst);
 	auto&       state = ctx.state;
+	const auto  emit_one = [&](const IR::MemoryInfo& selected) {
+        if (selected.kind == IR::ResourceKind::Buffer &&
+            EmptyIndirectBufferCandidate(state, selected.resource))
+            return ConstantU64(state, 0);
+        const auto resource =
+            PrepareStorageBufferResourceAccess(state, selected, state.storage_buffers[3]);
+        if (resource.object_pointer == 0u) return ConstantU64(state, 0);
+        const auto byte_address = ByteAddress(ctx, inst, selected);
+        const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
+		                           ConstantU32(state, 3u));
+        return EmitValueOrDefaultIfCondition(
+            state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
+            ConstantU64(state, 0), [&]() {
+                const auto pointer = EmitStorageBufferElementPointer(
+                    state, resource, index, TypeStorageBufferElementPointer(state, 64));
+                const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+                EmitAtomicMemoryBarrier(state, selected.kind);
+                return old;
+            });
+	};
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
-		    const auto resource =
-		        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
-		    const auto byte_address = ByteAddress(ctx, inst, mem);
-		    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
-		                              ConstantU32(state, 3u));
+		    if (mem.kind != IR::ResourceKind::Buffer || !FiniteBufferDescriptorsEnabled() ||
+		        state.program.info.buffers[mem.resource].indirect_root != mem.resource)
+			    return emit_one(mem);
+		    const auto& buffer   = state.program.info.buffers[mem.resource];
+		    const auto& handle   = *inst.Arg(0).ResolveInstruction();
+		    const auto  selected = ctx.Arg(handle, 0);
+		    const auto  valid    = Binary(state, spv::OpULessThan, TypeBool(state), selected,
+		                                  ConstantU32(state, buffer.indirect_resources.size()));
 		    return EmitValueOrDefaultIfCondition(
-		        state, EmitMemoryElementInBounds(state, resource, index), TypeU64(state),
-		        ConstantU64(state, 0), [&]() {
-			        const auto pointer = EmitStorageBufferElementPointer(
-			            state, resource, index, TypeStorageBufferElementPointer(state, 64));
-			        const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
-			        EmitAtomicMemoryBarrier(state, mem.kind);
-			        return old;
+		        state, valid, TypeU64(state), ConstantU64(state, 0), [&] {
+			        return EmitIndexSwitch(state, selected, buffer.indirect_resources.size(),
+			                               TypeU64(state), [&](uint32_t ordinal) {
+				                               auto candidate = mem;
+				                               candidate.resource =
+				                                   buffer.indirect_resources[ordinal];
+				                               return emit_one(candidate);
+			                               });
 		        });
 	    });
 }

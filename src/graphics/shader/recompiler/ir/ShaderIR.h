@@ -46,6 +46,10 @@ constexpr uint32_t IndirectBufferRuntimeTable = 0x40000000u;
 constexpr uint32_t HeapRowBits = 1u << 24u;
 constexpr uint32_t MaxHeapRows = 512u;
 
+constexpr uint32_t MaxFiniteBufferChoices    = 64u;
+constexpr uint32_t MaxFiniteBufferCandidates = 64u;
+constexpr uint32_t MaxFiniteBufferExprDepth  = 16u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
@@ -255,6 +259,15 @@ struct ImageResource {
 [[nodiscard]] inline bool IndirectFormattedStoresEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_INDIRECT_FORMATTED_STORES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+// Read once; finite descriptor plans change generated code, so A/B runs need separate caches.
+[[nodiscard]] inline bool FiniteBufferDescriptorsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FINITE_BUFFER_DESCRIPTORS");
 		return value != nullptr && value[0] == '1' && value[1] == '\0';
 	}();
 	return enabled;

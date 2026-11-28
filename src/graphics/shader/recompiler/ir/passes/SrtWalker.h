@@ -167,6 +167,8 @@ private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;
 };
+// Operations whose result is uniform when their operands are uniform.
+bool IsRuntimeUniformOp(ValueOpcode opcode);
 // Uniform across a compute wave, including values derived from its workgroup ID.
 // This does not imply that the host can evaluate the value.
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
