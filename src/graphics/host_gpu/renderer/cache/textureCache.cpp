@@ -1784,6 +1784,11 @@ void TextureCache::UpdateImage(ImageId id) {
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+	// Only images that start at the address match: none while its page has no registered image
+	// (a texel buffer read looks here first, mostly on pages without images).
+	if (!MayHaveImages(address, 1)) {
+		return {};
+	}
 	std::scoped_lock lock {m_lock};
 	Common::SmallVector<ImageId, 4> matches;
 	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
