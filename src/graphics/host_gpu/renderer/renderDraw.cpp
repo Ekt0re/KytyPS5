@@ -548,6 +548,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
 		const auto  aspects    = depth.desc.view_info.aspect;
+		if (metadata.kind == ImageMetadataKind::Htile) {
+			cache.NoteMetaClearValue(metadata.range.address, depth.depth_clear_value,
+			                         depth.stencil_clear_value);
+		}
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);

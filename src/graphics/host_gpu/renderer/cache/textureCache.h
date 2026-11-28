@@ -92,6 +92,9 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// The DB clear values a depth target over the HTile range was last bound with: its pending
+	// clears read as them.
+	void NoteMetaClearValue(uint64_t address, float depth, uint8_t stencil);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -108,6 +111,7 @@ private:
 		std::bitset<8192> clear_mask;
 		// The depth image that last acquired this HTile range.
 		ImageId owner;
+		vk::ClearDepthStencilValue clear_value {};
 	};
 
 	struct OverlapResult {
@@ -351,6 +355,9 @@ private:
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	// Caller holds m_lock. A fast-cleared depth image reads as cleared through any view, so the
+	// pending HTile clears of its slices are applied before it is sampled, stored to or copied.
+	void ApplyPendingMetaClears(ImageId id);
 	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
 	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
 	// render area.
