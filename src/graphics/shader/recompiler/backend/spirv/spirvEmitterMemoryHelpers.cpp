@@ -358,11 +358,14 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	const bool non_uniform = array_index != 0u;
 	const auto static_index = state.program.info.buffers.at(mem.resource).descriptor_index;
 	if (!non_uniform) array_index = ConstantU32(state, static_index);
+	const bool coherent = mem.coherent ||
+	                      (state.workgroup_buffer_coherence && mem.resource < state.program.info.buffers.size() &&
+	                       state.program.info.buffers[mem.resource].written);
 	MemoryResourceAccess access {.kind             = mem.kind,
 	                             .descriptor_index = array_index,
 	                             .non_uniform      = non_uniform,
-	                             .memory_access    = mem.coherent ? spv::MemoryAccessVolatileMask
-	                                                              : spv::MemoryAccessMaskNone};
+	                             .memory_access    = coherent ? spv::MemoryAccessVolatileMask
+	                                                          : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
 	                          buffer.variable, array_index);

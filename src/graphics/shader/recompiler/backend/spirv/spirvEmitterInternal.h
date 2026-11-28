@@ -114,6 +114,9 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	// A native 64-wide subgroup's same-address LDS stores keep the last active lane's value.
 	bool                                             lds_last_lane_stores    = false;
+	// Waves of one workgroup pass values through buffers they both write and read with plain
+	// loads after S_BARRIER (SpirvEmitter.cpp): those accesses bypass the per-CU cache.
+	bool                                             workgroup_buffer_coherence = false;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;

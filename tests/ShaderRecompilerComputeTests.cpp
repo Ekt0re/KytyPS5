@@ -45030,6 +45030,61 @@ TestCase CoherentBufferPairContention(u32 wave_size) {
   return test;
 }
 
+// GTA VI's rig-feature interpreter (CS 0x44d7e1bd85bee6c0, 1024 threads in wave64) passes
+// values between its waves through a buffer with plain (GLC=0) loads after S_BARRIER. The
+// console runs a workgroup on one CU, whose L0 all its waves share; RADV runs compute workgroups
+// in WGP mode, where the waves of a workgroup sit on two CUs with separate L0 caches. Each lane
+// first reads its own slot (caching it), then a lane of another wave overwrites it, then the lane
+// reads it again after the barrier and must see the new value.
+TestCase BufferCrossWaveBarrierVisibility(u32 wave_size, u32 threads) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 64 ? (threads == 1024 ? "BufferCrossWaveBarrierVisibilityWave64x1024"
+                                                 : "BufferCrossWaveBarrierVisibilityWave64")
+                              : "BufferCrossWaveBarrierVisibilityWave32";
+  auto &code = test.code;
+  const u32 mask = threads - 1u;
+  code.push_back(EncodeVop2(0x1a, 1, InlineU32(2), 0));       // v1 = tid * 4
+  code.push_back(EncodeMubuf0(0x0c));                          // v2 = buf[tid] (caches the line)
+  code.push_back(EncodeMubuf1(2, 12, 1));
+  code.push_back(EncodeSopp(0x0c, 0));                         // S_WAITCNT
+  code.push_back(EncodeVop2(0x25, 3, InlineU32(64), 0));       // v3 = (tid + 64) & mask
+  AppendVMovLiteral(&code, 6, mask);
+  code.push_back(EncodeVop2(0x1b, 3, Vgpr(6), 3));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 3));
+  AppendVMovLiteral(&code, 4, 1000u);
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(0), 4));             // v4 = tid + 1000
+  code.push_back(EncodeSopp(0x0a, 0));                         // S_BARRIER
+  code.push_back(EncodeMubuf0(0x1c));                          // buf[(tid + 64) & mask] = v4
+  code.push_back(EncodeMubuf1(4, 12, 3));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeSopp(0x0a, 0));                         // S_BARRIER
+  code.push_back(EncodeMubuf0(0x0c));                          // v5 = buf[tid]
+  code.push_back(EncodeMubuf1(5, 12, 1));
+  code.push_back(EncodeSopp(0x0c, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, threads);
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 2 * threads);
+  AppendEnd(&code);
+  test.initial.resize(3 * threads);
+  for (u32 t = 0; t < threads; t++) test.initial[t] = 7u + t;
+  test.expected.resize(3 * threads);
+  for (u32 t = 0; t < threads; t++) {
+    const u32 writer = (t - 64u) & mask;
+    test.expected[t] = writer + 1000u;
+    test.expected[threads + t] = writer + 1000u;
+    test.expected[2 * threads + t] = 7u + t;
+  }
+  test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::S_WAITCNT, O::V_ADD_NC_U32,
+                  O::V_MOV_B32, O::V_AND_B32, O::S_BARRIER, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = static_cast<uint8_t>(wave_size);
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false,
                                   bool store_completion = false) {
   using O = ShaderOpcode;
@@ -52971,6 +53026,9 @@ std::vector<TestCase> MakeCases() {
   };
   cases.push_back(BufferWorkgroupPublication(32));
   cases.push_back(BufferWorkgroupPublication(64));
+  cases.push_back(BufferCrossWaveBarrierVisibility(64, 1024));
+  cases.push_back(BufferCrossWaveBarrierVisibility(64, 256));
+  cases.push_back(BufferCrossWaveBarrierVisibility(32, 1024));
   cases.push_back(BufferWorkgroupPublication(32, true));
   cases.push_back(BufferWorkgroupPublication(32, false, true));
   cases.push_back(BufferWorkgroupPublication(64, false, true));
