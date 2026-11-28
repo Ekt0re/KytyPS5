@@ -57,10 +57,11 @@ class SymbolDatabase;
 
 namespace Libs {
 
-// Set once from KYTY_TRACE_CALLS at InitAll. Off leaves each library export pointing at the
-// original function, so a normal run pays nothing for the trace.
-inline bool                     g_trace_calls_enabled = false;
-inline bool                     g_trace_all           = false;
+// Set once from KYTY_TRACE_CALLS and KYTY_FP_ENV_CHECK at InitAll. With both off each library
+// export points at the original function, so a normal run pays nothing for the thunk below.
+inline bool                     g_trace_calls_enabled  = false;
+inline bool                     g_trace_all            = false;
+inline bool                     g_fp_env_check_enabled = false;
 inline std::vector<std::string> g_trace_libraries;
 
 constexpr size_t kCallRingSize = 256;
@@ -131,6 +132,8 @@ const CallRing& GetThreadCallRing();
 // that divides by it gives the guest an infinity.
 [[gnu::noinline]] void NoteFloatReturn(const void* fn_key, const char* library,
                                        const char* function, double value);
+// How many float- or double-returning library calls NoteFloatReturn has seen.
+uint64_t FloatReturnCalls();
 
 inline void CheckCallEntryFpEnv(const char* library, const char* function, Common::FpEnv env) {
 	if (Common::FpControlFirstDeviation(Common::FpCheckSite::LibraryEntry, env)) {
@@ -202,7 +205,7 @@ template <auto Fn, FixedString Library, FixedString Name, typename Ret, typename
 struct LibThunkHelper<Fn, Library, Name, Ret (KYTY_SYSV_ABI*)(Args...)> {
 	static KYTY_SYSV_ABI Ret Call(Args... args) {
 		const bool trace    = g_trace_calls_enabled;
-		const bool fp_check = Common::FpEnvCheckEnabled();
+		const bool fp_check = g_fp_env_check_enabled;
 		if (!trace && !fp_check) {
 			return Fn(args...);
 		}
@@ -260,10 +263,10 @@ struct LibThunkHelper<Fn, Library, Name, Ret (KYTY_SYSV_ABI*)(Args...)> {
 		}
 	}
 
-	// Read during InitAll, after g_trace_calls_enabled is set: with both switches off the export is
-	// the function itself, not this thunk.
+	// Read during InitAll, after both switches are set: with both off the export is the function
+	// itself, not this thunk.
 	static uint64_t Addr() {
-		return (g_trace_calls_enabled || Common::FpEnvCheckEnabled())
+		return (g_trace_calls_enabled || g_fp_env_check_enabled)
 		           ? reinterpret_cast<uint64_t>(&Call)
 		           : reinterpret_cast<uint64_t>(Fn);
 	}

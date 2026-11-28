@@ -555,7 +555,8 @@ add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(slot_vector_tests PRIVATE ${inc_headers})
 
-add_executable(common_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommonTests.cpp")
+add_executable(common_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommonTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(common_tests common kyty_test_gtest)
 
 add_executable(perf_summary_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PerfSummaryTests.cpp")

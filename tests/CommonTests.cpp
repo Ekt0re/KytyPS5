@@ -669,6 +669,80 @@ TEST(FpEnv, ReadWriteRoundTripsTheGuestControlState) {
 	EXPECT_TRUE(Common::SameFpControl(Common::ReadFpEnv(), saved));
 }
 
+KYTY_SYSV_ABI int ThunkTestFails(int a, const void* p) {
+	return a + (p != nullptr ? 1 : 0) - 100;
+}
+KYTY_SYSV_ABI double ThunkTestHalf(double x) {
+	return x * 0.5;
+}
+KYTY_SYSV_ABI void ThunkTestVoid(uint64_t* out) {
+	*out += 1;
+}
+
+// Restores the thunk switches a test changed.
+struct ThunkSwitches {
+	bool trace = Libs::g_trace_calls_enabled;
+	bool fp    = Libs::g_fp_env_check_enabled;
+	~ThunkSwitches() {
+		Libs::g_trace_calls_enabled  = trace;
+		Libs::g_fp_env_check_enabled = fp;
+	}
+};
+
+template <auto Fn>
+using TestThunk = Libs::LibThunkHelper<Fn, Libs::FixedString("libTest"), Libs::FixedString("fn"),
+                                       decltype(Fn)>;
+
+TEST(LibThunk, ExportIsTheFunctionItselfOnlyWithBothSwitchesOff) {
+	ThunkSwitches saved;
+	const auto    fn    = reinterpret_cast<uint64_t>(&ThunkTestFails);
+	const auto    thunk = reinterpret_cast<uint64_t>(&TestThunk<&ThunkTestFails>::Call);
+	for (int mask = 0; mask < 4; mask++) {
+		Libs::g_trace_calls_enabled  = (mask & 1) != 0;
+		Libs::g_fp_env_check_enabled = (mask & 2) != 0;
+		EXPECT_EQ((Libs::MakeLibThunk<&ThunkTestFails, Libs::FixedString("libTest"),
+		                              Libs::FixedString("fn")>()),
+		          mask == 0 ? fn : thunk);
+	}
+}
+
+TEST(LibThunk, TraceAndFpCheckWorkAloneAndTogether) {
+	ThunkSwitches saved;
+	const auto&   ring = Libs::GetThreadCallRing();
+	int           dummy {};
+	uint64_t      counter = 0;
+	for (int mask = 0; mask < 4; mask++) {
+		const bool trace             = (mask & 1) != 0;
+		const bool fp                = (mask & 2) != 0;
+		Libs::g_trace_calls_enabled  = trace;
+		Libs::g_fp_env_check_enabled = fp;
+		const auto ring_count        = ring.count;
+		const auto ring_next         = ring.next;
+		const auto float_calls       = Libs::FloatReturnCalls();
+
+		EXPECT_EQ(TestThunk<&ThunkTestFails>::Call(7, &dummy), -92);
+		EXPECT_EQ(TestThunk<&ThunkTestHalf>::Call(3.0), 1.5);
+		TestThunk<&ThunkTestVoid>::Call(&counter);
+
+		// The trace records all three calls in this thread's ring, results included.
+		const auto recorded = (ring.next + Libs::kCallRingSize - ring_next) % Libs::kCallRingSize;
+		EXPECT_EQ(recorded, trace ? 3u : 0u) << "mask " << mask;
+		if (trace) {
+			EXPECT_EQ(ring.count, std::min<size_t>(ring_count + 3, Libs::kCallRingSize));
+			const auto& first = ring.entries[ring_next];
+			EXPECT_STREQ(first.library, "libTest");
+			EXPECT_EQ(first.args[0], 7u);
+			EXPECT_EQ(first.args[1], reinterpret_cast<uint64_t>(&dummy));
+			EXPECT_EQ(first.result, static_cast<uint64_t>(static_cast<uint32_t>(-92)));
+			EXPECT_TRUE(first.completed);
+			EXPECT_TRUE(ring.entries[(ring_next + 2) % Libs::kCallRingSize].completed);
+		}
+		// The FP check notes the double result.
+		EXPECT_EQ(Libs::FloatReturnCalls() - float_calls, fp ? 1u : 0u) << "mask " << mask;
+	}
+	EXPECT_EQ(counter, 4u);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
