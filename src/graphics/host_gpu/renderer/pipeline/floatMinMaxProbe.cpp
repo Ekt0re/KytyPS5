@@ -6,14 +6,16 @@
 
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 
 namespace Libs::Graphics {
 
 namespace {
 
-// A compute program that bitcasts a uint pair to floats, runs NMin and NMax, and stores the
-// results back as uints: one invocation per pair, so each result keeps its source bits.
+// A compute program that bitcasts each uint pair to floats, runs GLSL.std.450 NMin and NMax (the
+// instructions EmitMinMaxF32Value emits), and stores the results back as uints, so each result
+// keeps its source bits. One invocation walks every pair.
 constexpr uint32_t kProbeModule[] = {
 0x07230203, 0x00010000, 0x0008000b, 0x00000040, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
 	0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -54,12 +56,12 @@ constexpr uint32_t kProbeModule[] = {
 	0x00000027, 0x00000013, 0x0000001d, 0x00000026, 0x0004003d, 0x00000006, 0x00000028, 0x00000027,
 	0x0004007c, 0x0000001a, 0x00000029, 0x00000028, 0x0003003e, 0x00000023, 0x00000029, 0x0004003d,
 	0x00000006, 0x0000002e, 0x00000008, 0x0004003d, 0x0000001a, 0x0000002f, 0x0000001c, 0x0004003d,
-	0x0000001a, 0x00000030, 0x00000023, 0x0007000c, 0x0000001a, 0x00000031, 0x00000001, 0x00000025,
+	0x0000001a, 0x00000030, 0x00000023, 0x0007000c, 0x0000001a, 0x00000031, 0x00000001, 0x0000004f,
 	0x0000002f, 0x00000030, 0x0004007c, 0x00000006, 0x00000032, 0x00000031, 0x00060041, 0x0000001f,
 	0x00000033, 0x0000002d, 0x0000001d, 0x0000002e, 0x0003003e, 0x00000033, 0x00000032, 0x0004003d,
 	0x00000006, 0x00000034, 0x00000008, 0x00050080, 0x00000006, 0x00000035, 0x00000034, 0x00000025,
 	0x0004003d, 0x0000001a, 0x00000036, 0x0000001c, 0x0004003d, 0x0000001a, 0x00000037, 0x00000023,
-	0x0007000c, 0x0000001a, 0x00000038, 0x00000001, 0x00000028, 0x00000036, 0x00000037, 0x0004007c,
+	0x0007000c, 0x0000001a, 0x00000038, 0x00000001, 0x00000050, 0x00000036, 0x00000037, 0x0004007c,
 	0x00000006, 0x00000039, 0x00000038, 0x00060041, 0x0000001f, 0x0000003a, 0x0000002d, 0x0000001d,
 	0x00000035, 0x0003003e, 0x0000003a, 0x00000039, 0x000200f9, 0x0000000d, 0x000200f8, 0x0000000d,
 	0x0004003d, 0x00000006, 0x0000003c, 0x00000008, 0x00050080, 0x00000006, 0x0000003d, 0x0000003c,
@@ -67,8 +69,8 @@ constexpr uint32_t kProbeModule[] = {
 	0x000100fd, 0x00010038,
 };
 
-constexpr uint32_t kProbePairCount = 13;
-// Ordered pairs covering signed zero, infinities, signaling and quiet NaN payloads.
+constexpr uint32_t kProbePairCount = 15;
+// Ordered pairs covering signed zero, infinities, quiet NaN payloads and signaling NaNs.
 constexpr std::array<uint32_t, 2 * kProbePairCount> kProbePairs = {{
     0x00000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x40000000u, 0xC0400000u, 0xC0400000u,
     0x40000000u, 0x7FC00000u, 0x40A00000u, 0x40A00000u, 0x7FC00000u, 0x7FC00000u, 0x7FC00000u,
@@ -223,7 +225,7 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
 	command.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout, 0, 1, &set, 0,
 	                           nullptr);
-	command.dispatch(kProbePairCount, 1, 1);
+	command.dispatch(1, 1, 1);
 	RequireVulkanSuccess(command.end(), "end min/max probe commands");
 
 	vk::FenceCreateInfo fence_info {};
@@ -240,12 +242,14 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 		                     "submit min/max probe commands");
 	}
 
-	const auto level = [&] {
+	bool       timed_out = false;
+	const auto level     = [&] {
 		if (graphics.device.waitForFences(1, &fence, VK_TRUE, 10000000000ull) != vk::Result::eSuccess) {
 			LOGF("[graphics] min/max probe timed out, using cascade lowering\n");
+			timed_out = true;
 			return ShaderRecompiler::Spirv::FloatMinMax::Cascade;
 		}
-		vmaFlushAllocation(graphics.allocator, result_allocation, 0, byte_size);
+		vmaInvalidateAllocation(graphics.allocator, result_allocation, 0, byte_size);
 		const auto* results = static_cast<const uint32_t*>(result_info.pMappedData);
 		auto level = ShaderRecompiler::Spirv::FloatMinMax::Exact;
 		for (uint32_t pair = 0; pair < kProbePairCount; ++pair) {
@@ -267,6 +271,10 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 		return level;
 	}();
 
+	if (timed_out) {
+		// The dispatch may still run: leak its objects rather than free what the GPU uses.
+		return level;
+	}
 	graphics.device.destroyFence(fence, nullptr);
 	graphics.device.freeCommandBuffers(command_pool, 1, &command);
 	graphics.device.destroyCommandPool(command_pool, nullptr);
@@ -278,6 +286,9 @@ ShaderRecompiler::Spirv::FloatMinMax RunProbe(const GraphicContext& graphics) {
 	vmaDestroyBuffer(graphics.allocator, source_buffer, source_allocation);
 	vmaDestroyBuffer(graphics.allocator, result_buffer, result_allocation);
 
+	static constexpr const char* names[] = {"cascade", "NMin/NMax with a NaN-pair select",
+	                                        "NMin/NMax"};
+	std::printf("Float min/max probe: %s\n", names[static_cast<int>(level)]);
 	return level;
 }
 
