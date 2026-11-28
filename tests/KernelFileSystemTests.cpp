@@ -3389,6 +3389,16 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (argc == 2 && std::string_view(argv[1]) == "--ampr-only") {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    CheckAprPaths(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: AMPR cases passed\n");
+    return 0;
+  }
+
   TestMutexHandoff();
   TestStaticRwlockDestroy();
   TestSignalWaitsForRunningHandler();
@@ -3398,16 +3408,6 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--mutex-only") {
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: mutex cases passed\n");
-    return 0;
-  }
-
-  if (argc == 2 && std::string_view(argv[1]) == "--ampr-only") {
-    TempDirectory temporary;
-    FileSystem::Initialize();
-    CheckAprPaths(temporary.Path());
-    FileSystem::Shutdown();
-    subsystems.Destroy();
-    std::printf("KernelFileSystemTests: AMPR cases passed\n");
     return 0;
   }
 
