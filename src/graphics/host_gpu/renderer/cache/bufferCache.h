@@ -8,9 +8,11 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/hotReadbackTable.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/readbackBatch.h"
 #include "graphics/host_gpu/renderer/cache/readbackWait.h"
+#include "graphics/host_gpu/renderer/cache/recentGpuWrites.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/zeroCopyFence.h"
 
@@ -257,6 +259,16 @@ private:
 	// windows are returned to the CPU. True when the first buffer had bytes to copy.
 	[[nodiscard]] bool DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_t size,
 	                                       ReadbackBatch::Range first_window);
+	// KYTY_READBACK_HOT: when the batch must flush, add bounded dirty ranges of hot buffers and
+	// finished small writes to the same copy sequence. Returns the number of extra parts added.
+	[[nodiscard]] size_t CollectPiggybackDownloads(std::vector<DownloadPart>& parts,
+	                                               std::vector<ReadbackBatch::Range>& windows,
+	                                               uint64_t& total_size);
+	[[nodiscard]] BufferId FindHotBuffer(uint64_t address, uint64_t size) const;
+	[[nodiscard]] uint64_t EstimateDownloadBytes(uint64_t address, uint64_t size) const;
+	[[nodiscard]] bool        CanPiggyback(uint64_t address, uint64_t size) const;
+	void                      NoteHotReadback(uint64_t address, uint64_t size);
+	void                      NoteRecentWrite(uint64_t address, uint64_t size);
 	// GPU writes recorded in the current command buffer, or bound and not recorded yet. A
 	// synchronous download of ranges without such writes reads them in a detached submission
 	// behind the submitted work, without flushing the current command buffer.
@@ -357,6 +369,10 @@ private:
 	// KYTY_BATCH_READBACK_PREFETCH=KiB: a batch also copies this much on both sides of the window.
 	uint64_t                                          m_batch_prefetch = 0;
 	ReadbackBatch::NeighbourHistory                   m_readback_neighbours;
+	// KYTY_READBACK_HOT (default 0): bounded piggyback candidates for a flushing sync batch.
+	bool                                              m_hot_readback_enabled = false;
+	HotReadbackTable                                  m_hot_readbacks;
+	RecentGpuWriteRing                                m_recent_writes;
 	// Statistics only (KYTY_SYNC_STATS): bytes last downloaded, and hashes of uploaded pages.
 	RangeSet                                          m_stats_downloaded;
 	std::unordered_map<uint64_t, uint64_t>            m_stats_upload_hashes;

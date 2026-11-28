@@ -69,6 +69,21 @@ private:
 	std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> m_memory;
 };
 
+template <class Visit>
+void ForEachUnclaimed(const RangeSet& claimed, uint64_t address, uint64_t size, Visit&& visit) {
+	const uint64_t end    = address + size;
+	uint64_t       cursor = address;
+	claimed.ForEachInRange(address, size, [&](uint64_t begin, uint64_t last) {
+		if (begin > cursor) {
+			visit(cursor, begin - cursor);
+		}
+		cursor = last;
+	});
+	if (cursor < end) {
+		visit(cursor, end - cursor);
+	}
+}
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -557,8 +572,12 @@ void BufferCache::RecordPendingWrites() {
 	if (m_mirror_on && m_address_writes_pending && m_mirror_index.RecentlyHit()) {
 		m_flush_throttle.Request();
 	}
-	m_pending_writes.ForEach(
-	    [this](uint64_t begin, uint64_t end) { MarkUnsubmittedWrite(begin, end - begin); });
+	m_pending_writes.ForEach([this](uint64_t begin, uint64_t end) {
+		MarkUnsubmittedWrite(begin, end - begin);
+		// Upstream now records the writer tick here too: remember the same write for the
+		// opt-in piggyback ring so a later batch can consider it.
+		NoteRecentWrite(begin, end - begin);
+	});
 	m_pending_writes.Clear();
 	if (m_address_writes_pending) {
 		m_address_writes_pending = false;
@@ -593,6 +612,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_batch_readback = m_batch_readback_env;
 	if (const char* value = std::getenv("KYTY_BATCH_READBACK_PREFETCH"); value != nullptr) {
 		m_batch_prefetch = std::strtoull(value, nullptr, 10) * 1024;
+	}
+	// KYTY_READBACK_HOT=1 lets a flushing synchronous batch carry bounded hot/recent dirty ranges.
+	if (const char* value = std::getenv("KYTY_READBACK_HOT"); value != nullptr && value[0] == '1') {
+		m_hot_readback_enabled = true;
 	}
 	// KYTY_DETACHED_READBACK=0 flushes and waits for every synchronous download, as before; 2
 	// reads detached without submitting the open command buffer afterwards.
@@ -761,6 +784,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				}
 			}
 			if (downloaded) {
+				NoteHotReadback(buffer.CpuAddress(), buffer.Size());
 				if (buffer.IsZeroCopy()) {
 					// Resolved in place: a VRAM buffer would have copied the window.
 					m_zero_copy_fences.CountSaved(buffer.CpuAddress());
@@ -859,6 +883,121 @@ bool BufferCache::BatchReadback() {
 	return m_batch_readback;
 }
 
+BufferId BufferCache::FindHotBuffer(uint64_t address, uint64_t size) const {
+	if (!GuestRange {address, size}.Valid()) {
+		return {};
+	}
+	const auto* owner = m_page_table.Find(address >> PageTable::kPageBits);
+	if (owner == nullptr || IsBufferInvalid(*owner) ||
+	    !m_slot_buffers[*owner].IsInBounds(address, size)) {
+		return {};
+	}
+	return *owner;
+}
+
+uint64_t BufferCache::EstimateDownloadBytes(uint64_t address, uint64_t size) const {
+	uint64_t bytes = 0;
+	m_gpu_modified_ranges.ForEachInRange(address, size, [&](uint64_t begin, uint64_t end) {
+		bytes += Common::AlignUp(end - begin, 64);
+	});
+	return bytes;
+}
+
+bool BufferCache::CanPiggyback(uint64_t address, uint64_t size) const {
+	const auto tick = m_scheduler.CurrentTick();
+	if (HasUnsubmittedWrite(address, size) || m_address_writes_pending ||
+	    m_address_write_tick == tick) {
+		return false;
+	}
+	// Upstream's writer-tick wait also covers a piggybacked range: only consider one whose writer
+	// tick is known and already submitted. DownloadParts then waits for that tick with the rest
+	// of the batch; an unknown or current-tick writer is left for a later readback.
+	if (m_tick_wait) {
+		const auto needed = NeededTick(address, size);
+		if (needed == ReadbackWait::UnknownTick || needed >= tick) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void BufferCache::NoteHotReadback(uint64_t address, uint64_t size) {
+	if (m_hot_readback_enabled) {
+		m_hot_readbacks.Note(address, size, m_scheduler.CurrentTick());
+	}
+}
+
+void BufferCache::NoteRecentWrite(uint64_t address, uint64_t size) {
+	if (m_hot_readback_enabled) {
+		m_recent_writes.Note(address, size, m_scheduler.CurrentTick());
+	}
+}
+
+size_t BufferCache::CollectPiggybackDownloads(std::vector<DownloadPart>& parts,
+                                              std::vector<ReadbackBatch::Range>& windows,
+                                              uint64_t& total_size) {
+	size_t      extra  = 0;
+	uint64_t    budget  = MaxHotReadbackBytes;
+	const auto  tick   = m_scheduler.CurrentTick();
+	RangeSet    claimed;
+	for (const auto& window: windows) {
+		claimed.Add(window.begin, window.Size());
+	}
+	std::vector<const Buffer*> seen;
+	seen.reserve(parts.size());
+	for (const auto& part: parts) {
+		seen.push_back(part.buffer);
+	}
+	const auto collect = [&](uint64_t address, uint64_t size, bool avoid_buffer) {
+		if (budget == 0) {
+			return;
+		}
+		const auto id = FindHotBuffer(address, size);
+		if (!id) {
+			return;
+		}
+		auto& buffer = m_slot_buffers[id];
+		if ((avoid_buffer && std::ranges::find(seen, &buffer) != seen.end()) ||
+		    !CanPiggyback(address, size)) {
+			return;
+		}
+		const auto estimate = EstimateDownloadBytes(address, size);
+		if (estimate == 0 || estimate > budget) {
+			return;
+		}
+		const auto before = total_size;
+		if (CollectDownload(buffer, address, size, parts, total_size)) {
+			windows.push_back({address, size});
+			budget -= total_size - before;
+			if (avoid_buffer) seen.push_back(&buffer);
+			extra++;
+		}
+	};
+	m_hot_readbacks.ForEachHot(tick, [&](uint64_t address, uint64_t size) {
+		collect(address, size, true);
+	});
+	if (budget == 0) {
+		return extra;
+	}
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const auto known_tick = master.KnownGpuTick();
+	if (known_tick == 0) {
+		return extra;
+	}
+	m_recent_writes.ForEachNewest(known_tick, [&](uint64_t address, uint64_t size, bool finished) {
+		if (finished && budget != 0) {
+			ForEachUnclaimed(claimed, address, size,
+			                 [&](uint64_t piece, uint64_t piece_size) {
+				                 collect(piece, piece_size, false);
+			                 });
+		}
+		claimed.Add(address, size);
+		return budget != 0;
+	});
+	return extra;
+}
+
 bool BufferCache::DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_t size,
                                       ReadbackBatch::Range first_window) {
 	using ReadbackBatch::Range;
@@ -910,6 +1049,13 @@ bool BufferCache::DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_
 	}
 	if (parts.empty()) {
 		return false;
+	}
+	if (m_hot_readback_enabled &&
+	    std::any_of(parts.begin(), parts.end(), [&](const DownloadPart& part) {
+		    return !CanDownloadDetached(part.buffer->CpuAddress(), part.copies);
+	    })) {
+		const auto extra = CollectPiggybackDownloads(parts, windows, total_size);
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::RbExtraBufs, extra);
 	}
 	DownloadParts<false>(parts, total_size, true);
 	for (const auto& range: windows) {
@@ -997,6 +1143,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
 	MarkUnsubmittedWrite(overlap.CpuAddress(), overlap.Size());
+	NoteRecentWrite(overlap.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
 }
 
@@ -1606,6 +1753,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_pending_writes.Add(vaddr, size);
 		m_sync_windows[m_guest_queue].writes.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+		NoteRecentWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
