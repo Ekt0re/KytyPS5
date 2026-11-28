@@ -516,6 +516,7 @@ private:
 			if (words[3] == 1u) {
 				empty++;
 			} else if (words[3] >= 2u) {
+				Common::FrameHoles::NoteDispatchSkip(Common::FrameHoles::DispatchSkipReason::Refused);
 				if (refused++ < 8) {
 					std::printf("Dispatch guard: refused indirect dispatch of shader 0x%016llx with "
 					            "GPU-written counts %ux%ux%u%s\n",

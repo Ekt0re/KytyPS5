@@ -912,6 +912,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs the host cannot run are not compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::FailedShader,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return false;
 	}
 	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
@@ -979,8 +983,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), targets.depth, buffer, draw.index_count, 0);
-		Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NoTargets,
-		                         CollectDrawTargetAddresses(buffer.GetRegisters()));
+		// Enabled() first: the target list is only built when the report is on.
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NoTargets,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return false;
 	}
 
@@ -1424,6 +1431,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			    if (skippable && !pending.Ready()) {
 				    occlusion_queries.End(command, occlusion_query);
 				    PipelineCache::NoteSkippedDraw();
+				    Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::PipelineBuilding);
 			    } else {
 				    record(command, pending.Get());
 			    }
@@ -1500,8 +1508,10 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
-		                         CollectDrawTargetAddresses(buffer.GetRegisters()));
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return true;
 	}
 
@@ -1594,8 +1604,10 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
-		Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
-		                         CollectDrawTargetAddresses(buffer.GetRegisters()));
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return true;
 	}
 

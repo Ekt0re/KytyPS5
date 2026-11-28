@@ -101,6 +101,7 @@ bool g_fault_stats = false;
 // writes the lines. Bounded so a long run with many incomplete frames cannot grow without limit.
 constexpr size_t         kMaxQueuedHoleLines = 64;
 std::deque<std::string>  g_hole_lines;
+uint64_t                 g_hole_lines_dropped = 0;
 
 // The GPU thread, set by RegisterGpuThread. Its CPU time, instructions and context switches
 // come from Linux interfaces; other hosts report the counters only ("na" for the rest).
@@ -353,9 +354,15 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 	}
 	if (Detail::g_frame_holes.load(std::memory_order_relaxed)) {
 		std::deque<std::string> pending;
+		uint64_t                dropped = 0;
 		{
 			std::lock_guard lock(g_mutex);
 			pending.swap(g_hole_lines);
+			std::swap(dropped, g_hole_lines_dropped);
+		}
+		if (dropped != 0) {
+			std::fprintf(stdout, "[frame-holes] %llu older lines dropped (queue holds %zu)\n",
+			             static_cast<unsigned long long>(dropped), kMaxQueuedHoleLines);
 		}
 		for (const auto& hole: pending) {
 			std::fputs(hole.c_str(), stdout);
@@ -393,6 +400,7 @@ void NoteFrameHolesFrame(uint64_t frame) {
 	std::lock_guard lock(g_mutex);
 	if (g_hole_lines.size() >= kMaxQueuedHoleLines) {
 		g_hole_lines.pop_front();
+		g_hole_lines_dropped++;
 	}
 	g_hole_lines.push_back(line);
 }
