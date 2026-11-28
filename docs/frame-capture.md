@@ -42,6 +42,12 @@ image, `diff.png` (differing pixels in red) to `--replay-out` (default: the capt
 - `steady`: the same statistics over passes 2..n, so shader compilation and first uploads in
   pass 1 are left out. Use `--replay-repeat 4` or more when comparing builds. With one pass,
   `steady` uses that pass.
+- `memory_ms` (per pass and in `steady`): the time the replay spent writing the guest memory the
+  game changed between GPU calls, one synchronous step per record. It is replay overhead the game
+  did not have, and it is inside the frame times: a GTA VI loading screen replays at about 97 ms
+  per frame with thousands of records per frame, where the game ran 30 fps. A change that speeds up
+  GPU work shows up in the frame times, but diluted by this part; compare it with `memory_ms`.
+  The GPU command thread CPU time is measured in 15.6 ms steps on Windows.
 - `image`: the replay's frame against the game's reference (`identical` share of pixels,
   `max_diff`, `mean_diff`, `psnr_db`, which is `null` when the images are identical).
 
@@ -54,8 +60,11 @@ image, `diff.png` (differing pixels in red) to `--replay-out` (default: the capt
 kyty_emulator --replay <capture> --replay-shaders <dir>
 ```
 
-writes every guest shader of the capture as `type<N>-<hash>.bin` (once per hash) and a
-`shaders.json` line per shader (address, type, size, hash), then exits without replaying. The hash
+writes every guest shader of the capture as `<stage>-<hash>.bin` (`cs`, `ps`, `gs`, ...; once per
+hash) and a `shaders.jsonl` line per shader (address, type, stage, size, hash), then exits without
+replaying. These are all the shaders the game had created by the end of the capture (a GTA VI
+capture lists about 19,000), not only the few the captured frames draw with: the
+`KYTY_TRACE_SHADERS` log of a replay names those. The hash
 is the one Kyty uses everywhere else (shader store, `KYTY_TRACE_SHADERS`, pipeline names), so a
 dumped file can be looked up in a trace or in pipeline statistics, and fed to
 `tools/shader` or the recompiler on its own.
@@ -78,8 +87,14 @@ Rank them with
 python3 tools/replay/pipeline_stats.py kyty_pipeline_stats.csv [--trace kyty.log] [--sort spills]
 ```
 
-With `--trace` (a log taken with `KYTY_TRACE_SHADERS`) pipelines are weighted by how many draws
-and dispatches used them, so the list starts with the shaders where a fix pays off most.
+With `--trace` (the log of a replay run with `KYTY_TRACE_SHADERS=1 --printf-direction Console`;
+without the second option the TRACE lines do not reach the log) pipelines are weighted by how many
+draws and dispatches used them, so the list starts with the shaders where a fix pays off most.
+
+Drivers name their statistics differently, and the columns are headed with the driver's own
+names. NVIDIA reports `Register Count`, `Local Memory Size` (where spilled registers go, in bytes),
+`Stack Size` and `Binary Size` (bytes, not an instruction count); AMD and Mesa report VGPRs,
+spills and instruction counts directly.
 
 ## Comparing two builds or settings
 

@@ -8,7 +8,8 @@ executable (a compiled stage) and sorts by the statistic --sort names, or by reg
 it is not given. It looks for these by name: registers (VGPRs, "Register Count", ...), spills
 (spilled registers, scratch memory) and instructions (instruction count, code size).
 
-With --trace <log> (a run with KYTY_TRACE_SHADERS=1, for instance a frame replay) it also
+With --trace <log> (the log of a run with KYTY_TRACE_SHADERS=1 and --printf-direction Console,
+which the TRACE lines need to reach the log; for instance a frame replay) it also
 counts how often the captured frames used each pipeline's shaders and ranks by uses x
 instructions, which is closer to where GPU time goes than any one statistic. With --shaders
 <dir> (kyty_emulator --replay <capture> --replay-shaders <dir>) it names the code file of each
@@ -27,10 +28,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 HASH = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{16})(?![0-9a-fA-F])")
+# Per kind, the names to look for, best first: NVIDIA, for one, reports no spill count but
+# "Local Memory Size" (where spilled registers go) and "Stack Size" (calls), and no instruction
+# count but "Binary Size" in bytes.
 KINDS = {
-    "registers": re.compile(r"vgpr|register count|registers|regs\b|gprs", re.I),
-    "spills": re.compile(r"spill|scratch|stack", re.I),
-    "instructions": re.compile(r"instruction|code size|binary size|isa size", re.I),
+    "registers": [re.compile(r"vgpr|register count|registers|regs\b|gprs", re.I)],
+    "spills": [re.compile(r"spill", re.I), re.compile(r"local memory|scratch|private memory", re.I),
+               re.compile(r"stack", re.I)],
+    "instructions": [re.compile(r"instruction", re.I), re.compile(r"code size|isa size|binary size", re.I)],
 }
 
 
@@ -55,9 +60,12 @@ def load(path):
 
 def pick(names, kind):
     """The statistic of a kind, the vector one first (VGPRs before SGPRs)."""
-    matches = [n for n in names if KINDS[kind].search(n)]
-    matches.sort(key=lambda n: (0 if "v" in n.lower()[:2] or "vgpr" in n.lower() else 1, len(n)))
-    return matches[0] if matches else None
+    for pattern in KINDS[kind]:
+        matches = [n for n in names if pattern.search(n)]
+        matches.sort(key=lambda n: (0 if "v" in n.lower()[:2] or "vgpr" in n.lower() else 1, len(n)))
+        if matches:
+            return matches[0]
+    return None
 
 
 def trace_uses(path):
@@ -131,7 +139,9 @@ def main():
           f"{'uses x ' + str(chosen['instructions']) if uses is not None else sort_by}")
     print("statistics found: " + ", ".join(f"{kind}={name}" for kind, name in chosen.items() if name))
     columns = ["registers", "spills", "instructions"] + (["uses"] if uses is not None else [])
-    header = f"{'#':>3} " + " ".join(f"{c[:12]:>12}" for c in columns) + "  executable / pipeline"
+    # Headed by the driver's own names: "spills" may be NVIDIA's local memory size in bytes.
+    titles = [(chosen.get(c) or c) if c in chosen else c for c in columns]
+    header = f"{'#':>3} " + " ".join(f"{t[:12]:>12}" for t in titles) + "  executable / pipeline"
     print(header)
     for index, entry in enumerate(ranked[: args.top], 1):
         cells = " ".join(f"{(entry.get(c) if entry.get(c) is not None else '-')!s:>12}" for c in columns)

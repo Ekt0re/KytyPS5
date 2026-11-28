@@ -54,6 +54,7 @@ def metrics(report):
         "frame_ms": frame if count and frame and frame >= 0.05 else None,
         "pass_ms": passes,
         "gpu_thread_cpu_ms": gpu_cpu,
+        "memory_ms": (steady.get("memory_ms") or {}).get("median"),
         "identical": image.get("identical") if image else None,
         "psnr_db": image.get("psnr_db") if image else None,
         "finished": finished and report.get("exit_code", 0) == 0,
@@ -102,7 +103,9 @@ def compare(runs_a, runs_b, label_a="A", label_b="B"):
     ma = [metrics(r) for r in runs_a]
     mb = [metrics(r) for r in runs_b]
     key = "frame_ms" if all(m["frame_ms"] is not None for m in ma + mb) else "pass_ms"
-    result = {"metric": key, "runs": [len(ma), len(mb)]}
+    result = {"metric": key, "runs": [len(ma), len(mb)],
+              "values": {label_a: [m[key] for m in ma], label_b: [m[key] for m in mb]},
+              "memory_ms": {label_a: [m["memory_ms"] for m in ma], label_b: [m["memory_ms"] for m in mb]}}
     print(f"metric: steady median {key.replace('_ms', '')} time (ms), {len(ma)} run(s) of {label_a}, "
           f"{len(mb)} of {label_b}")
     ok = True
@@ -142,12 +145,16 @@ def compare(runs_a, runs_b, label_a="A", label_b="B"):
             verdict = "no significant difference"
     else:
         low = high = None
-        interval = " (one run each: no interval; use --rounds 3 or more)"
+        interval = f" (one run each: no interval; use --rounds {MIN_RUNS} or more)"
         verdict = "inconclusive"
     for label, ms in ((label_a, ma), (label_b, mb)):
         gpu = [m["gpu_thread_cpu_ms"] for m in ms if m["gpu_thread_cpu_ms"] is not None]
         if gpu:
             print(f"  {label} GPU command thread CPU: median {statistics.median(gpu):.2f} ms per pass")
+        memory = [m["memory_ms"] for m in ms if m["memory_ms"] is not None]
+        if memory:
+            print(f"  {label} replay overhead (writing recorded memory): median "
+                  f"{statistics.median(memory):.2f} ms per pass, inside the times above")
     ia = [m["identical"] for m in ma if m["identical"] is not None]
     ib = [m["identical"] for m in mb if m["identical"] is not None]
     if ia and ib and min(ib) + 0.001 < min(ia):

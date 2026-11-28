@@ -1025,8 +1025,16 @@ void NoteShader(uint64_t code, uint32_t type, uint32_t bytes) {
 	ShaderList().push_back({code, type, bytes});
 }
 
-// Each distinct code once as <dir>/<type>-<hash>.bin, and one line per shader in shaders.json:
-// the hash is the one the shader store, KYTY_TRACE_SHADERS and pipeline names use.
+// The guest stage of a ShaderBinaryType (gpu_defs.h).
+const char* ShaderStageName(uint32_t type) {
+	static constexpr const char* NAMES[] = {"cs", "ps", "gs", "hs", "gs_front", "hs_front", "gs_back",
+	                                        "hs_back", "fs"};
+	return type < std::size(NAMES) ? NAMES[type] : "unknown";
+}
+
+// Each distinct code once as <dir>/<stage>-<hash>.bin, and one JSON object per line per shader
+// in shaders.jsonl: the hash is the one the shader store, KYTY_TRACE_SHADERS and pipeline names
+// use. These are all the shaders the game had created, not only the ones the frames draw with.
 void DumpShaders(const std::filesystem::path& directory) {
 	std::filesystem::create_directories(directory);
 	std::vector<CapturedShader> list;
@@ -1041,7 +1049,7 @@ void DumpShaders(const std::filesystem::path& directory) {
 		                       return a.code == b.code;
 	                       }),
 	           list.end());
-	std::ofstream                json(directory / "shaders.json");
+	std::ofstream                json(directory / "shaders.jsonl");
 	std::map<uint64_t, uint32_t> seen; // hash -> registrations
 	uint64_t                     written_bytes = 0;
 	std::vector<uint8_t>         code;
@@ -1053,17 +1061,18 @@ void DumpShaders(const std::filesystem::path& directory) {
 		    ShaderCodeHash(reinterpret_cast<const uint32_t*>(code.data()), shader.bytes, &hashed);
 		const auto same = seen[hash]++;
 		if (same == 0) {
-			std::ofstream out(directory / fmt::format("type{}-{:016x}.bin", shader.type, hash),
+			std::ofstream out(directory / fmt::format("{}-{:016x}.bin", ShaderStageName(shader.type), hash),
 			                  std::ios::binary);
 			out.write(reinterpret_cast<const char*>(code.data()), shader.bytes);
 			written_bytes += shader.bytes;
 		}
-		json << fmt::format("{{\"code\":\"0x{:x}\",\"type\":{},\"bytes\":{},\"program_bytes\":{},"
-		                    "\"hash\":\"{:016x}\",\"same_code_before\":{}}}\n",
-		                    shader.code, shader.type, shader.bytes, hashed, hash, same);
+		json << fmt::format("{{\"code\":\"0x{:x}\",\"type\":{},\"stage\":\"{}\",\"bytes\":{},"
+		                    "\"program_bytes\":{},\"hash\":\"{:016x}\",\"same_code_before\":{}}}\n",
+		                    shader.code, shader.type, ShaderStageName(shader.type), shader.bytes, hashed,
+		                    hash, same);
 	}
-	std::printf("[replay] %zu shaders, %zu distinct (%.1f MiB) written to %s\n", list.size(),
-	            seen.size(), static_cast<double>(written_bytes) / (1u << 20u),
+	std::printf("[replay] %zu shaders the game created, %zu distinct (%.1f MiB) written to %s\n",
+	            list.size(), seen.size(), static_cast<double>(written_bytes) / (1u << 20u),
 	            directory.string().c_str());
 }
 
@@ -1664,6 +1673,7 @@ void RunReplay(const ReplayOptions& options) {
 		// compile nothing new; with one pass, that pass.
 		std::vector<double> steady_frames;
 		std::vector<double> steady_passes;
+		std::vector<double> steady_memory;
 		std::vector<double> steady_gpu_cpu;
 		uint32_t            passes_done = 0;
 		for (uint32_t pass = 0; pass < std::max(1u, options.repeat); pass++) {
@@ -1684,6 +1694,10 @@ void RunReplay(const ReplayOptions& options) {
 			}
 			bool       started     = false;
 			uint64_t   submissions = 0;
+			// Replay overhead inside the pass: recorded memory written between GPU packets (wall
+			// time of each synchronous step), which the game itself did not wait for.
+			uint64_t   memory_records = 0;
+			uint64_t   memory_ns      = 0;
 			const auto gpu_cpu_start     = GpuThreadCpuNs();
 			const auto process_cpu_start = CpuNs(true);
 			const auto pass_start        = NowNs();
@@ -1696,8 +1710,11 @@ void RunReplay(const ReplayOptions& options) {
 						// buffer before it released the REWIND in front of it, but the pages of a
 						// record are in no such order, and a GPU that ran meanwhile would follow
 						// the released REWIND into a buffer that is not there yet.
-						const auto pages = Blob(call);
+						const auto pages        = Blob(call);
+						const auto memory_start = NowNs();
 						gpu.SendCommandSync([&] { ApplyPages(pages); });
+						memory_ns += NowNs() - memory_start;
+						memory_records++;
 						break;
 					}
 					case CallKind::Submit: {
@@ -1841,12 +1858,16 @@ void RunReplay(const ReplayOptions& options) {
 			            pass + 1, static_cast<double>(pass_ns) / 1e9, submissions, flips.size(),
 			            pacing.timeouts, RssGiB());
 			std::printf("[replay]   pacing: %" PRIu64 " waits ended with the GPU parked\n", pacing.stalls);
+			std::printf("[replay]   memory: %" PRIu64 " records written in %.1f ms (replay overhead)\n",
+			            memory_records, static_cast<double>(memory_ns) / 1e6);
 			// CPU times do not depend on what else the machine runs, unlike the wall time.
 			std::printf("[replay]   CPU: GPU command thread %.3f s, process %.3f s\n",
 			            static_cast<double>(gpu_cpu_ns) / 1e9, static_cast<double>(process_cpu_ns) / 1e9);
 			report << (pass != 0 ? "," : "") << "{\"seconds\":" << static_cast<double>(pass_ns) / 1e9
 			       << ",\"gpu_thread_cpu_seconds\":" << static_cast<double>(gpu_cpu_ns) / 1e9
 			       << ",\"process_cpu_seconds\":" << static_cast<double>(process_cpu_ns) / 1e9
+			       << ",\"memory_records\":" << memory_records
+			       << ",\"memory_ms\":" << static_cast<double>(memory_ns) / 1e6
 			       << ",\"submissions\":" << submissions << ",\"timeouts\":" << pacing.timeouts
 			       << ",\"stalls\":" << pacing.stalls << ",\"finished\":" << (finished ? "true" : "false")
 			       << ",\"flip_ms\":[";
@@ -1865,6 +1886,7 @@ void RunReplay(const ReplayOptions& options) {
 				steady_frames.insert(steady_frames.end(), intervals.begin(), intervals.end());
 				steady_passes.push_back(static_cast<double>(pass_ns) / 1e6);
 				steady_gpu_cpu.push_back(static_cast<double>(gpu_cpu_ns) / 1e6);
+				steady_memory.push_back(static_cast<double>(memory_ns) / 1e6);
 			}
 			if (!finished) break;
 		}
@@ -1875,12 +1897,14 @@ void RunReplay(const ReplayOptions& options) {
 			const auto gpu    = Stats(steady_gpu_cpu);
 			report << ",\"steady\":{\"passes\":" << steady_passes.size()
 			       << ",\"frame_ms\":" << StatsJson(frames) << ",\"pass_ms\":" << StatsJson(passes)
-			       << ",\"gpu_thread_cpu_ms\":" << StatsJson(gpu) << "}";
+			       << ",\"gpu_thread_cpu_ms\":" << StatsJson(gpu)
+			       << ",\"memory_ms\":" << StatsJson(Stats(steady_memory)) << "}";
 			std::printf(
 			    "[replay] steady (%zu of %u passes): frame %.2f ms median, p95 %.2f, stdev %.2f "
-			    "(%zu intervals); pass %.1f ms median; GPU command thread CPU %.1f ms median\n",
+			    "(%zu intervals); pass %.1f ms median, of it %.1f ms writing recorded memory; GPU "
+			    "command thread CPU %.1f ms median\n",
 			    steady_passes.size(), passes_done, frames.median, frames.p95, frames.stdev,
-			    frames.count, passes.median, gpu.median);
+			    frames.count, passes.median, Stats(steady_memory).median, gpu.median);
 		}
 		// The image the main port shows at the end.
 		std::vector<uint8_t> rgba;
