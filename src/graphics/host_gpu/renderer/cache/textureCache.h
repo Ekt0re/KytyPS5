@@ -260,7 +260,7 @@ private:
 	[[nodiscard]] static bool ParkImagesDefault() {
 		static const bool park = [] {
 			const char* value = std::getenv("KYTY_PARK_IMAGES");
-			return value != nullptr && value[0] == '1';
+			return value == nullptr || value[0] != '0';
 		}();
 		return park;
 	}
@@ -342,8 +342,10 @@ private:
 	// renders the depth aspect of the depth/stencil image at its address instead of replacing
 	// it with a depth-only image. With it on, the runtime toggle depth_split=1 turns it off again.
 	bool     m_share_depth_stencil     = ShareDepthStencilDefault();
-	// KYTY_PARK_IMAGES=1, or the runtime toggle park_images=1 (re-read at each suspend point):
-	// keep images that depth conversions replace for reuse (see ParkedImage). Off by default.
+	// Keep images that depth conversions replace for reuse (see ParkedImage). On by default
+	// (world A/B pk_ab: depth conversion time -44 %, -6 % GPU-thread time per operation);
+	// KYTY_PARK_IMAGES=0 turns it off. Runtime toggles, re-read at each suspend point:
+	// park_off=1 turns it off, park_images=1 turns it on.
 	// KYTY_PARK_MAX (images, default 256), KYTY_PARK_MB (default 256) and KYTY_PARK_FRAMES
 	// (suspend points a parked image is kept, default 30) bound the pool.
 	bool                     m_park_images      = ParkImagesDefault();

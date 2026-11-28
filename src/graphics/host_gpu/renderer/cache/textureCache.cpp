@@ -2451,7 +2451,8 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
 	m_share_depth_stencil = ShareDepthStencilDefault() && !Common::RuntimeToggles::Get("depth_split");
-	m_park_images = ParkImagesDefault() || Common::RuntimeToggles::Get("park_images");
+	m_park_images = (ParkImagesDefault() && !Common::RuntimeToggles::Get("park_off")) ||
+	                Common::RuntimeToggles::Get("park_images");
 	if (m_park_images) {
 		DiscardParkedImages(0, 0);
 	} else {
