@@ -44,9 +44,9 @@ image, `diff.png` (differing pixels in red) to `--replay-out` (default: the capt
   `steady` uses that pass.
 - `memory_ms` (per pass and in `steady`): the time the replay spent writing the guest memory the
   game changed between GPU calls, one synchronous step per record. It is replay overhead the game
-  did not have, and it is inside the frame times: a GTA VI loading screen replays at about 97 ms
-  per frame with thousands of records per frame, where the game ran 30 fps. A change that speeds up
-  GPU work shows up in the frame times, but diluted by this part; compare it with `memory_ms`.
+  did not have, and it is inside the frame times. On a 3-frame GTA VI loading-screen capture, 16
+  records per pass took about 58 ms of a 322 ms pass. A change that speeds up GPU work shows up in
+  the frame times, diluted by this part; compare it with `memory_ms`.
   The GPU command thread CPU time is measured in 15.6 ms steps on Windows.
 - `image`: the replay's frame against the game's reference (`identical` share of pixels,
   `max_diff`, `mean_diff`, `psnr_db`, which is `null` when the images are identical).
@@ -94,7 +94,9 @@ draws and dispatches used them, so the list starts with the shaders where a fix 
 Drivers name their statistics differently, and the columns are headed with the driver's own
 names. NVIDIA reports `Register Count`, `Local Memory Size` (where spilled registers go, in bytes),
 `Stack Size` and `Binary Size` (bytes, not an instruction count); AMD and Mesa report VGPRs,
-spills and instruction counts directly.
+spills and instruction counts directly. A statistic with the same huge value for every pipeline
+is left out: an RTX 2080 Super driver gave `Local Memory Size` 2^36 for all of them, so on that
+driver there is no spill column.
 
 ## Comparing two builds or settings
 

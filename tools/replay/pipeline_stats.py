@@ -29,12 +29,11 @@ from pathlib import Path
 
 HASH = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{16})(?![0-9a-fA-F])")
 # Per kind, the names to look for, best first: NVIDIA, for one, reports no spill count but
-# "Local Memory Size" (where spilled registers go) and "Stack Size" (calls), and no instruction
+# "Local Memory Size" (where spilled registers go; "Stack Size" is for calls), and no instruction
 # count but "Binary Size" in bytes.
 KINDS = {
     "registers": [re.compile(r"vgpr|register count|registers|regs\b|gprs", re.I)],
-    "spills": [re.compile(r"spill", re.I), re.compile(r"local memory|scratch|private memory", re.I),
-               re.compile(r"stack", re.I)],
+    "spills": [re.compile(r"spill", re.I), re.compile(r"local memory|scratch|private memory", re.I)],
     "instructions": [re.compile(r"instruction", re.I), re.compile(r"code size|isa size|binary size", re.I)],
 }
 
@@ -101,6 +100,15 @@ def main():
         sys.exit(f"{args.stats}: no statistics")
     names = sorted({n for stats in rows.values() for n in stats})
     chosen = {kind: pick(names, kind) for kind in KINDS}
+    # A statistic with one huge value for every pipeline describes the driver, not the shader:
+    # NVIDIA has reported Local Memory Size as 2^36 bytes for all of them.
+    for kind, name in chosen.items():
+        values = {stats.get(name) for stats in rows.values() if name in stats}
+        if name and len(rows) > 1 and len(values) == 1 and isinstance(next(iter(values)), (int, float)) \
+                and next(iter(values)) >= 1 << 32:
+            print(f"ignoring {name}: {next(iter(values))} for every pipeline")
+            others = [n for n in names if n != name]
+            chosen[kind] = pick(others, kind)
     if args.sort:
         sort_by = next((n for n in names if args.sort.lower() in n.lower()), None)
         if sort_by is None:
