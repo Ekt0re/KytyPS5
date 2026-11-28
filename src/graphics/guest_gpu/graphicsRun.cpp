@@ -1535,7 +1535,16 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			// Each begin/end pair differs by the step on every DB: games compare the sample count with
+			// the area they expect to see, so a step of 1 (16 samples per query) reads as all but
+			// hidden and GTA VI culls walls and characters in alternate frames. 2^20 per DB is more
+			// than a 4K target holds. KYTY_SYNTHETIC_OCCLUSION_STEP=1 restores the old counts.
+			static const uint64_t step = [] {
+				const char* env = std::getenv("KYTY_SYNTHETIC_OCCLUSION_STEP");
+				const auto  value = env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
+				return value != 0 ? value : (1ull << 20u);
+			}();
+			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + step) & counter_mask;
 			break;
 		}
 		default:
