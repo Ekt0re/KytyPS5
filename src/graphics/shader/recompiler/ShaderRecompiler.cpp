@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -484,6 +485,18 @@ bool ExecSelectsEnabled() {
 
 } // namespace
 
+std::atomic<PassTimingHook> g_pass_timing_hook {nullptr};
+
+void SetPassTimingHook(PassTimingHook hook) {
+	g_pass_timing_hook.store(hook, std::memory_order_relaxed);
+}
+
+static void FirePassTimingHook(const char* name, uint64_t nanoseconds) {
+	if (const auto hook = g_pass_timing_hook.load(std::memory_order_relaxed)) {
+		hook(name, nanoseconds);
+	}
+}
+
 const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Compute: return "CS";
@@ -603,7 +616,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	};
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " IR TranslateProgram\n", stage,
 	     options.shader_hash);
+	const auto translate_begin = std::chrono::steady_clock::now();
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	FirePassTimingHook("TranslateProgram",
+	                   static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                             std::chrono::steady_clock::now() - translate_begin)
+	                                             .count()));
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     stage, options.shader_hash,
@@ -715,8 +733,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
+	const auto spirv_begin = std::chrono::steady_clock::now();
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data, *options.profile,
 	                                options.emit_debug_info);
+	FirePassTimingHook("EmitProgram",
+	                   static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                             std::chrono::steady_clock::now() - spirv_begin)
+	                                             .count()));
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
 	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,

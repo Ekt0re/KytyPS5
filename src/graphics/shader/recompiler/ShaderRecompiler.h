@@ -77,6 +77,10 @@ struct ShaderSource {
 };
 
 [[nodiscard]] const char* StageName(ShaderType stage);
+
+// Optional observer for IR pass durations (benchmarks); null by default, no effect on output.
+using PassTimingHook = void (*)(const char* pass_name, uint64_t nanoseconds);
+void SetPassTimingHook(PassTimingHook hook);
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
