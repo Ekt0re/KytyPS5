@@ -39,7 +39,7 @@ std::vector<uint32_t> MemoryAccessOperands(const MemoryResourceAccess& resource)
 void AddMemoryAccessFunction(EmitterState& state, spv::Op opcode,
                              std::initializer_list<uint32_t> operands,
                              const MemoryResourceAccess& resource) {
-	std::vector<uint32_t> words {opcode};
+	std::vector<uint32_t> words {static_cast<uint32_t>(opcode)};
 	words.insert(words.end(), operands.begin(), operands.end());
 	const auto access = MemoryAccessOperands(resource);
 	words.insert(words.end(), access.begin(), access.end());
