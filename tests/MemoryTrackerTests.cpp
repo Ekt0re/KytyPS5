@@ -306,6 +306,113 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+// The sorted-block range set answers as the map version does, over random operations on many
+// intervals (block splits, joins and removals included).
+void TestRangeSetBlocksMatchMap() {
+  using Libs::Graphics::Detail::RangeSetBlocks;
+  using Libs::Graphics::Detail::RangeSetMap;
+  uint64_t state = 0x9e3779b97f4a7c15ull;
+  const auto next = [&state] {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
+  const auto dump = [](const auto &set) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    set.ForEach([&](uint64_t begin, uint64_t end) { out.emplace_back(begin, end); });
+    return out;
+  };
+  for (int round = 0; round < 4; ++round) {
+    RangeSetMap map;
+    RangeSetBlocks blocks;
+    // Rounds alternate a dense space (many merges) and a sparse one (many intervals).
+    const uint64_t space = round % 2 == 0 ? 0x100000 : 0x10000000;
+    const uint64_t span = round % 2 == 0 ? 0x400 : 0x4000;
+    for (int op = 0; op < 200000; ++op) {
+      const uint64_t address = 0x1000 + next() % space;
+      const uint64_t size = 1 + next() % span;
+      switch (next() % 6) {
+      case 0:
+      case 1:
+      case 2:
+        Check(map.Add(address, size) == blocks.Add(address, size),
+              "range set blocks: Add reported another change");
+        break;
+      case 3:
+        Check(map.Subtract(address, size) == blocks.Subtract(address, size),
+              "range set blocks: Subtract reported another change");
+        break;
+      case 4: {
+        Check(map.Intersects(address, size) == blocks.Intersects(address, size) &&
+                  map.Contains(address, size) == blocks.Contains(address, size),
+              "range set blocks: queries differ");
+        std::vector<std::pair<uint64_t, uint64_t>> a, b;
+        map.ForEachInRange(address, size, [&](uint64_t x, uint64_t y) { a.emplace_back(x, y); });
+        blocks.ForEachInRange(address, size,
+                              [&](uint64_t x, uint64_t y) { b.emplace_back(x, y); });
+        Check(a == b, "range set blocks: clamped parts differ");
+        break;
+      }
+      default:
+        if (next() % 4096 == 0) {
+          map.Clear();
+          blocks.Clear();
+        }
+        break;
+      }
+      Check(map.Empty() == blocks.Empty(), "range set blocks: emptiness differs");
+      if (op % 20000 == 0) {
+        Check(dump(map) == dump(blocks), "range set blocks: sets differ");
+      }
+    }
+    Check(dump(map) == dump(blocks), "range set blocks: final sets differ");
+  }
+}
+
+// Prints the time per operation of both range sets on one stream of operations over ~65,000
+// intervals (a measurement, not a check).
+void BenchRangeSets() {
+  using Libs::Graphics::Detail::RangeSetBlocks;
+  using Libs::Graphics::Detail::RangeSetMap;
+  const auto run = [](auto &set) {
+    uint64_t state = 0x2545f4914f6cdd1dull;
+    uint64_t hits = 0;
+    const auto start = std::chrono::steady_clock::now();
+    constexpr int ops = 2000000;
+    for (int op = 0; op < ops; ++op) {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      // 65,536 page-aligned slots, ranges shorter than a page: the set grows to ~65,000
+      // intervals that rarely merge.
+      const uint64_t address = 0x10000 + (state % 0x10000000) / 0x1000 * 0x1000;
+      const uint64_t size = 0x100 + (state >> 40) % 0xe00;
+      const auto kind = (state >> 20) % 20;
+      if (kind < 6) {
+        set.Add(address, size);
+      } else if (kind == 6) {
+        set.Subtract(address, size);
+      } else if (kind < 14) {
+        hits += set.Intersects(address, size) ? 1 : 0;
+      } else {
+        hits += set.Contains(address, size) ? 1 : 0;
+      }
+    }
+    const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+    return std::pair{ns / ops, hits};
+  };
+  RangeSetMap map;
+  RangeSetBlocks blocks;
+  const auto [map_ns, map_hits] = run(map);
+  const auto [blocks_ns, blocks_hits] = run(blocks);
+  size_t intervals = 0;
+  blocks.ForEach([&](uint64_t, uint64_t) { intervals++; });
+  Check(map_hits == blocks_hits, "range set bench: answers differ");
+  std::printf("MemoryTrackerTests: range set map %.1f ns/op, blocks %.1f ns/op (%zu intervals)\n",
+              map_ns, blocks_ns, intervals);
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -1385,6 +1492,8 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestRangeSetBlocksMatchMap();
+  BenchRangeSets();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
