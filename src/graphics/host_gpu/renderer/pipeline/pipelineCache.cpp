@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/createStats.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
 #include "graphics/host_gpu/renderer/pipeline/floatMinMaxProbe.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1581,6 +1582,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics,
 		const Common::CompilePause::Scope compile_pause;
 		WarmUp(shader_store);
 	}
+	if (CreateStats::Enabled()) {
+		PipelineCacheLog("{}", CreateStats::Line());
+	}
 	MarkProgramsKnown();
 }
 
@@ -1620,6 +1624,9 @@ PipelineCache::~PipelineCache() {
 		}
 	}
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	if (CreateStats::Enabled()) {
+		PipelineCacheLog("{}", CreateStats::Line());
+	}
 	PipelineBinaryStore::Get().Close();
 }
 
