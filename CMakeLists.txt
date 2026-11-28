@@ -534,6 +534,10 @@ add_executable(wait_diagnostics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/WaitDiagnosticsTests.cpp"
 )
 target_include_directories(wait_diagnostics_tests PRIVATE ${inc_headers})
+add_executable(subgroup_size_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SubgroupSizeTests.cpp"
+)
+target_include_directories(subgroup_size_tests PRIVATE ${inc_headers})
 add_executable(driver_cache_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/DriverCacheFileTests.cpp"
 )
@@ -920,6 +924,7 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME wait_diagnostics COMMAND $<TARGET_FILE:wait_diagnostics_tests>)
+	add_test(NAME subgroup_size COMMAND $<TARGET_FILE:subgroup_size_tests>)
 	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)

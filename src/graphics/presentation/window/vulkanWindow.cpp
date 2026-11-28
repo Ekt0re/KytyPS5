@@ -603,6 +603,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.subgroup_size     = properties11.subgroupSize;
 	graphics.min_subgroup_size = subgroup_control.minSubgroupSize;
 	graphics.max_subgroup_size = subgroup_control.maxSubgroupSize;
+	graphics.required_subgroup_size_stages =
+	    supported13.subgroupSizeControl == VK_TRUE ? subgroup_stages : vk::ShaderStageFlags {};
 	graphics.compute_subgroup_size_control_enabled =
 	    supported13.subgroupSizeControl == VK_TRUE &&
 	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&

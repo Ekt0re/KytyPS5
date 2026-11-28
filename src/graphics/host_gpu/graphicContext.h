@@ -70,6 +70,9 @@ struct GraphicContext {
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
+	// Full VkPhysicalDeviceSubgroupSizeControlProperties::requiredSubgroupSizeStages mask. Read by
+	// KYTY_SUBGROUP_STAGE_SIZE; the two existing per-stage booleans keep their earlier semantics.
+	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	uint32_t                           max_push_descriptors                  = 0;
 	uint32_t                           device_clock_period_ps                = 0;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;

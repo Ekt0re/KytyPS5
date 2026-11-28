@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipeline/subgroupSize.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -30,8 +31,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -313,6 +317,43 @@ static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
 	(void)graphics.device.setDebugUtilsObjectNameEXT(&info);
 }
 
+static bool UsesSubgroupOps(const ShaderRecompiler::IR::ShaderInfo& info) noexcept {
+	return info.subgroup_ballot || info.subgroup_vote || info.subgroup_barrier ||
+	       info.subgroup_shuffle || info.subgroup_arithmetic ||
+	       info.subgroup_local_invocation_id || info.pixel_valid_mask;
+}
+
+static SubgroupSizeCaps MakeSubgroupSizeCaps(const GraphicContext& graphics) noexcept {
+	return {
+	    .default_size     = graphics.subgroup_size,
+	    .min_size         = graphics.min_subgroup_size,
+	    .max_size         = graphics.max_subgroup_size,
+	    .supported_stages =
+	        static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
+	};
+}
+
+static void WarnSubgroupSizeMismatch(const ShaderRecompiler::IR::CompiledShaderInfo& info,
+                                     const SubgroupSizeDecision&                     decision,
+                                     const SubgroupSizeCaps&                         caps) {
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint32_t>> warned;
+	const std::pair<uint64_t, uint32_t>            key {info.shader_hash,
+	                                                    static_cast<uint32_t>(info.stage)};
+	{
+		std::scoped_lock lock(mutex);
+		if (!warned.insert(key).second) {
+			return;
+		}
+	}
+	LOGF("!!! SUBGROUP SIZE MISMATCH shader=0x%016" PRIx64
+	     " stage=%s guest_wave=%u expected_subgroup=%u host_default=%u"
+	     " supported_range=[%u,%u] supported_stages=0x%08x\n",
+	     info.shader_hash, ShaderRecompiler::StageName(info.stage), info.wave_size,
+	     decision.expected_size, caps.default_size, caps.min_size, caps.max_size,
+	     caps.supported_stages);
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout layout,
                                 const GraphicsPipelineKey&                key,
@@ -349,16 +390,34 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	// ballot bits of lanes 0-31; GTA VI's clustered-light shader (PS 0x02defa99cc8f3d1e) then took
 	// an empty cell's 0xffffffff into its slice range and looped until the GPU reset.
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo pixel_subgroup_size {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo stage_subgroup_sizes[4] {};
+	const auto subgroup_caps      = MakeSubgroupSizeCaps(graphics);
+	const bool stage_size_enabled = SubgroupStageSizeEnabled();
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			auto& info = shader_stages[shader_stage_count++];
+			const auto slot = shader_stage_count++;
+			auto& info = shader_stages[slot];
 			info       = {.stage  = NativeShaderStage(stage->info.stage),
 			              .module = stage->Handle(),
 			              .pName  = "main"};
 			const auto wave_size = stage->info.wave_size;
-			if (info.stage == vk::ShaderStageFlagBits::eFragment &&
-			    graphics.fragment_subgroup_size_control_enabled &&
-			    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+			if (stage_size_enabled) {
+				const bool emulated_wave64_on_32 =
+				    stage->info.stage == ShaderType::Mesh && wave_size == 64u &&
+				    graphics.subgroup_size == 32u;
+				const auto decision = ResolveStageSubgroupSize(
+				    static_cast<uint32_t>(info.stage), wave_size, emulated_wave64_on_32,
+				    UsesSubgroupOps(stage->info.info), subgroup_caps);
+				if (decision.apply) {
+					stage_subgroup_sizes[slot].requiredSubgroupSize = decision.required_size;
+					info.pNext                                      = &stage_subgroup_sizes[slot];
+				} else if (decision.mismatch_warning) {
+					WarnSubgroupSizeMismatch(stage->info, decision, subgroup_caps);
+				}
+			} else if (info.stage == vk::ShaderStageFlagBits::eFragment &&
+			           graphics.fragment_subgroup_size_control_enabled &&
+			           wave_size >= graphics.min_subgroup_size &&
+			           wave_size <= graphics.max_subgroup_size) {
 				pixel_subgroup_size.requiredSubgroupSize = wave_size;
 				info.pNext                               = &pixel_subgroup_size;
 			}
@@ -558,8 +617,21 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	comp_shader_stage_info.module = module.Handle();
 	comp_shader_stage_info.pName  = "main";
 	const auto wave_size = module.info.wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+	if (SubgroupStageSizeEnabled()) {
+		const auto caps                 = MakeSubgroupSizeCaps(graphics);
+		const bool emulated_wave64_on_32 =
+		    wave_size == 64u && !graphics.SupportsComputeWave64();
+		const auto decision = ResolveStageSubgroupSize(
+		    static_cast<uint32_t>(vk::ShaderStageFlagBits::eCompute), wave_size,
+		    emulated_wave64_on_32, UsesSubgroupOps(module.info.info), caps);
+		if (decision.apply) {
+			comp_subgroup_size.requiredSubgroupSize = decision.required_size;
+			comp_shader_stage_info.pNext            = &comp_subgroup_size;
+		} else if (decision.mismatch_warning) {
+			WarnSubgroupSizeMismatch(module.info, decision, caps);
+		}
+	} else if (graphics.compute_subgroup_size_control_enabled &&
+	           wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
