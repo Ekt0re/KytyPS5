@@ -31,6 +31,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -60,7 +61,8 @@ PFN_vkCreateInstance      g_create_instance   = nullptr;
 	X(vkCreatePipelineLayout)                                                                      \
 	X(vkDestroyPipelineLayout)                                                                     \
 	X(vkCreateComputePipelines)                                                                    \
-	X(vkDestroyPipeline)
+	X(vkDestroyPipeline)                                                                           \
+	X(vkCreatePipelineCache)
 
 #define DECLARE(name) PFN_##name g_##name = nullptr;
 INSTANCE_FUNCS(DECLARE)
@@ -169,6 +171,8 @@ void Reflect(Module& module) {
 
 struct Device {
 	VkDevice device                   = VK_NULL_HANDLE;
+	// --cache: one VkPipelineCache every creation passes, as the emulator's driver cache.
+	VkPipelineCache cache             = VK_NULL_HANDLE;
 	uint32_t max_push_descriptors     = 0;
 	uint32_t max_push_constants       = 128;
 };
@@ -178,6 +182,10 @@ struct Device {
 bool g_robust = false;
 // --uab: sets other than 0 are update-after-bind heaps (ImageHeap).
 bool g_uab = false;
+// --emu-ext: the emulator's other device extensions and their features.
+bool g_emu_ext = false;
+// --cache empty|<file> (Device::cache).
+std::string g_cache;
 // --reserve all|low (ReserveAddressSpace).
 std::string g_reserve;
 void ReserveAddressSpace(bool low);
@@ -282,6 +290,72 @@ bool CreateDevice(Device& out) {
 	                         "VK_EXT_shader_demote_to_helper_invocation"}) {
 		if (has(plain)) extensions.push_back(plain);
 	}
+	// --emu-ext: the other device extensions the emulator enables (vulkanWindow.cpp, FSR and GPU
+	// breadcrumbs off), each with its features as the driver has them.
+	VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR};
+	VkPhysicalDeviceMeshShaderFeaturesEXT mesh {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+	VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+	VkPhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT};
+	VkPhysicalDeviceProvokingVertexFeaturesEXT provoking {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT};
+	VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unified {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
+	VkPhysicalDeviceMaintenance8FeaturesKHR maintenance8 {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR};
+	VkPhysicalDeviceShaderClockFeaturesKHR clock {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR};
+	VkPhysicalDeviceConditionalRenderingFeaturesEXT conditional {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
+	VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+	VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+	VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5 {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+	VkPhysicalDevicePipelineBinaryFeaturesKHR binaries {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_BINARY_FEATURES_KHR};
+	VkPhysicalDeviceDepthClipControlFeaturesEXT clip_control {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT};
+	VkPhysicalDeviceImageViewMinLodFeaturesEXT min_lod {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_MIN_LOD_FEATURES_EXT};
+	VkPhysicalDeviceDepthClipEnableFeaturesEXT clip_enable {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT};
+	VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamic_state {
+	    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT};
+	if (g_emu_ext) {
+		const auto chain_once = [&](const char* extension, auto& feature) {
+			if (std::ranges::none_of(extensions, [&](const char* e) { return std::strcmp(e, extension) == 0; })) {
+				chain(extension, feature);
+			}
+		};
+		chain_once("VK_KHR_workgroup_memory_explicit_layout", workgroup);
+		chain_once("VK_EXT_mesh_shader", mesh);
+		chain_once("VK_EXT_attachment_feedback_loop_layout", feedback_layout);
+		chain_once("VK_EXT_attachment_feedback_loop_dynamic_state", feedback_dynamic);
+		chain_once("VK_EXT_provoking_vertex", provoking);
+		chain_once("VK_KHR_unified_image_layouts", unified);
+		chain_once("VK_KHR_maintenance8", maintenance8);
+		chain_once("VK_KHR_shader_clock", clock);
+		chain_once("VK_EXT_conditional_rendering", conditional);
+		chain_once("VK_KHR_fragment_shader_barycentric", barycentric);
+		chain_once("VK_KHR_compute_shader_derivatives", derivatives);
+		chain_once("VK_KHR_pipeline_binary", binaries);
+		chain_once("VK_EXT_depth_clip_control", clip_control);
+		chain_once("VK_EXT_image_view_min_lod", min_lod);
+		chain_once("VK_EXT_depth_clip_enable", clip_enable);
+		chain_once("VK_EXT_extended_dynamic_state", dynamic_state);
+		if (has("VK_KHR_maintenance5")) {
+			*tail = &maintenance5;
+			tail  = &maintenance5.pNext;
+		}
+		for (const char* plain: {"VK_EXT_memory_budget", "VK_EXT_external_memory_host",
+		                         "VK_EXT_depth_range_unrestricted", "VK_KHR_swapchain",
+		                         "VK_KHR_maintenance1"}) {
+			if (has(plain)) extensions.push_back(plain);
+		}
+	}
 	g_vkGetPhysicalDeviceFeatures2(physical, &features);
 	// Features that change how the driver compiles or need a capture/replay set-up stay off.
 	features.features.robustBufferAccess          = g_robust ? features.features.robustBufferAccess : VK_FALSE;
@@ -308,6 +382,27 @@ bool CreateDevice(Device& out) {
 	if (g_##name == nullptr) return false;
 	DEVICE_FUNCS(LOAD)
 #undef LOAD
+	if (!g_cache.empty()) {
+		// "empty", or a file whose VkPipelineCache data starts at its Vulkan header (the
+		// emulator's PPSA38500.bin has a prefix of its own before it).
+		std::vector<uint8_t> data;
+		if (g_cache != "empty") {
+			std::ifstream file(g_cache, std::ios::binary);
+			data.assign(std::istreambuf_iterator<char>(file), {});
+			size_t at = 0;
+			for (; at + 12 <= data.size(); at++) {
+				uint32_t header[3];
+				std::memcpy(header, data.data() + at, sizeof(header));
+				if (header[0] >= 32 && header[0] <= 64 && header[1] == 1 && header[2] == 0x10DE) break;
+			}
+			data.erase(data.begin(), data.begin() + static_cast<ptrdiff_t>(std::min(at, data.size())));
+		}
+		VkPipelineCacheCreateInfo cache_info {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+		cache_info.initialDataSize = data.size();
+		cache_info.pInitialData    = data.empty() ? nullptr : data.data();
+		const auto result = g_vkCreatePipelineCache(out.device, &cache_info, nullptr, &out.cache);
+		std::printf("pipeline cache: %zu bytes, result %d\n", data.size(), static_cast<int>(result));
+	}
 	return true;
 }
 
@@ -514,7 +609,7 @@ Sample Create(const Device& device, const Module& module, size_t index,
 	sample.performance  = cpu < performance.size() && performance[cpu];
 	const auto exceptions = g_exceptions.load();
 	sample.start          = Now();
-	sample.ok = g_vkCreateComputePipelines(device.device, VK_NULL_HANDLE, 1, &info, nullptr,
+	sample.ok = g_vkCreateComputePipelines(device.device, device.cache, 1, &info, nullptr,
 	                                       &pipeline) == VK_SUCCESS;
 	sample.end        = Now();
 	sample.exceptions = g_exceptions.load() - exceptions;
@@ -674,6 +769,8 @@ int main(int argc, char** argv) {
 		else if (arg == "--throttle") options.throttle = next, i++;
 		else if (arg == "--robust") g_robust = true;
 		else if (arg == "--uab") g_uab = true;
+		else if (arg == "--emu-ext") g_emu_ext = true;
+		else if (arg == "--cache") g_cache = next, i++;
 		else if (arg == "--reserve") g_reserve = next, i++;
 		else if (arg == "--counter") options.counter = next, i++;
 		else if (arg == "--child") options.child = std::strtoul(next, nullptr, 10), i++;
