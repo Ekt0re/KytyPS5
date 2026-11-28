@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderLookupIndex.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 
@@ -111,6 +112,52 @@ void TestEmpty() {
   Check(selection.keep.empty() && selection.modules_kept == 0, "empty store");
 }
 
+void TestShaderLookupHashes() {
+  using Libs::Graphics::HashShaderValue;
+  using Libs::Graphics::HashShaderWords;
+  using Libs::Graphics::ShaderRecompiler::IR::ResourceSpecialization;
+
+  ResourceSpecialization first;
+  first.buffers.push_back({.packed_stride = 16});
+  const auto second = first;
+  Check(HashShaderValue(first) == HashShaderValue(second), "equal specializations hash equally");
+
+  auto changed = first;
+  changed.buffers[0].packed_stride = 32;
+  Check(HashShaderValue(first) != HashShaderValue(changed), "specialization hash covers fields");
+
+  const std::vector<uint32_t> code{1, 2, 3};
+  const auto same_code = code;
+  Check(HashShaderWords(code) == HashShaderWords(same_code), "equal callee code hashes equally");
+  Check(HashShaderWords(code) != HashShaderWords(std::vector<uint32_t>{1, 2, 4}),
+        "callee-code hash covers words");
+}
+
+void TestShaderLookupIndexCollisions() {
+  struct Module {
+    uint32_t value;
+  };
+  using Libs::Graphics::ShaderLookupIndex;
+
+  ShaderLookupIndex<Module> index;
+  Module first{1};
+  Module second{2};
+  Module other_hash{3};
+  Check(index.Empty(), "lookup index starts empty");
+  Check(index.Find(7, [](const Module &) { return true; }) == nullptr,
+        "empty lookup index misses");
+
+  index.Add(7, &first);
+  index.Add(7, &second);
+  index.Add(9, &other_hash);
+  Check(index.Size() == 3, "lookup index keeps every module path");
+  Check(index.Find(7, [](const Module &module) { return module.value == 2; }) == &second,
+        "hash collision is resolved by the full match");
+  Check(index.Find(7, [](const Module &module) { return module.value == 3; }) == nullptr,
+        "a candidate with another hash is not considered");
+  Check(index.Find(8, [](const Module &) { return true; }) == nullptr, "unknown hash misses");
+}
+
 // A game and a precompile of one stamp must not both write its store.
 void TestStoreLockSingleWriter() {
   using Libs::Graphics::ShaderStoreLock;
@@ -159,6 +206,8 @@ int main() {
   TestNothingIdentical();
   TestPlanOfTheFirstKeptRecord();
   TestEmpty();
+  TestShaderLookupHashes();
+  TestShaderLookupIndexCollisions();
   std::printf("ShaderStoreTests: all passed\n");
   return 0;
 }

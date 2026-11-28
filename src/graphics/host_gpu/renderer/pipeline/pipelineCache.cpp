@@ -67,6 +67,14 @@ namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {1};
 
+bool ShaderKeyIndexEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_KEY_INDEX");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 uint8_t RemapSourceAlphaFactor(uint8_t factor) {
 	switch (static_cast<Prospero::BlendFactor>(factor)) {
 		case Prospero::BlendFactor::kSrcAlpha:
@@ -324,6 +332,16 @@ std::span<const uint32_t> PipelineCache::Program::FunctionCode() const {
 	    : std::span<const uint32_t>{};
 }
 
+ShaderModule& PipelineCache::Program::Adopt(ShaderModule&& module) {
+	auto& added = modules.emplace_back(std::move(module));
+	if (ShaderKeyIndexEnabled()) {
+		added.specialization_hash = HashShaderValue(added.specialization);
+		added.function_code_hash  = HashShaderWords(added.function_code);
+		module_index.Add(added.specialization_hash, &added);
+	}
+	return added;
+}
+
 bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 	const auto revision = call_source->revision;
 	ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
@@ -353,6 +371,9 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 		}
 	}
 	resource_plan.source_reads = call_source->reads;
+	if (ShaderKeyIndexEnabled() && (revision != call_source->revision || function_code_hash == 0)) {
+		function_code_hash = HashShaderWords(FunctionCode());
+	}
 	// KYTY_CALL_STATS=1: how often call shaders link, reuse a link or translate, on stderr.
 	static const bool stats = std::getenv("KYTY_CALL_STATS") != nullptr;
 	if (stats) {
@@ -428,18 +449,38 @@ ShaderModule* PipelineCache::Program::FindModule(
     ShaderRecompiler::IR::MemoryChangeSource* memory_changes) {
 	EXIT_IF(!Materialize(runtime, memory_changes));
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleLookups);
-	for (auto& candidate: modules) {
+	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword !=
 		        push_data.StartFor(layout.ShaderDataDwords(), candidate.info.stage) ||
 		    candidate.specialization != specialization) {
-			continue;
+			return false;
 		}
 		if constexpr (HasCalls) {
-			if (!std::ranges::equal(candidate.function_code, FunctionCode())) continue;
+			return candidate.function_code_hash == function_code_hash &&
+			       std::ranges::equal(candidate.function_code, FunctionCode());
+		} else {
+			return candidate.function_code.empty();
 		}
+	};
+	ShaderModule* found = nullptr;
+	if (ShaderKeyIndexEnabled()) {
+		specialization_hash = HashShaderValue(specialization);
+		if constexpr (HasCalls) {
+			if (function_code_hash == 0) function_code_hash = HashShaderWords(FunctionCode());
+		}
+		found = module_index.Find(specialization_hash, matches);
+	} else {
+		for (auto& candidate: modules) {
+			if (matches(candidate)) {
+				found = &candidate;
+				break;
+			}
+		}
+	}
+	if (found != nullptr) {
 		Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleHits);
-		return &candidate;
+		return found;
 	}
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleMisses);
 	return nullptr;
@@ -473,7 +514,7 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
 	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
-	auto& module = program.modules.emplace_back(ShaderModule {
+	auto& module = program.Adopt(ShaderModule {
 	    .id             = id,
 	    .module         = CompileSPV(result.spirv, m_graphics.device),
 	    .info           = std::move(info),

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/pipeline/materializationMemo.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderLookupIndex.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -174,6 +175,9 @@ struct ShaderModule {
 	std::vector<uint32_t>                        spirv;
 	// A module loaded from the shader store has no handle until Handle() first asks for it.
 	std::shared_ptr<StoredModule>                stored;
+	// Runtime-only keys for KYTY_SHADER_KEY_INDEX; not part of the stored record.
+	uint64_t                                     specialization_hash = 0;
+	uint64_t                                     function_code_hash  = 0;
 
 	[[nodiscard]] vk::ShaderModule Handle() const {
 		return stored != nullptr ? ResolveStoredModule(*stored) : module;
@@ -422,8 +426,11 @@ private:
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		MemoizedMaterialization                        materialization_memo;
+		uint64_t                                     specialization_hash = 0;
+		uint64_t                                     function_code_hash  = 0;
 		// Compiling pipelines keep references.
 		std::deque<ShaderModule>                     modules;
+		ShaderLookupIndex<ShaderModule>              module_index;
 		bool                                         skip_dispatch = false;
 		// A program from the shader store whose resource plan is still in its first record.
 		std::shared_ptr<StoredModule>                stored_plan;
@@ -435,6 +442,8 @@ private:
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                 ShaderRecompiler::IR::MemoryChangeSource* memory_changes);
+		// The only path that adds a module to `modules`; keeps the optional lookup index complete.
+		ShaderModule& Adopt(ShaderModule&& module);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         ShaderRecompiler::IR::PushData::Window push_data,

@@ -175,7 +175,7 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle and the SPIR-V report fields come from the SPIR-V; stored programs have no
 	// function code.
 	auto& [id, handle, info, specialization, function_code, rect_parameters, mesh_task, spirv_words,
-	       spirv, stored] = stage;
+	       spirv, stored, specialization_hash, function_code_hash] = stage;
 	IoAll(io, id, info, specialization, rect_parameters, mesh_task);
 }
 
@@ -734,7 +734,7 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 				if (stored.parts_left.fetch_sub(1) == 1) stored.store.reset();
 				break;
 			}
-			program->second.modules.push_back(std::move(loaded.module));
+			program->second.Adopt(std::move(loaded.module));
 			break;
 		}
 		// WarmUp creates the pipeline once every record is loaded.
@@ -1386,7 +1386,7 @@ void PipelineCache::MergeReplayed() {
 		}
 		done.module.module = CompileSPV(done.spirv, m_graphics.device);
 		RetainModuleSpirv(done.module, done.spirv);
-		const auto& module = program.modules.emplace_back(std::move(done.module));
+		const auto& module = program.Adopt(std::move(done.module));
 		StoreModule(entry->first, program, module, done.spirv);
 		m_replay_merged++;
 		if (module.info.stage == ShaderType::Compute && !m_compute_pipelines.contains(module.id)) {
