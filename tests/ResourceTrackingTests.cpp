@@ -6508,6 +6508,95 @@ void TestBoundedFormattedBufferStore() {
                "finite store accepted an unproved induction or indexed byte offset");
 }
 
+void TestIndirectFormattedStoreTracking(bool enabled) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  struct Case {
+    ValueOpcode opcode;
+    uint32_t dwords;
+    uint32_t bits;
+    uint32_t components;
+    bool control;
+  };
+  const auto make = [&](Case test, bool indexed = true, uint32_t offset = 0u) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    auto* entry = f.block;
+    auto* header = f.AddBlock();
+    auto* body = f.AddBlock();
+    auto* latch = f.AddBlock();
+    auto* exit = f.AddBlock();
+    const auto branch = [](Block* from, Block* to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    branch(entry, header);
+    branch(body, latch);
+    branch(latch, header);
+    header->AddBranch(body);
+    header->AddBranch(exit);
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body, .false_block = exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    const auto count = f.UserData(4u);
+    auto& phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, f.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(1u)}, 0, latch));
+    header->condition = f.Emit(ValueOpcode::SLessThan32, {Value(&phi), count}, 0, header);
+    f.block = body;
+    std::array<Value, 4> table_words;
+    for (uint32_t word = 0; word < table_words.size(); ++word) table_words[word] = f.UserData(word);
+    const auto table = f.Buffer(table_words);
+    const auto key_offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&phi), Value(4u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word)
+      words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, key_offset},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
+                       .component_index = word, .component_count = 4u}, 0x40u + word * 4u));
+    Value data = test.bits == 16u ? Value(uint16_t{42u}) : Value(42u);
+    if (test.opcode == ValueOpcode::StoreBufferU32x2)
+      data = f.Emit(ValueOpcode::CompositeConstructU32x2, {Value(42u), Value(43u)});
+    else if (test.opcode == ValueOpcode::StoreBufferU32x3)
+      data = f.Emit(ValueOpcode::CompositeConstructU32x3, {Value(42u), Value(43u), Value(44u)});
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    f.Emit(test.opcode,
+        {f.Buffer(words), lane, Value(offset), Value(0u), data, Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = test.dwords,
+                     .data_bits = test.bits, .component_count = test.components,
+                     .formatted = true, .idxen = indexed, .coherent = true}, 0x80u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  const std::array positive{
+      Case{ValueOpcode::StoreBufferU32x3, 3u, 32u, 3u, false},
+      Case{ValueOpcode::StoreBufferU32x2, 2u, 32u, 2u, false},
+      Case{ValueOpcode::StoreBufferU32, 1u, 16u, 1u, false},
+      Case{ValueOpcode::StoreBufferU32, 1u, 16u, 2u, false},
+      Case{ValueOpcode::StoreBufferU32x2, 2u, 16u, 3u, false},
+      Case{ValueOpcode::StoreBufferU32x2, 2u, 16u, 4u, false},
+      Case{ValueOpcode::StoreBufferU32, 1u, 32u, 1u, true}};
+  for (const auto test : positive) {
+    if (enabled || test.control) {
+      auto fixture = make(test);
+      Check(fixture->program.info.buffers.size() == 1u &&
+                fixture->program.info.buffers[0].written,
+            "supported indirect formatted store was not tracked as a write");
+    } else {
+      CheckFatal([&] { make(test); }, "not a valid runtime value",
+                 "switch-off formatted store tracking changed legacy behavior");
+    }
+  }
+  if (!enabled) return;
+  for (const auto test : {Case{ValueOpcode::StoreBufferU8, 1u, 8u, 1u, false},
+                          Case{ValueOpcode::StoreBufferU32x2, 2u, 16u, 2u, false},
+                          Case{ValueOpcode::StoreBufferU32x3, 2u, 32u, 3u, false}})
+    CheckFatal([&] { make(test); }, "not a valid runtime value",
+               "unsupported formatted store shape was accepted");
+  CheckFatal([&] { make(positive.front(), false); }, "not a valid runtime value",
+             "non-indexed formatted table store was accepted");
+  CheckFatal([&] { make(positive.front(), true, 4u); }, "not a valid runtime value",
+             "formatted table store with a nonzero offset was accepted");
+}
+
 std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass = false,
                                                   bool gpu_selected = false, uint32_t bias = 0u,
                                                   bool split_offsets = false,
@@ -9984,7 +10073,7 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -9993,6 +10082,27 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-only") == 0) {
+#ifdef _WIN32
+      _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "1");
+#else
+      setenv("KYTY_INDIRECT_FORMATTED_STORES", "1", 1);
+#endif
+      Run("indirect formatted stores", [] { TestIndirectFormattedStoreTracking(true); });
+      std::cout << "indirect formatted store tracking tests passed\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-off-only") == 0) {
+#ifdef _WIN32
+      _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "0");
+#else
+      setenv("KYTY_INDIRECT_FORMATTED_STORES", "0", 1);
+#endif
+      Run("indirect formatted stores off", [] { TestIndirectFormattedStoreTracking(false); });
+      Run("legacy bounded formatted store", TestBoundedFormattedBufferStore);
+      std::cout << "indirect formatted store switch-off tests passed\n";
+      return 0;
+    }
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
@@ -10032,6 +10142,7 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
+    Run("indirect formatted stores off", [] { TestIndirectFormattedStoreTracking(false); });
     Run("bounded buffer records", [] {
       for (const uint32_t components : {0u, 2u, 3u, 4u}) TestBoundedBufferRecords(components);
       TestGuardedWaterfallBufferRecords();

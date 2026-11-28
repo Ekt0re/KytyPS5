@@ -970,9 +970,17 @@ if(BUILD_TESTING)
 	add_test(NAME keep_going COMMAND $<TARGET_FILE:keep_going_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME resource_materialization_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:resource_materialization_tests> --indirect-formatted-stores-only)
+	add_test(NAME resource_materialization_indirect_formatted_stores_off
+		COMMAND $<TARGET_FILE:resource_materialization_tests> --indirect-formatted-stores-off-only)
 	add_test(NAME materialization_memo COMMAND $<TARGET_FILE:materialization_memo_tests>)
 	add_test(NAME guest_read_log COMMAND $<TARGET_FILE:guest_read_log_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME resource_tracking_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --indirect-formatted-stores-only)
+	add_test(NAME resource_tracking_indirect_formatted_stores_off
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --indirect-formatted-stores-off-only)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME win_read_efault COMMAND $<TARGET_FILE:win_read_efault_tests>)

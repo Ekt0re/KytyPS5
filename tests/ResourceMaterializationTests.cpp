@@ -10,6 +10,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <array>
 #include <cstring>
@@ -1369,6 +1370,72 @@ void TestIndirectStorageSwizzles() {
         "indirect storage candidates sharing one swizzle were incompatible");
 }
 
+void TestIndexedRawByteBounds(bool broad_conversion) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  const auto make = [](uint32_t stride, uint32_t bytes, uint32_t swizzle, bool add_tid,
+                      uint32_t extent) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    for (const uint32_t base : {0x10000u, 0x20000u}) {
+      DescriptorSource source;
+      source.dword_count = 4u;
+      source.dwords.fill(Value(0u));
+      source.dwords[0] = Value(base);
+      source.dwords[1] = Value(stride << 16u);
+      source.dwords[2] = Value(bytes);
+      source.dwords[3] = Value(uint32_t(F::k32UInt) << 12u | swizzle |
+                               (add_tid ? 1u << 23u : 0u) | (3u << 28u));
+      program.descriptor_sources.push_back(source);
+    }
+    DescriptorSource root;
+    root.dword_count = 4u;
+    root.dwords.fill(Value(0u));
+    auto& indirect = root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
+    indirect.sources = {0, 1};
+    indirect.indexed = true;
+    program.descriptor_sources.push_back(root);
+    program.info.buffers.push_back({.source = 2u, .max_byte_extent = extent,
+                                    .read = true, .written = true, .raw = true});
+    return Extract(program);
+  };
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{};
+  const auto materialize = [&](uint32_t stride, uint32_t bytes, uint32_t swizzle,
+                               bool add_tid, uint32_t extent) {
+    return MaterializeResources(make(stride, bytes, swizzle, add_tid, extent), runtime,
+                                snapshot, specialization);
+  };
+  const auto identity = Libs::Graphics::DstSel(4, 5, 6, 7);
+  Check(materialize(4u, 4096u, identity, false, 4u) == broad_conversion,
+        "indexed byte-bound conversion did not match the switch state");
+  if (broad_conversion) {
+    Check(snapshot.buffers.size() == 3u &&
+              std::ranges::all_of(std::span(snapshot.buffers).subspan(1), [](const auto& buffer) {
+                return buffer.dwords[2] == 1024u && (buffer.dwords[3] >> 28u) == 0u;
+              }),
+          "exact byte bounds were not converted to record bounds for every candidate");
+  }
+  Check(!materialize(4u, 4095u, identity, false, 4u),
+        "non-divisible byte bounds were rounded into record bounds");
+  Check(!materialize(0u, 4096u, identity, false, 4u),
+        "zero-stride byte bounds were converted");
+  Check(!materialize(6u, 4098u, identity, false, 4u),
+        "misaligned records were accepted after byte-bound conversion");
+  Check(!materialize(4u, 4096u, identity ^ 1u, false, 4u),
+        "swizzled byte bounds were converted");
+  Check(!materialize(4u, 4096u, identity, true, 4u),
+        "broad ADD_TID byte bounds were converted");
+  Check(materialize(1u, 4096u, identity, false, 1u) &&
+            snapshot.buffers.size() == 3u &&
+            std::ranges::all_of(std::span(snapshot.buffers).subspan(1), [](const auto& buffer) {
+              return buffer.dwords[2] == 4096u && (buffer.dwords[3] >> 28u) == 0u;
+            }),
+        "legacy stride-one byte bounds changed");
+}
+
 // GPU-selected indexed V#s with ADD_TID: compute stages keep the bit for the emitter, which adds the
 // lane to the index and to its bound; other stages and byte-offset roots reject it.
 void TestIndexedAddTidIndirectBuffers() {
@@ -1878,9 +1945,30 @@ void TestLookaheadRevalidation() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   // Lookahead's walkers log their loads' values; every case below runs with it.
   Libs::Graphics::ShaderRecompiler::IR::SetSrtWalkerValueCapture(true);
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "1");
+#else
+    setenv("KYTY_INDIRECT_FORMATTED_STORES", "1", 1);
+#endif
+    TestIndexedRawByteBounds(true);
+    std::puts("indirect formatted store tests passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-off-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "0");
+#else
+    setenv("KYTY_INDIRECT_FORMATTED_STORES", "0", 1);
+#endif
+    TestIndexedRawByteBounds(false);
+    TestIndexedAddTidIndirectBuffers();
+    std::puts("indirect formatted store switch-off tests passed");
+    return 0;
+  }
   TestWalkScratchCapturesLoadValues();
   TestLookaheadRevalidation();
   TestWalkerLoadsBypassSpecializationReader();
@@ -1906,6 +1994,7 @@ int main() {
   TestRuntimeStrideSharesEmptyBufferModule();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestIndirectStorageSwizzles();
+  TestIndexedRawByteBounds(false);
   TestIndexedAddTidIndirectBuffers();
   TestStorageFillSwizzle();
   TestSignedStorageSpecialization();
