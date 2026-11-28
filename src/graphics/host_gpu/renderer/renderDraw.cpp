@@ -1290,7 +1290,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	    static_cast<bool>(m_targets.depth.image_id) &&
 	    static_cast<bool>(m_targets.depth.AttachmentWriteAspects());
 	const bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
-	                       (async_mode >= 2 || !depth_writes);
+	                       (async_mode >= 2 || !depth_writes || state.deferrable);
 	// A draw that waits may start with an unoptimized pipeline (KYTY_FAST_PIPELINES).
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
 	                                                                  false, !skippable);
@@ -1426,12 +1426,15 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		record(vk_buffer, pipeline.pipeline);
 	} else {
 		m_context.GetCommandScheduler().Split(
-		    [record, skippable, &occlusion_queries, occlusion_query,
-		     pending = pipeline.Pending()](vk::CommandBuffer command) {
+		    [this, record, skippable, stall_deferrable = state.deferrable, &occlusion_queries,
+		     occlusion_query, pending = pipeline.Pending()](vk::CommandBuffer command) {
 			    if (skippable && !pending.Ready()) {
 				    occlusion_queries.End(command, occlusion_query);
 				    PipelineCache::NoteSkippedDraw();
 				    Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::PipelineBuilding);
+				    if (stall_deferrable) {
+					    m_context.GetPipelineCache().NoteDeferredNewTarget();
+				    }
 			    } else {
 				    record(command, pending.Get());
 			    }

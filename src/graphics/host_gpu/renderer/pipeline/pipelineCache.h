@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/compilePause.h"
 #include "common/file.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -211,6 +212,8 @@ struct DrawRenderState {
 	// Input: the user-data slots a GPU-read indirect draw patches.
 	ShaderIndirectOffsets                indirect_offsets;
 	bool                                 indirect_draw = false;
+	// KYTY_DEFER_NEW_TARGETS made this stalled, not-recently-redrawn target skippable.
+	bool                                 deferrable = false;
 
 	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
 		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
@@ -402,6 +405,8 @@ public:
 	static bool OnDemandShaderStore();
 	// A draw skipped because its pipeline was not ready; reported every 5 s.
 	static void NoteSkippedDraw();
+	// A stalled new-target draw was actually skipped while its pipeline built.
+	void NoteDeferredNewTarget();
 	// Waits for a pipeline being built on a worker; the guest clock stands still while it waits.
 	static vk::Pipeline WaitForPipeline(const std::shared_future<vk::Pipeline>& compiling);
 	// Without `wait` the pipeline may still be compiling.
@@ -523,6 +528,14 @@ private:
 	ShaderRecompiler::IR::HeapRowSource*   m_heap_rows = nullptr;
 	ShaderRecompiler::IR::MemoryChangeSource* m_memory_changes = nullptr;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
+	// KYTY_DEFER_NEW_TARGETS: recent per-target draw history and the current presented-frame stall.
+	struct TargetHistory {
+		uint64_t frame = ~uint64_t {0};
+		uint8_t  seen  = 0;
+	};
+	std::unordered_map<uint64_t, TargetHistory>       m_target_history;
+	Common::CompilePause::FrameStallTracker           m_frame_stall;
+	std::mutex                                        m_frame_stall_mutex;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
@@ -651,6 +664,10 @@ private:
 	                     ShaderRecompiler::IR::ResourcePlan& plan);
 	// Marks the keys of the programs in the cache as needing no translation ahead.
 	void MarkProgramsKnown();
+
+	// KYTY_DEFER_NEW_TARGETS (milliseconds, default 0).
+	static uint32_t DeferNewTargetsOnStallMs();
+	bool           NoteTargetDraw(uint64_t address, uint64_t frame);
 
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,

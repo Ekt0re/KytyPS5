@@ -16,6 +16,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -39,8 +40,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #if defined(__linux__)
@@ -1713,6 +1716,48 @@ int PipelineCache::AsyncPipelineMode() {
 	return mode;
 }
 
+uint32_t PipelineCache::DeferNewTargetsOnStallMs() {
+	static const uint32_t value = [] {
+		const char* env = std::getenv("KYTY_DEFER_NEW_TARGETS");
+		if (env == nullptr || env[0] == 0) {
+			return 0u;
+		}
+		const auto parsed = std::strtoul(env, nullptr, 10);
+		return parsed > std::numeric_limits<uint32_t>::max()
+		           ? std::numeric_limits<uint32_t>::max()
+		           : static_cast<uint32_t>(parsed);
+	}();
+	return value;
+}
+
+bool PipelineCache::NoteTargetDraw(uint64_t address, uint64_t frame) {
+	auto& history = m_target_history[address];
+	if (history.frame == ~uint64_t {0} || history.frame > frame) {
+		history = {.frame = frame, .seen = 1};
+	} else {
+		const auto age = frame - history.frame;
+		history.seen   = age >= 8 ? 0 : static_cast<uint8_t>(history.seen << age);
+		history.frame  = frame;
+		history.seen |= 1u;
+	}
+	constexpr size_t MaxTargets = 4096;
+	const bool redrawn = std::popcount(static_cast<unsigned>(history.seen & 0x3fu)) >= 3;
+	while (m_target_history.size() > MaxTargets) {
+		const auto oldest = std::min_element(
+		    m_target_history.begin(), m_target_history.end(),
+		    [](const auto& left, const auto& right) {
+			    return left.second.frame < right.second.frame;
+		    });
+		m_target_history.erase(oldest);
+	}
+	return redrawn;
+}
+
+void PipelineCache::NoteDeferredNewTarget() {
+	std::scoped_lock lock(m_frame_stall_mutex);
+	m_frame_stall.NoteDeferred();
+}
+
 void PipelineCache::NoteSkippedDraw() {
 	// Command threads only; one at a time per queue, so a mutex is cheap enough.
 	static std::mutex                            mutex;
@@ -2243,6 +2288,7 @@ bool PipelineCache::PrepareGraphicsStages(const HW::Context& context, const HW::
 }
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
+	state.deferrable = false;
 	UpdateWalkerGuard();
 	UpdateLookahead();
 	MergeReplayed();
@@ -2259,6 +2305,55 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 	const bool pixel_active      = inputs.pixel_active;
 	const bool tess_active       = inputs.tess_active;
 	const auto color_output_mask = inputs.color_output_mask;
+	// Upstream already skips ordinary new-target geometry in async mode. After a presented-frame
+	// stall, let the same path take a target that would otherwise wait (for example a depth writer
+	// in mode 1). Full-screen and memory-writing draws remain protected in renderDraw.cpp.
+	const uint32_t stall_ms = DeferNewTargetsOnStallMs();
+	if (stall_ms != 0 && AsyncPipelineMode() != 0) {
+		const auto& context       = command.GetRegisters();
+		const auto  frame         = static_cast<uint64_t>(command.GetContext().GetGpu().GetFrameNum());
+		bool        redrawn       = true;
+		uint32_t    color_targets = 0;
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((color_output_mask & (1u << slot)) == 0) {
+				continue;
+			}
+			const auto address = context.GetRenderTarget(slot).base.addr;
+			if (address != 0) {
+				color_targets++;
+				redrawn = NoteTargetDraw(address, frame) && redrawn;
+			}
+		}
+		if (color_targets == 0) {
+			const auto& depth = context.GetDepthRenderTarget();
+			const auto  base  = depth.z_write_base_addr != 0 ? depth.z_write_base_addr
+			                                                : depth.z_read_base_addr;
+			if (base != 0) {
+				redrawn = NoteTargetDraw(base, frame);
+			}
+		}
+		if (!redrawn) {
+			using Change = Common::CompilePause::FrameStallTracker::Change;
+			const auto now_ms = static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::milliseconds>(
+			        std::chrono::steady_clock::now().time_since_epoch())
+			        .count());
+			std::scoped_lock lock(m_frame_stall_mutex);
+			Change           change = Change::None;
+			state.deferrable = m_frame_stall.Update(frame, now_ms, stall_ms, &change);
+			if (change == Change::Started) {
+				PipelineCacheLog(
+				    "[async] no frame for {} ms (frame {}): stalled draws into targets not seen "
+				    "redrawn may be skipped while their pipelines build (KYTY_DEFER_NEW_TARGETS)",
+				    stall_ms, frame);
+			} else if (change == Change::Ended) {
+				PipelineCacheLog(
+				    "[async] frame {} recorded after the stall: {} new-target draws were skipped "
+				    "while their pipelines built ({} in all)",
+				    frame, m_frame_stall.deferred, m_frame_stall.deferred_total);
+			}
+		}
+	}
 	if (pixel_active) {
 		const auto* pixel_program = GetProgram(pixel_params, pixel_info, push_data);
 		if (pixel_program == nullptr) {

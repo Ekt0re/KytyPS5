@@ -530,6 +530,11 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(async_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AsyncPlanTests.cpp"
+)
+target_include_directories(async_plan_tests PRIVATE ${inc_headers})
+
 add_executable(wait_diagnostics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/WaitDiagnosticsTests.cpp"
 )
@@ -953,6 +958,7 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME async_plan COMMAND $<TARGET_FILE:async_plan_tests>)
 	add_test(NAME wait_diagnostics COMMAND $<TARGET_FILE:wait_diagnostics_tests>)
 	add_test(NAME subgroup_size COMMAND $<TARGET_FILE:subgroup_size_tests>)
 	add_test(NAME dispatch_limits COMMAND $<TARGET_FILE:dispatch_limits_tests>)
@@ -1138,6 +1144,7 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
+		async_plan_tests
 		wait_diagnostics_tests
 		driver_cache_file_tests
 		pipeline_create_stats_tests
