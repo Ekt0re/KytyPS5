@@ -1031,7 +1031,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     const PipelineCache::Pipeline&     pipeline,
                                     std::span<PreparedBindings* const> prepared_bindings) {
 	KYTY_PROFILER_FUNCTION();
-	const auto                     entry_buffer           = buffer.Handle();
+	const auto                     entry_buffer           = buffer.StateHandle();
 	size_t                         image_descriptor_count = 0;
 	ShaderRecompiler::IR::PushData push_data;
 	bool                           has_push_data = false;
@@ -1053,7 +1053,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	// Nothing here may restart the scheduler: the caller recorded state for this draw already.
 	// The handle is still read after the heap's uploads, so that a restart would at least keep
 	// the bindings and the draw in one command buffer.
-	const auto vk_buffer = buffer.Handle();
+	const auto vk_buffer = buffer.StateHandle();
 	if (vk_buffer != entry_buffer) {
 		static std::atomic<uint32_t> logged {0};
 		if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
@@ -1071,6 +1071,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		const auto& program     = prepared->runtime->module->info;
 		auto&       descriptors = *prepared;
 		if (descriptors.gds.buffer != nullptr) {
+			buffer.OrderDispatches();
 			buffer.EndRendering();
 			const auto barrier       = MakeGdsDependency(descriptors.gds.buffer);
 			const auto shader_stages = ShaderPipelineStages(NativeShaderStage(program.stage));

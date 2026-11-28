@@ -544,6 +544,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 void CommandScheduler::Split(Common::UniqueFunction<void, vk::CommandBuffer>&& tail) {
 	EXIT_IF(m_command.IsInvalid());
+	m_command.OrderDispatches();
+	m_command.m_barriers.Reset();
 	m_segments.push_back({m_command.m_buffer, std::move(tail)});
 	m_command.m_rendering = false;
 	m_command.m_buffer    = nullptr;
@@ -630,6 +632,7 @@ uint64_t CommandScheduler::SubmitWith(SubmitInfo submit, const DetachedPrefix* p
 	}
 
 	m_command.EndRendering();
+	m_command.OrderDispatches();
 	std::vector<vk::CommandBuffer> buffers;
 	buffers.reserve(m_segments.size() + 1);
 	for (const auto& segment: m_segments) {
@@ -638,6 +641,7 @@ uint64_t CommandScheduler::SubmitWith(SubmitInfo submit, const DetachedPrefix* p
 	}
 	m_segments.clear();
 	buffers.push_back(m_command.m_buffer);
+	m_command.m_barriers.Reset();
 	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 

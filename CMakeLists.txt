@@ -557,6 +557,11 @@ add_executable(readback_wait_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ReadbackWaitTests.cpp"
 )
 target_include_directories(readback_wait_tests PRIVATE ${inc_headers})
+add_executable(barrier_tracker_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BarrierTrackerTests.cpp"
+)
+target_link_libraries(barrier_tracker_tests common)
+target_include_directories(barrier_tracker_tests PRIVATE ${inc_headers})
 
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
@@ -905,6 +910,7 @@ if(BUILD_TESTING)
 	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)
 	add_test(NAME skip_taint COMMAND $<TARGET_FILE:skip_taint_tests>)
 	add_test(NAME readback_wait COMMAND $<TARGET_FILE:readback_wait_tests>)
+	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
 	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME draw_indirect_count COMMAND $<TARGET_FILE:draw_indirect_count_tests>)
@@ -1065,6 +1071,7 @@ if(BUILD_TESTING)
 		readback_batch_tests
 		skip_taint_tests
 		readback_wait_tests
+		barrier_tracker_tests
 		shader_store_tests
 		common_tests
 		draw_indirect_count_tests

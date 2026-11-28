@@ -305,6 +305,62 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+static ShaderAccessSet CollectDispatchAccesses(const ShaderComputeInputInfo& input_info,
+                                                const PreparedBindings&       bindings) {
+	const auto& program = input_info.stage.module->info;
+	ShaderAccessSet accesses;
+	const auto unknown = [&] {
+		accesses.unknown_reads  = true;
+		accesses.unknown_writes = true;
+	};
+	if (program.has_address_writes || program.info.uses_dma || program.info.uses_gds ||
+	    program.info.uses_device_address || program.info.uses_heap_rows ||
+	    program.info.uses_image_heap || program.info.function_scratch ||
+	    bindings.gds.buffer != nullptr || bindings.shared_memory.buffer != nullptr ||
+	    program.bindings.ray_query_dword != ShaderRecompiler::IR::PushData::NoStart) {
+		unknown();
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+		const auto& resource = program.info.buffers[i];
+		const bool read      = resource.read || resource.atomic;
+		const bool write     = resource.written || resource.atomic;
+		if (!read && !write) continue;
+		if (resource.descriptor_index == UINT32_MAX ||
+		    resource.descriptor_index >= bindings.buffer_sources.size()) {
+			if (read) accesses.unknown_reads = true;
+			if (write) accesses.unknown_writes = true;
+			continue;
+		}
+		const auto& source = bindings.buffer_sources[resource.descriptor_index];
+		if (source.address == 0 || source.size == 0) continue;
+		if (read) accesses.AddRead(source.address, source.size);
+		if (write) accesses.AddWrite(source.address, source.size);
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& resource = program.info.images[i];
+		const bool read      = resource.read || resource.atomic;
+		const bool write     = resource.written || resource.atomic;
+		if (!read && !write) continue;
+		if (resource.heap || i >= bindings.images.size() || bindings.images[i].image_id == 0) {
+			if (resource.heap || i >= bindings.images.size()) {
+				if (read) accesses.unknown_reads = true;
+				if (write) accesses.unknown_writes = true;
+			}
+			continue;
+		}
+		const auto& info = bindings.images[i].desc.info;
+		const auto add   = [&](GuestRange range) {
+			if (range.Empty()) return;
+			if (read) accesses.AddRead(range.address, range.size);
+			if (write) accesses.AddWrite(range.address, range.size);
+		};
+		add(info.data);
+		add(info.stencil);
+		add(info.metadata.range);
+	}
+	return accesses;
+}
+
 // Dispatch-argument guard (KYTY_DISPATCH_GUARD, on unless set to 0). Indirect dispatch counts a
 // guest compute pass produced are copied by a one-invocation pass into a slot of a host-visible
 // ring, which the dispatch reads instead: a count of 0 dispatches nothing (as on the console), and
@@ -498,7 +554,13 @@ template <typename Record>
 static void RecordDispatch(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
                            const Record& record) {
 	if (pipeline.pipeline) {
-		record(buffer.Handle(), pipeline.pipeline);
+		record(buffer.DispatchHandle(), pipeline.pipeline);
+		return;
+	}
+	if (buffer.GetBarrierTracker() != nullptr) {
+		// A split would move the logical dispatch into another command buffer while its tracker
+		// state stayed here. The opt-in tracker keeps the dispatch in this buffer instead.
+		record(buffer.DispatchHandle(), pipeline.Pending().Get());
 		return;
 	}
 	buffer.GetContext().GetCommandScheduler().Split(
@@ -814,13 +876,17 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
+	const auto accesses = CollectDispatchAccesses(input_info, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	auto vk_buffer = buffer.Handle();
-	if (HasStorageWrites(input_info, bindings)) {
-		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
-		// while allowing the queue to execute asynchronously.
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	auto vk_buffer = buffer.DispatchHandle();
+	auto* tracker  = buffer.GetBarrierTracker();
+	const ShaderBarrierOptions barrier_options {.tracker = tracker, .accesses = &accesses};
+	if (tracker != nullptr || HasStorageWrites(input_info, bindings)) {
+		// The legacy path keeps its write hazard. The tracker also orders read-only dispatches
+		// after earlier writes and emits a barrier only for an actual range hazard.
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader,
+		                         barrier_options);
 	}
 	if (Config::GraphicsDebugDumpEnabled()) {
 		const auto sampled_images = std::count_if(
@@ -924,14 +990,16 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 	} else {
 		RecordDispatch(buffer, pipeline, record);
-		vk_buffer = buffer.Handle();
+		vk_buffer = buffer.StateHandle();
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::Dispatches);
 	m_context.GetBufferCache().RecordPendingWrites();
 
-	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	// The legacy path still orders read-only dispatches before later writers. The tracker keeps
+	// the post-dispatch barrier pending until a later dispatch or command needs it.
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, true,
+	                    barrier_options);
 	ResetBindings();
 	m_context.GetBufferCache().FlushIfRequested();
 }
@@ -1113,11 +1181,21 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	}
 	const bool direct = earlier != nullptr && earlier->known;
 	RebindBuffers(bindings);
+	auto accesses = CollectDispatchAccesses(input_info, bindings);
+	if (!direct) accesses.AddRead(args_addr, sizeof(vk::DispatchIndirectCommand));
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
-	auto vk_buffer = buffer.Handle();
-	if (HasStorageWrites(input_info, bindings)) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	auto vk_buffer = buffer.DispatchHandle();
+	auto* tracker  = buffer.GetBarrierTracker();
+	const ShaderBarrierOptions barrier_options {.tracker = tracker, .accesses = &accesses};
+	if (tracker != nullptr || HasStorageWrites(input_info, bindings)) {
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader,
+		                         barrier_options);
+	}
+	if (tracker != nullptr && !direct) {
+		// Compute-to-compute does not cover the draw-indirect stage that fetches the counts.
+		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eDrawIndirect,
+		                         {.destination_access = vk::AccessFlagBits::eIndirectCommandRead});
 	}
 	LogAddressWrites(input_info.stage, 0, 0, 0);
 	if (const auto frame = m_context.GetGpu().GetFrameNum(); ShaderTrace::Active(frame)) {
@@ -1140,12 +1218,13 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		               }
 		               GpuBreadcrumbs::End(*graphics, command, crumb);
 	               });
-	vk_buffer = buffer.Handle();
+	vk_buffer = buffer.StateHandle();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::Dispatches);
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::IndirectDispatches);
 	m_context.GetBufferCache().RecordPendingWrites();
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader, true,
+	                    barrier_options);
 	ResetBindings();
 	m_context.GetBufferCache().FlushIfRequested();
 }

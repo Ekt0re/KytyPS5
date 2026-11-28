@@ -1122,11 +1122,11 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			return false;
 		}
 		image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead, std::nullopt,
-		               buffer.Handle());
+		               buffer.StateHandle());
 		return true;
 	});
-	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
-	                                   nullptr);
+	buffer.StateHandle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
+	                                        nullptr);
 }
 
 ImageHeap::GuardView ImageHeap::GuardFind(uint64_t slots) const {

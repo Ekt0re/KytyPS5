@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -21,7 +22,8 @@ CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
-	auto buffer = Handle();
+	m_barriers.Reset();
+	auto buffer = m_buffer;
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -32,12 +34,36 @@ void CommandBuffer::Begin() {
 }
 
 void CommandBuffer::End() const {
+	OrderDispatches();
 	EndRendering();
-	auto buffer = Handle();
+	auto buffer = m_buffer;
 
 	auto result = buffer.end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+}
+
+vk::CommandBuffer CommandBuffer::Handle() const noexcept {
+	if (auto* tracker = GetBarrierTracker()) {
+		EndRendering();
+		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eAllCommands,
+		                    tracker->HasPendingWrites(),
+		                    {.tracker = tracker, .phase = ShaderBarrierPhase::BeforeCommand});
+	}
+	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::DispatchHandle() const noexcept {
+	EndRendering();
+	return m_buffer;
+}
+
+void CommandBuffer::OrderDispatches() const noexcept {
+	if (auto* tracker = GetBarrierTracker()) {
+		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader,
+		                    tracker->HasPendingWrites(),
+		                    {.tracker = tracker, .phase = ShaderBarrierPhase::BeforeBarrier});
+	}
 }
 
 void CommandBuffer::BeginRendering(const RenderState& state) const {
@@ -91,7 +117,7 @@ void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	m_buffer.endRendering();
 	m_rendering = false;
 }
 

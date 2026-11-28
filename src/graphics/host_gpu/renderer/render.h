@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/barrierTracker.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/skipCatchUp.h"
@@ -122,8 +123,14 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
-	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
+	[[nodiscard]] vk::CommandBuffer Handle() const noexcept;
+	[[nodiscard]] vk::CommandBuffer StateHandle() const noexcept { return m_buffer; }
+	[[nodiscard]] vk::CommandBuffer DispatchHandle() const noexcept;
+	[[nodiscard]] BarrierTracker*  GetBarrierTracker() const noexcept {
+		return BarrierTrackerEnabled() ? &m_barriers : nullptr;
+	}
+	void OrderDispatches() const noexcept;
+	[[nodiscard]] GraphicContext& GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
@@ -140,11 +147,12 @@ private:
 	void Begin();
 	void End() const;
 
-	RenderContext&      m_context;
-	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer = nullptr;
-	mutable RenderState m_render_state;
-	mutable bool        m_rendering   = false;
+	RenderContext&       m_context;
+	GraphicContext&      m_graphics;
+	vk::CommandBuffer    m_buffer = nullptr;
+	mutable BarrierTracker m_barriers;
+	mutable RenderState  m_render_state;
+	mutable bool         m_rendering   = false;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

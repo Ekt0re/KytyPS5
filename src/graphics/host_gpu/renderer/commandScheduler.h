@@ -24,6 +24,7 @@ public:
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           EndRendering() { m_command.EndRendering(); }
+	void           OrderDispatches() { m_command.OrderDispatches(); }
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           Finish();
