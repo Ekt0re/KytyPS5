@@ -8129,7 +8129,7 @@ void TestFiniteBufferBounds() {
       const auto candidate = descriptor(unique_candidates ? index : index & 1u);
       for (uint32_t word = 0; word < words.size(); ++word)
         words[word] = f.Emit(ValueOpcode::SelectU32,
-            {conditions[index], candidate[word], words[word]});
+            {conditions[index], words[word], candidate[word]});
     }
     for (uint32_t index = 0; index < wrappers; ++index)
       for (auto& word: words) word = f.Emit(ValueOpcode::IAdd32, {word, Value(0u)});
