@@ -41,6 +41,34 @@ constexpr uint64_t GdsBufferSize = 64 * 1024;
 // GPU-modified ranges come as many small scattered islands, so a readback widens to a window.
 constexpr uint64_t DownloadWindowSize = 512 * 1024;
 
+class BufferMemoryStamp final: public ShaderRecompiler::IR::MemoryChangeStamp {
+public:
+	BufferMemoryStamp(RenderContext& context, uint64_t address, uint64_t size,
+	                  uint64_t mapping_generation, uint64_t backing_generation,
+	                  uint64_t content_generation,
+	                  std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> memory)
+	    : m_context(context), m_address(address), m_size(size),
+	      m_mapping_generation(mapping_generation), m_backing_generation(backing_generation),
+	      m_content_generation(content_generation), m_memory(std::move(memory)) {}
+
+	[[nodiscard]] bool Unchanged() const override {
+		return m_memory->Unchanged() &&
+		       !LibKernel::Memory::BackingChangedSince(m_backing_generation, m_address, m_size) &&
+		       !LibKernel::Memory::BackingContentChangedSince(m_content_generation, m_address, m_size) &&
+		       (m_context.MappingGeneration() == m_mapping_generation ||
+		        !m_context.MappingChangedSince(m_mapping_generation, m_address, m_size));
+	}
+
+private:
+	RenderContext& m_context;
+	uint64_t       m_address;
+	uint64_t       m_size;
+	uint64_t       m_mapping_generation;
+	uint64_t       m_backing_generation;
+	uint64_t       m_content_generation;
+	std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> m_memory;
+};
+
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
                                         vk::BufferUsageFlags usage, const auto& write) {
@@ -623,6 +651,34 @@ BufferCache::~BufferCache() {
 			EXIT("BufferCache: destroyed with GPU-modified buffer\n");
 		}
 	}
+}
+
+void BufferCache::BeginTracking() {
+	LibKernel::Memory::EnableBackingContentTracking();
+}
+
+std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> BufferCache::Track(uint64_t address,
+                                                                          uint64_t size,
+                                                                          uint32_t max_pages) {
+	if (size == 0) return m_memory_tracker.Track(address, size, max_pages);
+	auto& context = m_scheduler.Context();
+	if (!context.IsMapped(address, size) || m_texture_cache.IsRegionRegistered(address, size) ||
+	    m_address_writes_pending ||
+	    (m_address_write_tick != 0 && m_address_write_tick == m_scheduler.CurrentTick()) ||
+	    HasUnsubmittedWrite(address, size) || WrittenSinceGuestSync(address, size)) {
+		return {};
+	}
+	const auto mapping_before  = context.MappingGeneration();
+	const auto backing_before  = LibKernel::Memory::BackingGeneration();
+	const auto content_before  = LibKernel::Memory::BackingContentGeneration();
+	auto       memory          = m_memory_tracker.Track(address, size, max_pages);
+	if (memory == nullptr || mapping_before != context.MappingGeneration() ||
+	    backing_before != LibKernel::Memory::BackingGeneration() ||
+	    content_before != LibKernel::Memory::BackingContentGeneration()) {
+		return {};
+	}
+	return std::make_shared<BufferMemoryStamp>(context, address, size, mapping_before,
+	                                          backing_before, content_before, std::move(memory));
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {

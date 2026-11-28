@@ -909,6 +909,18 @@ bool BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->BackingChangedSince(generation, vaddr, size);
 }
 
+void EnableBackingContentTracking() {
+	g_guest_address_space->EnableBackingContentTracking();
+}
+
+uint64_t BackingContentGeneration() {
+	return g_guest_address_space->BackingContentGeneration();
+}
+
+bool BackingContentChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space->BackingContentChangedSince(generation, vaddr, size);
+}
+
 const void* TryGetBackingView(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->TryGetBackingView(vaddr, size);
 }

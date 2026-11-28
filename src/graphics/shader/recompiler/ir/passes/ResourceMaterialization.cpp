@@ -1890,7 +1890,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          bool capture_specialization_reads) {
 	Common::PerfSummary::ScopedMicros frame_timer(
 	    Common::PerfSummary::Counter::FrameMaterializeUs);
 	for (auto& keys: program.selector_keys) keys.resolved = false;
@@ -1898,8 +1899,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
 		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
 	};
-	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty() ||
-	    (runtime.indirect_args_address != 0u &&
+	const bool capture_reads = capture_specialization_reads || program.capture_specialization_reads ||
+	    !program.source_reads.empty() || (runtime.indirect_args_address != 0u &&
 	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;

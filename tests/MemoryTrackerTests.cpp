@@ -407,6 +407,40 @@ void TestCpuDirtyUpload() {
   Release(memory);
 }
 
+void TestMaterializationStamps() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  namespace IR = Libs::Graphics::ShaderRecompiler::IR;
+
+  Check(tracker.Track(address, 64, 1) == nullptr,
+        "CPU-dirty pages cannot be stamped");
+  tracker.ForEachUploadRange(address, page_size * 2, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  auto cpu_stamp = tracker.Track(address, 64, 1);
+  Check(cpu_stamp != nullptr && cpu_stamp->Unchanged(), "clean CPU-owned range is stamped");
+  tracker.MarkRegionAsCpuModified(address, 64);
+  Check(!cpu_stamp->Unchanged(), "CPU dirtiness invalidates a stamp");
+
+  tracker.ForEachUploadRange(address, page_size * 2, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  auto gpu_stamp = tracker.Track(address + page_size, 64, 1);
+  Check(gpu_stamp != nullptr && gpu_stamp->Unchanged(), "second clean page is stamped");
+  MarkGpuModified(tracker, address + page_size, 64);
+  Check(!gpu_stamp->Unchanged(), "GPU dirtiness invalidates a stamp");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, 64);
+  Check(tracker.Track(address + page_size, 64, 1) != nullptr,
+        "a downloaded clean page can be stamped again");
+  Check(tracker.Track(address, page_size * 2, 1) == nullptr,
+        "the stamp page cap rejects a larger range");
+  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  Release(memory);
+}
+
 void TestCleanUploadPreservesOwnership() {
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
@@ -1351,6 +1385,7 @@ int main(int argc, char **argv) {
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestMaterializationStamps();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestWriteFaultWindow();

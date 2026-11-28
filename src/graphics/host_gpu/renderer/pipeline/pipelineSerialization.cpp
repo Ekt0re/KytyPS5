@@ -712,6 +712,7 @@ bool PipelineCache::TakeStoredPlan(Program& program) {
 		return false;
 	}
 	// Decoded once; no other thread touches the plan any more.
+	program.materialization_memo.Clear();
 	program.resource_plan = std::move(stored->plan);
 	return true;
 }

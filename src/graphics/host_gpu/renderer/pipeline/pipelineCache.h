@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/materializationMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -307,7 +308,8 @@ class PipelineCache {
 public:
 	// Without a shader store path nothing is kept across runs.
 	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
-	              const std::filesystem::path& shader_store = {});
+	              const std::filesystem::path& shader_store = {},
+	              ShaderRecompiler::IR::MemoryChangeSource* memory_changes = nullptr);
 	~PipelineCache();
 	void SetHeapRows(ShaderRecompiler::IR::HeapRowSource* rows) { m_heap_rows = rows; }
 	KYTY_CLASS_NO_COPY(PipelineCache);
@@ -419,6 +421,7 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		MemoizedMaterialization                        materialization_memo;
 		// Compiling pipelines keep references.
 		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
@@ -430,9 +433,12 @@ private:
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
+		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                 ShaderRecompiler::IR::MemoryChangeSource* memory_changes);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         ShaderRecompiler::IR::PushData::Window  push_data);
+		                         ShaderRecompiler::IR::PushData::Window push_data,
+		                         ShaderRecompiler::IR::MemoryChangeSource* memory_changes);
 	};
 
 	struct ProgramKey {
@@ -487,6 +493,7 @@ private:
 	GraphicContext&                        m_graphics;
 	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
 	ShaderRecompiler::IR::HeapRowSource*   m_heap_rows = nullptr;
+	ShaderRecompiler::IR::MemoryChangeSource* m_memory_changes = nullptr;
 	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};

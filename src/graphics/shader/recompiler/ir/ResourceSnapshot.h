@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -15,6 +16,24 @@ struct DescriptorValue {
 	bool operator==(const DescriptorValue& other) const {
 		return dword_count == other.dword_count && dwords == other.dwords;
 	}
+};
+
+// Opaque proof that guest bytes covered by a materialization have not changed. Implementations
+// are owned by the renderer's existing memory and backing trackers.
+class MemoryChangeStamp {
+public:
+	virtual ~MemoryChangeStamp() = default;
+	[[nodiscard]] virtual bool Unchanged() const = 0;
+};
+
+class MemoryChangeSource {
+public:
+	virtual ~MemoryChangeSource() = default;
+	// Enables any tracking that must be active before a resource walk starts.
+	virtual void BeginTracking() {}
+	// A stamp over [address, address + size), or null when the range cannot be proven stable.
+	[[nodiscard]] virtual std::shared_ptr<MemoryChangeStamp> Track(uint64_t address, uint64_t size,
+	                                                              uint32_t max_pages) = 0;
 };
 
 enum class UniformFillKind { None, Buffer, Image };

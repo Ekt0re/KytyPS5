@@ -475,6 +475,7 @@ public:
 			    std::memcpy(m_backing_base + offset, source + (start - vaddr), bytes);
 		    },
 		    [](uint64_t, uint64_t) {});
+		NoteContentChange(vaddr, size);
 	}
 
 	// Needs no lock: page entries are atomic and buckets live as long as the store.
@@ -512,6 +513,35 @@ public:
 			}
 		}
 		return false;
+	}
+
+	// Content writes and guest protection changes are tracked separately from page binding. A
+	// materialization stamp uses this to notice direct backing publications that bypass page faults.
+	void EnableContentTracking() noexcept {
+		m_content_tracking.store(true, std::memory_order_release);
+	}
+	[[nodiscard]] uint64_t ContentGeneration() const noexcept {
+		return m_content_generation.load(std::memory_order_acquire);
+	}
+	[[nodiscard]] bool ContentChangedSince(uint64_t generation, uint64_t vaddr,
+	                                       uint64_t size) const {
+		if (!m_content_tracking.load(std::memory_order_acquire)) return true;
+		std::lock_guard lock(m_content_changes_mutex);
+		const auto      now = m_content_generation.load(std::memory_order_acquire);
+		if (generation > now || now - generation >= m_content_changes.size()) return true;
+		for (auto g = generation + 1u; g <= now; ++g) {
+			const auto& change = m_content_changes[g % m_content_changes.size()];
+			if (change.generation != g || (change.start < vaddr + size && vaddr < change.end)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	void NoteContentChange(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || !m_content_tracking.load(std::memory_order_acquire)) return;
+		std::lock_guard lock(m_content_changes_mutex);
+		const auto      generation = m_content_generation.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+		m_content_changes[generation % m_content_changes.size()] = {generation, vaddr, vaddr + size};
 	}
 
 	// The alias address of [vaddr, vaddr + size) when one contiguous backing run holds all of it,
@@ -961,6 +991,10 @@ private:
 	};
 	mutable std::mutex                                           m_changes_mutex;
 	std::array<PageChange, 1024>                                 m_changes {};
+	std::atomic<bool>                                            m_content_tracking {false};
+	std::atomic<uint64_t>                                        m_content_generation {1};
+	mutable std::mutex                                           m_content_changes_mutex;
+	std::array<PageChange, 1024>                                 m_content_changes {};
 };
 
 // Callers change it with the state lock held exclusively and query it under the operation lock or
@@ -1048,6 +1082,14 @@ public:
 	[[nodiscard]] bool     BackingChangedSince(uint64_t generation, uint64_t vaddr,
 	                                           uint64_t size) const {
 		return m_backing->ChangedSince(generation, vaddr, size);
+	}
+	void EnableBackingContentTracking() { m_backing->EnableContentTracking(); }
+	[[nodiscard]] uint64_t BackingContentGeneration() const {
+		return m_backing->ContentGeneration();
+	}
+	[[nodiscard]] bool BackingContentChangedSince(uint64_t generation, uint64_t vaddr,
+	                                              uint64_t size) const {
+		return m_backing->ContentChangedSince(generation, vaddr, size);
 	}
 
 	// See GuestBackingStore::ContiguousAlias; 0 also when a private mapping overlaps the range.
@@ -1317,6 +1359,7 @@ private:
 			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
+			m_backing->NoteContentChange(range_start, range_end - range_start);
 		}
 		return true;
 	}

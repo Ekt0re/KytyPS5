@@ -101,6 +101,16 @@ public:
 
 	KYTY_CLASS_NO_COPY(RegionManager);
 
+	[[nodiscard]] uint64_t Generation() const {
+		return m_stamp_generation.load(std::memory_order_acquire);
+	}
+	void EnableStampGeneration() noexcept { m_stamping.store(true, std::memory_order_release); }
+	void Changed() noexcept {
+		if (m_stamping.load(std::memory_order_acquire)) {
+			m_stamp_generation.fetch_add(1u, std::memory_order_acq_rel);
+		}
+	}
+
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(offset, size);
@@ -116,6 +126,7 @@ public:
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t offset, uint64_t size) {
+		Changed();
 		const auto [start, end] = GetPageRange(offset, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
 			if (m_gpu_dirty.Any(start, end)) {
@@ -147,6 +158,7 @@ public:
 	// size) for the runs it marked. Callers hold the lock.
 	template <typename Func>
 	void MarkGpuDirtyUnlessCpuDirty(uint64_t offset, uint64_t size, Func&& func) {
+		Changed();
 		const auto [start, end] = GetPageRange(offset, size);
 		RegionBits mask(~m_cpu_dirty, start, end);
 		if (mask.None()) {
@@ -168,6 +180,7 @@ public:
 	// Pages of the range that are neither CPU- nor GPU-modified become CPU-modified, which drops
 	// their write watch, in one protection change (a guest write fault's window).
 	void MarkCleanAsCpuModified(uint64_t offset, uint64_t size) {
+		Changed();
 		const auto [start, end] = GetPageRange(offset, size);
 		RegionBits changed(~m_cpu_dirty, start, end);
 		for (const auto [first, last]: RegionBits(m_gpu_dirty, start, end)) {
@@ -193,6 +206,7 @@ public:
 		if (!bits.Any(start, end)) {
 			return;
 		}
+		if constexpr (clear) Changed();
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			if (source == DirtySource::Cpu && hold_hot && m_storm != nullptr) {
@@ -328,6 +342,8 @@ private:
 	RegionBits                     m_cpu_dirty;
 	RegionBits                     m_gpu_dirty;
 	std::unique_ptr<PageStorm[]>   m_storm;
+	std::atomic<bool>              m_stamping {false};
+	std::atomic<uint64_t>          m_stamp_generation {0};
 };
 
 } // namespace Libs::Graphics

@@ -2,6 +2,7 @@
 #include "common/perfSummary.h"
 #include "common/shaderCompileStatus.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/materializationMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
 
@@ -130,6 +131,47 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
+}
+
+uint32_t EnvironmentCount(const char* name, uint32_t fallback, uint32_t maximum) {
+	const char* text = std::getenv(name);
+	if (text == nullptr || *text == '\0' || *text == '-') return fallback;
+	char* end = nullptr;
+	const auto value = std::strtoul(text, &end, 10);
+	return end != text && *end == '\0' && value <= maximum ? static_cast<uint32_t>(value) : fallback;
+}
+
+bool MaterializationMemoEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MATERIALIZE_MEMO");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+bool MayUseHeapRows(const ShaderRecompiler::IR::ResourcePlan& plan) {
+	using namespace ShaderRecompiler::IR;
+	if (plan.info.uses_heap_rows) return true;
+	for (const auto& source: plan.descriptor_sources) {
+		const auto* indirect = source.indirect_descriptor ? &*source.indirect_descriptor : nullptr;
+		if (indirect == nullptr) continue;
+		if (!indirect->table_maximum) return true;
+		const uint64_t children = indirect->pointer_table.has_value()
+		                              ? std::max<uint64_t>(indirect->pointer_table->count, 1u)
+		                              : std::max<size_t>(indirect->sources.size(), 1u);
+		if (*indirect->table_maximum >= MaxIndirectDescriptorProbes ||
+		    children > MaxIndirectDescriptorProbes / (uint64_t {*indirect->table_maximum} + 1u)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool CanMemoizePlan(const ShaderRecompiler::IR::ResourcePlan& plan) {
+	// Native walker loads and call-source reads do not pass through the callback hashed by the
+	// memo's race check. Heap-row selection is owned by the GPU report and is not memoized yet.
+	return plan.srt_reads.empty() && plan.srt_captures == 0 && plan.source_reads.empty() &&
+	       !MayUseHeapRows(plan);
 }
 
 // SRT walker loads from pages that share GPU-written bytes: served like the fault handler serves
@@ -282,6 +324,7 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 	const auto revision = call_source->revision;
 	ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
 	bool changed = revision != call_source->revision;
+	if (changed) materialization_memo.Clear();
 	// KYTY_CALL_LINK_REUSE=0: every callee-set switch translates the program again.
 	static const bool reuse = [] {
 		const char* value = std::getenv("KYTY_CALL_LINK_REUSE");
@@ -325,11 +368,61 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 }
 
 
+bool PipelineCache::Program::Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                         ShaderRecompiler::IR::MemoryChangeSource* memory_changes) {
+	static const uint32_t entries =
+	    EnvironmentCount("KYTY_MATERIALIZE_MEMO_ENTRIES", 1u, 4096u);
+	static const uint32_t stamp_pages =
+	    EnvironmentCount("KYTY_MATERIALIZE_MEMO_STAMPS", 1024u, 1u << 20u);
+	if (!MaterializationMemoEnabled() || memory_changes == nullptr) {
+		return ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+		                                                  specialization);
+	}
+	if (!CanMemoizePlan(resource_plan)) {
+		materialization_memo.Clear();
+		return ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
+		                                                  specialization);
+	}
+	memory_changes->BeginTracking();
+	materialization_memo.Configure(entries, memory_changes, stamp_pages);
+	MemoOutcome     outcome = MemoOutcome::Empty;
+	MemoLookupStats stats;
+	if (auto* entry = materialization_memo.Lookup(runtime, outcome, stats)) {
+		if (materialization_memo.current != entry->serial) {
+			resources      = entry->resources;
+			specialization = entry->specialization;
+			materialization_memo.current = entry->serial;
+		}
+		materialization_memo.store_gate.Note(true);
+		return true;
+	}
+	materialization_memo.store_gate.Note(false);
+	const bool store = materialization_memo.store_gate.Allows();
+	materialization_memo.current = 0;
+	RecordingImageHeap recorder(runtime.image_heap);
+	WalkReadHashes     hashes;
+	auto               walk = store ? hashes.Wrap(runtime) : runtime;
+	if (store && runtime.image_heap != nullptr) walk.image_heap = &recorder;
+	if (!ShaderRecompiler::IR::MaterializeResources(resource_plan, walk, resources,
+	                                                specialization, true)) {
+		return false;
+	}
+	if (!store) return true;
+	uint32_t        evicted = 0;
+	MemoLookupStats store_stats;
+	if (auto* entry = materialization_memo.Store(runtime, resources, specialization, recorder, evicted,
+	                                            store_stats, &hashes)) {
+		materialization_memo.current = entry->serial;
+	}
+	return true;
+}
+
 template <bool HasCalls>
-ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                                 ShaderRecompiler::IR::PushData::Window push_data) {
-	EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-	                                                    specialization));
+ShaderModule* PipelineCache::Program::FindModule(
+    const ShaderRecompiler::IR::SrtRuntime& runtime,
+    ShaderRecompiler::IR::PushData::Window push_data,
+    ShaderRecompiler::IR::MemoryChangeSource* memory_changes) {
+	EXIT_IF(!Materialize(runtime, memory_changes));
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleLookups);
 	for (auto& candidate: modules) {
 		const auto& layout = candidate.info.bindings;
@@ -681,9 +774,11 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 					             source_changed ? ", translates" : "", text.c_str());
 				}
 			}
-			if (!source_changed) module = cached.FindModule<true>(runtime, push_data);
+			if (!source_changed) {
+				module = cached.FindModule<true>(runtime, push_data, m_memory_changes);
+			}
 		} else {
-			module = cached.FindModule<false>(runtime, push_data);
+			module = cached.FindModule<false>(runtime, push_data, m_memory_changes);
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -742,19 +837,22 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 		                         : ShaderRecompiler::IR::ExtractResourcePlan(translated.program),
 		}).first;
 		auto& program = entry->second;
-		if (!ShaderRecompiler::IR::MaterializeResources(program.resource_plan, runtime,
-		                                                program.resources, program.specialization)) {
+		if (!program.Materialize(runtime, m_memory_changes)) {
 			EXIT("shader 0x%016" PRIx64 " (%s): resources could not be materialized\n",
 			     m_lookup_key.hash, ShaderRecompiler::StageName(m_lookup_key.stage));
 		}
 	} else if (source_changed) {
+		entry->second.materialization_memo.Clear();
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<true>(runtime, push_data)) {
+		if (const auto* module =
+		        entry->second.FindModule<true>(runtime, push_data, m_memory_changes)) {
 			return bind(*module);
 		}
 	} else if (plan_lost) {
+		entry->second.materialization_memo.Clear();
 		entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		if (const auto* module = entry->second.FindModule<false>(runtime, push_data)) {
+		if (const auto* module =
+		        entry->second.FindModule<false>(runtime, push_data, m_memory_changes)) {
 			return bind(*module);
 		}
 	}
@@ -1314,10 +1412,11 @@ PipelineCache::Pipeline& PipelineCache::Resolve(Pipeline& pipeline, bool wait) {
 	return pipeline;
 }
 
-PipelineCache::PipelineCache(GraphicContext&                         graphics,
+PipelineCache::PipelineCache(GraphicContext& graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap,
-                             const std::filesystem::path&           shader_store)
-    : m_graphics(graphics), m_image_heap(image_heap),
+                             const std::filesystem::path& shader_store,
+                             ShaderRecompiler::IR::MemoryChangeSource* memory_changes)
+    : m_graphics(graphics), m_image_heap(image_heap), m_memory_changes(memory_changes),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval),
       m_compute_subgroup_size(graphics.SupportsComputeWave64() ? 64u : 32u),
       m_max_compute_shared_memory(

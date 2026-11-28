@@ -163,6 +163,10 @@ uint64_t               BackingGeneration();
 // Whether pages of [vaddr, vaddr + size) were bound or unbound after `generation` (true when
 // that is too long ago to tell).
 bool                   BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size);
+// Direct backing publications and guest protection changes, for runtime materialization stamps.
+void                   EnableBackingContentTracking();
+[[nodiscard]] uint64_t BackingContentGeneration();
+bool                   BackingContentChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size);
 // The host address of the range in the backing alias when one contiguous run of backing holds
 // all of it, else nullptr. The GPU resource tracker never protects the alias, so reads through it
 // never fault: they see what the CPU (and every publication of GPU data) stored last, not GPU

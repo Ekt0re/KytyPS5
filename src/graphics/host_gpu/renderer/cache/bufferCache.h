@@ -35,7 +35,7 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
-class BufferCache {
+class BufferCache final: public ShaderRecompiler::IR::MemoryChangeSource {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
@@ -75,6 +75,9 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void                   BeginTracking() override;
+	[[nodiscard]] std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> Track(
+	    uint64_t address, uint64_t size, uint32_t max_pages) override;
 	// After a guest write fault: the clean pages of the window become CPU-modified too, so the
 	// guest's next writes there do not fault one page at a time.
 	void                   InvalidateWriteWindow(uint64_t vaddr, uint64_t size);

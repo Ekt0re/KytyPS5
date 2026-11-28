@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,7 +17,7 @@
 
 namespace Libs::Graphics {
 
-class MemoryTracker final {
+class MemoryTracker final: public ShaderRecompiler::IR::MemoryChangeSource {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
 	~MemoryTracker();
@@ -25,6 +26,8 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> Track(
+	    uint64_t address, uint64_t size, uint32_t max_pages) override;
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	// Drops the write watch of the range's pages that hold no CPU- or GPU-modified data.
