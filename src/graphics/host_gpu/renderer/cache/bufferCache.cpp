@@ -967,7 +967,7 @@ size_t BufferCache::CollectPiggybackDownloads(std::vector<DownloadPart>& parts,
 		}
 		const auto before = total_size;
 		if (CollectDownload(buffer, address, size, parts, total_size)) {
-			windows.push_back({address, size});
+			windows.push_back({address, address + size});
 			budget -= total_size - before;
 			if (avoid_buffer) seen.push_back(&buffer);
 			extra++;
