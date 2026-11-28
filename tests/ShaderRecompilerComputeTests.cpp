@@ -33533,6 +33533,87 @@ TestCase NativeAndSdwa16BitDestinationWrites() {
            O::S_ENDPGM}};
 }
 
+TestCase VectorVop1SdwaRemainingTwins() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x11223344u);
+  AppendVMovLiteral(&code, 1, 0x80000000u);
+  AppendVMovLiteral(&code, 2, 0x000000f0u);
+
+  code.push_back(EncodeVop1(0x12, 10, 249)); // V_CVT_F32_UBYTE1 src0_sel:WORD_1
+  code.push_back(EncodeVop1Sdwa(0, 6, 0, 5));
+  code.push_back(EncodeVop1(0x13, 11, 249)); // V_CVT_F32_UBYTE2 src0_sel:WORD_1 sext
+  code.push_back(EncodeVop1Sdwa(1, 6, 0, 5, 1));
+  code.push_back(EncodeVop1(0x14, 12, 249)); // V_CVT_F32_UBYTE3 src0_sel:WORD_1 sext
+  code.push_back(EncodeVop1Sdwa(1, 6, 0, 5, 1));
+  code.push_back(EncodeVop1(0x3b, 13, 249)); // V_FFBH_I32 src0_sel:BYTE_0 sext
+  code.push_back(EncodeVop1Sdwa(2, 6, 0, 0, 1));
+  code.push_back(EncodeVop1(0x3b, 14, 249)); // V_FFBH_I32 src0_sel:BYTE_0 zext
+  code.push_back(EncodeVop1Sdwa(2, 6, 0, 0, 0));
+
+  for (u32 i = 0; i < 5u; ++i) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendEnd(&code);
+
+  return {"VectorVop1SdwaRemainingTwins",
+          code,
+          {},
+          {0x41880000u, 0x437f0000u, 0x437f0000u, 28u, 24u},
+          {O::V_MOV_B32, O::V_CVT_F32_UBYTE1, O::V_CVT_F32_UBYTE2,
+           O::V_CVT_F32_UBYTE3, O::V_FFBH_I32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
+}
+
+TestCase VectorVop2SdwaRemainingTwins() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3fc00000u); // 1.5f
+  AppendVMovLiteral(&code, 1, 0x40800000u); // 4.0f
+  AppendVMovLiteral(&code, 2, 0x12340010u);
+  AppendVMovLiteral(&code, 3, 0x56780003u);
+  AppendVMovLiteral(&code, 13, 0xaaaa0000u);
+  AppendVMovLiteral(&code, 14, 0xbbbb0000u);
+
+  // Float32 SDWA profile with dst_unused:UNUSED_PRESERVE and source modifiers.
+  code.push_back(EncodeVop2(0x05, 10, 249, 1)); // (-4.0f) - 1.5f = -5.5f
+  code.push_back(EncodeVop2Sdwa(0, 6, 2, 6, 6, 0, 0, 0, 0, 1, 0));
+  code.push_back(EncodeVop2(0x0f, 11, 249, 1)); // min(-1.5f, 4.0f) = -1.5f
+  code.push_back(EncodeVop2Sdwa(0, 6, 2, 6, 6, 0, 0, 1, 0, 0, 0));
+  code.push_back(EncodeVop2(0x10, 12, 249, 1)); // max(1.5f, -4.0f) = 1.5f
+  code.push_back(EncodeVop2Sdwa(0, 6, 2, 6, 6, 0, 0, 0, 0, 1, 0));
+
+  // IntegerPartialDestination SDWA profile for carry-in/out subtracts.
+  code.push_back(EncodeVopc(0xc2, Vgpr(2), 2)); // Set VCC = 1 (borrow-in = 1).
+  code.push_back(EncodeVop2(0x29, 13, 249, 3)); // 0x10 - 0x03 - 1 = 0x0c, borrow=0
+  code.push_back(EncodeVop2Sdwa(2, 4, 2, 4, 4));
+  code.push_back(EncodeSMovB32(20, 106));
+
+  code.push_back(EncodeVopc(0xc2, Vgpr(2), 2)); // Set VCC = 1 (borrow-in = 1).
+  code.push_back(EncodeVop2(0x2a, 14, 249, 3)); // 0x03 - 0x10 - 1 = 0xfffffff2, borrow=1
+  code.push_back(EncodeVop2Sdwa(2, 4, 2, 4, 4));
+  code.push_back(EncodeSMovB32(21, 106));
+
+  for (u32 i = 0; i < 5u; ++i) {
+    AppendStoreVgpr(&code, 10u + i, i);
+  }
+  AppendStoreSgprPair(&code, 20, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorVop2SdwaRemainingTwins";
+  test.code = std::move(code);
+  test.expected = {0xc0b00000u, 0xbfc00000u, 0x3fc00000u, 0xaaaa000cu,
+                   0xbbbbfff2u, 0u,          1u};
+  test.opcodes = {O::V_MOV_B32,       O::V_SUBREV_F32,      O::V_MIN_F32,
+                  O::V_MAX_F32,       O::V_CMP_EQ_U32,      O::V_SUB_CO_CI_U32,
+                  O::V_SUBREV_CO_CI_U32, O::S_MOV_B32,      O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorMinMaxMed3F16Ops() {
   using O = ShaderOpcode;
 
@@ -52835,6 +52916,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCvtF16I16ByteSource);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
+  AddCase(VectorVop1SdwaRemainingTwins);
+  AddCase(VectorVop2SdwaRemainingTwins);
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorFractF16CapturedAndEdges);
@@ -61886,6 +61969,19 @@ int main(int argc, char **argv) {
 #endif
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxConstAndU16RemainingTwins());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-twins-only") == 0) {
+    // These cases move whole dwords, so the coarser storage-buffer bounds of a host without
+    // byte-granular robust access are enough.
+#ifdef _WIN32
+    _putenv_s("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1");
+#else
+    setenv("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1", 1);
+#endif
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVop1SdwaRemainingTwins());
+    RunCase(&vulkan, VectorVop2SdwaRemainingTwins());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mul-i24-only") == 0) {
