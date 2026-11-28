@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/renderFix.h"
 #include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/alignment.h"
@@ -1019,6 +1020,14 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
+// KYTY_RETIRE_CPU_WRITTEN_BC (default 0, toggle retire_cpu_written_bc): 1 retires a BC image the
+// CPU wrote after its upload like a clean one when a raw block request overlaps it, so only the
+// request's bytes become GPU-written. 0 keeps it and returns it as a view of the request, as
+// before. PPSA01341 lost a heap it keeps in the bytes of old mips that way. Off by default: GTA VI
+// reaches the case (8-level BC images), but the retiring path has not run in a game here yet.
+static RenderFix RetireCpuWrittenBc {"CPU-written BC images under raw block requests",
+                                     "KYTY_RETIRE_CPU_WRITTEN_BC", "retire_cpu_written_bc", false};
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id, bool exact_format,
@@ -1035,7 +1044,20 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                      requested.BlockExtent() == cached.info.BlockExtent() &&
 	                      requested.resources.levels == cached.info.resources.levels &&
 	                      requested.resources.layers < cached.info.resources.layers;
-	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
+	// A BC image the CPU wrote after its upload is never written back, so it is retired like a
+	// clean one. As a view, the next GPU write of the request would mark its whole mip chain
+	// GPU-written, levels the request does not cover included, and a later read-back would write
+	// those stale levels over whatever the guest keeps there now. An image that may only be
+	// CPU-dirty can still hold GPU writes and stays.
+	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsMaybeCpuDirty() &&
+	    cached.IsCpuDirty()) {
+		RetireCpuWrittenBc.Hit("BC image 0x%llx %ux%u, %u levels",
+		                       static_cast<unsigned long long>(cached.info.data.address),
+		                       cached.info.extent.width, cached.info.extent.height,
+		                       cached.info.resources.levels);
+	}
+	if (!raw_view && BcAlias::Matches(requested, cached.info) &&
+	    (RetireCpuWrittenBc.Enabled() ? !cached.IsMaybeCpuDirty() : !cached.IsCpuDirty())) {
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
