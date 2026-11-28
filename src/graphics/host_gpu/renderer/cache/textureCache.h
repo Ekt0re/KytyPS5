@@ -346,11 +346,11 @@ private:
 	// (world A/B pk_ab: depth conversion time -44 %, -6 % GPU-thread time per operation);
 	// KYTY_PARK_IMAGES=0 turns it off. Runtime toggles, re-read at each suspend point:
 	// park_off=1 turns it off, park_images=1 turns it on.
-	// KYTY_PARK_MAX (images, default 256), KYTY_PARK_MB (default 256) and KYTY_PARK_FRAMES
+	// KYTY_PARK_MAX (images, default 256), KYTY_PARK_MB (default 128) and KYTY_PARK_FRAMES
 	// (suspend points a parked image is kept, default 30) bound the pool.
 	bool                     m_park_images      = ParkImagesDefault();
 	uint64_t                 m_park_max_count   = ParkEnvValue("KYTY_PARK_MAX", 256);
-	uint64_t                 m_park_max_bytes   = ParkEnvValue("KYTY_PARK_MB", 256) << 20u;
+	uint64_t                 m_park_max_bytes   = ParkEnvValue("KYTY_PARK_MB", 128) << 20u;
 	uint64_t                 m_park_max_frames  = ParkEnvValue("KYTY_PARK_FRAMES", 30);
 	uint64_t                 m_parked_bytes     = 0;
 	uint64_t                 m_park_cap_hits    = 0;
