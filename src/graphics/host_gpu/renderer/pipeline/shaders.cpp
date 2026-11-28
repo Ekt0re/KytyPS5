@@ -631,11 +631,12 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
+	const auto result =
+	    PipelineBinaryStore::Get().CreateGraphics(graphics, driver_cache, pipeline_info, &pipeline);
+	// The driver fills the feedback during the create call, so read it afterwards.
 	const auto feedback_flags =
 	    feedback ? feedback->total.flags : vk::PipelineCreationFeedbackFlags {};
 	const auto driver_ns = feedback ? feedback->total.duration : 0;
-	const auto result =
-	    PipelineBinaryStore::Get().CreateGraphics(graphics, driver_cache, pipeline_info, &pipeline);
 	if (on) {
 		CreateStats::Leave(
 		    stats, stats.graphics,
@@ -715,11 +716,12 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
+	const auto result =
+	    PipelineBinaryStore::Get().CreateCompute(graphics, driver_cache, info, &pipeline);
+	// The driver fills the feedback during the create call, so read it afterwards.
 	const auto feedback_flags =
 	    feedback ? feedback->total.flags : vk::PipelineCreationFeedbackFlags {};
 	const auto driver_ns = feedback ? feedback->total.duration : 0;
-	const auto result =
-	    PipelineBinaryStore::Get().CreateCompute(graphics, driver_cache, info, &pipeline);
 	if (on) {
 		CreateStats::Leave(
 		    stats, stats.compute,
