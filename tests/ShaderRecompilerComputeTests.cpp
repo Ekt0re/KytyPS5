@@ -33134,6 +33134,32 @@ TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
           {O::V_MOV_B32, O::V_PK_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop3pPkFmaF16RoundsToNearestEven() {
+  using O = ShaderOpcode;
+
+  // 1.5h * (1+2^-10)h = 1.5 + 1.5 ulp: nearest even gives +-0x3e02; RADV's PackHalf2x16
+  // rounds toward zero (0x3e01), which is what the translator used to inherit.
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x3c013e00u); // low=1.5h, high=(1+2^-10)h
+  AppendVMovLiteral(&code, 1, 0xbe003c01u); // low=(1+2^-10)h, high=-1.5h
+  AppendVMovLiteral(&code, 2, 0x00000000u);
+  AppendVMovLiteral(&code, 3, 0x00030003u); // 3 * 2^-24, half subnormals
+  AppendVMovLiteral(&code, 4, 0x38003800u); // 0.5h
+  // V_PK_FMA_F16 v10, v0, v1, v2 and v11, v3, v4, v2 (op_sel_hi on every source).
+  code.insert(code.end(), {0xcc0e400au, 0x1c0a0300u});
+  code.insert(code.end(), {0xcc0e400bu, 0x1c0a0903u});
+  AppendStoreVgpr(&code, 10, 0);
+  AppendStoreVgpr(&code, 11, 1);
+  AppendEnd(&code);
+
+  // 3 * 2^-24 * 0.5 = 1.5 * 2^-24: nearest even 0x0002, toward zero 0x0001.
+  return {"Vop3pPkFmaF16RoundsToNearestEven",
+          code,
+          {},
+          {0xbe023e02u, 0x00020002u},
+          {O::V_MOV_B32, O::V_PK_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase Vop3pIntegerNegationCapturedAndSelectedHalves() {
   using O = ShaderOpcode;
 
@@ -53084,6 +53110,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
+  AddCase(Vop3pPkFmaF16RoundsToNearestEven);
   AddCase(Vop3pIntegerNegationCapturedAndSelectedHalves);
   AddCase(Vop3pInt16Ops);
   AddCase(CvtPkU8F32PacksSelectedByte);
