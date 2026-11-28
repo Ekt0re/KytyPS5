@@ -25,9 +25,13 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_PERMLANEX16_B32: V_PERMLANE16_B32(inst, true); return;
 
 		case O::V_CMP_F_I32:
-		case O::V_CMP_F_U32: EmitCompareConstant(inst, false, false); return;
+		case O::V_CMP_F_U32:
+		case O::V_CMPX_F_I32:
+		case O::V_CMPX_F_U32: EmitCompareConstant(inst, false, false); return;
 		case O::V_CMP_T_I32:
-		case O::V_CMP_T_U32: EmitCompareConstant(inst, true, false); return;
+		case O::V_CMP_T_U32:
+		case O::V_CMPX_T_I32:
+		case O::V_CMPX_T_U32: EmitCompareConstant(inst, true, false); return;
 		case O::V_CMP_EQ_U32:
 		case O::V_CMP_EQ_I32:
 		case O::V_CMPX_EQ_U32:
@@ -148,6 +152,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThan32, false);
 			return;
 		case O::V_CMP_GE_U16:
+		case O::V_CMPX_GE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThanEqual32, false);
 			return;
 		case O::V_CMP_LT_U16:
@@ -155,6 +160,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThan32, false);
 			return;
 		case O::V_CMP_LE_U16:
+		case O::V_CMPX_LE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThanEqual32, false);
 			return;
 		case O::V_CMP_GT_I16:
@@ -174,8 +180,10 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThanEqual32, true);
 			return;
 
-		case O::V_CMP_F_F32: EmitCompareConstant(inst, false, false); return;
-		case O::V_CMP_TRU_F32: EmitCompareConstant(inst, true, false); return;
+		case O::V_CMP_F_F32:
+		case O::V_CMPX_F_F32: EmitCompareConstant(inst, false, false); return;
+		case O::V_CMP_TRU_F32:
+		case O::V_CMPX_TRU_F32: EmitCompareConstant(inst, true, false); return;
 		case O::V_CMP_EQ_F32:
 		case O::V_CMPX_EQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, false);

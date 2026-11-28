@@ -27423,6 +27423,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMP_NEQ_F32:
   case Opcode::V_CMP_NLT_F32:
   case Opcode::V_CMP_TRU_F32:
+  case Opcode::V_CMPX_F_F32:
   case Opcode::V_CMPX_LT_F32:
   case Opcode::V_CMPX_EQ_F32:
   case Opcode::V_CMPX_LE_F32:
@@ -27436,6 +27437,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMPX_NLE_F32:
   case Opcode::V_CMPX_NEQ_F32:
   case Opcode::V_CMPX_NLT_F32:
+  case Opcode::V_CMPX_TRU_F32:
   case Opcode::V_CMP_CLASS_F32:
   case Opcode::V_CMPX_CLASS_F32:
   case Opcode::V_CMP_CLASS_F16:
@@ -38355,6 +38357,87 @@ TestCase VectorVopcCmpNleF16CapturedSdwa(bool cmpx) {
     test.compute_info.wave_size = 32; // VCC_HI remains available as a saved mask.
     test.has_compute_info = true;
   }
+  return test;
+}
+
+TestCase VectorVopcCmpxConstAndU16RemainingTwins() {
+  using O = ShaderOpcode;
+  enum Encoding { Compact, Sdwa, Vop3 };
+  struct CompareCase {
+    u32 opcode;
+    Encoding encoding;
+    u32 lhs;
+    u32 rhs;
+    u32 expected;
+    u32 exec = 1;
+  };
+  const std::array<CompareCase, 18> cases{{
+      {0x10u, Compact, 0x3f800000u, 0x3f800000u, 0},
+      {0x10u, Sdwa, 0x3f800000u, 0x3f800000u, 0},
+      {0x1fu, Compact, 0x7fc00000u, 0x7fc00000u, 1},
+      {0x1fu, Vop3, 0x3f800000u, 0x3f800000u, 0, 0},
+      {0x90u, Compact, 1u, 1u, 0},
+      {0x97u, Compact, 1u, 1u, 1},
+      {0x97u, Sdwa, 1u, 1u, 0, 0},
+      {0xd0u, Compact, 1u, 1u, 0},
+      {0xd7u, Compact, 1u, 1u, 1},
+      {0xd7u, Vop3, 1u, 1u, 0, 0},
+      {0xbbu, Compact, 0xffff0005u, 0x00000005u, 1},
+      {0xbbu, Compact, 0x00000006u, 0x00000005u, 0},
+      {0xbbu, Sdwa, 0x0000ffffu, 0x00008000u, 0},
+      {0xbbu, Vop3, 0x00000001u, 0x0000ffffu, 0, 0},
+      {0xbeu, Compact, 0x00000005u, 0xffff0005u, 1},
+      {0xbeu, Compact, 0x00000004u, 0x00000005u, 0},
+      {0xbeu, Sdwa, 0x0000ffffu, 0x00000001u, 1},
+      {0xbeu, Vop3, 0x0000ffffu, 0x00000001u, 0, 0},
+  }};
+  constexpr u32 vcc_sentinel = 0x89abcdefu;
+  TestCase test;
+  test.name = "VectorVopcCmpxConstAndU16RemainingTwins";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.rhs});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 8u);
+    AppendBufferLoadDword(&code, 15, 30);
+    AppendVMovU32(&code, 30, i * 8u + 4u);
+    AppendBufferLoadDword(&code, 1, 30);
+    AppendSMovLiteral(&code, 106, vcc_sentinel);
+    AppendSMovLiteral(&code, 107, vcc_sentinel);
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
+    switch (entry.encoding) {
+    case Compact:
+      code.push_back(EncodeVopc(entry.opcode, Vgpr(15), 1u));
+      break;
+    case Sdwa:
+      code.push_back(EncodeVopc(entry.opcode, 249u, 1u));
+      code.push_back(EncodeVopcSdwa(15u));
+      break;
+    case Vop3:
+      AppendVop3(&code, entry.opcode, 126u, Vgpr(15), Vgpr(1));
+      break;
+    }
+    code.push_back(EncodeSMovB32(20, 126));
+    code.push_back(EncodeSMovB32(21, 106));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = static_cast<u32>(test.initial.size()) + i * 3u;
+    AppendStoreSgprPair(&code, 20, out);
+    AppendStoreSgpr(&code, 107, out + 2u);
+    test.expected.insert(test.expected.end(),
+                         {entry.expected, vcc_sentinel, vcc_sentinel});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32,      O::S_MOV_B32,      O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_F_F32,   O::V_CMPX_TRU_F32, O::V_CMPX_F_I32,
+                  O::V_CMPX_T_I32,   O::V_CMPX_F_U32,   O::V_CMPX_T_U32,
+                  O::V_CMPX_LE_U16,  O::V_CMPX_GE_U16,  O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpULessThanEqual", "OpUGreaterThanEqual"};
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -52879,6 +52962,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpUF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpxConstAndU16RemainingTwins);
   AddCase([] { return VectorVopcCmpNleF16CapturedSdwa(false); });
   AddCase([] { return VectorVopcCmpNleF16CapturedSdwa(true); });
   for (u32 mode = 0; mode < 4; ++mode) {
@@ -61790,6 +61874,18 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarConditionalMoveB32());
     RunCase(&vulkan, ScalarConditionalMoveImm32());
     RunCase(&vulkan, ScalarBfeI64());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vopc-twins-only") == 0) {
+    // The compare twins only read whole dwords from the case buffer, so a host without
+    // byte-granular robust access can still run them.
+#ifdef _WIN32
+    _putenv_s("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1");
+#else
+    setenv("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1", 1);
+#endif
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpxConstAndU16RemainingTwins());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mul-i24-only") == 0) {

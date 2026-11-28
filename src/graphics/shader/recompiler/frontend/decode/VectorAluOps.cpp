@@ -165,13 +165,15 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0x0au, Opcode::V_CMP_NLG_F32},        {0x0bu, Opcode::V_CMP_NGT_F32},
     {0x0cu, Opcode::V_CMP_NLE_F32},        {0x0du, Opcode::V_CMP_NEQ_F32},
     {0x0eu, Opcode::V_CMP_NLT_F32},        {0x0fu, Opcode::V_CMP_TRU_F32},
-    {0x11u, Opcode::V_CMPX_LT_F32},        {0x12u, Opcode::V_CMPX_EQ_F32},
-    {0x13u, Opcode::V_CMPX_LE_F32},        {0x14u, Opcode::V_CMPX_GT_F32},
-    {0x15u, Opcode::V_CMPX_LG_F32},        {0x16u, Opcode::V_CMPX_GE_F32},
+    {0x10u, Opcode::V_CMPX_F_F32},         {0x11u, Opcode::V_CMPX_LT_F32},
+    {0x12u, Opcode::V_CMPX_EQ_F32},        {0x13u, Opcode::V_CMPX_LE_F32},
+    {0x14u, Opcode::V_CMPX_GT_F32},        {0x15u, Opcode::V_CMPX_LG_F32},
+    {0x16u, Opcode::V_CMPX_GE_F32},
     {0x17u, Opcode::V_CMPX_O_F32},         {0x18u, Opcode::V_CMPX_U_F32},
     {0x19u, Opcode::V_CMPX_NGE_F32},       {0x1au, Opcode::V_CMPX_NLG_F32},
     {0x1bu, Opcode::V_CMPX_NGT_F32},       {0x1cu, Opcode::V_CMPX_NLE_F32},
     {0x1du, Opcode::V_CMPX_NEQ_F32},       {0x1eu, Opcode::V_CMPX_NLT_F32},
+    {0x1fu, Opcode::V_CMPX_TRU_F32},
     {0x20u, Opcode::V_CMP_F_F64, false},    {0x21u, Opcode::V_CMP_LT_F64, false},
     {0x22u, Opcode::V_CMP_EQ_F64, false},   {0x23u, Opcode::V_CMP_LE_F64, false},
     {0x24u, Opcode::V_CMP_GT_F64, false},   {0x25u, Opcode::V_CMP_LG_F64, false},
@@ -197,10 +199,11 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0x8au, Opcode::V_CMP_EQ_I16},         {0x8bu, Opcode::V_CMP_LE_I16},
     {0x8cu, Opcode::V_CMP_GT_I16},         {0x8du, Opcode::V_CMP_NE_I16},
     {0x8eu, Opcode::V_CMP_GE_I16},         {0x8fu, Opcode::V_CMP_CLASS_F16, false},
-    {0x91u, Opcode::V_CMPX_LT_I32},
+    {0x90u, Opcode::V_CMPX_F_I32},         {0x91u, Opcode::V_CMPX_LT_I32},
     {0x92u, Opcode::V_CMPX_EQ_I32},        {0x93u, Opcode::V_CMPX_LE_I32},
     {0x94u, Opcode::V_CMPX_GT_I32},        {0x95u, Opcode::V_CMPX_NE_I32},
-    {0x96u, Opcode::V_CMPX_GE_I32},        {0x98u, Opcode::V_CMPX_CLASS_F32},
+    {0x96u, Opcode::V_CMPX_GE_I32},        {0x97u, Opcode::V_CMPX_T_I32},
+    {0x98u, Opcode::V_CMPX_CLASS_F32},
     {0x99u, Opcode::V_CMPX_LT_I16, false}, {0x9au, Opcode::V_CMPX_EQ_I16, false},
     {0x9bu, Opcode::V_CMPX_LE_I16, false}, {0x9cu, Opcode::V_CMPX_GT_I16, false},
     {0x9du, Opcode::V_CMPX_NE_I16, false}, {0x9eu, Opcode::V_CMPX_GE_I16, false},
@@ -209,15 +212,18 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xabu, Opcode::V_CMP_LE_U16},         {0xacu, Opcode::V_CMP_GT_U16},
     {0xadu, Opcode::V_CMP_NE_U16},         {0xaeu, Opcode::V_CMP_GE_U16},
     {0xb9u, Opcode::V_CMPX_LT_U16, false}, {0xbau, Opcode::V_CMPX_EQ_U16, false},
-    {0xbcu, Opcode::V_CMPX_GT_U16},        {0xbdu, Opcode::V_CMPX_NE_U16, false},
+    {0xbbu, Opcode::V_CMPX_LE_U16, false}, {0xbcu, Opcode::V_CMPX_GT_U16},
+    {0xbdu, Opcode::V_CMPX_NE_U16, false}, {0xbeu, Opcode::V_CMPX_GE_U16, false},
     {0xc0u, Opcode::V_CMP_F_U32},
     {0xc1u, Opcode::V_CMP_LT_U32},         {0xc2u, Opcode::V_CMP_EQ_U32},
     {0xc3u, Opcode::V_CMP_LE_U32},         {0xc4u, Opcode::V_CMP_GT_U32},
     {0xc5u, Opcode::V_CMP_NE_U32},         {0xc6u, Opcode::V_CMP_GE_U32},
-    {0xc7u, Opcode::V_CMP_T_U32},          {0xd1u, Opcode::V_CMPX_LT_U32},
+    {0xc7u, Opcode::V_CMP_T_U32},          {0xd0u, Opcode::V_CMPX_F_U32},
+    {0xd1u, Opcode::V_CMPX_LT_U32},
     {0xd2u, Opcode::V_CMPX_EQ_U32},        {0xd3u, Opcode::V_CMPX_LE_U32},
     {0xd4u, Opcode::V_CMPX_GT_U32},        {0xd5u, Opcode::V_CMPX_NE_U32},
-    {0xd6u, Opcode::V_CMPX_GE_U32},        {0xa0u, Opcode::V_CMP_F_I64, false},
+    {0xd6u, Opcode::V_CMPX_GE_U32},        {0xd7u, Opcode::V_CMPX_T_U32},
+    {0xa0u, Opcode::V_CMP_F_I64, false},
     {0xa1u, Opcode::V_CMP_LT_I64, false},  {0xa2u, Opcode::V_CMP_EQ_I64, false},
     {0xa3u, Opcode::V_CMP_LE_I64, false},  {0xa4u, Opcode::V_CMP_GT_I64, false},
     {0xa5u, Opcode::V_CMP_NE_I64, false},  {0xa6u, Opcode::V_CMP_GE_I64, false},
@@ -896,6 +902,7 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMP_NEQ_F32:
 		case Opcode::V_CMP_NLT_F32:
 		case Opcode::V_CMP_TRU_F32:
+		case Opcode::V_CMPX_F_F32:
 		case Opcode::V_CMPX_LT_F32:
 		case Opcode::V_CMPX_EQ_F32:
 		case Opcode::V_CMPX_LE_F32:
@@ -910,6 +917,7 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMPX_NLE_F32:
 		case Opcode::V_CMPX_NEQ_F32:
 		case Opcode::V_CMPX_NLT_F32:
+		case Opcode::V_CMPX_TRU_F32:
 		case Opcode::V_CMP_LT_F16:
 		case Opcode::V_CMP_EQ_F16:
 		case Opcode::V_CMP_LE_F16:
@@ -1521,6 +1529,7 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NEQ_F64:
 		case Opcode::V_CMPX_NLT_F64:
 		case Opcode::V_CMPX_TRU_F64:
+		case Opcode::V_CMPX_F_F32:
 		case Opcode::V_CMPX_LT_F32:
 		case Opcode::V_CMPX_EQ_F32:
 		case Opcode::V_CMPX_LE_F32:
@@ -1535,20 +1544,25 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NLE_F32:
 		case Opcode::V_CMPX_NEQ_F32:
 		case Opcode::V_CMPX_NLT_F32:
+		case Opcode::V_CMPX_TRU_F32:
+		case Opcode::V_CMPX_F_I32:
 		case Opcode::V_CMPX_LT_I32:
 		case Opcode::V_CMPX_EQ_I32:
 		case Opcode::V_CMPX_LE_I32:
 		case Opcode::V_CMPX_GT_I32:
 		case Opcode::V_CMPX_NE_I32:
 		case Opcode::V_CMPX_GE_I32:
+		case Opcode::V_CMPX_T_I32:
 		case Opcode::V_CMPX_CLASS_F32:
 		case Opcode::V_CMPX_CLASS_F16:
+		case Opcode::V_CMPX_F_U32:
 		case Opcode::V_CMPX_LT_U32:
 		case Opcode::V_CMPX_EQ_U32:
 		case Opcode::V_CMPX_LE_U32:
 		case Opcode::V_CMPX_GT_U32:
 		case Opcode::V_CMPX_NE_U32:
 		case Opcode::V_CMPX_GE_U32:
+		case Opcode::V_CMPX_T_U32:
 		case Opcode::V_CMPX_F_I64:
 		case Opcode::V_CMPX_LT_I64:
 		case Opcode::V_CMPX_EQ_I64:
@@ -1573,8 +1587,10 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_GE_I16:
 		case Opcode::V_CMPX_LT_U16:
 		case Opcode::V_CMPX_EQ_U16:
+		case Opcode::V_CMPX_LE_U16:
 		case Opcode::V_CMPX_GT_U16:
 		case Opcode::V_CMPX_NE_U16:
+		case Opcode::V_CMPX_GE_U16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:
 		case Opcode::V_CMPX_LE_F16:

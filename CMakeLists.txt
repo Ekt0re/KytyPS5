@@ -994,6 +994,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME shader_recompiler_scalar_twins
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-twins-only)
+	add_test(NAME shader_recompiler_vopc_twins
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vopc-twins-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
