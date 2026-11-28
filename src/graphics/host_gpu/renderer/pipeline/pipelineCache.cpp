@@ -604,6 +604,13 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 	});
 	RetainModuleSpirv(module, result.spirv);
 	m_compiled[static_cast<size_t>(key.stage)]++;
+	// Diagnostic for scripts/pipeline-ab.py and compile-report.py: which modules a run compiles
+	// instead of loading, and their SPIR-V size.
+	std::printf("ShaderModule: stage=%s hash=%016llx id=%016llx spirv_words=%zu spirv_xxh=%016llx\n",
+	            stage, static_cast<unsigned long long>(key.hash), static_cast<unsigned long long>(id),
+	            result.spirv.size(),
+	            static_cast<unsigned long long>(
+	                XXH3_64bits(result.spirv.data(), result.spirv.size() * 4u)));
 	// Guest geometry shaders are compiled through the host mesh stage.
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
 	            m_compiled[static_cast<size_t>(ShaderType::Vertex)],
@@ -1863,6 +1870,24 @@ PipelineCache::Pipeline& PipelineCache::Resolve(Pipeline& pipeline, bool wait) {
 		pipeline.deferred  = nullptr;
 	}
 	return pipeline;
+}
+
+void PipelineCache::GraceWait(Pipeline& pipeline, std::chrono::milliseconds limit) {
+	// A background creation no worker started would not progress while this waits.
+	if (pipeline.grace_waited || !pipeline.compiling.valid() ||
+	    (pipeline.deferred != nullptr && !pipeline.deferred->Claimed())) {
+		return;
+	}
+	pipeline.grace_waited = true;
+	const auto start      = std::chrono::steady_clock::now();
+	bool       ready      = false;
+	{
+		const Common::CompilePause::Scope compile_pause;
+		ready = pipeline.compiling.wait_for(limit) == std::future_status::ready;
+	}
+	NotePipelineWait(
+	    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	if (ready) Resolve(pipeline, false);
 }
 
 PipelineCache::PipelineCache(GraphicContext& graphics,

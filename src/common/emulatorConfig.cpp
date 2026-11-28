@@ -2,7 +2,9 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfAb.h"
 #include "common/perfSummary.h"
+#include "common/profiler.h"
 
 #include <algorithm>
 #include <array>
@@ -80,8 +82,21 @@ static void StartSyncStatsReporter() {
 		constexpr auto                                  N = static_cast<size_t>(Counter::Count);
 		std::array<uint64_t, N>                         last {};
 		auto                                            last_time = std::chrono::steady_clock::now();
+		const bool                                      ab        = Common::PerfAb::Enabled();
+		if (ab) {
+			Common::PerfAb::g_arm.store(0, std::memory_order_relaxed);
+		}
 		for (uint64_t index = 0;; index++) {
-			std::this_thread::sleep_for(std::chrono::seconds(period));
+			const int arm = Common::PerfAb::g_arm.load(std::memory_order_relaxed);
+			if (arm == 1) {
+				KYTY_PROFILER_BLOCK("PerfAb arm on");
+				std::this_thread::sleep_for(std::chrono::seconds(period));
+			} else if (arm == 0) {
+				KYTY_PROFILER_BLOCK("PerfAb arm off");
+				std::this_thread::sleep_for(std::chrono::seconds(period));
+			} else {
+				std::this_thread::sleep_for(std::chrono::seconds(period));
+			}
 			const auto now  = std::chrono::steady_clock::now();
 			const auto secs = std::chrono::duration<double>(now - last_time).count();
 			last_time       = now;
@@ -94,13 +109,14 @@ static void StartSyncStatsReporter() {
 				       secs;
 			};
 			constexpr double MB = 1024.0 * 1024.0;
-			std::printf("SyncStats t=%" PRIu64 " flips/s=%.1f subs/s=%.0f draws/s=%.0f | "
+			std::printf("SyncStats t=%" PRIu64 "%s flips/s=%.1f subs/s=%.0f draws/s=%.0f | "
 			            "faults r/s=%.0f w/s=%.0f all/s=%.0f fault_ms/s=%.1f (buf %.1f tex %.1f heap %.1f) | "
 			            "readbacks/s=%.0f detached/s=%.0f zc_releases/s=%.0f zc_read_waits/s=%.0f readback_ms/s=%.1f bufdown_MB/s=%.1f texdown_MB/s=%.1f | "
 			            "bufup_MB/s=%.1f reup_MB/s=%.1f unchanged_MB/s=%.1f stream_MB/s=%.1f "
 			            "bda_MB/s=%.1f texup_MB/s=%.1f | protect/s=%.0f protect_MB/s=%.1f "
 			            "protect_ms/s=%.1f | gpuwait_ms/s=%.0f gputhread_ms/s=%.0f\n",
-			            index * period, d(Counter::FlipsRequested), d(Counter::QueueSubmits),
+			            index * period, arm < 0 ? "" : arm == 1 ? " arm=on" : " arm=off",
+			            d(Counter::FlipsRequested), d(Counter::QueueSubmits),
 			            d(Counter::Draws), d(Counter::SyncReadFaults), d(Counter::SyncWriteFaults),
 			            d(Counter::GpuFaults), d(Counter::SyncFaultNs) / 1e6, d(Counter::SyncFaultBufferNs) / 1e6,
 			            d(Counter::SyncFaultTextureNs) / 1e6, d(Counter::SyncFaultHeapNs) / 1e6, d(Counter::SyncReadbacks), d(Counter::SyncDetachedReadbacks),
@@ -113,6 +129,9 @@ static void StartSyncStatsReporter() {
 			            d(Counter::GpuWaitNs) / 1e6, d(Counter::GpuThreadBusyNs) / 1e6);
 			std::fflush(stdout);
 			last = cur;
+			if (ab) {
+				Common::PerfAb::g_arm.store(arm == 1 ? 0 : 1, std::memory_order_relaxed);
+			}
 		}
 	}).detach();
 }

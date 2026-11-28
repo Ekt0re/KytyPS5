@@ -1,10 +1,37 @@
 #include "graphics/host_gpu/renderer/dynamicState.h"
 
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/renderFix.h"
 
 namespace Libs::Graphics {
 
+// KYTY_DYNAMIC_STATE_ALWAYS (default 1, toggle dynamic_state_always): set the depth compare op,
+// depth bounds, depth bias and stencil state of a draw whether or not its test or bias is
+// enabled. Pipelines declare them all dynamic, and Vulkan requires every dynamic state of the
+// bound pipeline to be set in the command buffer before a draw (VUID-vkCmdDraw-None-07848);
+// with 0 they are only set while the test or bias that uses them is on, as before.
+static RenderFix DynamicStateAlways {"dynamic state of disabled tests",
+                                     "KYTY_DYNAMIC_STATE_ALWAYS", "dynamic_state_always",
+                                     true};
+
 void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf) {
+	// Invalidate() marks every state dirty at the start of a command buffer, so a dirty state of
+	// a disabled test is one this command buffer has not set yet, or one whose value changed.
+	const bool unset = (!depth_test_enabled && dirty_state.depth_compare_op) ||
+	                   (!depth_bounds_test_enabled && dirty_state.depth_bounds) ||
+	                   (!depth_bias_enabled && dirty_state.depth_bias) ||
+	                   (!stencil_test_enabled &&
+	                    (dirty_state.stencil_front_ops || dirty_state.stencil_back_ops ||
+	                     dirty_state.stencil_front_reference || dirty_state.stencil_back_reference ||
+	                     dirty_state.stencil_front_write_mask || dirty_state.stencil_back_write_mask ||
+	                     dirty_state.stencil_front_compare_mask ||
+	                     dirty_state.stencil_back_compare_mask));
+	const bool always = unset && DynamicStateAlways.Enabled();
+	if (unset) {
+		DynamicStateAlways.Hit("depth test %d, depth bounds %d, depth bias %d, stencil test %d",
+		                       depth_test_enabled ? 1 : 0, depth_bounds_test_enabled ? 1 : 0,
+		                       depth_bias_enabled ? 1 : 0, stencil_test_enabled ? 1 : 0);
+	}
 	if (dirty_state.viewports) {
 		dirty_state.viewports = false;
 		cmdbuf.setViewportWithCount(num_viewports, viewports.data());
@@ -22,7 +49,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		// Note that this must be set in a command buffer even if depth test is disabled.
 		cmdbuf.setDepthWriteEnable(depth_write_enabled);
 	}
-	if (depth_test_enabled && dirty_state.depth_compare_op) {
+	if ((depth_test_enabled || always) && dirty_state.depth_compare_op) {
 		dirty_state.depth_compare_op = false;
 		cmdbuf.setDepthCompareOp(depth_compare_op);
 	}
@@ -32,7 +59,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		cmdbuf.setDepthBoundsTestEnable(depth_bounds_test_enabled);
 #endif
 	}
-	if (depth_bounds_test_enabled && dirty_state.depth_bounds) {
+	if ((depth_bounds_test_enabled || always) && dirty_state.depth_bounds) {
 		dirty_state.depth_bounds = false;
 #if !defined(__APPLE__)
 		cmdbuf.setDepthBounds(depth_bounds_min, depth_bounds_max);
@@ -42,7 +69,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.depth_bias_enabled = false;
 		cmdbuf.setDepthBiasEnable(depth_bias_enabled);
 	}
-	if (depth_bias_enabled && dirty_state.depth_bias) {
+	if ((depth_bias_enabled || always) && dirty_state.depth_bias) {
 		dirty_state.depth_bias = false;
 		cmdbuf.setDepthBias(depth_bias_constant, depth_bias_clamp, depth_bias_slope);
 	}
@@ -50,7 +77,7 @@ void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdb
 		dirty_state.stencil_test_enabled = false;
 		cmdbuf.setStencilTestEnable(stencil_test_enabled);
 	}
-	if (stencil_test_enabled) {
+	if (stencil_test_enabled || always) {
 		if (dirty_state.stencil_front_ops && dirty_state.stencil_back_ops &&
 		    stencil_front_ops == stencil_back_ops) {
 			dirty_state.stencil_front_ops = false;

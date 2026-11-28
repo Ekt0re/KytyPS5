@@ -834,7 +834,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 			    (graphics.StorageMinAlignment() - 1);
 			size = Libs::LibKernel::Memory::TryClampRangeSize(
-			    address, std::min({size, uint64_t {256} * 1024 * 1024, limit}));
+			    address, std::min(std::min(size, uint64_t {256} * 1024 * 1024), limit));
 		} else if (size >= (uint64_t {1} << 30u) || allow_unmapped) {
 			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size, true);
 		}
@@ -914,6 +914,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		prepared.shader_data[layout.MemorySizeDword() + index] =
 		    static_cast<uint32_t>(prepared.buffer_sources[index].size + buffer_offset);
 	}
+	KYTY_PROFILER_BLOCK("RebindBuffers::Uploads");
 	ShaderRecompiler::IR::PackBufferRuntimeStrides(program.info.buffers, layout, snapshot,
 	                                               prepared.shader_data);
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {

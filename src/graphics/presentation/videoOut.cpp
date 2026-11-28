@@ -939,6 +939,21 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::Flips);
 	Graphics::WaitDiag::NoteFramePresented();
+	{
+		// One line when a frame first holds 500 draws or more (the game's world has started
+		// rendering), which run scripts wait for instead of a frame number. Counted only while the
+		// debug counters are on (--perf-overlay or KYTY_SYNC_STATS).
+		static uint64_t previous  = 0;
+		static bool     announced = false;
+		const auto      draws = Common::DebugCounters::Get(Common::DebugCounters::Counter::Draws);
+		if (!announced && draws - previous >= 500) {
+			announced = true;
+			std::printf("Milestone: the first frame of 500 draws or more (%" PRIu64 ")\n",
+			            draws - previous);
+			std::fflush(stdout);
+		}
+		previous = draws;
+	}
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;

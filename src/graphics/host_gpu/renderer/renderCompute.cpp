@@ -262,11 +262,16 @@ static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& st
                             PreparedBindings& bindings) {
 	const auto& program = stage.module->info;
 	auto        dword   = program.bindings.ray_query_dword;
-	if (dword == ShaderRecompiler::IR::PushData::NoStart) return;
+	if (dword == ShaderRecompiler::IR::PushData::NoStart) {
+		if (auto* ray_tracing = context.GetRayTracing(); ray_tracing != nullptr && program.info.bvh) {
+			ray_tracing->NoteGuestDispatch(program.shader_hash, stage.resources->user_data);
+		}
+		return;
+	}
 	const auto& flat = stage.resources->flattened_srt;
 	for (const auto [low, high]: program.info.ray_query_tlases) {
-		const auto address =
-		    context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
+		const auto address = context.GetRayTracing()->Prepare(
+		    flat[low] | uint64_t {flat[high]} << 32u, program.shader_hash);
 		bindings.shader_data[dword]     = static_cast<uint32_t>(address);
 		bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
 		dword += 2u;
@@ -281,6 +286,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 	}
 	auto& cache = context.GetBufferCache();
 	if (indirect_args != 0) {
+		KYTY_PROFILER_BLOCK("BindSharedMemory::ReadArgs");
 		const ReadbackOrigin::Scope origin(ReadbackOrigin::Origin::Args);
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),

@@ -9,11 +9,15 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -304,6 +308,13 @@ void RayTracing::Apply(Area& area) {
 	const auto* data = area.buffer->Mapped().data();
 	Context     context {};
 	std::memcpy(&context, data, sizeof(context));
+	if (context.valid != 0) {
+		++m_coverage.valid;
+	} else {
+		++m_coverage.invalid;
+		m_coverage.last_invalid = area.shader_hash;
+		m_coverage.unreadable += context.instances == ~0u ? 1u : 0u;
+	}
 	// Instance counts past the device limit keep the mirror invalid.
 	const auto it = m_tlases.find(area.tlas);
 	if (it != m_tlases.end() && context.instances > it->second.instance_slots &&
@@ -392,9 +403,10 @@ void RayTracing::Apply(Area& area) {
 	}
 }
 
-vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
+vk::DeviceAddress RayTracing::Prepare(uint64_t tlas, uint64_t shader_hash) {
 	if (const auto found = m_prepared.find(tlas);
 	    found != m_prepared.end() && found->second.flip == m_flip && m_contexts != nullptr) {
+		++m_coverage.traced;
 		return m_contexts->BufferDeviceAddress() + sizeof(Context) * found->second.slot;
 	}
 	Collect();
@@ -411,6 +423,8 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	if (readback) {
 		m_next_area = (m_next_area + 1) % Areas;
 	}
+	area.shader_hash = shader_hash;
+	++m_coverage.traced;
 	const auto serial = ++m_serial;
 
 	auto& top = m_tlases[tlas];
@@ -708,7 +722,84 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	return m_contexts->BufferDeviceAddress() + context;
 }
 
+void RayTracing::NoteGuestDispatch(uint64_t shader_hash, std::span<const uint32_t> user_data) {
+	++m_coverage.guest;
+	m_coverage.last_guest = shader_hash;
+	// KYTY_RT_HEADER_PROBE=1 logs the BVH headers the first dispatch of each program that walks a
+	// guest BVH without a ray query can reach through its user SGPR pointers (a diagnostic: it
+	// reads them back from the GPU).
+	static const bool probe = [] {
+		const char* value = std::getenv("KYTY_RT_HEADER_PROBE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (probe && m_probed.size() < 64 && m_probed.insert(shader_hash).second) {
+		ProbeHeaders(shader_hash, user_data);
+	}
+	ReportCoverage();
+}
+
+void RayTracing::ProbeHeaders(uint64_t shader_hash, std::span<const uint32_t> user_data) {
+	constexpr uint64_t Table = 0x100, Header = 0x100;
+	const auto read = [&](uint64_t address, uint64_t size) {
+		if (address == 0 || (address & 7u) != 0 || !m_context.IsMapped(address, size)) return false;
+		m_buffer_cache.ReadMemory(address, size);
+		return true;
+	};
+	const auto load = [](uint64_t address, uint64_t offset, auto value) {
+		std::memcpy(&value, reinterpret_cast<const void*>(address + offset), sizeof(value));
+		return value;
+	};
+	uint32_t found = 0;
+	for (uint32_t sgpr = 0; sgpr + 1 < user_data.size(); ++sgpr) {
+		const auto table = user_data[sgpr] | uint64_t {user_data[sgpr + 1]} << 32u;
+		if (!read(table, Table)) continue;
+		for (uint64_t offset = 0; offset < Table; offset += 8) {
+			const auto header = load(table, offset, uint64_t {});
+			if (!read(header, Header) || load(header, 0, uint32_t {}) != 0x5f525350u ||
+			    load(header, 4, uint32_t {}) != 0x4c485642u) {
+				continue;
+			}
+			++found;
+			std::printf("[RT] header probe: cs %016" PRIx64 " [s[%u:%u] + 0x%02" PRIx64
+			            "] = 0x%" PRIx64 ": PSR_BVHL version %u properties 0x%08x (%s) +0x28 0x%" PRIx64
+			            " +0x30 0x%" PRIx64 " +0x70 %u +0x74 %u\n",
+			            shader_hash, sgpr, sgpr + 1, offset, header, load(header, 0xfc, uint32_t {}),
+			            load(header, 0x18, uint32_t {}),
+			            (load(header, 0x18, uint32_t {}) & 0x40u) != 0 ? "BLAS" : "TLAS",
+			            load(header, 0x28, uint64_t {}), load(header, 0x30, uint64_t {}),
+			            load(header, 0x70, uint32_t {}), load(header, 0x74, uint32_t {}));
+		}
+	}
+	if (found == 0) {
+		std::printf("[RT] header probe: cs %016" PRIx64 ": no PSR_BVHL header behind %zu user SGPRs\n",
+		            shader_hash, user_data.size());
+	}
+	std::fflush(stdout);
+}
+
+void RayTracing::ReportCoverage() {
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_report_time < std::chrono::seconds(10)) return;
+	m_report_time    = now;
+	const auto  last = m_reported;
+	const auto& c    = m_coverage;
+	const auto  programs = ShaderRecompiler::GetRayTracingPrograms();
+	m_reported           = c;
+	const bool unrecognized = programs.unrecognized != m_reported_programs;
+	m_reported_programs     = programs.unrecognized;
+	if (c.guest == last.guest && c.invalid == last.invalid && !unrecognized) return;
+	std::printf("[RT] 10 s: dispatches traced %" PRIu64 ", walking a guest BVH %" PRIu64
+	            " (last cs %016" PRIx64 "); TLAS contexts valid %" PRIu64 ", not valid %" PRIu64
+	            " (header unreadable %" PRIu64 ", last cs %016" PRIx64 "); programs so far: traced %" PRIu64
+	            ", with walks left to the guest %" PRIu64 " (last cs %016" PRIx64 ")\n",
+	            c.traced - last.traced, c.guest - last.guest, c.last_guest, c.valid - last.valid,
+	            c.invalid - last.invalid, c.unreadable - last.unreadable, c.last_invalid,
+	            programs.traced, programs.unrecognized, programs.last_unrecognized);
+	std::fflush(stdout);
+}
+
 void RayTracing::RunGarbageCollector() {
+	ReportCoverage();
 	if (++m_frame % EvictFrames != 0) {
 		return;
 	}

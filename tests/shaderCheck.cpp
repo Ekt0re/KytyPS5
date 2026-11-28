@@ -425,7 +425,10 @@ int TranslateOne(const std::filesystem::path& path, const std::filesystem::path&
 	if (emit) {
 		ShaderRecompiler::Spirv::Profile profile {};
 		profile.robust_buffer_access = true;
-		profile.ray_query            = true;
+		// SHADER_CHECK_RAY_QUERY=0: translate as a device without ray queries does (the game
+		// without --native-rt); otherwise as one with them.
+		const char* ray_query        = std::getenv("SHADER_CHECK_RAY_QUERY");
+		profile.ray_query            = ray_query == nullptr || std::strcmp(ray_query, "0") != 0;
 		// SHADER_CHECK_MINMAX=othernan|exact: the float min/max lowering a probed host earns.
 		if (const char* minmax = std::getenv("SHADER_CHECK_MINMAX"); minmax != nullptr) {
 			if (std::strcmp(minmax, "exact") == 0) {

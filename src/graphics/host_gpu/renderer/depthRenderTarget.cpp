@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderFix.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -232,6 +233,12 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
+// KYTY_HTILE_EXPAND_ONLY_CLEARED (default 1, toggle htile_expand_only_cleared): bind the depth
+// target of a DEPTH_COMPRESS_DISABLE pass with depth and stencil tests off only when its HTile has
+// a pending fast clear to expand; 0 binds it for every such pass, as before.
+static RenderFix HtileExpandOnlyCleared {"HTile expand-only passes", "KYTY_HTILE_EXPAND_ONLY_CLEARED",
+                                         "htile_expand_only_cleared", true};
+
 void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
 	r = {};
@@ -247,13 +254,14 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 	// With HTile, DEPTH_COMPRESS_DISABLE expands touched tiles even with depth/stencil tests off.
 	// PPSA32236 fast-clears HTile each frame, runs this pass, then samples the depth as raw memory.
 	// Unbound, the clear never lands: NaN depth makes one compute pass ~95 ms (60 -> 10 fps).
-	const bool depth_active =
+	const bool depth_tested =
 	    has_depth &&
-	    (dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable || rc.copy_depth_to_color ||
-		 (rc.depth_compress_disable && z.z_info.htile_acceleration));
+	    (dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable || rc.copy_depth_to_color);
 	const bool stencil_active =
 	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
-	if (!depth_active && !stencil_active) {
+	const bool expand_only = has_depth && !depth_tested && !stencil_active &&
+	                         rc.depth_compress_disable && z.z_info.htile_acceleration;
+	if (!depth_tested && !stencil_active && !expand_only) {
 		return;
 	}
 	if (rc.copy_stencil_to_color || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
@@ -274,6 +282,24 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		r.desc     = MakeDepthTargetDesc(buffer, z);
 		r.image_id = m_context.GetTextureCache().FindImage(r.desc);
 		m_context.GetResolveCache().SetDepth(z, r.desc, r.image_id);
+	}
+	// The host attachment is never compressed: a pass that only expands HTile has work to do
+	// when its HTile has a pending fast clear. Days Gone (PPSA28180) runs several a frame
+	// without one, and binding their depth targets loses the device on NVIDIA ("3D WIDTH ZT
+	// Violation", then a TDR).
+	if (expand_only) {
+		const auto& metadata = r.desc.info.metadata;
+		if (metadata.kind != ImageMetadataKind::Htile ||
+		    !m_context.GetTextureCache().IsMetaCleared(metadata.range.address,
+		                                               r.desc.view_info.base_layer)) {
+			HtileExpandOnlyCleared.Hit("depth 0x%llx %ux%u, no pending HTile fast clear",
+			                           static_cast<unsigned long long>(r.desc.info.data.address),
+			                           r.desc.info.extent.width, r.desc.info.extent.height);
+			if (HtileExpandOnlyCleared.Enabled()) {
+				r = {};
+				return;
+			}
+		}
 	}
 	r.depth_clear_enable      = has_depth && rc.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();

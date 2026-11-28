@@ -366,6 +366,8 @@ public:
 		std::shared_ptr<DeferredPipeline> deferred;
 		// KYTY_FAST_PIPELINES: the optimized build that replaces an unoptimized `pipeline`.
 		std::shared_future<vk::Pipeline> optimized;
+		// KYTY_ASYNC_PIPELINES=3: a draw waited for it once (GraceWait).
+		bool                    grace_waited          = false;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		// The push constant range's stages, which every update names.
 		vk::ShaderStageFlags    push_stages;
@@ -396,10 +398,14 @@ public:
 	static bool FastPipelines();
 	// Takes a finished compile, or with `wait` the running one.
 	static Pipeline& Resolve(Pipeline& pipeline, bool wait);
+	// KYTY_ASYNC_PIPELINES=3: the first time a draw finds `pipeline` compiling on a worker, waits
+	// up to `limit` for it (the guest clock stands still) and takes it if it finished.
+	static void GraceWait(Pipeline& pipeline, std::chrono::milliseconds limit);
 	// KYTY_ASYNC_PIPELINES: 0 (default) every draw waits for its pipeline; 1 ordinary geometry
 	// whose pipeline is not ready when its commands are submitted is skipped for that frame,
 	// while full-screen passes, depth or stencil writers, draws whose shaders write memory and
-	// all dispatches wait; 2 also skips depth and stencil writers.
+	// all dispatches wait; 2 also skips depth and stencil writers; 3 is 1 with the UI, layer and
+	// small draws of renderDraw.cpp waiting too.
 	static int AsyncPipelineMode();
 	// KYTY_LAZY_SHADER_STORE=1 (frame replays): the shader store decodes a record only when a
 	// lookup needs it and creates a stored pipeline only when a draw or dispatch needs it, with no

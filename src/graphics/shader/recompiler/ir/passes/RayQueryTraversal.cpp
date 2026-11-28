@@ -1464,7 +1464,8 @@ void RewriteStackWalk(Program& program, StackWalk& t, uint32_t context) {
 
 } // namespace
 
-uint32_t TraceTraversalsWithRayQueries(Program& program) {
+uint32_t TraceTraversalsWithRayQueries(Program& program, uint32_t* left) {
+	if (left != nullptr) *left = 0;
 	if (program.stage != ShaderType::Compute) return 0;
 	std::vector<Inst*> intersections;
 	for (auto* block: program.blocks) {
@@ -1498,6 +1499,7 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 			}
 			++traced;
 		} else if (EnclosingLoop(program, bvh->Parent()) != nullptr) {
+			if (left != nullptr) ++*left;
 			Log::WriteToConsoleAndLog(
 			    fmt::format("ShaderRecompiler BVH traversal left to emulation: hash=0x{:016x}\n",
 				            program.shader_hash));

@@ -24,9 +24,11 @@
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
+#include <utility>
 #include <xxhash.h>
 #include <zstd.h>
 
@@ -271,6 +273,24 @@ bool PrecompileMode() {
 	return g_precompile_mode.load(std::memory_order_relaxed);
 }
 
+// KYTY_PRECOMPILE_SHARD=<i>/<n> (measuring driver throughput across processes, after simnJS
+// 78959548d's helper processes): a precompile creates only the stored pipelines whose module id
+// (compute) or key hash (graphics) is i modulo n, and runs without writing the store, so n
+// precompiles of one store can run at once. {0, 1} otherwise.
+std::pair<uint64_t, uint64_t> PrecompileShard() {
+	static const std::pair<uint64_t, uint64_t> shard = []() -> std::pair<uint64_t, uint64_t> {
+		const char* env = std::getenv("KYTY_PRECOMPILE_SHARD");
+		uint64_t    i = 0, n = 0;
+		if (env == nullptr || std::sscanf(env, "%llu/%llu", reinterpret_cast<unsigned long long*>(&i),
+		                                  reinterpret_cast<unsigned long long*>(&n)) != 2 ||
+		    n < 2 || i >= n) {
+			return {0, 1};
+		}
+		return {i, n};
+	}();
+	return PrecompileMode() ? shard : std::pair<uint64_t, uint64_t> {0, 1};
+}
+
 // --restamp-shader-store: the store of another stamp is checked against this translator.
 std::atomic<bool>   g_restamp_mode {false};
 std::atomic<size_t> g_restamp_sample {0};
@@ -298,6 +318,22 @@ bool SyncWarmUp() {
 		return env != nullptr && env[0] == '1';
 	}();
 	return sync;
+}
+
+// KYTY_PIPELINE_STORE_ORDER=1 (after simnJS 2332d2ac5, "compile first the pipelines of the
+// shaders the game used in earlier sessions"): the warm-up queues the store's pipelines for
+// background creation in the order the store recorded their modules and pipelines, which is the
+// order earlier runs first needed them, compute and graphics together. Otherwise compute
+// pipelines go first, in hash order, then graphics pipelines, in hash order. With a cold driver
+// (a new driver or executable, KYTY_PIPELINE_COLD_SALT) the game needs the pipelines in about the
+// store's order, and each one no worker has started yet is created on the command thread with the
+// guest clock held.
+bool StoreOrderWarmUp() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_PIPELINE_STORE_ORDER");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
 }
 
 // Decode time by part, summed over the warm-up's threads.
@@ -368,6 +404,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
 	    Common::ParallelThreads()));
 	auto records  = std::span<const uint8_t>(bytes);
+	// KYTY_PIPELINE_STORE_ORDER: where each module and graphics pipeline is in the store.
+	struct {
+		std::unordered_map<uint64_t, size_t> modules;
+		std::unordered_map<GraphicsPipelineKey, size_t, GraphicsPipelineKeyHash> pipelines;
+	} store_order;
 	bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (RestampMode()) {
@@ -414,6 +455,14 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		for (; kept < loaded.size() && loaded[kept].ok; kept++) {
 			if (loaded[kept].module.stored != nullptr) {
 				stored.push_back(loaded[kept].module.stored);
+			}
+			if (StoreOrderWarmUp()) {
+				// The first record of each id or key counts.
+				if (static_cast<Record>(loaded[kept].type) == Record::Module) {
+					store_order.modules.try_emplace(loaded[kept].module.id, kept);
+				} else if (static_cast<Record>(loaded[kept].type) == Record::GraphicsPipeline) {
+					store_order.pipelines.try_emplace(loaded[kept].pipeline_key, kept);
+				}
 			}
 			if (RestampMode()) {
 				// What a partial restamp keeps or drops, record by record.
@@ -502,6 +551,16 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			compute.push_back(module);
 		}
 	}
+	if (const auto [shard, shards] = PrecompileShard(); shards > 1) {
+		// The other shards' pipelines are left to the other processes.
+		std::erase_if(compute, [&](const ShaderModule* module) { return module->id % shards != shard; });
+		std::erase_if(graphics, [&](const auto& entry) {
+			return GraphicsPipelineKeyHash {}(*entry.first) % shards != shard;
+		});
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader precompile: shard {} of {}: {} compute and {} graphics pipelines\n", shard, shards,
+		    compute.size(), graphics.size()));
+	}
 	const bool sync = SyncWarmUp();
 	if (RestampMode()) {
 		// Nothing is created: a restamp only compares modules.
@@ -542,14 +601,15 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			}
 			return pipeline;
 		};
-		for (const auto* module: compute) {
+		const auto start_compute = [&](const ShaderModule* module) {
 			auto& pipeline = m_compute_pipelines[module->id];
 			CreatePipelineLayouts(m_graphics, pipeline, {&module, 1});
 			StartDeferredCompile(pipeline, [this, counted, layout = pipeline.pipeline_layout, module] {
 				return counted(CreateHostPipeline(m_graphics, layout, *module, m_driver_cache));
 			});
-		}
-		for (const auto& [key, stages]: graphics) {
+		};
+		const auto start_graphics = [&](const GraphicsPipelineKey*               key,
+		                                const std::array<const ShaderModule*, 4>& stages) {
 			auto& pipeline = m_graphics_pipelines.at(*key);
 			CreatePipelineLayouts(m_graphics, pipeline, stages);
 			StartDeferredCompile(pipeline,
@@ -557,6 +617,42 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 				                     return counted(CreateHostPipeline(m_graphics, layout, *key,
 				                                                       stages, m_driver_cache));
 			                     });
+		};
+		if (StoreOrderWarmUp()) {
+			// Store position, then compute before graphics; SIZE_MAX (not found) goes last.
+			struct Queued {
+				size_t position = SIZE_MAX;
+				size_t index    = 0; // In compute, or in graphics after compute.size().
+			};
+			std::vector<Queued> queued;
+			queued.reserve(compute.size() + graphics.size());
+			for (size_t i = 0; i < compute.size(); i++) {
+				const auto found = store_order.modules.find(compute[i]->id);
+				queued.push_back(
+				    {found != store_order.modules.end() ? found->second : SIZE_MAX, i});
+			}
+			for (size_t i = 0; i < graphics.size(); i++) {
+				const auto found = store_order.pipelines.find(*graphics[i].first);
+				queued.push_back({found != store_order.pipelines.end() ? found->second : SIZE_MAX,
+				                  compute.size() + i});
+			}
+			std::ranges::stable_sort(queued, [](const Queued& a, const Queued& b) {
+				return a.position < b.position;
+			});
+			for (const auto& entry: queued) {
+				if (entry.index < compute.size()) {
+					start_compute(compute[entry.index]);
+				} else {
+					const auto& [key, stages] = graphics[entry.index - compute.size()];
+					start_graphics(key, stages);
+				}
+			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader cache: {} compute and {} graphics pipelines queued in store order\n",
+			    compute.size(), graphics.size()));
+		} else {
+			for (const auto* module: compute) start_compute(module);
+			for (const auto& [key, stages]: graphics) start_graphics(key, stages);
 		}
 	}
 	OpenRecipes(path);
@@ -1512,7 +1608,8 @@ void PipelineCache::SetPrecompileMode() {
 bool PipelineCache::Precompile() {
 	using Clock      = std::chrono::steady_clock;
 	const auto start = Clock::now();
-	if (!m_store) {
+	// A shard (KYTY_PRECOMPILE_SHARD) only reads the store: the other shards' processes share it.
+	if (!m_store && PrecompileShard().second < 2) {
 		Log::WriteToConsoleAndLog(
 		    "Shader precompile: no shader store (a Release build and a title id are needed, and no "
 		    "other process may be writing it)\n");

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/renderFix.h"
 #include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/alignment.h"
@@ -6,6 +7,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfAb.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/runtimeToggles.h"
@@ -296,6 +298,17 @@ bool TextureCache::ReleaseIdleImages(GuestRange requested) {
 	return true;
 }
 
+bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const noexcept {
+	// KYTY_IMAGE_PAGE_COUNTS=0 takes the texture cache lock for every lookup again. By default
+	// CPU write invalidations and texel buffer image lookups on pages without a registered image
+	// return without the lock (most write faults land on such pages).
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_PAGE_COUNTS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return !Common::PerfAb::Apply(enabled) || MayCoverImages(address, size);
+}
+
 void TextureCache::RegisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	const auto& data  = image.info.data;
@@ -313,6 +326,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_resolve_cache.Invalidate(data.address, data.size);
 	m_total_used_memory += image.AccountedSize();
 }
@@ -380,7 +394,15 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	// KYTY_LRU_TOUCH_ONCE=0 touches the LRU entry on every call again. Draws touch the same images
+	// many times per tick; the image keeps the tick of its last touch, so only the first touch
+	// loads the entry (a cache miss) and moves it. The LRU order is the same either way.
+	static const bool once = [] {
+		const char* value = std::getenv("KYTY_LRU_TOUCH_ONCE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (image.registered && (!Common::PerfAb::Apply(once) || image.lru_tick < m_gc_tick)) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }
@@ -1019,6 +1041,14 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
+// KYTY_RETIRE_CPU_WRITTEN_BC (default 0, toggle retire_cpu_written_bc): 1 retires a BC image the
+// CPU wrote after its upload like a clean one when a raw block request overlaps it, so only the
+// request's bytes become GPU-written. 0 keeps it and returns it as a view of the request, as
+// before. PPSA01341 lost a heap it keeps in the bytes of old mips that way. Off by default: GTA VI
+// reaches the case (8-level BC images), but the retiring path has not run in a game here yet.
+static RenderFix RetireCpuWrittenBc {"CPU-written BC images under raw block requests",
+                                     "KYTY_RETIRE_CPU_WRITTEN_BC", "retire_cpu_written_bc", false};
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id, bool exact_format,
@@ -1035,7 +1065,20 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	                      requested.BlockExtent() == cached.info.BlockExtent() &&
 	                      requested.resources.levels == cached.info.resources.levels &&
 	                      requested.resources.layers < cached.info.resources.layers;
-	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsCpuDirty()) {
+	// A BC image the CPU wrote after its upload is never written back, so it is retired like a
+	// clean one. As a view, the next GPU write of the request would mark its whole mip chain
+	// GPU-written, levels the request does not cover included, and a later read-back would write
+	// those stale levels over whatever the guest keeps there now. An image that may only be
+	// CPU-dirty can still hold GPU writes and stays.
+	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsMaybeCpuDirty() &&
+	    cached.IsCpuDirty()) {
+		RetireCpuWrittenBc.Hit("BC image 0x%llx %ux%u, %u levels",
+		                       static_cast<unsigned long long>(cached.info.data.address),
+		                       cached.info.extent.width, cached.info.extent.height,
+		                       cached.info.resources.levels);
+	}
+	if (!raw_view && BcAlias::Matches(requested, cached.info) &&
+	    (RetireCpuWrittenBc.Enabled() ? !cached.IsMaybeCpuDirty() : !cached.IsCpuDirty())) {
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
@@ -1742,6 +1785,11 @@ void TextureCache::UpdateImage(ImageId id) {
 }
 
 ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+	// Only images that start at the address match: none while its page has no registered image
+	// (a texel buffer read looks here first, mostly on pages without images).
+	if (!MayHaveImages(address, 1)) {
+		return {};
+	}
 	std::scoped_lock lock {m_lock};
 	Common::SmallVector<ImageId, 4> matches;
 	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
@@ -2380,9 +2428,12 @@ bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size)
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
-	// Images register their pages before they are tracked, so a write to an uncovered page has
-	// nothing to invalidate and does not need the cache lock.
-	if (!MayCoverImages(address, size)) return;
+	// Images register their pages before they are tracked, so CPU writes to pages without one
+	// have nothing to invalidate. Most write faults land there and need not wait for the lock.
+	if (!MayHaveImages(address, size)) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("TextureCache::InvalidateMemory");
 	std::scoped_lock lock {m_lock};
 	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
 	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);

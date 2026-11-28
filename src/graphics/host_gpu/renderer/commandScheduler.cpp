@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/perfSummary.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
 #include "graphics/host_gpu/renderer/recorder.h"
@@ -343,6 +344,7 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Flush");
 	Submit(submit);
 	BeginNext();
 }
@@ -362,6 +364,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Wait");
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
