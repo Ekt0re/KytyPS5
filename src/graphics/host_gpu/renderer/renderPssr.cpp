@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_pssr_linear_spv.h"
 #include "graphics/guest_gpu/pssr.h"
@@ -99,18 +100,44 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		        descriptor.Type() == Prospero::ImageType::kColor2DArray) &&
 		       descriptor.TileMode() != Prospero::TileMode::kDepth;
 	};
-	EXIT_IF(!is_2d(input_descriptor) || !is_2d(output_descriptor) ||
-	        !Pssr::IsColorFormat(input_descriptor.Format()) ||
-	        output_descriptor.Format() != Prospero::BufferFormat::k11_11_10Float ||
-	        output_descriptor.TileMode() != Prospero::TileMode::kStandard256B ||
-	        output_descriptor.BaseLevel() != 0 || output_descriptor.LastLevel() != 0 ||
-	        output_descriptor.MaxMip() != 0 || output_descriptor.BaseArray5() != 0 ||
-	        output_descriptor.Depth() != 0 || request.width == 0 || request.height == 0);
+	// R_PSSR packets can arrive without libPsml's validation; an unsupported request skips
+	// the pass rather than killing the emulator.
+	const auto reject = [&]() {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			LOGF("PSSR: skipping unsupported request (input type=%u format=%u tile=%u "
+			     "base=%u last=%u mip=%u array=%u depth=%u; output type=%u format=%u "
+			     "tile=%u base=%u last=%u mip=%u array=%u depth=%u; %ux%u)\n",
+			     uint32_t(input_descriptor.Type()), uint32_t(input_descriptor.Format()),
+			     uint32_t(input_descriptor.TileMode()), uint32_t(input_descriptor.BaseLevel()),
+			     uint32_t(input_descriptor.LastLevel()), uint32_t(input_descriptor.MaxMip()),
+			     uint32_t(input_descriptor.BaseArray5()), uint32_t(input_descriptor.Depth()),
+			     uint32_t(output_descriptor.Type()), uint32_t(output_descriptor.Format()),
+			     uint32_t(output_descriptor.TileMode()), uint32_t(output_descriptor.BaseLevel()),
+			     uint32_t(output_descriptor.LastLevel()), uint32_t(output_descriptor.MaxMip()),
+			     uint32_t(output_descriptor.BaseArray5()), uint32_t(output_descriptor.Depth()),
+			     request.width, request.height);
+		}
+	};
+	if (!is_2d(input_descriptor) || !is_2d(output_descriptor) ||
+	    !Pssr::IsColorFormat(input_descriptor.Format()) ||
+	    output_descriptor.Format() != Prospero::BufferFormat::k11_11_10Float ||
+	    output_descriptor.TileMode() != Prospero::TileMode::kStandard256B ||
+	    output_descriptor.BaseLevel() != 0 || output_descriptor.LastLevel() != 0 ||
+	    output_descriptor.MaxMip() != 0 || output_descriptor.BaseArray5() != 0 ||
+	    output_descriptor.Depth() != 0 || request.width == 0 || request.height == 0) {
+		reject();
+		return;
+	}
 	const auto input_width = std::max(1u, (input_descriptor.Width5() + 1u) >>
 	                                         input_descriptor.BaseLevel());
 	const auto input_height = std::max(1u, (input_descriptor.Height5() + 1u) >>
 	                                          input_descriptor.BaseLevel());
-	EXIT_IF(request.width > input_width || request.height > input_height);
+	if (request.width > input_width || request.height > input_height) {
+		reject();
+		return;
+	}
 	PssrParameters parameters {{request.width, request.height},
 	                           {output_descriptor.Width5() + 1u, output_descriptor.Height5() + 1u},
 	                           {4, 4, 4, 4}};
