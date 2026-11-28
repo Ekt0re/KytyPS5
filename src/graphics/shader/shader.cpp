@@ -71,10 +71,10 @@ static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size,
 	const auto* footer = binary + (size - FooterSize) / 4;
 	const auto  end    = Common::AlignUp(uint64_t {footer[5]}, 16) + footer[6];
 	if (std::memcmp(footer, "barefoot", 8) != 0 || footer[4] != 1 || footer[5] == 0 ||
-	    end % 4 != 0 || end > size - FooterSize) {
+	    footer[5] % sizeof(uint32_t) != 0 || end % 4 != 0 || end > size - FooterSize) {
 		return size;
 	}
-	*instruction_bytes = static_cast<uint32_t>(Common::AlignUp(uint64_t {footer[5]}, 16));
+	*instruction_bytes = footer[5];
 	return static_cast<uint32_t>(end);
 }
 
