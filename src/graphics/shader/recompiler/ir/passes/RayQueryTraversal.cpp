@@ -940,17 +940,225 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 	                           [&](const auto& commit) { return copied(commit.second); });
 }
 
-void Rewrite(Program& program, Traversal& t) {
+// PPSA38500 (GTA VI): one loop walks the TLAS and the BLASes off a per-lane stack. It carries the
+// low and high words of the current BVH header >> 3, starting as the TLAS header's, and a node: a
+// box pushes its hit children; a TLAS leaf node >> 3 is the instance slot, whose record (format
+// 10: BLAS >> 3 at +48 under flags from bit 54, mask in bits 24..31 of +60) moves the walk into
+// the BLAS; a BLAS leaf is an 8-byte prim record {triangle node, data} at header + (node & ~7),
+// and the next iteration intersects the triangle, whose test reads the record's data, the
+// instance flags and, from the instance array at slot << 7, the instance's geometry. Under the
+// query, every iteration runs that triangle test on a candidate instead.
+struct StackWalk: Traversal {
+	Inst*                node      = nullptr;
+	Inst*                base_low  = nullptr; // Header >> 3.
+	Inst*                base_high = nullptr;
+	Inst*                data      = nullptr; // Prim record word 1.
+	Inst*                slot      = nullptr; // Instance slot, if the walk keeps it.
+	Inst*                flags     = nullptr; // Instance flags (+52 >> 22).
+	const Inst*          pc        = nullptr; // A prim record load, for new loads' pc.
+	std::array<Value, 2> tlas_header {};      // The TLAS header address.
+};
+
+// Phis of the header, other than `skip`, whose back edge can carry a value `match` accepts.
+template <typename Match>
+std::vector<Inst*> CarriedPhis(const Loop& t, const Inst* skip, Match&& match) {
+	std::vector<Inst*> carriers;
+	for (auto& inst: *t.header) {
+		if (inst.GetOpcode() != ValueOpcode::Phi || inst.GetType() != Type::U32 || &inst == skip) {
+			continue;
+		}
+		std::unordered_set<const Inst*> values;
+		Collect(Back(t, inst), t.header, values);
+		if (std::ranges::any_of(values, match)) carriers.push_back(&inst);
+	}
+	return carriers;
+}
+
+bool MatchStackWalk(const Program& program, Inst& bvh, StackWalk& t) {
+	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
+	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
+	if (descriptor == nullptr || address == nullptr || bvh.Flags<uint32_t>() != 2u ||
+	    !MatchLoop(program, bvh, address->Arg(2), t)) {
+		return false;
+	}
+	for (uint32_t word = 0; word < 4; ++word) {
+		if (Immediate(descriptor->Arg(word)) != TraversalDescriptor[word]) return false;
+	}
+	for (uint32_t arg = 2; arg < 9; ++arg) {
+		const auto* ray = HeaderPhi(t, address->Arg(arg));
+		if (ray == nullptr) return false;
+		t.ray[(arg + 4) % 7] = Entry(t, *ray);
+	}
+
+	// The node address is node + header >> 3, its high word the carry into the header's.
+	const auto  exec  = Value(t.exec);
+	const auto  lanes = Entry(t, *t.exec);
+	const auto* sum   = Producer(ResolveActiveU32(address->Arg(0), exec), ValueOpcode::IAdd32);
+	if (sum == nullptr) return false;
+	// The header phi starts as the TLAS header >> 3, read from the flattened SRT.
+	const Inst* low   = nullptr;
+	const Inst* shift = nullptr;
+	const Inst* base  = nullptr;
+	for (uint32_t arg = 0; arg < 2 && base == nullptr; ++arg) {
+		auto* node   = HeaderPhi(t, sum->Arg(1 - arg));
+		auto* header = HeaderPhi(t, sum->Arg(arg));
+		low          = header != nullptr ? Producer(ResolveActiveU32(Entry(t, *header), lanes),
+		                                            ValueOpcode::CompositeExtractU64)
+		                                 : nullptr;
+		shift = low != nullptr ? Producer(low->Arg(0), ValueOpcode::ShiftRightLogical64) : nullptr;
+		base  = shift != nullptr ? Producer(shift->Arg(0), ValueOpcode::CompositeConstructU64)
+		                         : nullptr;
+		if (node == nullptr || base == nullptr || Immediate(low->Arg(1)) != 0u ||
+		    Immediate(shift->Arg(1)) != 3u) {
+			base = nullptr;
+			continue;
+		}
+		t.node     = node;
+		t.base_low = header;
+	}
+	if (base == nullptr) return false;
+	for (uint32_t word = 0; word < 2; ++word) {
+		const auto value = ResolveActiveU32(base->Arg(word), lanes);
+		const auto slot  = Slot(value);
+		if (!slot) return false;
+		t.tlas[word]   = *slot;
+		t.tlas_header[word] = value;
+	}
+	const auto* carry = Producer(ResolveActiveU32(address->Arg(1), exec), ValueOpcode::IAdd32);
+	for (uint32_t arg = 0; carry != nullptr && arg < 2 && t.base_high == nullptr; ++arg) {
+		auto*       phi  = HeaderPhi(t, carry->Arg(arg));
+		const auto* high = phi != nullptr ? Producer(ResolveActiveU32(Entry(t, *phi), lanes),
+		                                             ValueOpcode::CompositeExtractU64)
+		                                  : nullptr;
+		if (high != nullptr && high->Arg(0) == low->Arg(0) && Immediate(high->Arg(1)) == 1u) {
+			t.base_high = phi;
+		}
+	}
+	if (t.base_high == nullptr) return false;
+
+	// The node takes word 0 of a prim record whose word 1 a phi carries.
+	const auto offset_of = [&](const Inst& load) {
+		return program.memory_info[load.Flags<MemoryFlags>().index].offset;
+	};
+	const auto record_load = [&](const Inst* inst) {
+		return inst->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+		       Producer(inst->Arg(0), ValueOpcode::GetAddressResource) != nullptr &&
+		       Inside(t, inst->Parent());
+	};
+	std::unordered_set<const Inst*> nodes;
+	Collect(Back(t, *t.node), t.header, nodes);
+	const Inst* word0 = nullptr;
+	for (const auto* inst: nodes) {
+		if (!record_load(inst) || offset_of(*inst) != 0u) continue;
+		if (word0 != nullptr) return false;
+		word0 = inst;
+	}
+	if (word0 == nullptr) return false;
+	const auto data = CarriedPhis(t, t.node, [&](const Inst* inst) {
+		return record_load(inst) && inst->Arg(0) == word0->Arg(0) && inst->Arg(1) == word0->Arg(1) &&
+		       offset_of(*inst) == 4u;
+	});
+	if (data.size() != 1) return false;
+	t.data = data[0];
+	t.pc   = word0;
+
+	// The instance flags: a phi of +52 >> 22.
+	const auto flags = CarriedPhis(t, t.node, [](const Inst* inst) {
+		return inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 && Immediate(inst->Arg(1)) == 22u;
+	});
+	if (flags.size() != 1) return false;
+	t.flags = flags[0];
+
+	// A TLAS leaf loads its instance record, whose word 15 the mask test reads: (word & mask << 24)
+	// != 0. The slot phi, if the walk keeps one, takes the record index, node >> 3.
+	const auto kept = [](Value value) {
+		for (uint32_t depth = 0; depth < 8; ++depth) {
+			const auto* select = Producer(value, ValueOpcode::SelectU32);
+			if (select == nullptr) break;
+			value = select->Arg(1);
+		}
+		return value;
+	};
+	std::optional<uint32_t> mask;
+	const Inst*             record = nullptr;
+	const auto note = [&](uint32_t bits, const Inst* load) {
+		if ((mask && *mask != bits) || (record != nullptr && record != load)) return false;
+		mask   = bits;
+		record = load;
+		return true;
+	};
+	const auto instance_word = [&](Value value) -> const Inst* {
+		const auto* word = Producer(kept(value), ValueOpcode::CompositeExtractU32x4);
+		return word != nullptr && Immediate(word->Arg(1)) == 3u
+		           ? Producer(word->Arg(0), ValueOpcode::LoadBufferU32x4)
+		           : nullptr;
+	};
+	for (const auto* block: t.loop) {
+		for (const auto& inst: *block) {
+			// Any mask bit: 0x00ffffff < word.
+			if (inst.GetOpcode() == ValueOpcode::UGreaterThanEqual32 &&
+			    Immediate(inst.Arg(0)) == 0x00ffffffu) {
+				if (const auto* load = instance_word(inst.Arg(1)); load != nullptr && !note(0xffu, load)) {
+					return false;
+				}
+				continue;
+			}
+			if (inst.GetOpcode() != ValueOpcode::INotEqual32) continue;
+			for (uint32_t arg = 0; arg < 2; ++arg) {
+				const auto* bits = Immediate(inst.Arg(1 - arg)) == 0u
+				                       ? Producer(inst.Arg(arg), ValueOpcode::BitwiseAnd32)
+				                       : nullptr;
+				for (uint32_t side = 0; bits != nullptr && side < 2; ++side) {
+					const auto  value = Immediate(bits->Arg(side));
+					const auto* word  = Producer(kept(bits->Arg(1 - side)),
+					                             ValueOpcode::CompositeExtractU32x4);
+					const auto* load  = word != nullptr
+					                        ? Producer(word->Arg(0), ValueOpcode::LoadBufferU32x4)
+					                        : nullptr;
+					if (!value || *value == 0u || (*value & 0x00ffffffu) != 0u || load == nullptr ||
+					    Immediate(word->Arg(1)) != 3u) {
+						continue;
+					}
+					if ((mask && *mask != *value >> 24) || (record != nullptr && record != load)) {
+						return false;
+					}
+					mask   = *value >> 24;
+					record = load;
+				}
+			}
+		}
+	}
+	if (!mask) return false;
+	t.cull_mask = *mask;
+	const auto* index_select = record->Arg(1).Resolve().TryInstruction();
+	const auto* index =
+	    ResolveActiveU32(record->Arg(1), record->Arg(record->NumArgs() - 1)).TryInstruction();
+	if (index == nullptr || index->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
+	    Immediate(index->Arg(1)) != 3u) {
+		return false;
+	}
+	const auto slots = CarriedPhis(t, t.node, [&](const Inst* inst) { return inst == index; });
+	for (auto* phi: slots) {
+		std::unordered_set<const Inst*> values;
+		Collect(Back(t, *phi), t.header, values);
+		if (index_select != index && values.contains(index_select)) continue;
+		if (t.slot != nullptr) return false;
+		t.slot = phi;
+	}
+	return true;
+}
+
+void Rewrite(Program& program, Traversal& t, uint32_t context) {
 	using Op = ValueOpcode;
 	// The preheader starts the query on the loop's lanes, which then run while it has candidates.
 	const Inserter entry {t.preheader, t.preheader->end()};
 	const auto     lanes   = Entry(t, *t.exec);
-	const auto     valid   = entry(Op::RayQueryValid, {});
+	const auto     valid   = entry(Op::RayQueryValid, {}, context);
 	const auto     invalid = entry(Op::LogicalNot, {valid});
 	const auto     start   = entry(Op::LogicalAnd, {valid, lanes});
 	entry(Op::RayQueryInitialize, {t.ray[0], t.ray[1], t.ray[2], t.ray[3], t.ray[4], t.ray[5],
-	                               t.ray[6], Value(t.cull_mask), start});
-	const auto entering = entry(Op::SelectU1, {valid, entry(Op::RayQueryProceed, {start}), lanes});
+	                               t.ray[6], Value(t.cull_mask), start}, context);
+	const auto entering = entry(Op::SelectU1, {valid, entry(Op::RayQueryProceed, {start}, context), lanes});
 	for (auto* lane: t.lanes) {
 		lane->SetArg(Incoming(*lane, t.preheader), entering);
 	}
@@ -961,8 +1169,8 @@ void Rewrite(Program& program, Traversal& t) {
 		                   return inst.GetOpcode() != Op::Phi;
 	                   })};
 	const auto     current   = at(Op::LogicalAnd, {valid, Value(t.exec)});
-	const auto     candidate = at(Op::RayQueryCandidate, {current});
-	const auto     instance  = at(Op::RayQueryCandidateInstance, {current});
+	const auto     candidate = at(Op::RayQueryCandidate, {current}, context);
+	const auto     instance  = at(Op::RayQueryCandidateInstance, {current}, context);
 	const auto     part      = [&](Op op, Value value, uint32_t index) {
 		return at(op, {value, Value(index)});
 	};
@@ -1048,9 +1256,9 @@ void Rewrite(Program& program, Traversal& t) {
 	// The latch commits a closer hit to the query and takes the next candidate.
 	const Inserter vote {t.vote->Parent(), Position(*t.vote)};
 	const auto     moved = vote(Op::INotEqual32, {Back(t, *t.extent), Value(t.extent)});
-	vote(Op::RayQueryConfirm, {vote(Op::LogicalAnd, {current, moved})});
+	vote(Op::RayQueryConfirm, {vote(Op::LogicalAnd, {current, moved})}, context);
 	const auto alive =
-	    vote(Op::SelectU1, {valid, vote(Op::RayQueryProceed, {current}), t.vote->Arg(0)});
+	    vote(Op::SelectU1, {valid, vote(Op::RayQueryProceed, {current}, context), t.vote->Arg(0)});
 	t.vote->SetArg(0, alive);
 	for (auto* lane: t.lanes) {
 		lane->SetArg(Incoming(*lane, t.latch), alive);
@@ -1059,13 +1267,13 @@ void Rewrite(Program& program, Traversal& t) {
 
 // Under the query, the walk skips its body: each iteration takes a lane's next candidate and runs
 // copies of the walk's instance and commit tests on it, and a lane leaves at the first it commits.
-void RewriteWalk(Program& program, Walk& w) {
+void RewriteWalk(Program& program, Walk& w, uint32_t context) {
 	using Op = ValueOpcode;
 	const Inserter entry {w.preheader, w.preheader->end()};
-	const auto     valid = entry(Op::RayQueryValid, {});
+	const auto     valid = entry(Op::RayQueryValid, {}, context);
 	const auto     start = entry(Op::LogicalAnd, {valid, w.lanes});
 	entry(Op::RayQueryInitialize, {w.ray[0], w.ray[1], w.ray[2], w.ray[3], w.ray[4], w.ray[5],
-	                               w.ray[6], CullMask(w, Value(w.accepted)), start});
+	                               w.ray[6], CullMask(w, Value(w.accepted)), start}, context);
 	const Inserter skip {w.skip->Parent(), Position(*w.skip)};
 	w.skip->SetArg(0, skip(Op::LogicalAnd, {w.skip->Arg(0), skip(Op::LogicalNot, {valid})}));
 	auto& alive = *w.header->PrependNewInst(w.header->begin(), Op::Phi);
@@ -1076,8 +1284,8 @@ void RewriteWalk(Program& program, Walk& w) {
 	const Inserter at {vote, std::ranges::find_if(*vote, [](const Inst& inst) {
 		                   return inst.GetOpcode() != Op::Phi;
 	                   })};
-	const auto     current   = at(Op::RayQueryProceed, {Value(&alive)});
-	const auto     candidate = at(Op::RayQueryCandidate, {current});
+	const auto     current   = at(Op::RayQueryProceed, {Value(&alive)}, context);
+	const auto     candidate = at(Op::RayQueryCandidate, {current}, context);
 	const auto     with      = [&](Op op, Value value, uint32_t immediate) {
 		return at(op, {value, Value(immediate)});
 	};
@@ -1096,7 +1304,7 @@ void RewriteWalk(Program& program, Walk& w) {
 		          std::bit_cast<uint64_t>(flags));
 	};
 	const auto u64 = [&](Value low) { return at(Op::CompositeConstructU64, {low, Value(0u)}); };
-	const auto instance = halves(at(Op::RayQueryCandidateInstance, {current}));
+	const auto instance = halves(at(Op::RayQueryCandidateInstance, {current}, context));
 	const auto blas     = at(Op::CompositeConstructU64,
 	                         {load(instance, InstanceBlas), load(instance, InstanceBlas + 4)});
 	const auto record =
@@ -1115,7 +1323,7 @@ void RewriteWalk(Program& program, Walk& w) {
 	const auto odd =
 	    with(Op::INotEqual32,
 		     with(Op::BitwiseAnd32, at(Op::ShiftRightLogical32, {Value(OddRemaps), order}), 1), 0);
-	const auto faces = at(Op::LogicalXor, {at(Op::RayQueryCandidateFrontFace, {current}), odd});
+	const auto faces = at(Op::LogicalXor, {at(Op::RayQueryCandidateFrontFace, {current}, context), odd});
 	const auto t     = with(Op::CompositeExtractU32x4, candidate, 0);
 	const std::array<Value, None> natives {
 	    current,
@@ -1145,6 +1353,115 @@ void RewriteWalk(Program& program, Walk& w) {
 	w.leave->SetArg(0, leave(Op::SelectU1, {valid, leave(Op::LogicalNot, {any}), w.leave->Arg(0)}));
 }
 
+
+// Under the query, each iteration intersects nothing: the node, BVH header, prim record data and
+// instance slot and flags are the candidate's, and the intersection its triangle hit, so the
+// walk's triangle test runs on it. The latch commits a hit that moved t_max and takes the next.
+void RewriteStackWalk(Program& program, StackWalk& t, uint32_t context) {
+	using Op = ValueOpcode;
+	const Inserter entry {t.preheader, t.preheader->end()};
+	const auto     lanes   = Entry(t, *t.exec);
+	const auto     valid   = entry(Op::RayQueryValid, {}, context);
+	const auto     invalid = entry(Op::LogicalNot, {valid});
+	const auto     start   = entry(Op::LogicalAnd, {valid, lanes});
+	entry(Op::RayQueryInitialize, {t.ray[0], t.ray[1], t.ray[2], t.ray[3], t.ray[4], t.ray[5],
+	                               t.ray[6], Value(t.cull_mask), start}, context);
+	const auto entering = entry(Op::SelectU1, {valid, entry(Op::RayQueryProceed, {start}, context), lanes});
+	for (auto* lane: t.lanes) {
+		lane->SetArg(Incoming(*lane, t.preheader), entering);
+	}
+
+	auto*          body = t.header->terminator.true_block;
+	const Inserter at {body, std::ranges::find_if(*body, [](const Inst& inst) {
+		                   return inst.GetOpcode() != Op::Phi;
+	                   })};
+	const auto     current   = at(Op::LogicalAnd, {valid, Value(t.exec)});
+	const auto     candidate = at(Op::RayQueryCandidate, {current}, context);
+	const auto     with      = [&](Op op, Value value, uint32_t immediate) {
+		return at(op, {value, Value(immediate)});
+	};
+	const auto halves = [&](Value address) {
+		return std::array {with(Op::CompositeExtractU64, address, 0),
+		                   with(Op::CompositeExtractU64, address, 1)};
+	};
+	const auto load = [&](const std::array<Value, 2>& address, uint32_t offset) {
+		const MemoryFlags flags {.index = static_cast<uint32_t>(program.memory_info.size()),
+		                         .pc    = t.pc->Flags<MemoryFlags>().pc};
+		program.memory_info.push_back(
+		    {.kind = ResourceKind::Global, .offset = offset, .address_is_full = true});
+		const auto& [low, high] = address;
+		return at(Op::LoadAddressU32, {at(Op::GetAddressResource, {low, high}), low, high, current},
+		          std::bit_cast<uint64_t>(flags));
+	};
+	const auto u64      = [&](Value low) { return at(Op::CompositeConstructU64, {low, Value(0u)}); };
+	const auto instance = halves(at(Op::RayQueryCandidateInstance, {current}, context));
+	const auto header   = load(instance, 48);
+	const auto upper    = load(instance, 52);
+	const auto high     = with(Op::BitwiseAnd32, upper, 0x003fffffu);
+	const auto blas =
+	    with(Op::ShiftLeftLogical64, at(Op::CompositeConstructU64, {header, high}), 3);
+	const auto record = halves(at(
+	    Op::IAdd64, {blas, with(Op::ShiftLeftLogical64,
+	                             u64(with(Op::CompositeExtractU32x4, candidate, 3)), 3)}));
+	const auto triangle = load(record, 0);
+	// The guest's numerators and denominator have the sign of its facing, in the node's vertex
+	// order, which the mirror reverses for odd remaps of a triangle's barycentric vertices.
+	const auto vertices = halves(at(
+	    Op::IAdd64,
+	    {blas, with(Op::ShiftLeftLogical64, u64(with(Op::ShiftRightLogical32, triangle, 3)), 6)}));
+	const auto shift = with(Op::ShiftLeftLogical32, with(Op::BitwiseAnd32, triangle, 7), 3);
+	const auto order =
+	    with(Op::BitwiseAnd32, at(Op::ShiftRightLogical32, {load(vertices, 60), shift}), 0xf);
+	const auto odd =
+	    with(Op::INotEqual32,
+	         with(Op::BitwiseAnd32, at(Op::ShiftRightLogical32, {Value(OddRemaps), order}), 1), 0);
+	const auto faces = at(Op::LogicalXor, {at(Op::RayQueryCandidateFrontFace, {current}, context), odd});
+	const auto sign  = at(Op::SelectU32, {faces, Value(0u), Value(0x80000000u)});
+	const auto signed_part = [&](uint32_t index) {
+		return at(Op::BitwiseOr32, {with(Op::CompositeExtractU32x4, candidate, index), sign});
+	};
+	const std::array result {signed_part(0),
+	                         at(Op::SelectU32, {faces, Value(One), Value(0xbf800000u)}),
+	                         signed_part(1), signed_part(2)};
+
+	const auto choose = [&](Inst& phi, Value native) {
+		const auto chosen = at(Op::SelectU32, {current, native, Value(&phi)});
+		Redirect(phi, chosen, *chosen.Instruction());
+	};
+	choose(*t.node, triangle);
+	choose(*t.base_low, header);
+	choose(*t.base_high, high);
+	choose(*t.data, load(record, 4));
+	choose(*t.flags, with(Op::ShiftRightLogical32, upper, 22));
+	if (t.slot != nullptr) {
+		// The mirror's instances are the TLAS header's format 10 array, at the header's +0x30.
+		const auto array = at(Op::IAdd32, {t.tlas_header[0], load(t.tlas_header, 0x30)});
+		choose(*t.slot, with(Op::ShiftRightLogical32, at(Op::ISub32, {instance[0], array}), 7));
+	}
+
+	// The intersection runs only without the query.
+	const Inserter intersect {t.bvh->Parent(), Position(*t.bvh)};
+	t.bvh->SetArg(2, intersect(Op::LogicalAnd, {Value(t.exec), invalid}));
+	const auto uses = t.bvh->Uses();
+	for (const auto& use: uses) {
+		auto&          extract = *use.user;
+		const Inserter after {extract.Parent(), std::next(Position(extract))};
+		const auto     chosen =
+		    after(Op::SelectU32, {valid, result[extract.Arg(1).U32()], Value(&extract)});
+		Redirect(extract, chosen, *chosen.Instruction());
+	}
+
+	const Inserter vote {t.vote->Parent(), Position(*t.vote)};
+	const auto     moved = vote(Op::INotEqual32, {Back(t, *t.extent), Value(t.extent)});
+	vote(Op::RayQueryConfirm, {vote(Op::LogicalAnd, {current, moved})}, context);
+	const auto alive =
+	    vote(Op::SelectU1, {valid, vote(Op::RayQueryProceed, {current}, context), t.vote->Arg(0)});
+	t.vote->SetArg(0, alive);
+	for (auto* lane: t.lanes) {
+		lane->SetArg(Incoming(*lane, t.latch), alive);
+	}
+}
+
 } // namespace
 
 uint32_t TraceTraversalsWithRayQueries(Program& program) {
@@ -1163,10 +1480,22 @@ uint32_t TraceTraversalsWithRayQueries(Program& program) {
 		const bool  matched = nested ? MatchNested(program, *bvh, intersections, traversal)
 		                             : Match(program, *bvh, traversal);
 		const bool  walked  = !matched && nested && MatchWalk(program, *bvh, intersections, walk);
-		const auto& tlas    = walked ? walk.tlas : traversal.tlas;
-		if ((matched || walked) && (traced == 0 || tlas == program.info.ray_query_tlas)) {
-			walked ? RewriteWalk(program, walk) : Rewrite(program, traversal);
-			program.info.ray_query_tlas = tlas;
+		StackWalk   stack;
+		const bool  stacked = !matched && !walked && !nested && MatchStackWalk(program, *bvh, stack);
+		const auto& tlas    = stacked ? stack.tlas : walked ? walk.tlas : traversal.tlas;
+		if (matched || walked || stacked) {
+			// Each TLAS the shader traces gets a query context of its own.
+			auto&      tlases  = program.info.ray_query_tlases;
+			const auto found   = std::ranges::find(tlases, tlas);
+			const auto context = static_cast<uint32_t>(found - tlases.begin());
+			if (found == tlases.end()) tlases.push_back(tlas);
+			if (stacked) {
+				RewriteStackWalk(program, stack, context);
+			} else if (walked) {
+				RewriteWalk(program, walk, context);
+			} else {
+				Rewrite(program, traversal, context);
+			}
 			++traced;
 		} else if (EnclosingLoop(program, bvh->Parent()) != nullptr) {
 			Log::WriteToConsoleAndLog(

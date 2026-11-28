@@ -36,8 +36,8 @@ public:
 	// call made while every readback area is in flight waits for one if none holds its TLAS, and
 	// otherwise reads nothing back. Instance i has custom index i and SBT offset equal to the first
 	// prim record of its range, so a hit's record is that plus the primitive. The context and the
-	// mirrors serve the commands recorded before the next call. The guest page table must be
-	// synchronized first (PrepareBda).
+	// mirrors serve the commands recorded before the next call; the context, those recorded before
+	// the 16th call after it. The guest page table must be synchronized first (PrepareBda).
 	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas);
 
 	// Called at each suspend point. Every EvictFrames of them, the mirrors no call used since the
@@ -45,10 +45,15 @@ public:
 	// and BLASes left without pairs. A BVH used again gets its mirror a few readbacks later.
 	void RunGarbageCollector();
 
+	// At each guest flip. The first call over a TLAS after one mirrors it; later calls before the
+	// next take that call's context: the guest refits its BVHs once a frame.
+	void NoteFlip() noexcept { ++m_flip; }
+
 private:
 	friend struct RayTracingTestAccess;
 
 	static constexpr uint32_t Areas       = 8;
+	static constexpr uint32_t Contexts    = 16;
 	static constexpr uint32_t EvictFrames = 64;
 
 	struct Structure {
@@ -124,8 +129,10 @@ private:
 	void Create(Structure& structure, const vk::AccelerationStructureGeometryKHR& geometry,
 	            vk::AccelerationStructureTypeKHR type, vk::BuildAccelerationStructureFlagsKHR flags,
 	            uint32_t capacity);
+	// A buffer of at least `size` bytes; one that grows takes the next power of two unless `exact`
+	// (acceleration structures and triangle buffers, which keep their size, and there are thousands).
 	void Reserve(std::unique_ptr<Buffer>& buffer, vk::BufferUsageFlags usage, uint64_t size,
-	             MemoryUsage memory = MemoryUsage::DeviceLocal);
+	             MemoryUsage memory = MemoryUsage::DeviceLocal, bool exact = false);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -144,6 +151,17 @@ private:
 	std::vector<std::array<uint32_t, 4>>              m_keys; // {BLAS low, high, root, pair}.
 	std::map<uint64_t, Tlas>                          m_tlases;
 	std::unique_ptr<Buffer>                           m_state;
+	// Copies of the context each call returns: a dispatch tracing several TLASes reads one per
+	// call, and the next call rewrites m_state. A TLAS keeps a slot of its own while there are
+	// free ones; the rest share the slots after them in turn.
+	std::unique_ptr<Buffer>                           m_contexts;
+	uint32_t                                          m_next_context = 0;
+	struct Prepared {
+		uint64_t flip = 0;
+		uint32_t slot = 0;
+	};
+	std::map<uint64_t, Prepared>                      m_prepared; // By TLAS header.
+	uint64_t                                          m_flip = 1;
 	std::unique_ptr<Buffer>                           m_scratch;
 	std::array<Area, Areas>                           m_areas;
 	uint32_t                                          m_next_area = 0;

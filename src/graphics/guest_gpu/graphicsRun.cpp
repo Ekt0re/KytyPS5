@@ -1558,6 +1558,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	}
 	NoteGuestSync();
 	m_renderer.GetOcclusionQueries().Publish();
+	if (auto* ray_tracing = m_renderer.GetRayTracing(); ray_tracing != nullptr) {
+		ray_tracing->NoteFlip();
+	}
 
 	auto& command = CurrentBuffer();
 	auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);

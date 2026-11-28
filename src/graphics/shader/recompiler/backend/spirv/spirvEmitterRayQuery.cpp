@@ -16,9 +16,10 @@ uint32_t RayQuery(EmitterState& s) {
 	return variable;
 }
 
-// The context address the host writes into shader data; 0 when the dispatch has no context.
-uint32_t ContextAddress(EmitterState& s) {
-	const auto dword = s.program.bindings.ray_query_dword;
+// The address of query context `index` (the instruction's flags) the host writes into shader data;
+// 0 when the dispatch has no context.
+uint32_t ContextAddress(EmitterState& s, const IR::Inst& inst) {
+	const auto dword = s.program.bindings.ray_query_dword + 2u * inst.Flags<uint32_t>();
 	return PackU64(s, EmitShaderDataDwordLoad(s, dword), EmitShaderDataDwordLoad(s, dword + 1));
 }
 
@@ -37,7 +38,7 @@ uint32_t LoadContext(EmitterState& s, uint32_t address, uint32_t offset, uint32_
 
 uint32_t EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      s       = ctx.state;
-	const auto address = ContextAddress(s);
+	const auto address = ContextAddress(s, inst);
 	const auto present = Binary(s, spv::OpINotEqual, TypeBool(s), address, ConstantU64(s, 0));
 	return EmitValueOrDefaultIfCondition(s, present, TypeBool(s), ConstantBool(s, false), [&] {
 		return Binary(s, spv::OpINotEqual, TypeBool(s), LoadContext(s, address, 0, TypeU32(s), 4),
@@ -48,8 +49,8 @@ uint32_t EmitRayQueryValid(ValueEmitContext& ctx, const IR::Inst& inst) {
 // Ported from batatinhafcbatatinha-pixel/KytyPS5 658e8d1bc (GPL-2.0).
 // Whether the dispatch has a context: the queries of both lane halves are started and advanced
 // under this uniform condition only, so their traversals can be in flight together.
-uint32_t ContextPresent(EmitterState& s) {
-	return Binary(s, spv::OpINotEqual, TypeBool(s), ContextAddress(s), ConstantU64(s, 0));
+uint32_t ContextPresent(EmitterState& s, const IR::Inst& inst) {
+	return Binary(s, spv::OpINotEqual, TypeBool(s), ContextAddress(s, inst), ConstantU64(s, 0));
 }
 
 // Only a finite ray with a nonnegative t_max is traced: any other starts a query that culls every
@@ -57,7 +58,7 @@ uint32_t ContextPresent(EmitterState& s) {
 // query too, so that every lane can advance its query without a branch of its own.
 void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
-	EmitIfCondition(s, ContextPresent(s), [&] {
+	EmitIfCondition(s, ContextPresent(s, inst), [&] {
 		const auto              f = TypeF32(s), b = TypeBool(s), zero = ConstantF32Value(s, 0.0f);
 		std::array<uint32_t, 7> ray {};
 		for (uint32_t i = 0; i < ray.size(); ++i) {
@@ -81,7 +82,7 @@ void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
 		};
 		const auto structure = Unary(s, spv::OpConvertUToAccelerationStructureKHR,
 		                             s.builder.Type(spv::OpTypeAccelerationStructureKHR),
-		                             LoadContext(s, ContextAddress(s), 16, TypeU64(s), 8));
+		                             LoadContext(s, ContextAddress(s, inst), 16, TypeU64(s), 8));
 		s.builder.AddFunction(spv::OpRayQueryInitializeKHR, RayQuery(s), structure,
 		                      ConstantU32(s, 0),
 		                      Select(s, TypeU32(s), traced, ctx.Arg(inst, 7), ConstantU32(s, 0)),
@@ -94,7 +95,7 @@ void EmitRayQueryInitialize(ValueEmitContext& ctx, const IR::Inst& inst) {
 uint32_t EmitRayQueryProceed(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      s         = ctx.state;
 	const auto proceeded = EmitValueOrDefaultIfCondition(
-	    s, ContextPresent(s), TypeBool(s), ConstantBool(s, false),
+	    s, ContextPresent(s, inst), TypeBool(s), ConstantBool(s, false),
 	    [&] { return Unary(s, spv::OpRayQueryProceedKHR, TypeBool(s), RayQuery(s)); });
 	return Binary(s, spv::OpLogicalAnd, TypeBool(s), ctx.Arg(inst, 0), proceeded);
 }
@@ -137,7 +138,7 @@ uint32_t EmitRayQueryCandidateInstance(ValueEmitContext& ctx, const IR::Inst& in
 		const auto offset = Binary(s, spv::OpShiftLeftLogical, TypeU64(s),
 		                           Unary(s, spv::OpUConvert, TypeU64(s), index), ConstantU32(s, 7));
 		return Binary(s, spv::OpIAdd, TypeU64(s),
-		              LoadContext(s, ContextAddress(s), 24, TypeU64(s), 8), offset);
+		              LoadContext(s, ContextAddress(s, inst), 24, TypeU64(s), 8), offset);
 	});
 }
 

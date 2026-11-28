@@ -30,6 +30,7 @@ constexpr uint32_t RootLink     = 4u << 3 | 4u;
 constexpr uint32_t StateAbsent  = 1; // The job met a page no buffer backs.
 constexpr uint32_t GroupSize    = 64;
 constexpr uint64_t TriangleSize = 36;
+constexpr uint64_t BatchScratch = 128ull << 20;
 
 constexpr auto BuildInput = vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR;
 constexpr auto BlasFlags  = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace |
@@ -215,14 +216,14 @@ RayTracing::~RayTracing() {
 }
 
 void RayTracing::Reserve(std::unique_ptr<Buffer>& buffer, vk::BufferUsageFlags usage, uint64_t size,
-                         MemoryUsage memory) {
+                         MemoryUsage memory, bool exact) {
 	if (buffer && buffer->Size() >= size) {
 		return;
 	}
 	Retire(buffer);
 	buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, memory, 0,
 	                                  usage | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-	                                  std::bit_ceil(size));
+	                                  exact ? size : std::bit_ceil(size));
 }
 
 void RayTracing::Create(Structure& structure, const vk::AccelerationStructureGeometryKHR& geometry,
@@ -238,7 +239,7 @@ void RayTracing::Create(Structure& structure, const vk::AccelerationStructureGeo
 	m_graphics.device.getAccelerationStructureBuildSizesKHR(
 	    vk::AccelerationStructureBuildTypeKHR::eDevice, &info, &capacity, &sizes);
 	Reserve(structure.buffer, vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR,
-	        sizes.accelerationStructureSize);
+	        sizes.accelerationStructureSize, MemoryUsage::DeviceLocal, true);
 	vk::AccelerationStructureCreateInfoKHR create {};
 	create.buffer = structure.buffer->Handle();
 	create.size   = sizes.accelerationStructureSize;
@@ -392,6 +393,10 @@ void RayTracing::Apply(Area& area) {
 }
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
+	if (const auto found = m_prepared.find(tlas);
+	    found != m_prepared.end() && found->second.flip == m_flip && m_contexts != nullptr) {
+		return m_contexts->BufferDeviceAddress() + sizeof(Context) * found->second.slot;
+	}
 	Collect();
 	// A TLAS with no readback in flight waits for an area, so calls over other TLASes cannot take
 	// every area from it.
@@ -426,7 +431,7 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 		auto&      blas    = m_blases[index];
 		const auto records = blas.end - blas.begin;
 		if (records > blas.capacity) {
-			Reserve(blas.triangles, BuildInput, TriangleSize * records);
+			Reserve(blas.triangles, BuildInput, TriangleSize * records, MemoryUsage::DeviceLocal, true);
 			blas.capacity = static_cast<uint32_t>(blas.triangles->Size() / TriangleSize);
 		}
 		blases[index] = {blas.address, 0, blas.capacity};
@@ -448,7 +453,11 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_pointers;
 	geometries.reserve(m_pairs.size());
 	ranges.reserve(m_pairs.size());
-	uint64_t                             scratch_size = 0;
+	// BLAS builds go in batches whose scratch ranges are disjoint; a batch takes at most
+	// BatchScratch bytes of it (or one build), and the next reuses it after a barrier.
+	uint64_t                             scratch_size  = 0;
+	uint64_t                             batch_scratch = 0;
+	std::vector<size_t>                  batch_starts {0};
 	std::vector<GpuPair>                 pairs(m_pairs.size());
 	std::vector<std::array<uint32_t, 2>> box_chunks;
 	area.walks.clear();
@@ -498,10 +507,16 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 			info.dstAccelerationStructure  = pair.structure.handle;
 			info.geometryCount             = 1;
 			info.pGeometries               = &geometries.back();
-			info.scratchData.deviceAddress = scratch_size;
-			scratch_size += Common::AlignUp(update ? pair.structure.update_scratch
-			                                       : pair.structure.build_scratch,
-			                                m_scratch_alignment);
+			const auto need = Common::AlignUp(
+			    update ? pair.structure.update_scratch : pair.structure.build_scratch,
+			    m_scratch_alignment);
+			if (batch_scratch != 0 && batch_scratch + need > BatchScratch) {
+				batch_starts.push_back(builds.size());
+				batch_scratch = 0;
+			}
+			info.scratchData.deviceAddress = batch_scratch;
+			batch_scratch += need;
+			scratch_size = std::max(scratch_size, batch_scratch);
 			builds.push_back(info);
 			ranges.push_back({pair.count, 0, 0, 0});
 			range_pointers.push_back(&ranges.back());
@@ -627,16 +642,22 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	Barrier(command);
 	dispatch(Instances, (top.instance_slots + GroupSize - 1) / GroupSize);
 
-	// BLAS builds in one call over disjoint scratch ranges, then the TLAS over the first.
+	// BLAS builds a batch per call over disjoint scratch ranges, then the TLAS over the first.
 	Reserve(m_scratch, vk::BufferUsageFlagBits::eStorageBuffer,
-	        std::max(scratch_size, top.structure.build_scratch) + m_scratch_alignment);
+	        std::max(scratch_size, top.structure.build_scratch) + m_scratch_alignment,
+	        MemoryUsage::DeviceLocal, true);
 	const auto scratch = Common::AlignUp(m_scratch->BufferDeviceAddress(), m_scratch_alignment);
 	for (auto& info: builds) {
 		info.scratchData.deviceAddress += scratch;
 	}
-	if (!builds.empty()) {
-		command.buildAccelerationStructuresKHR(static_cast<uint32_t>(builds.size()), builds.data(),
-		                                       range_pointers.data());
+	for (size_t batch = 0; batch < batch_starts.size() && !builds.empty(); ++batch) {
+		const auto first = batch_starts[batch];
+		const auto end   = batch + 1 < batch_starts.size() ? batch_starts[batch + 1] : builds.size();
+		if (batch != 0) {
+			Barrier(command);
+		}
+		command.buildAccelerationStructuresKHR(static_cast<uint32_t>(end - first),
+		                                       builds.data() + first, range_pointers.data() + first);
 	}
 	Barrier(command);
 
@@ -660,12 +681,31 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 		command.copyBuffer(m_state->Handle(), area.buffer->Handle(), 1, &copy);
 		Barrier(command);
 	}
+	// A slot is rewritten only after the barrier the call rewriting it records first.
+	Reserve(m_contexts, vk::BufferUsageFlagBits::eTransferDst, sizeof(Context) * Contexts);
+	constexpr uint32_t Owned = Contexts / 2;
+	uint32_t           slot  = 0;
+	if (const auto found = m_prepared.find(tlas); found != m_prepared.end()) {
+		slot = found->second.slot;
+		found->second.flip = m_flip;
+	} else if (m_prepared.size() < Owned) {
+		slot = static_cast<uint32_t>(m_prepared.size());
+		m_prepared[tlas] = {m_flip, slot};
+	} else {
+		slot           = Owned + m_next_context;
+		m_next_context = (m_next_context + 1) % (Contexts - Owned);
+	}
+	const auto           context = sizeof(Context) * slot;
+	const vk::BufferCopy keep {0, context, sizeof(Context)};
+	command.copyBuffer(m_state->Handle(), m_contexts->Handle(), 1, &keep);
+	Barrier(command);
+
 	area.tick           = m_scheduler.CurrentTick();
 	area.serial         = serial;
 	area.tlas           = tlas;
 	area.instance_slots = top.instance_slots;
 	area.pairs          = m_pairs.size();
-	return state;
+	return m_contexts->BufferDeviceAddress() + context;
 }
 
 void RayTracing::RunGarbageCollector() {
@@ -678,6 +718,10 @@ void RayTracing::RunGarbageCollector() {
 		if (top.used) {
 			top.used = false;
 			return false;
+		}
+		// Its next call mirrors it again.
+		if (const auto prepared = m_prepared.find(entry.first); prepared != m_prepared.end()) {
+			prepared->second.flip = 0;
 		}
 		Retire(top.structure);
 		Retire(top.instances);
