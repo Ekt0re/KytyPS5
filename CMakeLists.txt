@@ -467,6 +467,9 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_kyty_full_emulator_test(descriptor_heap_tests "${KYTY_TESTS_DIR}/DescriptorHeapTests.cpp")
 add_kyty_full_emulator_test(shader_check "${KYTY_TESTS_DIR}/shaderCheck.cpp")
 
+add_executable(driver_repro EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader/driver_repro.cpp")
+target_link_libraries(driver_repro Vulkan::Headers ${CMAKE_DL_LIBS})
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
@@ -876,6 +879,7 @@ if(BUILD_TESTING)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME shader_corpus COMMAND $<TARGET_FILE:shader_check> --self-test)
+	add_test(NAME driver_repro COMMAND $<TARGET_FILE:driver_repro> --self-test)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -1032,6 +1036,7 @@ if(BUILD_TESTING)
 		ime_dialog_tests
 		shader_cfg_tests
 		shader_check
+		driver_repro
 		descriptor_heap_tests
 		scalar_provenance_tests
 		image_page_table_tests
