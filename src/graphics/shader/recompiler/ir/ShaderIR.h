@@ -250,6 +250,16 @@ struct ImageResource {
 	return enabled;
 }
 
+// KYTY_INDIRECT_FORMATTED_STORES=1: admit the remaining indirect formatted store shapes and
+// exact byte-to-record bound conversion. Read once; A/B runs need separate shader caches.
+[[nodiscard]] inline bool IndirectFormattedStoresEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_FORMATTED_STORES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
 // "Image atomic operations are supported only on 32- and 64-bit-per pixel surfaces ... Atomic
 // operations treat the element as a single component of 32- or 64-bits" (RDNA ISA, Image
 // Instructions). The opcode types the operation, so any single-component 32-bit T# (64-bit for

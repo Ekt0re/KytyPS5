@@ -291,7 +291,7 @@ const char* NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const 
 	// BufferIndexInBounds read packed_stride bit 20). Byte offsets alone have no index to add it to
 	// once the stride becomes 1 below. Indexed ADD_TID after Axellito/VIKyng bcee3021.
 	if (descriptor.AddTid() && (!indexed || !lane_index)) return "thread ID";
-	const auto oob = descriptor.OutOfBounds();
+	auto oob = descriptor.OutOfBounds();
 	if (!indexed) {
 		if (resource.formatted) return "formatted byte offsets";
 		if (oob != 0u && oob != 3u) return "byte offsets without a byte bound";
@@ -313,7 +313,16 @@ const char* NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const 
 	const auto stride = descriptor.Stride();
 	if (oob == 2u) return "no index bound";
 	if (oob == 1u && (stride == 0u || extent > stride)) return "accesses past the last record";
-	if (oob == 3u && (stride != 1u || extent != 1u)) return "raw bounds under an index";
+	if (oob == 3u && (stride != 1u || extent != 1u)) {
+		if (!IndirectFormattedStoresEnabled() || descriptor.AddTid())
+			return "raw bounds under an index";
+		if (stride == 0u || descriptor.NumRecords() % stride != 0u)
+			return "non-divisible raw bounds under an index";
+		value.dwords[2] = descriptor.NumRecords() / stride;
+		value.dwords[3] &= ~(3u << 28u);
+		if (!DecodeBufferDescriptor(value, descriptor)) return "V# width";
+		oob = descriptor.OutOfBounds();
+	}
 	// Inside a record the index test alone decides, so mode 1 is mode 0. With one-byte records,
 	// raw byte bounds and record bounds cover the same bytes.
 	value.dwords[3] &= ~(3u << 28u);

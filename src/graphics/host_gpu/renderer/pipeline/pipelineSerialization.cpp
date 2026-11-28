@@ -136,6 +136,8 @@ uint64_t CodegenSwitches() {
 	if (env("KYTY_EXEC_SELECTS")[0] == '0' || env("KYTY_EXEC_SELECT_ELIM")[0] == '0') {
 		switches |= 8u;
 	}
+	// IndirectFormattedStoresEnabled (ShaderIR.h).
+	if (ShaderRecompiler::IR::IndirectFormattedStoresEnabled()) switches |= uint64_t {1} << 64u;
 	return switches;
 }
 
