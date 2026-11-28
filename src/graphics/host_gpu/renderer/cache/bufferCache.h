@@ -264,7 +264,7 @@ private:
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 	// Re-reads the rb_tick_wait and rb_mirror settings at most every 250 ms.
 	void               RefreshReadbackWaitToggles();
-	// KYTY_RB_TICK_WAIT / toggle rb_tick_wait (default off): copy-queue readbacks wait on the GPU
+	// KYTY_RB_TICK_WAIT / toggle rb_tick_wait (default on; KYTY_RB_TICK_WAIT=0 turns it off): copy-queue readbacks wait on the GPU
 	// for the tick that last wrote their bytes (ReadbackWait::WriteTicks) instead of every
 	// submitted tick, and operations writing ranges whose readbacks had to flush are submitted at
 	// once (ReadbackWait::HotWriters).
@@ -337,7 +337,7 @@ private:
 	ReadbackWait::FlushThrottle                       m_flush_throttle;
 	ReadbackWait::MirrorIndex                         m_mirror_index;
 	std::unique_ptr<Buffer>                           m_mirror;
-	bool                                              m_tick_wait_env = false;
+	bool                                              m_tick_wait_env = true;
 	bool                                              m_mirror_env    = false;
 	bool                                              m_tick_wait     = false;
 	bool                                              m_mirror_on     = false;

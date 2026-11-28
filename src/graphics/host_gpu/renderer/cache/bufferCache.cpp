@@ -573,10 +573,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		                      : value[0] == '2' ? DetachedReadback::NoSubmit
 		                                        : DetachedReadback::Submit;
 	}
-	// KYTY_RB_TICK_WAIT=1 / KYTY_RB_MIRROR=1 (default off), overridden by toggles rb_tick_wait and
-	// rb_mirror when the toggle file has those lines.
+	// KYTY_RB_TICK_WAIT (default on, 0 = off; pr_ab world: copy-back waits 314 -> 154 ms/f) and
+	// KYTY_RB_MIRROR=1 (default off), overridden by toggles rb_tick_wait and rb_mirror when the
+	// toggle file has those lines.
 	if (const char* value = std::getenv("KYTY_RB_TICK_WAIT"); value != nullptr) {
-		m_tick_wait_env = value[0] == '1';
+		m_tick_wait_env = value[0] != '0';
 	}
 	if (const char* value = std::getenv("KYTY_RB_MIRROR"); value != nullptr) {
 		m_mirror_env = value[0] == '1';
