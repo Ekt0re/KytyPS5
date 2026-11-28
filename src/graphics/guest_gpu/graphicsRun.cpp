@@ -1236,9 +1236,22 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 			buffer_cache.ReadMemory(address, size);
 		}
 	};
+	// rb_mirror: a GPU-written count may come from the readback mirror instead (its page can stay
+	// read-protected, so the value is taken from the mirror read, not from guest memory).
+	uint32_t mirrored_count = 0;
+	bool     count_mirrored = false;
 	if (count_addr != nullptr) {
 		const auto start = std::chrono::steady_clock::now();
-		read_gpu_data(reinterpret_cast<uint64_t>(count_addr), sizeof(uint32_t));
+		const auto address = reinterpret_cast<uint64_t>(count_addr);
+		if (GuestRange {address, sizeof(uint32_t)}.Valid() &&
+		    buffer_cache.HasGpuDirtyBytes(address, sizeof(uint32_t))) {
+			const ReadbackOrigin::Scope origin(ReadbackOrigin::Origin::Args);
+			count_mirrored = buffer_cache.TryReadMirroredGpuWrites(address, &mirrored_count,
+			                                                      sizeof(uint32_t));
+		}
+		if (!count_mirrored) {
+			read_gpu_data(address, sizeof(uint32_t));
+		}
 		if (auto* stats = IndirectReadbackStats::Get()) {
 			stats->Add(start, 0, true);
 		}
@@ -1246,7 +1259,8 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	const auto draw_count =
 	    count_addr == nullptr
 	        ? max_count_or_count
-	        : ClampIndirectDrawCount(uint32_t {*count_addr}, max_count_or_count);
+	        : ClampIndirectDrawCount(count_mirrored ? mirrored_count : uint32_t {*count_addr},
+	                                 max_count_or_count);
 	if (draw_count == 0) {
 		return;
 	}
