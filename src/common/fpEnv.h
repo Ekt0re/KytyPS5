@@ -7,10 +7,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#include <float.h>
-#include <immintrin.h>
-#endif
 
 namespace Common {
 
@@ -23,53 +19,10 @@ struct FpEnv {
 // all exceptions masked; x87 64-bit precision, round to nearest, all exceptions masked.
 inline constexpr FpEnv GuestFpEnv {0x9fc0, 0x037f};
 
-// x86-64 only: the MXCSR intrinsics work with clang-cl and gcc/clang; the x87 control word uses
-// the CRT's word on Windows, where inline AT&T assembly is not available.
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-inline uint32_t ReadMxcsr() {
-	return _mm_getcsr();
-}
-inline void WriteMxcsr(uint32_t value) {
-	_mm_setcsr(value);
-}
-// MSVC's control word scrambles the six exception masks and keeps precision and rounding in
-// different bits from the x87 word. Convert only the fields GuestFpEnv specifies.
-inline uint16_t MsvcToX87(unsigned word) {
-	uint16_t control = 0;
-	if ((word & 0x10u) != 0) control |= 1u << 0; // invalid
-	if ((word & 0x02u) != 0) control |= 1u << 1; // denormal
-	if ((word & 0x08u) != 0) control |= 1u << 2; // divide by zero
-	if ((word & 0x04u) != 0) control |= 1u << 3; // overflow
-	if ((word & 0x01u) != 0) control |= 1u << 4; // underflow
-	if ((word & 0x20u) != 0) control |= 1u << 5; // precision
-	if ((word & 0x30000u) == 0x10000u) control |= 0x200u;  // double precision
-	if ((word & 0x30000u) != 0x10000u && (word & 0x30000u) != 0x20000u) control |= 0x300u;
-	control |= static_cast<uint16_t>(((word >> 8u) & 3u) << 10u); // rounding
-	return control;
-}
-inline unsigned X87ToMsvc(uint16_t control) {
-	unsigned word = 0;
-	if ((control & (1u << 0)) != 0) word |= 0x10u;
-	if ((control & (1u << 1)) != 0) word |= 0x02u;
-	if ((control & (1u << 2)) != 0) word |= 0x08u;
-	if ((control & (1u << 3)) != 0) word |= 0x04u;
-	if ((control & (1u << 4)) != 0) word |= 0x01u;
-	if ((control & (1u << 5)) != 0) word |= 0x20u;
-	if ((control & 0x300u) == 0u) word |= 0x20000u;   // single precision
-	else if ((control & 0x300u) == 0x200u) word |= 0x10000u; // double
-	word |= ((control >> 10u) & 3u) << 8u; // rounding
-	return word;
-}
-inline uint16_t ReadX87Control() {
-	unsigned word = 0;
-	_controlfp_s(&word, 0, 0);
-	return MsvcToX87(word);
-}
-inline void WriteX87Control(uint16_t control) {
-	const unsigned mask = _MCW_EM | _MCW_RC | _MCW_PC;
-	_controlfp_s(nullptr, X87ToMsvc(control), mask);
-}
-#elif defined(__x86_64__) || defined(_M_X64)
+// x86-64: the same GNU inline assembly as before on every host compiler the tree supports
+// (clang, gcc, clang-cl). The MSVC CRT's _controlfp_s cannot stand in on x64 Windows: it sets the
+// SSE control state and does not support the x87 precision field.
+#if defined(__x86_64__) || defined(_M_X64)
 inline uint32_t ReadMxcsr() {
 	uint32_t value {};
 	asm volatile("stmxcsr %0" : "=m"(value) : : "memory");
