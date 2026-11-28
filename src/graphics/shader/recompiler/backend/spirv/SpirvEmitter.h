@@ -9,10 +9,19 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
+// How the host's GLSL.std.450 NMin/NMax compare to the guest's V_MIN/V_MAX rule: ordered
+// sources and signed zero always agree; the levels differ on NaN sources.
+enum class FloatMinMax : uint8_t {
+	Cascade,        // Results differ; lower with compares and selects.
+	OtherNanSelect, // The other source for one NaN, a canonical NaN for two: fix the pair.
+	Exact,          // The other source for one NaN, the left source for two.
+};
+
 // Host device capabilities and user options that change the emitted SPIR-V. Built once per device.
 struct Profile {
 	bool maintenance8         = false; // Dynamic texel offsets on image samples.
-	bool native_float_min_max = false; // NMin/NMax give the guest's NaN and signed-zero results.
+	// Host NMin/NMax behavior against the guest min/max rule, from a probe of the device.
+	FloatMinMax float_min_max = FloatMinMax::Cascade;
 	// OpReadClockKHR Device tick in picoseconds; 0 without shaderDeviceClock.
 	uint32_t device_clock_period_ps = 0;
 	// Storage buffer elements past the descriptor range, to the byte, read zero and drop writes.

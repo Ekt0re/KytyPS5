@@ -75,7 +75,7 @@ struct GraphicContext {
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	// ImageHeapCapacity(*this) fills it in from the device limits on first use.
 	mutable uint32_t                   image_heap_capacity                   = 0;
-	Common::Mutex                      queue_mutex;
+	mutable Common::Mutex              queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
 	// KYTY_COPY_QUEUE (default 1; 0 = off): a queue of a compute/transfer family without graphics, for synchronous

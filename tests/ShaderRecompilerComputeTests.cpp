@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/pipeline/floatMinMaxProbe.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -2300,16 +2301,9 @@ class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
   ~VulkanHarness() { Destroy(); }
-  // Host float min/max is used on AMD GPUs, as in Kyty.
-  [[nodiscard]] bool SupportsNativeFloatMinMax() const {
-    vk::PhysicalDeviceDriverProperties driver{};
-    vk::PhysicalDeviceProperties2 properties;
-    properties.pNext = &driver;
-    m_physical_device.getProperties2(&properties);
-    // AMD's own drivers implement NMin/NMax as v_min/v_max; Mesa's RADV uses the
-    // GLSL.std.450 semantics, which do not return the other operand for a NaN source.
-    return properties.properties.vendorID == 0x1002u &&
-           driver.driverID != vk::DriverId::eMesaRadv;
+  // The probe dispatches the min/max edge matrix on this device, as the emulator does.
+  [[nodiscard]] ShaderRecompiler::Spirv::FloatMinMax FloatMinMaxLevel() {
+    return ProbeFloatMinMax(RuntimeContext());
   }
 
   VulkanHarness(const VulkanHarness &) = delete;
@@ -60621,20 +60615,33 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-min-max-only") == 0) {
-    // Host min/max must keep the emulated results on AMD GPUs; other GPUs only
-    // compile it.
-    static constexpr ShaderProfile native_profile{.maintenance8 = true,
-                                                  .native_float_min_max = true};
+    // The probe says which host lowerings keep the emulated results; a level the device
+    // did not earn is compiled but not run.
+    static constexpr ShaderProfile other_nan_profile{
+        .maintenance8 = true,
+        .float_min_max = ShaderRecompiler::Spirv::FloatMinMax::OtherNanSelect};
+    static constexpr ShaderProfile exact_profile{
+        .maintenance8 = true,
+        .float_min_max = ShaderRecompiler::Spirv::FloatMinMax::Exact};
     VulkanHarness vulkan;
-    const bool supported = vulkan.SupportsNativeFloatMinMax();
-    for (bool native : {false, true}) {
+    const auto level = vulkan.FloatMinMaxLevel();
+    struct Variant {
+      const ShaderProfile *profile;
+      bool native_ops;
+      bool runs;
+    };
+    for (const auto &[profile, native_ops, runs] :
+         {Variant{&Maintenance8Profile, false, true},
+          Variant{&other_nan_profile, true,
+                  level != ShaderRecompiler::Spirv::FloatMinMax::Cascade},
+          Variant{&exact_profile, true, level == ShaderRecompiler::Spirv::FloatMinMax::Exact}}) {
       for (auto test :
            {VectorMinMaxF32NanAndSignedZeroEdges(),
             VectorMinMaxF32RuntimeEdges(32), VectorMinMaxF32RuntimeEdges(64)}) {
-        auto &spirv = native ? test.required_spirv : test.forbidden_spirv;
+        auto &spirv = native_ops ? test.required_spirv : test.forbidden_spirv;
         spirv = {" NMin ", " NMax "};
-        test.profile = native ? &native_profile : &Maintenance8Profile;
-        test.compile_only = native && !supported;
+        test.profile = profile;
+        test.compile_only = !runs;
         RunCase(&vulkan, test);
       }
     }

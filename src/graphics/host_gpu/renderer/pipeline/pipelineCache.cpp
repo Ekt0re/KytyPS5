@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
+#include "graphics/host_gpu/renderer/pipeline/floatMinMaxProbe.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -276,12 +277,10 @@ static bool LdsLaneSyncEnabled() {
 }
 
 ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics) {
-	// AMD's own drivers run NMin/NMax as v_min/v_max, which give the guest's NaN and signed-zero
-	// results; Mesa's RADV implements the GLSL.std.450 semantics instead, so it keeps the ordered
-	// compare. GLSL.std.450 alone does not order -0 below +0.
+	// The probe dispatches the min/max edge matrix on the device once; the vendor id says
+	// nothing about how a driver's NMin/NMax treat NaN sources and signed zero.
 	return {.maintenance8           = graphics.maintenance8_enabled,
-	        .native_float_min_max   = graphics.physical_device_properties.vendorID == 0x1002u &&
-	                                  graphics.driver_id != vk::DriverId::eMesaRadv,
+	        .float_min_max          = ProbeFloatMinMax(graphics),
 	        .device_clock_period_ps = graphics.device_clock_period_ps,
 	        .robust_buffer_access   = graphics.robust_buffer_access_enabled,
 	        .r8_srgb_views          = graphics.r8_srgb_views,
