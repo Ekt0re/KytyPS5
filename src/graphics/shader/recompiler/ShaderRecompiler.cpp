@@ -26,7 +26,9 @@
 #include <cstdlib>
 #include <fmt/format.h>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -497,6 +499,32 @@ static void FirePassTimingHook(const char* name, uint64_t nanoseconds) {
 	}
 }
 
+namespace {
+
+std::mutex                                  g_ray_tracing_programs_mutex;
+std::array<std::unordered_set<uint64_t>, 2> g_ray_tracing_programs;
+RayTracingPrograms                          g_ray_tracing_counts;
+
+} // namespace
+
+void NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash) {
+	const std::lock_guard lock(g_ray_tracing_programs_mutex);
+	if (!g_ray_tracing_programs[static_cast<size_t>(kind)].insert(shader_hash).second) {
+		return;
+	}
+	if (kind == RayTracingProgramKind::Traced) {
+		g_ray_tracing_counts.traced++;
+	} else {
+		g_ray_tracing_counts.unrecognized++;
+		g_ray_tracing_counts.last_unrecognized = shader_hash;
+	}
+}
+
+RayTracingPrograms GetRayTracingPrograms() {
+	const std::lock_guard lock(g_ray_tracing_programs_mutex);
+	return g_ray_tracing_counts;
+}
+
 const char* StageName(ShaderType stage) {
 	switch (stage) {
 		case ShaderType::Compute: return "CS";
@@ -718,9 +746,14 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		(void)IR::EliminateExecSelects(ir);
 	}
 	if (options.profile->ray_query) {
-		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir); traced != 0) {
+		uint32_t left = 0;
+		if (const auto traced = IR::TraceTraversalsWithRayQueries(ir, &left); traced != 0) {
 			LOGF("ShaderRecompiler %s ray query traversals: hash=0x%016" PRIx64 " loops=%u\n",
 			     stage, ir.shader_hash, traced);
+			NoteRayTracingProgram(RayTracingProgramKind::Traced, ir.shader_hash);
+		}
+		if (left != 0) {
+			NoteRayTracingProgram(RayTracingProgramKind::Unrecognized, ir.shader_hash);
 		}
 	}
 
