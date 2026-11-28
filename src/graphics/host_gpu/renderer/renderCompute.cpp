@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/frameHoles.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
@@ -1036,6 +1037,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	Common::LockGuard lock(m_context.GetMutex());
 	DrainSkippedDispatches(buffer);
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
+		Common::FrameHoles::NoteDispatchSkip(Common::FrameHoles::DispatchSkipReason::NullShader);
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",
 		     thread_group_x, thread_group_y, thread_group_z, mode);
@@ -1088,11 +1090,13 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) {
 		NoteSkippedDispatch(capture, ComputeBufferUses(input_info.stage));
+		Common::FrameHoles::NoteDispatchSkip(Common::FrameHoles::DispatchSkipReason::FailedShader);
 		return;
 	}
 	std::vector<SkipTaint::Use> uses;
 	if (SkipOnTaintedInput(m_skip_taint, input_info.stage, 0, uses)) {
 		NoteSkippedDispatch(capture, uses);
+		Common::FrameHoles::NoteDispatchSkip(Common::FrameHoles::DispatchSkipReason::Tainted);
 		return;
 	}
 	if (DispatchLimitsEnabled()) {
@@ -1392,6 +1396,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
+		Common::FrameHoles::NoteDispatchSkip(Common::FrameHoles::DispatchSkipReason::NullShader);
 		return;
 	}
 	CapturedDispatch capture {};
@@ -1407,11 +1412,13 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetImageHeap().BeginDraw();
 	if (!m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info)) {
 		NoteSkippedDispatch(capture, ComputeBufferUses(input_info.stage));
+		Common::FrameHoles::NoteDispatchSkip(Common::FrameHoles::DispatchSkipReason::FailedShader);
 		return;
 	}
 	std::vector<SkipTaint::Use> uses;
 	if (SkipOnTaintedInput(m_skip_taint, input_info.stage, args_addr, uses)) {
 		NoteSkippedDispatch(capture, uses);
+		Common::FrameHoles::NoteDispatchSkip(Common::FrameHoles::DispatchSkipReason::Tainted);
 		return;
 	}
 	if (DispatchLimitsEnabled() && args_known) {

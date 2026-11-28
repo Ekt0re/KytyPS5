@@ -18,8 +18,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TRIAGE = HERE.parent / 'triage.py'
 
-ALL_SECTIONS = ('TIMELINE', 'PERF', 'SYNC', 'FLIPS', 'TRACES', 'SHADERS', 'CACHE',
-                'DEVICE LOST', 'CRASH', 'FATAL')
+ALL_SECTIONS = ('TIMELINE', 'PERF', 'SYNC', 'FLIPS', 'FRAME HOLES', 'TRACES', 'SHADERS',
+                'CACHE', 'DEVICE LOST', 'CRASH', 'FATAL')
 
 
 def H(n):
@@ -359,6 +359,32 @@ class RunWrapperTest(unittest.TestCase):
             data = json.loads((run / 'triage.json').read_text(encoding='utf-8'))
             self.assertEqual(data['findings']['perf']['intervals'][0]['counters']['flips'], '1')
             self.assertIn('VERDICT:', (run / 'triage.txt').read_text(encoding='utf-8'))
+
+
+class FrameHolesTest(unittest.TestCase):
+    def test_frame_holes(self):
+        text = ('@@T 12\n'
+                '[frame-holes] frame=3 draws skipped=4 (shader-building=3, failed-shader=1) '
+                'dispatches skipped=5 (wait=2, tainted=2, refused=1) '
+                'targets affected=2 (0x000100010000, 0x000100020000)\n'
+                '@@T 14\n'
+                '[frame-holes] frame=4 draws skipped=0 (none) '
+                'dispatches skipped=3 (failed-shader=2, wait=1) '
+                'targets affected=1 (0x000100020000)\n')
+        out, data = run_log(text)
+        fh = data['findings']['frame_holes']
+        self.assertEqual(fh['incomplete_frames'], 2)
+        self.assertEqual(fh['draws_skipped'], 4)
+        self.assertEqual(fh['dispatches_skipped'], 8)
+        self.assertEqual([(r['reason'], r['count']) for r in fh['draw_reasons']],
+                         [('shader-building', 3), ('failed-shader', 1)])
+        self.assertEqual([(r['reason'], r['count']) for r in fh['dispatch_reasons']],
+                         [('wait', 3), ('tainted', 2), ('failed-shader', 2), ('refused', 1)])
+        self.assertEqual(fh['top_targets'][0], dict(address='0x000100020000', frames=2))
+        joined = '\n'.join(sections(out)['FRAME HOLES'])
+        self.assertIn('2 incomplete frames; draws skipped=4, dispatches skipped=8', joined)
+        self.assertIn('ranked reasons: dispatch:wait=3, draw:shader-building=3', joined)
+        self.assertIn('0x000100020000=2', joined)
 
 
 if __name__ == '__main__':

@@ -996,6 +996,9 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 }
 
 void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+	// The draws recorded before this flip are the ones its frame is made of. Their skip counts are
+	// handed to PerfSummary's existing reporter, using its own flip counter for the frame number.
+	Common::PerfSummary::NoteFrameHolesFrame(Common::PerfSummary::Frames());
 	VideoOutConfig* cfg        = nullptr;
 	uint64_t        generation = 0;
 	int             index      = 0;

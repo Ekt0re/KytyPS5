@@ -1,3 +1,4 @@
+#include "common/frameHoles.h"
 #include "common/perfSummary.h"
 
 #include <atomic>
@@ -55,6 +56,53 @@ TEST(PerfSummaryFrame, AddAccumulatesCountersOnlyWhileEnabled) {
 	EXPECT_EQ(Detail::g_counters[static_cast<size_t>(Counter::FrameModuleMisses)].load(
 	              std::memory_order_relaxed),
 	          2u);
+}
+
+TEST(PerfSummaryFrameHoles, LineCountsReasonsAndDistinctTargets) {
+	using namespace Common::FrameHoles;
+	Tracker                  tracker;
+	EXPECT_TRUE(tracker.TakeFrameLine(1).empty());
+	const uint64_t rt_addrs[]  = {0x100010000ull, 0x100020000ull};
+	const uint64_t buf_addrs[] = {0x100020000ull, 0x100030000ull};
+	tracker.RecordDraw(DrawSkipReason::ShaderBuilding, rt_addrs);
+	tracker.RecordDraw(DrawSkipReason::FailedShader, {rt_addrs, 1});
+	tracker.RecordDispatch(DispatchSkipReason::Wait, buf_addrs);
+	tracker.RecordDispatch(DispatchSkipReason::Tainted, {buf_addrs + 1, 1});
+	tracker.RecordDispatch(DispatchSkipReason::Refused);
+	const auto snapshot = tracker.TakeSnapshot();
+	const auto line     = Detail::FormatFrameHolesLine(42, snapshot);
+	EXPECT_NE(line.find("[frame-holes] frame=42 draws skipped=2 (shader-building=1, "
+	                    "failed-shader=1)"),
+	          std::string::npos)
+	    << line;
+	EXPECT_NE(line.find("dispatches skipped=3 (wait=1, tainted=1, refused=1)"), std::string::npos)
+	    << line;
+	EXPECT_NE(line.find("targets affected=3 (0x000100010000, 0x000100020000, 0x000100030000)"),
+	          std::string::npos)
+	    << line;
+	EXPECT_TRUE(tracker.TakeFrameLine(43).empty());
+}
+
+TEST(PerfSummaryFrameHoles, TargetTableIsBoundedAndReportsOverflow) {
+	using namespace Common::FrameHoles;
+	Tracker tracker;
+	for (uint64_t i = 1; i <= Tracker::MaxTrackedTargets + 4u; i++) {
+		tracker.RecordDraw(DrawSkipReason::NoTargets, {&i, 1});
+	}
+	const auto line = tracker.TakeFrameLine(7);
+	EXPECT_NE(line.find("targets affected=20"), std::string::npos) << line;
+	EXPECT_NE(line.find(", +12 more"), std::string::npos) << line;
+}
+
+TEST(PerfSummaryFrameHoles, RecordingIsSilentWhileTheSwitchIsOff) {
+	using namespace Common::FrameHoles;
+	EXPECT_FALSE(Common::FrameHoles::Enabled());
+	Global().TakeSnapshot();
+	NoteDrawSkip(DrawSkipReason::NoTargets);
+	NoteDispatchSkip(DispatchSkipReason::NullShader);
+	NoteFrameHolesFrame(Common::PerfSummary::Frames());
+	EXPECT_TRUE(Common::PerfSummary::FrameHolesEnabled() == false);
+	EXPECT_TRUE(Global().TakeSnapshot().Empty());
 }
 
 } // namespace

@@ -93,6 +93,13 @@ CACHE_LOADED_RE = re.compile(r'^Shader cache: loaded (\d+) programs, (\d+) modul
 AT_RE = re.compile(r'^@@T ([0-9.]+)$')
 ANSI_RE = re.compile(r'^\x1b\[[0-9;]*m')
 KV_RE = re.compile(r'([\w/.-]+)=(\S+)')
+# [frame-holes] line: src/common/perfSummary.cpp FormatFrameHolesLine (with the pure formatter in
+# src/common/frameHoles.h). Reason names are hyphenated, hence the separate key regex.
+FRAME_HOLES_RE = re.compile(
+    r'^\[frame-holes\] frame=(\d+) draws skipped=(\d+) \(([^)]*)\) '
+    r'dispatches skipped=(\d+) \(([^)]*)\) targets affected=(\d+)(?: \(([^)]*)\))?$'
+)
+FRAME_HOLES_KV_RE = re.compile(r'([\w-]+)=(\d+)')
 
 MAX_PERF = 2000
 MAX_SYNC = 500
@@ -162,6 +169,14 @@ class Triage:
         self.crash_files: list[str] = []
         self.fatal: collections.deque[str] = collections.deque(maxlen=MAX_LINES)
         self.first_fatal_line: int | None = None
+        self.frame_holes_frames = 0
+        self.frame_holes_draws = 0
+        self.frame_holes_dispatches = 0
+        self.frame_holes_draw_reasons: collections.Counter[str] = collections.Counter()
+        self.frame_holes_dispatch_reasons: collections.Counter[str] = collections.Counter()
+        self.frame_holes_targets: collections.Counter[str] = collections.Counter()
+        self.frame_holes_t_first: float | None = None
+        self.frame_holes_t_last: float | None = None
 
     # -- one line -----------------------------------------------------------------------------
     def line(self, raw: str) -> None:
@@ -178,6 +193,26 @@ class Triage:
             self.t = float(at.group(1))
             if self.first_t is None:
                 self.first_t = self.t
+            return
+
+        if line.startswith('[frame-holes]'):
+            m = FRAME_HOLES_RE.match(line)
+            if m:
+                self.frame_holes_frames += 1
+                self.frame_holes_draws += int(m.group(2))
+                self.frame_holes_dispatches += int(m.group(4))
+                if self.frame_holes_t_first is None:
+                    self.frame_holes_t_first = self.t
+                self.frame_holes_t_last = self.t
+                for reason, count in FRAME_HOLES_KV_RE.findall(m.group(3)):
+                    self.frame_holes_draw_reasons[reason] += int(count)
+                for reason, count in FRAME_HOLES_KV_RE.findall(m.group(5)):
+                    self.frame_holes_dispatch_reasons[reason] += int(count)
+                if m.group(7):
+                    for address in re.findall(r'0x[0-9a-fA-F]+', m.group(7)):
+                        a = address.lower()
+                        if a in self.frame_holes_targets or len(self.frame_holes_targets) < MAX_IDS:
+                            self.frame_holes_targets[a] += 1
             return
 
         if line.startswith('PerfSummary'):
@@ -404,6 +439,18 @@ class Triage:
                       'longest_hold_ms': self.longest_hold_ms,
                       'longest_wait_ms': self.longest_wait_ms,
                       'recent': list(self.flip_recent)},
+            'frame_holes': {
+                'incomplete_frames': self.frame_holes_frames,
+                'draws_skipped': self.frame_holes_draws,
+                'dispatches_skipped': self.frame_holes_dispatches,
+                'draw_reasons': [dict(reason=k, count=v)
+                                 for k, v in self.frame_holes_draw_reasons.most_common()],
+                'dispatch_reasons': [dict(reason=k, count=v)
+                                     for k, v in self.frame_holes_dispatch_reasons.most_common()],
+                'top_targets': [dict(address=k, frames=v)
+                                for k, v in self.frame_holes_targets.most_common(10)],
+                't_first': self.frame_holes_t_first, 't_last': self.frame_holes_t_last,
+            },
             'traces': {'frames': len(self.traced_frames), 'draws': self.draws,
                        'dispatches': self.dispatches, 'gpu_indirect': self.indirect_gpu,
                        'ids_by_stage': {k: len(v) for k, v in sorted(self.trace_ids.items())}},
@@ -475,6 +522,7 @@ class Triage:
             ('PERF', self._perf),
             ('SYNC', self._sync),
             ('FLIPS', self._flips),
+            ('FRAME HOLES', self._frame_holes),
             ('TRACES', self._traces),
             ('SHADERS', self._shaders),
             ('CACHE', self._cache),
@@ -529,6 +577,24 @@ class Triage:
                 (fl['presented'], fl['out_of_order'], fl['arg_backward'], fl['held'],
                  fl['longest_hold_ms'], fl['longest_wait_ms']),
                 'recent: %s' % ('; '.join(fl['recent'][-5:]) or 'none')]
+
+    def _frame_holes(self, f: dict) -> list[str]:
+        fh = f['frame_holes']
+        if not fh['incomplete_frames']:
+            return []
+        sec = ['@%s-%s s: %d incomplete frames; draws skipped=%d, dispatches skipped=%d' %
+               (fh['t_first'], fh['t_last'], fh['incomplete_frames'],
+                fh['draws_skipped'], fh['dispatches_skipped'])]
+        ranked = ([('draw:' + r['reason'], r['count']) for r in fh['draw_reasons']] +
+                  [('dispatch:' + r['reason'], r['count']) for r in fh['dispatch_reasons']])
+        ranked.sort(key=lambda kv: (-kv[1], kv[0]))
+        if ranked:
+            sec.append('ranked reasons: ' + ', '.join('%s=%d' % (k, v) for k, v in ranked))
+        if fh['top_targets']:
+            sec.append('top targets (frames): ' +
+                       ', '.join('%s=%d' % (t_['address'], t_['frames'])
+                                 for t_ in fh['top_targets'][:8]))
+        return sec
 
     def _traces(self, f: dict) -> list[str]:
         tr = f['traces']

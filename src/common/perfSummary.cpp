@@ -1,9 +1,11 @@
 #include "common/perfSummary.h"
 
 #include "common/faultStats.h"
+#include "common/frameHoles.h"
 
 #include <array>
 #include <chrono>
+#include <deque>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -95,6 +97,10 @@ double g_frame_bad_secs = 0.0;
 bool   g_frame_warned   = false;
 // KYTY_FAULT_STATS=1: the existing reporter also prints one [fault] group per interval.
 bool g_fault_stats = false;
+// KYTY_FRAME_HOLES=1: completed frames hand their skip counts to this queue; only the reporter
+// writes the lines. Bounded so a long run with many incomplete frames cannot grow without limit.
+constexpr size_t         kMaxQueuedHoleLines = 64;
+std::deque<std::string>  g_hole_lines;
 
 // The GPU thread, set by RegisterGpuThread. Its CPU time, instructions and context switches
 // come from Linux interfaces; other hosts report the counters only ("na" for the rest).
@@ -345,6 +351,17 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 		const auto hot   = Detail::FormatFaultHotLine(blocks.data(), used, dropped);
 		std::fputs(hot.c_str(), stdout);
 	}
+	if (Detail::g_frame_holes.load(std::memory_order_relaxed)) {
+		std::deque<std::string> pending;
+		{
+			std::lock_guard lock(g_mutex);
+			pending.swap(g_hole_lines);
+		}
+		for (const auto& hole: pending) {
+			std::fputs(hole.c_str(), stdout);
+			std::fputc('\n', stdout);
+		}
+	}
 	std::fflush(stdout);
 }
 
@@ -363,6 +380,22 @@ void PrintTotal() {
 }
 
 } // namespace
+
+void NoteFrameHolesFrame(uint64_t frame) {
+	if (!FrameHolesEnabled()) {
+		return;
+	}
+	const auto snap = FrameHoles::Global().TakeSnapshot();
+	const auto line = Detail::FormatFrameHolesLine(frame, snap);
+	if (line.empty()) {
+		return;
+	}
+	std::lock_guard lock(g_mutex);
+	if (g_hole_lines.size() >= kMaxQueuedHoleLines) {
+		g_hole_lines.pop_front();
+	}
+	g_hole_lines.push_back(line);
+}
 
 namespace Detail {
 
@@ -436,6 +469,10 @@ std::string FormatFaultHotLine(const FaultBlock* blocks, size_t count, uint64_t 
 	return line;
 }
 
+std::string FormatFrameHolesLine(uint64_t frame, const FrameHoles::Snapshot& snapshot) {
+	return FrameHoles::Tracker::FormatLine(frame, snapshot);
+}
+
 } // namespace Detail
 
 void Start() {
@@ -449,12 +486,18 @@ void Start() {
 	const char* fault_env  = std::getenv("KYTY_FAULT_STATS");
 	const bool  fault_stats =
 	    fault_env != nullptr && fault_env[0] != '\0' && fault_env[0] != '0';
-	if ((env == nullptr || env[0] == '\0' || env[0] == '0') && !frame_cost && !fault_stats) {
+	const char* holes_env  = std::getenv("KYTY_FRAME_HOLES");
+	const bool  frame_holes =
+	    holes_env != nullptr && holes_env[0] != '\0' && holes_env[0] != '0';
+	if ((env == nullptr || env[0] == '\0' || env[0] == '0') && !frame_cost && !fault_stats &&
+	    !frame_holes) {
 		return;
 	}
 	g_started     = true;
 	g_frame_cost  = frame_cost;
 	g_fault_stats = fault_stats;
+	Detail::g_frame_holes.store(frame_holes, std::memory_order_relaxed);
+	FrameHoles::SetEnabled(frame_holes);
 	bool explicit_period = false;
 	if (env != nullptr && env[0] != '\0' && env[0] != '0') {
 		if (const auto period = std::strtoul(env, nullptr, 10); period >= 2) {
@@ -462,8 +505,8 @@ void Start() {
 			explicit_period = true;
 		}
 	}
-	// The frame and fault lines are a five-second window unless the caller chose a reporter period.
-	if ((frame_cost || fault_stats) && !explicit_period) {
+	// The frame, fault and hole lines are a five-second window unless the caller chose a period.
+	if ((frame_cost || fault_stats || frame_holes) && !explicit_period) {
 		g_period = 5;
 	}
 	Detail::g_enabled.store(true, std::memory_order_relaxed);

@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/frameHoles.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
@@ -433,6 +434,20 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
 	return vs.es_regs.data_addr != 0;
+}
+
+static std::vector<uint64_t> CollectDrawTargetAddresses(const HW::Context& context) {
+	std::vector<uint64_t> addrs;
+	const uint32_t        mask = context.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; ++slot) {
+		if (((mask >> slot) & 1u) == 0u) continue;
+		const auto addr = context.GetRenderTarget(slot).base.addr;
+		if (addr != 0) addrs.push_back(addr);
+	}
+	const auto& depth = context.GetDepthRenderTarget();
+	const auto  zaddr = depth.z_write_base_addr != 0 ? depth.z_write_base_addr : depth.z_read_base_addr;
+	if (zaddr != 0) addrs.push_back(zaddr);
+	return addrs;
 }
 
 struct DrawCallInfo {
@@ -964,6 +979,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), targets.depth, buffer, draw.index_count, 0);
+		Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NoTargets,
+		                         CollectDrawTargetAddresses(buffer.GetRegisters()));
 		return false;
 	}
 
@@ -1483,6 +1500,8 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
+		                         CollectDrawTargetAddresses(buffer.GetRegisters()));
 		return true;
 	}
 
@@ -1575,6 +1594,8 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
+		                         CollectDrawTargetAddresses(buffer.GetRegisters()));
 		return true;
 	}
 

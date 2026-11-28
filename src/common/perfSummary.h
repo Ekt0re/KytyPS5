@@ -7,6 +7,10 @@
 #include <cstdint>
 #include <string>
 
+namespace Common::FrameHoles {
+struct Snapshot;
+}
+
 // KYTY_PERF_SUMMARY=1: a work-based performance summary on stdout, one "PerfSummary ..." line
 // every 10 s (KYTY_PERF_SUMMARY=n: every n s, n >= 2) and one "PerfSummary total ..." line at exit.
 // It counts work per guest frame (flip) rather than frames per second, so that two builds can be
@@ -18,6 +22,9 @@
 // KYTY_FAULT_STATS=1 also prints [fault] rate lines from this same reporter (5 s by default):
 // write/read fault rates, handler/protection/lock-wait cost and the hottest 64 KiB blocks. The
 // fault-storm thresholds come from KYTY_FAULT_STORM_FAULTS/_FRAMES/_HOLD and are off by default.
+// KYTY_FRAME_HOLES=1 also prints one [frame-holes] line per incomplete frame from this same
+// reporter: skipped draws and dispatches by reason and the affected target addresses. The frame
+// number is the existing flip counter, never a second one. Off by default.
 namespace Common::PerfSummary {
 
 enum class Counter {
@@ -193,6 +200,7 @@ enum class Gauge {
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+inline std::atomic<bool>     g_frame_holes {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_gauge_peaks[static_cast<int>(Gauge::Count)] {};
 } // namespace Detail
@@ -216,6 +224,19 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
 }
 
+// Presented frames, counted once in videoOut. Used to number completed frames for the hole line.
+[[nodiscard]] inline uint64_t Frames() noexcept {
+	return Detail::g_counters[static_cast<int>(Counter::Flips)].load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline bool FrameHolesEnabled() noexcept {
+	return Detail::g_frame_holes.load(std::memory_order_relaxed);
+}
+
+// A flip hands its completed frame's counts to the reporter; the queued lines are printed by the
+// reporter's existing writer at the next interval. Lines are bounded and dropped when full.
+void NoteFrameHolesFrame(uint64_t frame);
+
 namespace Detail {
 
 // Pure formatters for the [frame] line. They take interval totals (not per-frame values) so the
@@ -237,6 +258,9 @@ std::string FormatFaultLine(double secs, uint64_t writes, uint64_t reads, uint64
                             uint64_t invalidate_us, uint64_t protect_us, uint64_t lock_wait_us,
                             uint64_t fast_skips, uint64_t marked, uint64_t kept, uint64_t expired);
 std::string FormatFaultHotLine(const FaultBlock* blocks, size_t count, uint64_t dropped);
+
+// Pure formatter for the [frame-holes] line, shared by the reporter and the unit test.
+std::string FormatFrameHolesLine(uint64_t frame, const FrameHoles::Snapshot& snapshot);
 
 } // namespace Detail
 
