@@ -224,6 +224,9 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// KYTY_INPLACE_READBACK: copies finished GPU writes from a host-visible mapping after waiting
+	// only for submitted ticks, without flushing the open command buffer or using a copy queue.
+	[[nodiscard]] bool ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One buffer's ranges of a download, packed into the download buffer at dstOffset.
 	struct DownloadPart {
 		Buffer*                     buffer;
@@ -336,6 +339,7 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	RangeSet                                          m_pending_writes;
+	std::vector<uint8_t>                              m_in_place_scratch;
 	struct SyncWindow {
 		RangeSet writes;
 		uint64_t generation = 0;
@@ -360,6 +364,8 @@ private:
 	bool                                              m_address_writes_pending = false;
 	enum class DetachedReadback { Off, Submit, NoSubmit };
 	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;
+	// KYTY_INPLACE_READBACK (default 0): mapped game buffers use direct synchronous readback.
+	bool                                              m_inplace_readback = false;
 	// KYTY_BATCH_READBACK (default 1), overridden by the batch_readback toggle when present.
 	bool                                              m_batch_readback_env = true;
 	bool                                              m_batch_readback     = true;

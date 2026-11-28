@@ -71,7 +71,8 @@ constexpr vk::AccessFlags MEMORY_ACCESS =
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               bool host_readable)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
@@ -96,6 +97,13 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	const bool want_mapping = host_readable && usage == MemoryUsage::DeviceLocal;
+	if (want_mapping) {
+		allocation_info.flags |=
+		    VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+		allocation_info.requiredFlags =
+		    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+	}
 
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
@@ -113,6 +121,21 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		result = static_cast<vk::Result>(
 		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+	}
+	if (result != vk::Result::eSuccess && want_mapping) {
+		// No mappable device-local heap, or no budget left in it: ordinary VRAM keeps working.
+		allocation_info.flags &=
+		    ~(VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+		allocation_info.requiredFlags = 0;
+		result = static_cast<vk::Result>(
+		    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+		if (result == vk::Result::eErrorOutOfDeviceMemory) {
+			allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+			result = static_cast<vk::Result>(
+			    vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+			                    &allocation_info, &native_buffer, &m_allocation, &allocation_result));
+		}
 	}
 	if (result != vk::Result::eSuccess) {
 		graphics.LogMemoryBudget();
@@ -267,6 +290,20 @@ void Buffer::Invalidate(uint64_t offset, uint64_t size) {
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
 		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
 	}
+}
+
+void Buffer::ReadMapped(uint64_t offset, uint64_t size, void* destination) const {
+	EXIT_IF(!IsHostReadable() || offset > Size() || size > Size() - offset ||
+	        (size != 0 && destination == nullptr));
+	if (size == 0) {
+		return;
+	}
+	if (!IsCoherent()) {
+		const auto result =
+		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
+		EXIT_NOT_IMPLEMENTED(static_cast<vk::Result>(result) != vk::Result::eSuccess);
+	}
+	std::memcpy(destination, m_mapped.data() + offset, static_cast<size_t>(size));
 }
 
 vk::BufferMemoryBarrier Buffer::Barrier(uint64_t offset, uint64_t size, vk::AccessFlags source,

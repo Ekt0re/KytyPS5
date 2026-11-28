@@ -632,14 +632,28 @@ uint64_t CommandScheduler::SubmitWith(SubmitInfo submit, const DetachedPrefix* p
 	}
 
 	m_command.EndRendering();
+	// Upstream's dispatch ordering records its own barriers; the in-place readback barrier must be
+	// added after it and before the pending barrier batch is reset below.
 	m_command.OrderDispatches();
+	const auto host_barrier = [this](vk::CommandBuffer buffer) {
+		if (!m_inplace_readback) {
+			return;
+		}
+		const vk::MemoryBarrier to_host {.srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+		                                 .dstAccessMask = vk::AccessFlagBits::eHostRead};
+		buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eHost, {}, 1, &to_host, 0, nullptr,
+		                       0, nullptr);
+	};
 	std::vector<vk::CommandBuffer> buffers;
 	buffers.reserve(m_segments.size() + 1);
 	for (const auto& segment: m_segments) {
 		segment.tail(segment.buffer);
+		host_barrier(segment.buffer);
 		buffers.push_back(segment.buffer);
 	}
 	m_segments.clear();
+	host_barrier(m_command.m_buffer);
 	buffers.push_back(m_command.m_buffer);
 	m_command.m_barriers.Reset();
 	auto& graphics = m_graphics;

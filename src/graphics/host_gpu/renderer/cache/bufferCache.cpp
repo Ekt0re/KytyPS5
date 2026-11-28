@@ -249,6 +249,54 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	return true;
 }
 
+bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	uint64_t dirty = 0;
+	m_gpu_modified_ranges.ForEachInRange(
+	    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty += end - begin; });
+	const auto current_tick = m_scheduler.CurrentTick();
+	const auto write_tick   = std::max(buffer.readback_write_tick, m_address_write_tick);
+	const bool unsubmitted  = HasUnsubmittedWrite(vaddr, size) || m_address_writes_pending ||
+	                          m_address_write_tick == current_tick;
+	if (!ReadbackBatch::CanReadInPlace({.enabled           = m_inplace_readback,
+	                                    .host_readable     = buffer.IsHostReadable(),
+	                                    .dirty_bytes       = dirty,
+	                                    .unsubmitted_write = unsubmitted,
+	                                    .write_tick        = write_tick,
+	                                    .current_tick      = current_tick})) {
+		return false;
+	}
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::SyncReadbacks,
+	                                         Common::DebugCounters::Counter::SyncReadbackNs);
+	if (write_tick != 0 && !m_scheduler.IsFree(write_tick)) {
+		m_scheduler.Wait(write_tick);
+	}
+	// Earlier publications must land before this one writes the same guest bytes.
+	if (write_tick != 0) {
+		m_scheduler.WaitPriorityOperations(write_tick);
+	}
+	const auto buffer_address = buffer.CpuAddress();
+	bool       copied         = false;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "in-place readback");
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    m_in_place_scratch.resize(static_cast<size_t>(end - start));
+			    buffer.ReadMapped(start - buffer_address, end - start, m_in_place_scratch.data());
+			    Libs::LibKernel::Memory::WriteBacking(start, m_in_place_scratch.data(),
+			                                          end - start);
+			    copied = true;
+		    });
+		    m_gpu_modified_ranges.Subtract(address, bytes);
+		    ForgetColorMetadataChecks(address, bytes);
+	    });
+	if (copied) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, dirty);
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::BufferReadbacks);
+	}
+	return copied;
+}
+
 bool BufferCache::CollectDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                   std::vector<DownloadPart>& parts, uint64_t& total_size) {
 	const auto   buffer_address = buffer.CpuAddress();
@@ -617,6 +665,12 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	if (const char* value = std::getenv("KYTY_READBACK_HOT"); value != nullptr && value[0] == '1') {
 		m_hot_readback_enabled = true;
 	}
+	// KYTY_INPLACE_READBACK=1 maps game buffers when the device has host-visible VRAM. Eligible
+	// synchronous reads then bypass detached copies; every other buffer keeps the normal path.
+	if (const char* value = std::getenv("KYTY_INPLACE_READBACK"); value != nullptr && value[0] == '1') {
+		m_inplace_readback = true;
+		m_scheduler.SetInPlaceReadbackEnabled(true);
+	}
 	// KYTY_DETACHED_READBACK=0 flushes and waits for every synchronous download, as before; 2
 	// reads detached without submitting the open command buffer afterwards.
 	if (const char* value = std::getenv("KYTY_DETACHED_READBACK"); value != nullptr) {
@@ -775,9 +829,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				Common::PerfSummary::Add(Common::PerfSummary::Counter::RbNeighbour);
 			}
 			bool downloaded = false;
-			if (!buffer.IsZeroCopy() && BatchReadback()) {
+			if (m_inplace_readback && buffer.IsHostReadable()) {
+				downloaded = ReadBackInPlace(buffer, start, end - start);
+				if (downloaded) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
+				}
+			}
+			if (!downloaded && !buffer.IsZeroCopy() && BatchReadback()) {
 				downloaded = DownloadWindowBatch(buffer_id, vaddr, size, {start, end});
-			} else {
+			} else if (!downloaded) {
 				downloaded = DownloadBufferMemory<false>(buffer, start, end - start);
 				if (downloaded) {
 					m_memory_tracker.UnmarkRegionAsGpuModified(start, end - start);
@@ -1142,6 +1202,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	new_buffer.readback_write_tick = m_scheduler.CurrentTick();
 	MarkUnsubmittedWrite(overlap.CpuAddress(), overlap.Size());
 	NoteRecentWrite(overlap.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
@@ -1548,7 +1609,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	}
 	if (!zero_copy) {
 		id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
-		                           flags, length);
+		                           flags, length, m_inplace_readback);
 	}
 	const auto& buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
@@ -1730,7 +1791,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, end - vaddr, is_written, image);
 	if (is_written) {
-		buffer.probe_write_tick = m_scheduler.CurrentTick();
+		buffer.probe_write_tick    = m_scheduler.CurrentTick();
+		buffer.readback_write_tick = m_scheduler.CurrentTick();
 	}
 	if (!is_written && buffer.IsZeroCopy()) {
 		FenceZeroCopyRead(id, buffer, vaddr, end - vaddr);

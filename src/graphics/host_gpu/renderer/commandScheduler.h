@@ -28,6 +28,8 @@ public:
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
 	void           Finish();
+	// Set before submission starts: make completed writes visible to in-place host reads.
+	void           SetInPlaceReadbackEnabled(bool enabled) noexcept { m_inplace_readback = enabled; }
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Records a small command buffer, submits it behind all submitted work and waits for it. The
@@ -177,6 +179,7 @@ private:
 	void*                        m_submit_hook_data  = nullptr;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
+	bool                         m_inplace_readback = false;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
 	// Recorded before m_command and submitted with it.

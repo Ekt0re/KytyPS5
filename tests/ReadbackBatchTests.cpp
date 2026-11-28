@@ -21,7 +21,10 @@ using Libs::Graphics::RecentGpuWriteRing;
 using Libs::Graphics::RecentWriteMaxBytes;
 using Libs::Graphics::TRACKER_PAGE_SIZE;
 using Libs::Graphics::ReadbackBatch::AccessWindow;
+using Libs::Graphics::ReadbackBatch::CanReadInPlace;
 using Libs::Graphics::ReadbackBatch::ChooseReadbackPath;
+using Libs::Graphics::ReadbackBatch::InPlaceReadbackInput;
+using Libs::Graphics::ReadbackBatch::MaxInPlaceReadback;
 using Libs::Graphics::ReadbackBatch::ReadbackPath;
 using Libs::Graphics::ReadbackBatch::NeighbourHistory;
 using Libs::Graphics::ReadbackBatch::Range;
@@ -186,6 +189,37 @@ void TestRecentGpuWriteRing() {
 
 } // namespace
 
+void TestInPlaceReadbackPath() {
+	const InPlaceReadbackInput ready {.enabled           = true,
+	                                  .host_readable     = true,
+	                                  .dirty_bytes       = 64 * KiB,
+	                                  .write_tick        = 2,
+	                                  .current_tick      = 3};
+	Check(CanReadInPlace(ready), "finished writes in a mapped buffer can be read in place");
+	Check(!CanReadInPlace({}), "in-place readback defaults off");
+	Check(!CanReadInPlace({.host_readable = true, .dirty_bytes = 1, .current_tick = 1}),
+	      "the feature switch is required");
+	Check(!CanReadInPlace({.enabled = true, .dirty_bytes = 1, .current_tick = 1}),
+	      "an unmappable buffer uses the copy path");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .current_tick = 1}),
+	      "a clean range needs no readback");
+	Check(CanReadInPlace({.enabled = true, .host_readable = true,
+	                      .dirty_bytes = MaxInPlaceReadback, .current_tick = 1}),
+	      "the in-place byte cap is inclusive");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true,
+	                       .dirty_bytes = MaxInPlaceReadback + 1, .current_tick = 1}),
+	      "an oversized read uses the copy path");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .dirty_bytes = 1,
+	                       .unsubmitted_write = true, .current_tick = 1}),
+	      "an open producer is never bypassed");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .dirty_bytes = 1,
+	                       .write_tick = 1, .current_tick = 1}),
+	      "the current tick is not submitted");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .dirty_bytes = 1,
+	                       .write_tick = 2, .current_tick = 1}),
+	      "a future write tick is rejected");
+}
+
 void TestReadbackPath() {
 	// detached, copy_queue, fuse
 	static_assert(ChooseReadbackPath({false, false, false}) == ReadbackPath::Flush);
@@ -204,6 +238,7 @@ void TestReadbackPath() {
 }
 
 int main() {
+	TestInPlaceReadbackPath();
 	TestReadbackPath();
 	TestAccessWindow();
 	TestSplitOneBuffer();
