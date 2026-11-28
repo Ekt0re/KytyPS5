@@ -60985,6 +60985,21 @@ void CheckPm4RewindResume(RenderContext &renderer) {
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "1");
+#else
+    setenv("KYTY_INDIRECT_FORMATTED_STORES", "1", 1);
+#endif
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    EnsureConfigInitialized();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferFormatStoreVariants());
+    RunCase(&vulkan, BufferStoreFormatXResource16UintWritesHalfword());
+    RunCase(&vulkan, BufferStoreFormatXResource16UintPreservesAdjacentLanes());
+    return 0;
+  }
+
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();

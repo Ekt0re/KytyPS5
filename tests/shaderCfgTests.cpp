@@ -7698,6 +7698,90 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
   }
 }
 
+void TestIndirectFormattedStoreTypedIr() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  const auto run = [](ValueOpcode opcode, uint32_t bits, uint32_t components,
+                      uint32_t dwords, F format, uint32_t swizzle) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.user_data_count = 16u;
+    auto storage = std::make_unique<Block>();
+    auto *block = storage.get();
+    program.block_storage.push_back(std::move(storage));
+    program.blocks.push_back(block);
+    block->terminator.kind = CFG::TerminatorKind::Return;
+    std::array<Value, 4> table_words;
+    for (uint32_t word = 0; word < table_words.size(); ++word)
+      table_words[word] = Value(&block->AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(word))}));
+    const auto table = Value(&block->AppendNewInst(
+        ValueOpcode::GetBufferResource, {table_words[0], table_words[1], table_words[2], table_words[3]}));
+    const auto lane = Value(&block->AppendNewInst(ValueOpcode::LaneId));
+    const auto key = Value(&block->AppendNewInst(
+        ValueOpcode::ReadFirstLane, {lane, Value(true)}));
+    const auto offset = Value(&block->AppendNewInst(
+        ValueOpcode::ShiftLeftLogical32, {key, Value(4u)}));
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
+                                     .component_index = word, .component_count = 4u});
+      words[word] = Value(&block->AppendNewInst(ValueOpcode::ReadConstBuffer,
+          {table, offset}, MemoryFlags{.index = static_cast<uint32_t>(word)}));
+    }
+    const auto handle = Value(&block->AppendNewInst(
+        ValueOpcode::GetBufferResource, {words[0], words[1], words[2], words[3]}));
+    Value data = bits == 16u ? Value(uint16_t{42u}) : Value(42u);
+    if (opcode == ValueOpcode::StoreBufferU32x2)
+      data = Value(&block->AppendNewInst(ValueOpcode::CompositeConstructU32x2,
+                                        {Value(42u), Value(43u)}));
+    else if (opcode == ValueOpcode::StoreBufferU32x3)
+      data = Value(&block->AppendNewInst(ValueOpcode::CompositeConstructU32x3,
+                                        {Value(42u), Value(43u), Value(44u)}));
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .data_dwords = dwords,
+                                   .data_bits = bits, .component_count = components,
+                                   .formatted = true, .idxen = true, .coherent = true});
+    block->AppendNewInst(opcode,
+        {handle, lane, Value(0u), Value(0u), data, Value(true)},
+        MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+    ShaderComputeInputInfo compute{};
+    TrackResources(program, {}, {}, {.compute = &compute});
+    Check(program.info.buffers.size() == 1u && program.info.buffers[0].written,
+          "indirect formatted typed-IR store was not tracked as a write");
+    const auto plan = ExtractResourcePlan(program);
+    std::array<uint32_t, 8> descriptors{};
+    for (uint32_t row = 0; row < 2u; ++row) {
+      const auto first = row * 4u;
+      descriptors[first] = 0x1000u + row * 0x1000u;
+      descriptors[first + 1] = 16u << 16u;
+      descriptors[first + 2] = 16u;
+      descriptors[first + 3] = uint32_t(format) << 12u | swizzle;
+    }
+    const auto address = reinterpret_cast<uint64_t>(descriptors.data());
+    const std::array<uint32_t, 16> user_data{static_cast<uint32_t>(address),
+        static_cast<uint32_t>(address >> 32u), 16u << 16u, 2u, 0x5204u};
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_specialization_memory = ReadHostTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "indirect formatted typed-IR store did not materialize");
+    ApplyResourceSpecialization(program, specialization);
+    TranslateResult translated;
+    translated.program = std::move(program);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    const auto compiled = CompileProgram(std::move(translated), options, specialization);
+    CheckSpirvBinaryValidates(compiled.spirv);
+  };
+  run(ValueOpcode::StoreBufferU32x3, 32u, 3u, 3u, F::k32_32_32_32Float,
+      Libs::Graphics::DstSel(4, 5, 6, 1));
+  run(ValueOpcode::StoreBufferU32, 16u, 2u, 1u, F::k16_16Float,
+      Libs::Graphics::DstSel(4, 5, 0, 1));
+  run(ValueOpcode::StoreBufferU32x2, 16u, 4u, 2u, F::k16_16_16_16Float,
+      Libs::Graphics::DstSel(4, 5, 6, 7));
+}
+
 void TestCapturedBufferAtomicsX2() {
   using ShaderRecompiler::IR::ValueOpcode;
   struct Case {
@@ -14536,6 +14620,16 @@ int main(int argc, char** argv) {
   }
   if (g_pass_bench.enabled) {
     ShaderRecompiler::SetPassTimingHook(PassBenchHook);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "1");
+#else
+    setenv("KYTY_INDIRECT_FORMATTED_STORES", "1", 1);
+#endif
+    EnsureConfigInitialized();
+    TestIndirectFormattedStoreTypedIr();
+    return 0;
   }
 
   EnsureConfigInitialized();

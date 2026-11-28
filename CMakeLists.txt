@@ -938,6 +938,8 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_cfg_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --indirect-formatted-stores-only)
 	add_test(NAME shader_corpus COMMAND $<TARGET_FILE:shader_check> --self-test)
 	add_test(NAME driver_repro COMMAND $<TARGET_FILE:driver_repro> --self-test)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -1006,6 +1008,8 @@ if(BUILD_TESTING)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
 	add_test(NAME user_service COMMAND $<TARGET_FILE:user_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_recompiler_compute_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-formatted-stores-only)
 	add_test(NAME image_heap COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-heap-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
