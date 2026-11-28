@@ -28,7 +28,8 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x24u, Opcode::S_BFM_B32},
     {0x25u, Opcode::S_BFM_B64},         {0x26u, Opcode::S_MUL_I32},
     {0x27u, Opcode::S_BFE_U32},         {0x28u, Opcode::S_BFE_I32},
-    {0x29u, Opcode::S_BFE_U64},         {0x2cu, Opcode::S_ABSDIFF_I32},
+    {0x29u, Opcode::S_BFE_U64},         {0x2au, Opcode::S_BFE_I64},
+    {0x2cu, Opcode::S_ABSDIFF_I32},
     {0x2eu, Opcode::S_LSHL1_ADD_U32},
     {0x2fu, Opcode::S_LSHL2_ADD_U32},   {0x30u, Opcode::S_LSHL3_ADD_U32},
     {0x31u, Opcode::S_LSHL4_ADD_U32},   {0x32u, Opcode::S_PACK_LL_B32_B16},
@@ -40,6 +41,7 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
 constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x03u, Opcode::S_MOV_B32},
     {0x04u, Opcode::S_MOV_B64},
+    {0x05u, Opcode::S_CMOV_B32},
     {0x06u, Opcode::S_CMOV_B64},
     {0x07u, Opcode::S_NOT_B32},
     {0x08u, Opcode::S_NOT_B64},
@@ -69,15 +71,29 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x20u, Opcode::S_SETPC_B64},
     {0x21u, Opcode::S_SWAPPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
+    {0x25u, Opcode::S_OR_SAVEEXEC_B64},
+    {0x26u, Opcode::S_XOR_SAVEEXEC_B64},
+    {0x27u, Opcode::S_ANDN2_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
+    {0x29u, Opcode::S_NAND_SAVEEXEC_B64},
+    {0x2au, Opcode::S_NOR_SAVEEXEC_B64},
+    {0x2bu, Opcode::S_XNOR_SAVEEXEC_B64},
     {0x2cu, Opcode::S_QUADMASK_B32},
     {0x2du, Opcode::S_QUADMASK_B64},
     {0x34u, Opcode::S_ABS_I32},
     {0x37u, Opcode::S_ANDN1_SAVEEXEC_B64},
+    {0x38u, Opcode::S_ORN1_SAVEEXEC_B64},
     {0x3bu, Opcode::S_BITREPLICATE_B64_B32},
     {0x3cu, Opcode::S_AND_SAVEEXEC_B32},
+    {0x3du, Opcode::S_OR_SAVEEXEC_B32},
+    {0x3eu, Opcode::S_XOR_SAVEEXEC_B32},
+    {0x3fu, Opcode::S_ANDN2_SAVEEXEC_B32},
     {0x40u, Opcode::S_ORN2_SAVEEXEC_B32},
+    {0x41u, Opcode::S_NAND_SAVEEXEC_B32},
+    {0x42u, Opcode::S_NOR_SAVEEXEC_B32},
+    {0x43u, Opcode::S_XNOR_SAVEEXEC_B32},
     {0x44u, Opcode::S_ANDN1_SAVEEXEC_B32},
+    {0x45u, Opcode::S_ORN1_SAVEEXEC_B32},
 };
 
 constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
@@ -91,7 +107,8 @@ constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
 };
 
 constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
-    {0x00u, Opcode::S_MOVK_I32},   {0x03u, Opcode::S_CMP_EQ_I32}, {0x04u, Opcode::S_CMP_LG_I32},
+    {0x00u, Opcode::S_MOVK_I32},   {0x02u, Opcode::S_CMOVK_I32},
+    {0x03u, Opcode::S_CMP_EQ_I32}, {0x04u, Opcode::S_CMP_LG_I32},
     {0x05u, Opcode::S_CMP_GT_I32}, {0x06u, Opcode::S_CMP_GE_I32}, {0x07u, Opcode::S_CMP_LT_I32},
     {0x08u, Opcode::S_CMP_LE_I32}, {0x09u, Opcode::S_CMP_EQ_U32}, {0x0au, Opcode::S_CMP_LG_U32},
     {0x0bu, Opcode::S_CMP_GT_U32}, {0x0cu, Opcode::S_CMP_GE_U32}, {0x0du, Opcode::S_CMP_LT_U32},
@@ -178,9 +195,16 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		case Opcode::S_BITSET0_B64:
 		case Opcode::S_BITSET1_B64:
 		case Opcode::S_AND_SAVEEXEC_B64:
+		case Opcode::S_OR_SAVEEXEC_B64:
+		case Opcode::S_XOR_SAVEEXEC_B64:
+		case Opcode::S_ANDN2_SAVEEXEC_B64:
 		case Opcode::S_ORN2_SAVEEXEC_B64:
+		case Opcode::S_NAND_SAVEEXEC_B64:
+		case Opcode::S_NOR_SAVEEXEC_B64:
+		case Opcode::S_XNOR_SAVEEXEC_B64:
 		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_ANDN1_SAVEEXEC_B64:
+		case Opcode::S_ORN1_SAVEEXEC_B64:
 		case Opcode::S_BITREPLICATE_B64_B32:
 			inst.data_dwords = 2u;
 			break;
@@ -225,7 +249,8 @@ void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
 	DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1);
-	if (opcode == 0x0bu || (opcode >= 0x0fu && opcode <= 0x25u && (opcode & 1u)) || opcode == 0x29u)
+	if (opcode == 0x0bu || (opcode >= 0x0fu && opcode <= 0x25u && (opcode & 1u)) || opcode == 0x29u ||
+	    opcode == 0x2au)
 		inst.data_dwords = 2u;
 }
 
@@ -255,7 +280,8 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	switch (inst.opcode) {
 		case Opcode::S_GETREG_B32:
-		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
+		case Opcode::S_MOVK_I32:
+		case Opcode::S_CMOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:
 			DecodeScalarDestination(sdst, pc, inst.dst);

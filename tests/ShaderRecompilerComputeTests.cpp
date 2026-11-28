@@ -28645,6 +28645,84 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
   return test;
 }
 
+TestCase ScalarSaveExecRemainingTwins() {
+  using O = ShaderOpcode;
+  struct SaveExecCase {
+    u32 opcode;
+    bool is64;
+    u32 src_lo;
+    u32 src_hi;
+    u32 expected_lo;
+    u32 expected_hi;
+    u32 expected_scc;
+  };
+  constexpr u32 init_lo = 0x0000000cu;
+  constexpr u32 init_hi = 0x80000000u;
+  constexpr u32 src_lo = 0x00000005u;
+  constexpr u32 src_hi = 0x80000001u;
+  const std::array<SaveExecCase, 15> cases{{
+      {0x25u, true, src_lo, src_hi, 0x0000000du, 0x80000001u, 1u},
+      {0x26u, true, src_lo, src_hi, 0x00000009u, 0x00000001u, 1u},
+      {0x27u, true, src_lo, src_hi, 0x00000001u, 0x00000001u, 1u},
+      {0x29u, true, src_lo, src_hi, 0xfffffffbu, 0x7fffffffu, 1u},
+      {0x2au, true, src_lo, src_hi, 0xfffffff2u, 0x7ffffffeu, 1u},
+      {0x2bu, true, src_lo, src_hi, 0xfffffff6u, 0xfffffffeu, 1u},
+      {0x38u, true, src_lo, src_hi, 0xfffffffeu, 0xfffffffeu, 1u},
+      {0x3du, false, src_lo, 0u, 0x0000000du, init_hi, 1u},
+      {0x3eu, false, src_lo, 0u, 0x00000009u, init_hi, 1u},
+      {0x3fu, false, src_lo, 0u, 0x00000001u, init_hi, 1u},
+      {0x3fu, false, init_lo, 0u, 0x00000000u, init_hi, 0u},
+      {0x41u, false, src_lo, 0u, 0xfffffffbu, init_hi, 1u},
+      {0x42u, false, src_lo, 0u, 0xfffffff2u, init_hi, 1u},
+      {0x43u, false, src_lo, 0u, 0xfffffff6u, init_hi, 1u},
+      {0x45u, false, src_lo, 0u, 0xfffffffeu, init_hi, 1u},
+  }};
+
+  TestCase test;
+  test.name = "ScalarSaveExecRemainingTwins";
+  auto &code = test.code;
+  u32 out = 0;
+  for (const auto &entry : cases) {
+    AppendSMovLiteral(&code, 126, init_lo);
+    AppendSMovLiteral(&code, 127, init_hi);
+    AppendSMovLiteral(&code, 0, entry.src_lo);
+    AppendSMovLiteral(&code, 1, entry.src_hi);
+    code.push_back(EncodeSop1(entry.opcode, 2, 0));
+    code.push_back(EncodeSop1(0x04, 4, 126));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    code.push_back(EncodeSMovB32(127, InlineU32(0)));
+    if (entry.is64) {
+      AppendStoreSgprPair(&code, 2, out);
+      AppendStoreSgprPair(&code, 4, out + 2u);
+      AppendStoreSgpr(&code, 253, out + 4u);
+      test.expected.insert(test.expected.end(),
+                           {init_lo, init_hi, entry.expected_lo,
+                            entry.expected_hi, entry.expected_scc});
+      out += 5u;
+    } else {
+      AppendStoreSgpr(&code, 2, out);
+      AppendStoreSgprPair(&code, 4, out + 1u);
+      AppendStoreSgpr(&code, 253, out + 3u);
+      test.expected.insert(test.expected.end(),
+                           {init_lo, entry.expected_lo, entry.expected_hi,
+                            entry.expected_scc});
+      out += 4u;
+    }
+  }
+  AppendEnd(&code);
+  test.opcodes = {
+      O::S_MOV_B32,           O::S_MOV_B64,           O::S_OR_SAVEEXEC_B64,
+      O::S_XOR_SAVEEXEC_B64,  O::S_ANDN2_SAVEEXEC_B64, O::S_NAND_SAVEEXEC_B64,
+      O::S_NOR_SAVEEXEC_B64,  O::S_XNOR_SAVEEXEC_B64, O::S_ORN1_SAVEEXEC_B64,
+      O::S_OR_SAVEEXEC_B32,   O::S_XOR_SAVEEXEC_B32,  O::S_ANDN2_SAVEEXEC_B32,
+      O::S_NAND_SAVEEXEC_B32, O::S_NOR_SAVEEXEC_B32,  O::S_XNOR_SAVEEXEC_B32,
+      O::S_ORN1_SAVEEXEC_B32, O::V_MOV_B32,           O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {
   using O = ShaderOpcode;
   constexpr u32 exec_hi = 0xa5a55a5au;
@@ -29455,6 +29533,63 @@ TestCase Scalar64BitOps() {
            O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarBfeI64() {
+  using O = ShaderOpcode;
+  struct BfeCase {
+    uint64_t source;
+    u32 field;
+    uint64_t expected;
+    u32 scc;
+  };
+  constexpr std::array<BfeCase, 7> cases{{
+      {0x0123456789abcdefull, 0x000c0004u, 0xfffffffffffffcdeuLL, 1u},
+      {0x0123456789abcdefull, 0x00040000u, 0xffffffffffffffffull, 1u},
+      {0x0123456789abcdefull, 0x0008001cu, 0x0000000000000078ull, 1u},
+      {0x8000000000000000ull, 0x0001003fu, 0xffffffffffffffffull, 1u},
+      {0x8000000000000000ull, 0x00400000u, 0x8000000000000000ull, 1u},
+      {0x8000000000000000ull, 0x00400020u, 0xffffffff80000000ull, 1u},
+      {0xffffffffffffffffull, 0x00000004u, 0x0000000000000000ull, 0u},
+  }};
+  TestCase test;
+  test.name = "ScalarBfeI64";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(),
+                        {u32(entry.source), u32(entry.source >> 32), entry.field});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    for (u32 word = 0; word < 3u; ++word) {
+      AppendVMovU32(&code, 30, (i * 3u + word) * sizeof(u32));
+      AppendBufferLoadDword(&code, 1, 30);
+      code.push_back(EncodeVop1(0x02, 8u + word, Vgpr(1)));
+    }
+    code.push_back(EncodeSop2(0x2a, 12, 8, 10));
+    code.push_back(EncodeSMovB32(14, 253));
+    const u32 out = static_cast<u32>(test.expected.size());
+    AppendStoreSgprPair(&code, 12, out);
+    AppendStoreSgpr(&code, 14, out + 2u);
+    test.expected.insert(test.expected.end(),
+                         {u32(entry.expected), u32(entry.expected >> 32), entry.scc});
+  }
+  // Signed literal source sign-extends bit 31 across bits 63..32.
+  AppendSMovLiteral(&code, 10, 0x00080020u);
+  code.push_back(EncodeSop2(0x2a, 12, 255u, 10));
+  code.push_back(0x80000001u);
+  code.push_back(EncodeSMovB32(14, 253));
+  const u32 lit_out = static_cast<u32>(test.expected.size());
+  AppendStoreSgprPair(&code, 12, lit_out);
+  AppendStoreSgpr(&code, 14, lit_out + 2u);
+  test.expected.insert(test.expected.end(), {0xffffffffu, 0xffffffffu, 1u});
+
+  AppendEnd(&code);
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::S_MOV_B32,
+                  O::S_BFE_I64,         O::V_MOV_B32,           O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase ScalarDynamic64BitOps() {
   using O = ShaderOpcode;
   struct Input {
@@ -29806,6 +29941,61 @@ TestCase ScalarAshrI64Masks(u32 wave_size) {
   test.has_compute_info = true;
   return test;
 }
+TestCase ScalarConditionalMoveB32() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ScalarConditionalMoveB32";
+  auto &code = test.code;
+  for (u32 scc : {0u, 1u}) {
+    AppendSMovLiteral(&code, 0, 0x13579bdfu);
+    AppendSMovLiteral(&code, 2, 0xabcdef01u);
+    code.push_back(EncodeSopc(0x06, InlineU32(scc), InlineU32(1)));
+    code.push_back(EncodeSop1(0x05, 0, 2));
+    code.push_back(EncodeSop2(0x0a, 4, InlineU32(1), InlineU32(0)));
+    AppendStoreSgpr(&code, 0, scc * 2);
+    AppendStoreSgpr(&code, 4, scc * 2 + 1);
+  }
+  AppendEnd(&code);
+  test.expected = {0x13579bdfu, 0, 0xabcdef01u, 1};
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CMOV_B32,
+                  O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
+TestCase ScalarConditionalMoveImm32() {
+  using O = ShaderOpcode;
+  struct Case {
+    u32 scc;
+    u32 imm;
+    u32 expected;
+  };
+  constexpr std::array<Case, 4> cases{{
+      {0u, 0x1234u, 0x13579bdfu},
+      {1u, 0x1234u, 0x00001234u},
+      {0u, 0x8001u, 0x13579bdfu},
+      {1u, 0x8001u, 0xffff8001u},
+  }};
+  TestCase test;
+  test.name = "ScalarConditionalMoveImm32";
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendSMovLiteral(&code, 0, 0x13579bdfu);
+    code.push_back(EncodeSopc(0x06, InlineU32(entry.scc), InlineU32(1)));
+    code.push_back(EncodeSopk(0x02, 0, entry.imm));
+    code.push_back(EncodeSop2(0x0a, 4, InlineU32(1), InlineU32(0)));
+    AppendStoreSgpr(&code, 0, i * 2u);
+    AppendStoreSgpr(&code, 4, i * 2u + 1u);
+    test.expected.insert(test.expected.end(), {entry.expected, entry.scc});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_CMOVK_I32,
+                  O::S_CSELECT_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase ScalarConditionalMoveB64() {
   using O = ShaderOpcode;
   TestCase test;
@@ -52429,6 +52619,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarFlbitSignedGpu);
   AddCase(ScalarSaveExecOps);
   AddCase(ScalarOrn2SaveexecUsesSourceOrNotExec);
+  AddCase(ScalarSaveExecRemainingTwins);
   cases.push_back(ScalarOrn2SaveexecB32(32, 32));
   cases.push_back(ScalarOrn2SaveexecB32(64, 64));
   cases.push_back(ScalarOrn2SaveexecB32(32, 4));
@@ -52450,6 +52641,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
   AddCase(Scalar64BitOps);
+  AddCase(ScalarBfeI64);
   AddCase(ScalarDynamic64BitOps);
   cases.push_back(ScalarAshrI64Edges(false));
   cases.push_back(ScalarAshrI64Edges(true));
@@ -52458,6 +52650,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarAshrI64Masks(64));
   AddCase(VectorDynamicU64ShiftEdges);
   AddCase(VectorVop3AshrrevI64Operands);
+  AddCase(ScalarConditionalMoveB32);
+  AddCase(ScalarConditionalMoveImm32);
   AddCase(ScalarConditionalMoveB64);
   AddCase(ScalarConditionalMoveB64PreservesMasks);
   AddCase(ScalarAndn2B64SccUsesMaskShadow);
@@ -61581,6 +61775,21 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-addc-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAddcWritesPerLaneCarryOut());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-twins-only") == 0) {
+    // These cases move whole dwords, so the coarser storage-buffer bounds of a host without
+    // byte-granular robust access are enough.
+#ifdef _WIN32
+    _putenv_s("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1");
+#else
+    setenv("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1", 1);
+#endif
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarSaveExecRemainingTwins());
+    RunCase(&vulkan, ScalarConditionalMoveB32());
+    RunCase(&vulkan, ScalarConditionalMoveImm32());
+    RunCase(&vulkan, ScalarBfeI64());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mul-i24-only") == 0) {

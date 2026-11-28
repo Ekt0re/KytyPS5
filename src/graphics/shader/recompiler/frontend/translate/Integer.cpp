@@ -457,6 +457,38 @@ void Translator::S_BFE_U64(const Decoder::Instruction& inst) {
 	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
 }
 
+void Translator::S_BFE_I64(const Decoder::Instruction& inst) {
+	// Signed 64-bit sources sign-extend literals; generic B64 operands zero-extend them.
+	const auto source =
+	    inst.src0.kind == Decoder::OperandKind::LiteralConstant
+	        ? ir.ConstructU64(
+	              ReadU32(inst.src0),
+	              IR::U32(IR::Value((inst.src0.value & 0x80000000u) ? 0xffffffffu : 0u)))
+	        : ReadU64(inst.src0);
+	const auto field = ReadU32(inst.src1);
+	const auto offset =
+	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {field, IR::Value(0u), IR::Value(6u)}));
+	const auto raw_count =
+	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {field, IR::Value(16u), IR::Value(7u)}));
+	const auto remaining = ir.ISub(IR::U32(IR::Value(64u)), offset);
+	const auto count     = IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {raw_count, remaining}));
+	const auto non_zero  = ir.INotEqual(count, IR::U32(IR::Value(0u)));
+	const auto safe_cnt  = ir.Select(non_zero, count, IR::U32(IR::Value(1u)));
+	const auto end_bit   = ir.IAdd(offset, safe_cnt);
+	const auto left_amt  = ir.ISub(IR::U32(IR::Value(64u)), end_bit);
+	const auto right_amt = ir.ISub(IR::U32(IR::Value(64u)), safe_cnt);
+	const auto shifted =
+	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftLeftLogical64, {source, left_amt}));
+	const auto signed_val =
+	    IR::U64(ir.Emit(IR::ValueOpcode::ShiftRightArithmetic64, {shifted, right_amt}));
+	const auto words  = ExtractU64(signed_val);
+	const auto zero   = IR::U32(IR::Value(0u));
+	const auto result = ir.ConstructU64(ir.Select(non_zero, words[0], zero),
+	                                    ir.Select(non_zero, words[1], zero));
+	WriteOperand(DestinationOperand(inst), result);
+	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
+}
+
 void Translator::V_BFE_U32(const Decoder::Instruction& inst, bool sign) {
 	const auto source    = ReadU32(inst.src0);
 	const auto offset    = ir.BitwiseAnd(ReadU32(inst.src1), IR::U32(IR::Value(31u)));

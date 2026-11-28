@@ -46,12 +46,20 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 }
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
-                            bool negate_exec, bool negate_source, bool write_64) {
+                            bool negate_exec, bool negate_source, bool write_64,
+                            bool negate_result) {
 	const auto combine = [&](IR::U32 old, IR::U32 src) {
 		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
 		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		return operation == IR::ValueOpcode::LogicalAnd ? ir.BitwiseAnd(lhs, rhs)
-		                                                : ir.BitwiseOr(lhs, rhs);
+		IR::U32    res;
+		if (operation == IR::ValueOpcode::LogicalAnd) {
+			res = ir.BitwiseAnd(lhs, rhs);
+		} else if (operation == IR::ValueOpcode::LogicalOr) {
+			res = ir.BitwiseOr(lhs, rhs);
+		} else {
+			res = ir.BitwiseXor(lhs, rhs);
+		}
+		return negate_result ? ir.BitwiseNot(res) : res;
 	};
 	if (!write_64) {
 		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
@@ -72,8 +80,11 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 	const std::array old_mask {ir.GetExecLo(), ir.GetExecHi()};
 	const std::array mask {combine(old_mask[0], src_mask[0]), combine(old_mask[1], src_mask[1])};
 	WriteMask(inst.dst, old, old_mask, true);
-	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), IR::U1(ir.Emit(operation, {lhs, rhs})),
-	          mask);
+	auto exec_pred = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	if (negate_result) {
+		exec_pred = ir.LogicalNot(exec_pred);
+	}
+	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), exec_pred, mask);
 	ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
 }
 
@@ -233,6 +244,11 @@ void Translator::S_GETPC_B64(const Decoder::Instruction& inst) {
 
 void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(inst.src1));
+	WriteOperand(DestinationOperand(inst), result);
+}
+
+void Translator::S_CMOV_B32(const Decoder::Instruction& inst) {
+	const auto result = ir.Select(ir.GetScc(), ReadU32(inst.src0), ReadU32(inst.dst));
 	WriteOperand(DestinationOperand(inst), result);
 }
 
