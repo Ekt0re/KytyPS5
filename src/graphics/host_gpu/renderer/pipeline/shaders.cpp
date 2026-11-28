@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <string>
@@ -41,6 +42,25 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Owns a creation-feedback chain for as long as the create call runs. Constructed only when the
+// reporter is on and the device enabled VK_EXT_pipeline_creation_feedback; an empty optional
+// leaves the create info's pNext chain exactly as upstream builds it.
+struct CreationFeedback {
+	vk::PipelineCreationFeedback                        total {};
+	std::array<vk::PipelineCreationFeedback, 8>         stages {};
+	vk::PipelineCreationFeedbackCreateInfo              info {};
+
+	explicit CreationFeedback(uint32_t stage_count) {
+		info.pPipelineCreationFeedback          = &total;
+		info.pipelineStageCreationFeedbackCount = stage_count;
+		info.pPipelineStageCreationFeedbacks    = stages.data();
+	}
+};
+
+} // namespace
 
 bool RetainModuleSpirv() {
 	static const bool enabled = [] {
@@ -594,16 +614,14 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
 	}
 
-	vk::PipelineCreationFeedback          feedback {};
-	std::array<vk::PipelineCreationFeedback, 8> stage_feedback {};
-	vk::PipelineCreationFeedbackCreateInfo feedback_info {};
-	feedback_info.pPipelineCreationFeedback          = &feedback;
-	feedback_info.pipelineStageCreationFeedbackCount = shader_stage_count;
-	feedback_info.pPipelineStageCreationFeedbacks    = stage_feedback.data();
-	rendering_info.pNext = &feedback_info; // pipeline_info.pNext already points at rendering_info.
-
 	auto&       stats = CreateStats::Global();
 	const bool  on    = CreateStats::Enabled();
+	std::optional<CreationFeedback> feedback;
+	if (on && graphics.pipeline_creation_feedback_enabled) {
+		feedback.emplace(shader_stage_count);
+		// pipeline_info.pNext already points at rendering_info.
+		rendering_info.pNext = &feedback->info;
+	}
 	std::chrono::steady_clock::time_point begin;
 	if (on) {
 		begin = std::chrono::steady_clock::now();
@@ -613,6 +631,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
+	const auto feedback_flags =
+	    feedback ? feedback->total.flags : vk::PipelineCreationFeedbackFlags {};
+	const auto driver_ns = feedback ? feedback->total.duration : 0;
 	const auto result =
 	    PipelineBinaryStore::Get().CreateGraphics(graphics, driver_cache, pipeline_info, &pipeline);
 	if (on) {
@@ -621,10 +642,10 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 		                              std::chrono::steady_clock::now() - begin)
 		                              .count()),
-		    static_cast<bool>(feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid),
-		    static_cast<bool>(feedback.flags &
+		    static_cast<bool>(feedback_flags & vk::PipelineCreationFeedbackFlagBits::eValid),
+		    static_cast<bool>(feedback_flags &
 		                      vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit),
-		    feedback.duration);
+		    driver_ns);
 	}
 	if (result != vk::Result::eSuccess) {
 		ExitPipelineFailure("vkCreateGraphicsPipelines", result, stages);
@@ -678,16 +699,13 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	info.stage  = comp_shader_stage_info;
 	info.layout = layout;
 
-	vk::PipelineCreationFeedback       feedback {};
-	vk::PipelineCreationFeedback       stage_feedback {};
-	vk::PipelineCreationFeedbackCreateInfo feedback_info {};
-	feedback_info.pPipelineCreationFeedback          = &feedback;
-	feedback_info.pipelineStageCreationFeedbackCount = 1;
-	feedback_info.pPipelineStageCreationFeedbacks    = &stage_feedback;
-	info.pNext = &feedback_info;
-
 	auto&       stats = CreateStats::Global();
 	const bool  on    = CreateStats::Enabled();
+	std::optional<CreationFeedback> feedback;
+	if (on && graphics.pipeline_creation_feedback_enabled) {
+		feedback.emplace(1);
+		info.pNext = &feedback->info;
+	}
 	std::chrono::steady_clock::time_point begin;
 	if (on) {
 		begin = std::chrono::steady_clock::now();
@@ -697,6 +715,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
+	const auto feedback_flags =
+	    feedback ? feedback->total.flags : vk::PipelineCreationFeedbackFlags {};
+	const auto driver_ns = feedback ? feedback->total.duration : 0;
 	const auto result =
 	    PipelineBinaryStore::Get().CreateCompute(graphics, driver_cache, info, &pipeline);
 	if (on) {
@@ -705,10 +726,10 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 		                              std::chrono::steady_clock::now() - begin)
 		                              .count()),
-		    static_cast<bool>(feedback.flags & vk::PipelineCreationFeedbackFlagBits::eValid),
-		    static_cast<bool>(feedback.flags &
+		    static_cast<bool>(feedback_flags & vk::PipelineCreationFeedbackFlagBits::eValid),
+		    static_cast<bool>(feedback_flags &
 		                      vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit),
-		    feedback.duration);
+		    driver_ns);
 	}
 	if (result != vk::Result::eSuccess) {
 		const ShaderModule* modules[] = {&module};

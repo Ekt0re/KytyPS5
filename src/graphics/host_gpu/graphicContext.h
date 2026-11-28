@@ -43,6 +43,8 @@ struct GraphicContext {
 	bool                               unified_image_layouts_enabled         = false;
 	// KYTY_PIPELINE_STATS: pipelines are created with their driver statistics (pipelineStats.h).
 	bool                               pipeline_statistics_enabled           = false;
+	// VK_EXT_pipeline_creation_feedback: driver compile feedback for KYTY_PIPELINE_CREATE_STATS.
+	bool                               pipeline_creation_feedback_enabled    = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	// VK_KHR_pipeline_binary with maintenance5 (PipelineBinaryStore).

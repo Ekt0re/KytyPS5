@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
+#include "graphics/host_gpu/renderer/pipeline/createStats.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 #include "graphics/host_gpu/renderer/recorder.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -518,6 +519,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    PipelineStats::Requested() && add(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
 	if (!pipeline_stats_extension) {
 		supported.unlink<vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
+	}
+	// Creation feedback is only requested while the reporter is on. With the reporter off the
+	// extension is not even added to the device, matching the default device setup.
+	if (CreateStats::Enabled()) {
+		graphics.pipeline_creation_feedback_enabled =
+		    add(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
 	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
