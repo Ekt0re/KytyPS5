@@ -21,7 +21,7 @@
 // Code that records with its own function pointers (upscaler SDKs, ImGui) must call Sync() on
 // the command buffer first.
 //
-// Off by default; KYTY_RECORDER=1 turns it on (KYTY_RECORDER_TOGGLE then switches it at run time).
+// On by default; KYTY_RECORDER=0 turns it off (KYTY_RECORDER_TOGGLE then switches it at run time).
 
 #include "graphics/host_gpu/renderer/recorder.h"
 
@@ -1641,9 +1641,10 @@ void Install() {
 		Log::WriteToConsoleAndLog("[recorder] device functions loaded again: recording stays on the calling thread\n");
 		return;
 	}
-	// Off by default until it shows a gain (one GTA VI A/B: within noise).
+	// On by default (GTA VI world A/B rt_ab1: -26 % GPU-thread instructions per operation);
+	// KYTY_RECORDER=0 turns it off.
 	const char* setting = std::getenv("KYTY_RECORDER");
-	if (setting == nullptr || std::strcmp(setting, "1") != 0) {
+	if (setting != nullptr && std::strcmp(setting, "0") == 0) {
 		return;
 	}
 	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;
