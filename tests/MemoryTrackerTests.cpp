@@ -424,6 +424,7 @@ void TestMaterializationStamps() {
   Check(cpu_stamp != nullptr && cpu_stamp->Unchanged(), "clean CPU-owned range is stamped");
   tracker.MarkRegionAsCpuModified(address, 64);
   Check(!cpu_stamp->Unchanged(), "CPU dirtiness invalidates a stamp");
+  Check(IsWritable(memory), "taking a stamp left an extra write watch");
 
   tracker.ForEachUploadRange(address, page_size * 2, false,
                              [](uint64_t, uint64_t) noexcept {},
@@ -438,6 +439,8 @@ void TestMaterializationStamps() {
   Check(tracker.Track(address, page_size * 2, 1) == nullptr,
         "the stamp page cap rejects a larger range");
   tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  Check(IsWritable(memory) && IsWritable(memory + page_size),
+        "materialization stamps retained write watches after dirtiness");
   Release(memory);
 }
 

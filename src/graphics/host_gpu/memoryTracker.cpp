@@ -133,11 +133,9 @@ std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> MemoryTracker::Track(ui
 		offset = 0;
 		index++;
 	}
-	// A guest protection change may have made a clean page writable. Re-arm the existing page
-	// manager's write watch so the next CPU write faults into the tracker again.
-	const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
-	const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
-	m_page_manager.UpdatePageWatchers<true>(begin, end - begin);
+	// Clean pages are already write-watched by the upload transition that cleared their dirty
+	// state. A stamp observes that region-owned watch; taking another counted reference here would
+	// outlive the stamp and keep the page protected after it became CPU-dirty.
 	return std::make_shared<MemoryStamp>(std::move(regions));
 }
 
