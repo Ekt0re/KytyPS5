@@ -5,9 +5,12 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <charconv>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <optional>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -751,13 +754,19 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	const auto loop_shader = LoopIterationShaderHash();
 	if (!state.program.dispatcher_fallback && LoopIterationLimit() != 0 &&
+	    (loop_shader == 0 || loop_shader == program.shader_hash) &&
 	    std::ranges::any_of(program.blocks, [](const IR::Block* block) {
 		    const auto& term = block->terminator;
 		    return term.loop_header && term.merge_block != nullptr &&
 		           term.continue_block != nullptr;
 	    })) {
 		state.loop_fuel_variable = state.builder.AllocateId();
+		if (loop_shader != 0) {
+			std::fprintf(stderr, "Shader loop guard: %016" PRIx64 ", limit %u\n",
+			             loop_shader, LoopIterationLimit());
+		}
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.loop_fuel_variable, spv::StorageClassFunction);
@@ -843,6 +852,22 @@ uint32_t LoopIterationLimit() {
 	}();
 	return forced >= 0 ? static_cast<uint32_t>(forced)
 	                   : g_loop_iteration_limit_default.load(std::memory_order_relaxed);
+}
+
+uint64_t LoopIterationShaderHash() {
+	static const uint64_t hash = []() -> uint64_t {
+		const char* value = std::getenv("KYTY_SHADER_LOOP_HASH");
+		if (value == nullptr || *value == '\0') return 0;
+		const std::string_view text(value);
+		uint64_t parsed = 0;
+		const auto end = text.data() + text.size();
+		const auto result = std::from_chars(text.data(), end, parsed, 16);
+		if (result.ec != std::errc{} || result.ptr != end || parsed == 0) {
+			EXIT("KYTY_SHADER_LOOP_HASH requires a nonzero hexadecimal shader hash\n");
+		}
+		return parsed;
+	}();
+	return hash;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

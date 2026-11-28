@@ -71,6 +71,8 @@ bool BallotGuardsEnabled();
 inline constexpr uint32_t DefaultLoopIterationLimit = 0u;
 void                      SetLoopIterationLimitDefault(uint32_t limit);
 uint32_t                  LoopIterationLimit();
+// Nonzero selects a single guest shader for the loop guard (KYTY_SHADER_LOOP_HASH, in hex).
+uint64_t                  LoopIterationShaderHash();
 
 // KYTY_RT_OFF=1: BVH node tests always miss (an empty scene). Not part of Profile, so the shader
 // store header stays; the pipeline cache neither loads nor stores BVH modules while it is set.

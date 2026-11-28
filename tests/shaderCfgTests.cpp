@@ -14386,10 +14386,16 @@ void TestSpirvLoopIterationGuard() {
       EncodeSopp(0x02, 0xfffcu),   // continue/backedge
       EncodeSopp(0x01),
   };
-  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.shader_hash = Spirv::LoopIterationShaderHash();
   const auto plain = RecompileForTest(shader, options).spirv;
   Spirv::SetLoopIterationLimitDefault(1000);
   const auto guarded = RecompileForTest(shader, options).spirv;
+  if (options.shader_hash != 0) {
+    options.shader_hash ^= 1;
+    Check(RecompileForTest(shader, options).spirv == plain,
+          "loop guard: unrelated shader changed when a single hash was selected");
+  }
   Spirv::SetLoopIterationLimitDefault(0);
   CheckSpirvBinaryValidates(plain);
   CheckSpirvBinaryValidates(guarded);

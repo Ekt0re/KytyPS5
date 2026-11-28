@@ -154,6 +154,7 @@ uint64_t CodegenSwitchKey() {
 	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
 		constexpr uint64_t LoopLimitStamp = 0x6c6f6f706c696d00ull;
 		key ^= LoopLimitStamp ^ (uint64_t {limit} * 0xff51afd7ed558ccdull);
+		key ^= ShaderRecompiler::Spirv::LoopIterationShaderHash() * 0xc2b2ae3d27d4eb4full;
 	}
 	return key;
 }
@@ -197,6 +198,9 @@ std::string ShaderStoreVariant() {
 	if (const auto limit = ShaderRecompiler::Spirv::LoopIterationLimit();
 	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
 		variant += fmt::format("-loop{}", limit);
+		if (const auto shader = ShaderRecompiler::Spirv::LoopIterationShaderHash(); shader != 0) {
+			variant += fmt::format("-{:016x}", shader);
+		}
 	}
 	return variant;
 }
