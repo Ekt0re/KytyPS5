@@ -82,7 +82,7 @@ bool IsRuntimeSelect(ValueOpcode op) {
 	       op == ValueOpcode::SelectF32;
 }
 
-bool IsRuntimeUniformOp(ValueOpcode op) {
+bool IsRuntimeUniformOpImpl(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::ConditionRef:
 		case ValueOpcode::BitCastU32F32:
@@ -400,7 +400,7 @@ private:
 				return finish(false);
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
+		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOpImpl(op)) {
 			return finish(false);
 		}
 		return finish(ValidateArguments(*inst, true));
@@ -772,7 +772,8 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 		}
 		default:
 			// The other runtime-uniform ops are strict; a U32x2 pair is only read through its extracts.
-			if (!IsRuntimeUniformOp(inst.GetOpcode()) || inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
+			if (!IsRuntimeUniformOpImpl(inst.GetOpcode()) ||
+			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
 				return {};
 			for (size_t i = 0; i < inst.NumArgs(); ++i) {
 				node.args.push_back(arg(inst.Arg(i)));
@@ -1599,6 +1600,10 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 }
 
 } // namespace
+
+bool IsRuntimeUniformOp(ValueOpcode opcode) {
+	return IsRuntimeUniformOpImpl(opcode);
+}
 
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
