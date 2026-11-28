@@ -116,6 +116,19 @@ Which of them each walk traces was read only for `12d153e6` (`+0x10`) and `27eed
 `0x02020024 & 0xa01c0000 == 0`, so the mirror accepts these headers: not Trinity, not BVH8, not
 three-level, not depopulated, not GPU-sized. The BLAS headers were not probed.
 
+## The tree's own recognizer test fails
+
+`shader_recompiler_compute_tests --bvh-mirror-only` passes the mirror checks (formats 1, 3 and 10). It
+then aborts in `CheckRayQueryTraversal` at "recognized loop: the traversal loop was not driven by a ray
+query" (`RayQueryTraversalGpuTests.inc:456`).
+
+The anyvi build fails the same way. Its ray tracing sources are identical to origin/main's, so the
+failure is not caused by the coverage commit. On this tree the pass no longer drives even the walk it
+was written for. That holds for any game, not only GTA VI, and should be bisected from upstream's
+`e141b44a` before any recognizer work.
+
+`--ray-tracing-only` passes.
+
 ## Why the tree's recognizer rejects them
 
 These are the first failing checks, as lines of `RayQueryTraversal.cpp` at `af5e20d8`:
