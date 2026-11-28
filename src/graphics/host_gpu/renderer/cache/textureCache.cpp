@@ -314,6 +314,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
 	m_resolve_cache.Invalidate(data.address, data.size);
 	m_total_used_memory += image.AccountedSize();
 }
@@ -381,7 +382,15 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
+	// KYTY_LRU_TOUCH_ONCE=0 touches the LRU entry on every call again. Draws touch the same images
+	// many times per tick; the image keeps the tick of its last touch, so only the first touch
+	// loads the entry (a cache miss) and moves it. The LRU order is the same either way.
+	static const bool once = [] {
+		const char* value = std::getenv("KYTY_LRU_TOUCH_ONCE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (image.registered && (!once || image.lru_tick < m_gc_tick)) {
+		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
 }
