@@ -61084,6 +61084,13 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--registered-pages-only") == 0) {
+    // This case checks page counts, not byte-granular robustness; allow the coarser bounds RADV
+    // reports so the harness can start on hosts that cannot run the byte-accurate cases.
+#ifdef _WIN32
+    _putenv_s("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1");
+#else
+    setenv("KYTY_TEST_ALLOW_COARSE_ROBUST_BUFFER_ACCESS", "1", 1);
+#endif
     VulkanHarness vulkan;
     vulkan.CheckRegisteredPageSkips();
     return 0;
