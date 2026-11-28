@@ -1172,7 +1172,7 @@ bool MayReadTimeStampCounter(uintptr_t start, uintptr_t end) {
 // code, so its other functions were never analyzed and kept their red-zone stores unprotected.
 // Returns how many it added.
 size_t AddCalledFunctionStarts(uintptr_t segment_start, uintptr_t segment_end,
-                               std::vector<uintptr_t>& starts) {
+                               std::vector<uintptr_t>& starts, size_t* lea_count) {
 	// One bit per byte of the segment: an instruction that starts there was decoded.
 	std::vector<u64> decoded_bits((segment_end - segment_start + 63u) / 64u);
 	const auto       decoded = [&](uintptr_t address) {
@@ -1218,6 +1218,7 @@ size_t AddCalledFunctionStarts(uintptr_t segment_start, uintptr_t segment_end,
 					if (target_in_segment && known.insert(target).second) {
 						starts.push_back(target);
 						functions.push_back(target);
+						*lea_count += rip_relative_lea ? 1 : 0;
 					}
 				} else if (instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
 					if (target_in_segment) blocks.push_back(target);
@@ -1785,7 +1786,8 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
                                                    std::span<const uintptr_t> function_starts,
                                                    bool protect_memory, bool emulate_amd,
                                                    GuestInstructionHostFeatures host_features,
-                                                   u64                          tsc_multiplier) {
+                                                   u64                          tsc_multiplier,
+                                                   std::span<const std::pair<uintptr_t, uintptr_t>> listed_ranges) {
 	GuestInstructionPatchResult result {};
 	const bool                  tsc_only = !protect_memory && !emulate_amd;
 	if (tsc_only && tsc_multiplier == 0) {
@@ -1805,7 +1807,14 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		}
 	}
 	if (!tsc_only || MayReadTimeStampCounter(segment_addr, segment_end)) {
-		result.called_function_count = AddCalledFunctionStarts(segment_addr, segment_end, starts);
+		const size_t listed_count = starts.size();
+		size_t       lea_count    = 0;
+		result.called_function_count =
+		    AddCalledFunctionStarts(segment_addr, segment_end, starts, &lea_count);
+		result.lea_function_count = lea_count;
+		for (size_t index = listed_count; index < starts.size(); ++index) {
+			result.called_inside_listed_count += IsInsideListedFunction(listed_ranges, starts[index]);
+		}
 	}
 	std::ranges::sort(starts);
 	const auto unique_end = std::ranges::unique(starts).begin();
@@ -1923,6 +1932,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	const auto trampoline_addr =
 	    reinterpret_cast<u64>(module->trampoline_gen.getCode()) + trampoline_begin;
 	const auto trampoline_size = module->trampoline_gen.getSize() - trampoline_begin;
+	result.trampoline_bytes    = trampoline_size;
 	Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 	if (trampoline_size != 0) {
 		Common::VirtualMemory::FlushInstructionCache(trampoline_addr, trampoline_size);
@@ -2103,6 +2113,173 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 		function_starts->push_back(function_start);
 	}
 	return true;
+}
+
+namespace {
+
+bool ReadUleb128(const uint8_t** cursor, const uint8_t* end, uint64_t* value) {
+	uint64_t result = 0;
+	for (unsigned shift = 0; *cursor < end && shift < 64; shift += 7) {
+		const uint8_t byte = *(*cursor)++;
+		result |= static_cast<uint64_t>(byte & 0x7fu) << shift;
+		if ((byte & 0x80u) == 0) {
+			*value = result;
+			return true;
+		}
+	}
+	return false;
+}
+
+size_t EncodedPointerSize(uint8_t encoding) {
+	switch (encoding & DW_EH_PE_FORMAT_MASK) {
+		case 0x00:
+		case 0x04:
+		case 0x0c: return 8;
+		case 0x02:
+		case 0x0a: return 2;
+		case 0x03:
+		case 0x0b: return 4;
+		default: return 0;
+	}
+}
+
+// The pointer encoding of the FDEs that use the CIE at cie ('R' augmentation), or nullopt.
+std::optional<uint8_t> ReadCiePointerEncoding(const uint8_t* cie) {
+	uint32_t length = 0;
+	std::memcpy(&length, cie, sizeof(length));
+	if (length == 0 || length == 0xffffffffu) {
+		return std::nullopt;
+	}
+	const uint8_t* end    = cie + sizeof(length) + length;
+	const uint8_t* cursor = cie + sizeof(length) + sizeof(uint32_t); // past the CIE id
+	if (cursor >= end) {
+		return std::nullopt;
+	}
+	const uint8_t version      = *cursor++;
+	const auto*   augmentation = reinterpret_cast<const char*>(cursor);
+	const size_t  aug_length   = strnlen(augmentation, static_cast<size_t>(end - cursor));
+	cursor += aug_length + 1;
+	if (aug_length >= 2 && augmentation[0] == 'e' && augmentation[1] == 'h') {
+		cursor += sizeof(uintptr_t);
+	}
+	// Code and data alignment: the SLEB128 is skipped the same way as a ULEB128.
+	uint64_t ignored = 0;
+	if (!ReadUleb128(&cursor, end, &ignored) || !ReadUleb128(&cursor, end, &ignored)) {
+		return std::nullopt;
+	}
+	if (version == 1) {
+		++cursor;
+	} else if (!ReadUleb128(&cursor, end, &ignored)) {
+		return std::nullopt;
+	}
+	if (aug_length == 0 || augmentation[0] != 'z') {
+		return uint8_t {0};
+	}
+	if (!ReadUleb128(&cursor, end, &ignored)) {
+		return std::nullopt;
+	}
+	for (size_t index = 1; index < aug_length && cursor < end; ++index) {
+		switch (augmentation[index]) {
+			case 'R': return *cursor;
+			case 'L': ++cursor; break;
+			case 'P': {
+				const uint8_t encoding = *cursor++;
+				const size_t  size     = EncodedPointerSize(encoding);
+				if (size == 0) {
+					return std::nullopt;
+				}
+				cursor += size;
+				break;
+			}
+			case 'S':
+			case 'B': break;
+			default: return std::nullopt;
+		}
+	}
+	return uint8_t {0};
+}
+
+} // namespace
+
+bool DecodeEhFrameFunctionRanges(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
+                                 std::vector<std::pair<uintptr_t, uintptr_t>>* ranges) {
+	if (ranges == nullptr || eh_frame_header_addr == 0 || eh_frame_header_size < 4 ||
+	    eh_frame_header_size > UINTPTR_MAX - eh_frame_header_addr) {
+		return false;
+	}
+	ranges->clear();
+	const auto* start             = reinterpret_cast<const uint8_t*>(eh_frame_header_addr);
+	const auto* end               = start + eh_frame_header_size;
+	const auto* cursor            = start;
+	uint8_t     version           = 0;
+	uint8_t     eh_frame_encoding = 0;
+	uint8_t     count_encoding    = 0;
+	uint8_t     table_encoding    = 0;
+	uintptr_t   ignored           = 0;
+	uintptr_t   fde_count         = 0;
+	if (!ReadEhValue(&cursor, end, &version) || !ReadEhValue(&cursor, end, &eh_frame_encoding) ||
+	    !ReadEhValue(&cursor, end, &count_encoding) ||
+	    !ReadEhValue(&cursor, end, &table_encoding) || version != 1 ||
+	    !ReadEncodedEhPointer(&cursor, end, eh_frame_encoding, eh_frame_header_addr, &ignored) ||
+	    count_encoding == DW_EH_PE_OMIT || table_encoding == DW_EH_PE_OMIT ||
+	    !ReadEncodedEhPointer(&cursor, end, count_encoding, eh_frame_header_addr, &fde_count) ||
+	    fde_count > eh_frame_header_size / 2u) {
+		return false;
+	}
+	std::map<const uint8_t*, std::optional<uint8_t>> cie_encodings;
+	ranges->reserve(static_cast<size_t>(fde_count));
+	for (uintptr_t index = 0; index < fde_count; ++index) {
+		uintptr_t function_start = 0;
+		uintptr_t fde_address    = 0;
+		if (!ReadEncodedEhPointer(&cursor, end, table_encoding, eh_frame_header_addr,
+		                          &function_start) ||
+		    !ReadEncodedEhPointer(&cursor, end, table_encoding, eh_frame_header_addr,
+		                          &fde_address) ||
+		    fde_address == 0) {
+			return false;
+		}
+		const auto* fde    = reinterpret_cast<const uint8_t*>(fde_address);
+		uint32_t    length = 0;
+		uint32_t    cie_id = 0;
+		std::memcpy(&length, fde, sizeof(length));
+		std::memcpy(&cie_id, fde + sizeof(length), sizeof(cie_id));
+		if (length == 0 || length == 0xffffffffu || cie_id == 0) {
+			continue;
+		}
+		const uint8_t* cie = fde + sizeof(length) - cie_id;
+		auto           it  = cie_encodings.find(cie);
+		if (it == cie_encodings.end()) {
+			it = cie_encodings.emplace(cie, ReadCiePointerEncoding(cie)).first;
+		}
+		if (!it->second) {
+			continue;
+		}
+		const size_t pointer_size = EncodedPointerSize(*it->second);
+		if (pointer_size == 0) {
+			continue;
+		}
+		// The range uses only the format of the encoding: no base, never indirect.
+		const uint8_t* range_cursor = fde + sizeof(length) + sizeof(cie_id) + pointer_size;
+		uintptr_t      range        = 0;
+		if (!ReadEncodedEhPointer(&range_cursor, fde + sizeof(length) + length,
+		                          *it->second & DW_EH_PE_FORMAT_MASK, 0, &range)) {
+			continue;
+		}
+		ranges->emplace_back(function_start, function_start + range);
+	}
+	std::ranges::sort(*ranges);
+	return true;
+}
+
+bool IsInsideListedFunction(std::span<const std::pair<uintptr_t, uintptr_t>> ranges,
+                            uintptr_t                                         address) {
+	const auto upper = std::ranges::upper_bound(ranges, address, {},
+	                                            [](const auto& range) { return range.first; });
+	if (upper == ranges.begin()) {
+		return false;
+	}
+	const auto& range = *std::prev(upper);
+	return address > range.first && address < range.second;
 }
 
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,

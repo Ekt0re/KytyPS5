@@ -7,6 +7,7 @@
 #include "common/common.h"
 
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace Loader {
@@ -38,6 +39,12 @@ struct GuestInstructionPatchResult {
 	uint64_t               function_count                           = 0;
 	// Functions found through the calls and address loads of the listed ones.
 	uint64_t               called_function_count                    = 0;
+	// Of those, the ones found only through a RIP-relative LEA.
+	uint64_t               lea_function_count                       = 0;
+	// Found starts that lie strictly inside the range of a function .eh_frame lists: they split a
+	// real function in two (or are not instruction boundaries at all).
+	uint64_t               called_inside_listed_count               = 0;
+	uint64_t               trampoline_bytes                         = 0;
 	uint64_t               instruction_count                        = 0;
 	uint64_t               red_zone_function_count                  = 0;
 	uint64_t               memory_instruction_count                 = 0;
@@ -65,10 +72,19 @@ GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
     bool protect_memory, bool emulate_amd,
     GuestInstructionHostFeatures host_features  = GetGuestInstructionHostFeatures(),
-    uint64_t                     tsc_multiplier = 0);
+    uint64_t                     tsc_multiplier = 0,
+    std::span<const std::pair<uintptr_t, uintptr_t>> listed_ranges = {});
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);
+
+// The [start, end) range of every function .eh_frame lists, sorted by start (diagnostics only).
+bool DecodeEhFrameFunctionRanges(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
+                                 std::vector<std::pair<uintptr_t, uintptr_t>>* ranges);
+
+// Whether address lies strictly inside one of the sorted ranges (not at its start).
+bool IsInsideListedFunction(std::span<const std::pair<uintptr_t, uintptr_t>> ranges,
+                            uintptr_t                                         address);
 
 } // namespace Loader
 

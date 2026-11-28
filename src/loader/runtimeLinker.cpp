@@ -1842,7 +1842,8 @@ uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
 // called directly. Executable segments hold no data, so these addresses are function entries.
 static void AddRelocatedCodeAddresses(Program* program,
                                       const std::vector<std::pair<uint64_t, uint64_t>>& segments,
-                                      std::vector<uintptr_t>* function_starts) {
+                                      std::vector<uintptr_t>* function_starts,
+                                      std::vector<uintptr_t>* relocated = nullptr) {
 	auto*       elf        = program->elf.get();
 	Elf64_Rela* rela       = nullptr;
 	uint64_t    rela_bytes = 0;
@@ -1862,6 +1863,9 @@ static void AddRelocatedCodeAddresses(Program* program,
 			    return address >= segment.first && address < segment.first + segment.second;
 		    })) {
 			function_starts->push_back(address);
+			if (relocated != nullptr) {
+				relocated->push_back(address);
+			}
 		}
 	}
 }
@@ -2008,18 +2012,57 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		                                &function_starts) &&
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
+		const auto patch_begin = std::chrono::steady_clock::now();
+		// Diagnostics for the summary line: the functions .eh_frame lists, with their ranges, and
+		// the code addresses only relocations name (and of those, the ones inside a listed range).
+		std::vector<std::pair<uintptr_t, uintptr_t>> listed_ranges;
+		uint64_t                                     listed_count             = function_starts.size();
+		uint64_t                                     relocated_count          = 0;
+		uint64_t                                     relocated_inside_listed  = 0;
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
 			    module_name));
 		} else {
-			AddRelocatedCodeAddresses(program, executable_segments, &function_starts);
+			if (protect_memory_faults) {
+				DecodeEhFrameFunctionRanges(eh_frame_header_addr, eh_frame_header_size,
+				                            &listed_ranges);
+			}
+			std::vector<uintptr_t> relocated;
+			AddRelocatedCodeAddresses(program, executable_segments, &function_starts, &relocated);
+			std::vector<uintptr_t> listed(function_starts.begin(),
+			                              function_starts.begin() +
+			                                  static_cast<std::ptrdiff_t>(listed_count));
+			std::ranges::sort(listed);
+			std::ranges::sort(relocated);
+			relocated.erase(std::ranges::unique(relocated).begin(), relocated.end());
+			for (const uintptr_t address: relocated) {
+				if (!std::ranges::binary_search(listed, address)) {
+					++relocated_count;
+					relocated_inside_listed += IsInsideListedFunction(listed_ranges, address);
+				}
+			}
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(
 			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
-			    GetGuestInstructionHostFeatures(), tsc_multiplier);
+			    GetGuestInstructionHostFeatures(), tsc_multiplier, listed_ranges);
+			totals.function_count += result.function_count;
+			totals.called_function_count += result.called_function_count;
+			totals.lea_function_count += result.lea_function_count;
+			totals.called_inside_listed_count += result.called_inside_listed_count;
+			totals.red_zone_function_count += result.red_zone_function_count;
+			totals.memory_instruction_count += result.memory_instruction_count;
+			totals.patched_memory_instruction_count += result.patched_memory_instruction_count;
+			totals.short_memory_instruction_count += result.short_memory_instruction_count;
+			totals.stack_dependent_memory_instruction_count +=
+			    result.stack_dependent_memory_instruction_count;
+			totals.control_flow_memory_instruction_count +=
+			    result.control_flow_memory_instruction_count;
+			totals.unrelocatable_memory_instruction_count +=
+			    result.unrelocatable_memory_instruction_count;
+			totals.trampoline_bytes += result.trampoline_bytes;
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -2039,6 +2082,26 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (protect_memory_faults && have_function_starts) {
+			const auto patch_ms = std::chrono::duration<double, std::milli>(
+			                          std::chrono::steady_clock::now() - patch_begin)
+			                          .count();
+			const auto trampoline_area = program->base_vaddr + program->base_size_aligned;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Red-zone patcher: {}: functions={} (eh_frame={}, relocations={}, calls={}, lea={}; "
+			    "inside a listed function: relocations={}, calls/lea={}), red_zone={}, memory={}, "
+			    "patched={}, short={}, stack={}, control={}, unrelocatable={}, "
+			    "trampolines={} bytes of {} at {:#x}, time={:.0f} ms\n",
+			    module_name, totals.function_count, listed_count, relocated_count,
+			    totals.called_function_count - totals.lea_function_count, totals.lea_function_count,
+			    relocated_inside_listed, totals.called_inside_listed_count,
+			    totals.red_zone_function_count, totals.memory_instruction_count,
+			    totals.patched_memory_instruction_count, totals.short_memory_instruction_count,
+			    totals.stack_dependent_memory_instruction_count,
+			    totals.control_flow_memory_instruction_count,
+			    totals.unrelocatable_memory_instruction_count, totals.trampoline_bytes,
+			    program->instruction_trampoline_size, trampoline_area, patch_ms));
 		}
 		if (totals.rdtsc.found != 0) {
 			Log::WriteToConsoleAndLog(
