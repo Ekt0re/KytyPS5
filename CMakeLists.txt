@@ -471,6 +471,9 @@ add_executable(driver_repro EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/
 target_link_libraries(driver_repro Vulkan::Headers ${CMAKE_DL_LIBS})
 if(WIN32)
 	target_link_libraries(driver_repro shell32)
+	# Compute pipeline creation from threads against processes (tools/shader/pipeline_bench.cpp).
+	add_executable(pipeline_bench EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader/pipeline_bench.cpp")
+	target_link_libraries(pipeline_bench Vulkan::Headers)
 endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
