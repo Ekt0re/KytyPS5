@@ -19,6 +19,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -14385,6 +14386,133 @@ void TestIndirectBufferRuntimeTableCompilesAndValidates() {
               specialization.buffers.size() - 1u, compiled.spirv.size());
 }
 
+// The shader store persists a program's ResourcePlan (reread every run to re-materialize
+// resources from live SRT state) and, per compiled module, its CompiledShaderInfo (what the
+// renderer drives descriptor/table setup from, ShaderModule::info in pipelineCache.h). Both
+// travel through the generic KYTY_IO_FIELDS field-by-field codec in ir/Serialize.h. This test
+// proves the bit-30 runtime-table mapping, the table's header-word position and its class
+// children survive both round trips unchanged, using the same 5000-row/four-class fixture as
+// TestIndirectBufferRuntimeTableCompilesAndValidates.
+void TestIndirectBufferRuntimeTableSurvivesStoreRoundTrip() {
+  using F = Prospero::BufferFormat;
+  const auto make_desc = [](uint64_t base, uint32_t stride, uint32_t records, F fmt,
+                            uint32_t swizzle) {
+    return std::array<uint32_t, 4>{
+        static_cast<uint32_t>(base),
+        static_cast<uint32_t>((base >> 32u) & 0xffffu) | (stride << 16u),
+        records,
+        swizzle | (static_cast<uint32_t>(fmt) << 12u),
+    };
+  };
+
+  std::vector<uint32_t> shader{
+      EncodeVop3Word0(0x182, 4),
+      EncodeVop3Word1(256u + 0u, 0, 0),
+      EncodeSop2(0x0e, 4, 4, 255),
+      0x00001fffu,
+      EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x0a, 8, 0),
+      4u << 25u,
+      0xbf8cc07fu,
+      EncodeVop1(0x01, 6u, 128u + 0u),
+      EncodeVop2(0x25, 5u, 128u + 1u, 0u),
+      EncodeMubuf0(0x03, 0u, true),
+      EncodeMubuf1(1u, 2u, 5u),
+      EncodeVop2(0x25, 6u, 256u + 1u, 6u),
+      EncodeMubuf0(0x07, 0u, true),
+      EncodeMubuf1(6u, 2u, 5u),
+      EncodeSopp(0x01),
+  };
+
+  constexpr uint32_t kRows = ShaderRecompiler::IR::MaxIndirectBufferCandidates + 904u;
+  std::vector<std::array<uint32_t, 4>> table_rows(kRows);
+  const std::array<F, 4> formats{F::k8UInt, F::k32Float, F::k8_8_8_8UNorm,
+                                  F::k32_32_32_32Float};
+  const std::array<uint32_t, 4> strides{16u, 16u, 32u, 64u};
+  const std::array<uint32_t, 4> swizzles{DstSel(4, 0, 0, 1), DstSel(4, 0, 0, 1),
+                                         DstSel(4, 5, 6, 7), DstSel(4, 5, 6, 7)};
+  table_rows[0] = {0u, 0u, 0u, 0u};
+  for (uint32_t row = 1u; row < kRows; ++row) {
+    const uint32_t cls = row % 4u;
+    table_rows[row] = make_desc(0x1005000000ull + static_cast<uint64_t>(row) * 0x10000ull,
+                                strides[cls], 1024u, formats[cls], swizzles[cls]);
+  }
+  const auto table_addr = reinterpret_cast<uint64_t>(table_rows.data());
+  std::array<uint32_t, 4> user_data{
+      static_cast<uint32_t>(table_addr),
+      static_cast<uint32_t>((table_addr >> 32u) & 0xffffu) | (16u << 16u),
+      kRows,
+      0x00005204u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.shader_hash = 0u;
+  ShaderComputeInputInfo compute = *options.input_info.compute;
+  compute.thread_ids_num = 1u;
+  compute.threads_num[0] = 64u;
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+
+  // The on-disk record of a program (PipelineCache::ResolveStoredPlan reads it back through
+  // LoadResourcePlan every run before re-materializing). Round trip it through bytes.
+  const auto stored_plan_bytes = ShaderRecompiler::IR::SaveResourcePlan(plan);
+  ShaderRecompiler::IR::ResourcePlan loaded_plan;
+  Check(ShaderRecompiler::IR::LoadResourcePlan(stored_plan_bytes, loaded_plan),
+        "runtime-table resource plan failed to load back from the store bytes");
+  Check(plan.info == loaded_plan.info,
+        "runtime-table ShaderInfo (the bit-30 mapping_offset tag) did not survive the "
+        "resource-plan round trip");
+
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data, .read_specialization_memory = ReadHostTestMemory};
+  ShaderRecompiler::IR::ResourceSnapshot snapshot_live, snapshot_loaded;
+  ShaderRecompiler::IR::ResourceSpecialization specialization_live, specialization_loaded;
+  Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot_live,
+                                                   specialization_live),
+        "runtime-table materialization from the live plan failed");
+  Check(ShaderRecompiler::IR::MaterializeResources(loaded_plan, runtime, snapshot_loaded,
+                                                   specialization_loaded),
+        "runtime-table materialization from the round-tripped plan failed");
+
+  Check(specialization_live.buffers == specialization_loaded.buffers,
+        "runtime-table specialization (root + class children) differs after the plan round trip");
+  Check(snapshot_live.indirect_buffer_tables.size() == 1u &&
+            snapshot_loaded.indirect_buffer_tables.size() == 1u,
+        "runtime table missing from a materialization");
+  const auto& live_table   = snapshot_live.indirect_buffer_tables[0];
+  const auto& loaded_table = snapshot_loaded.indirect_buffer_tables[0];
+  Check(live_table.root_resource == loaded_table.root_resource &&
+            live_table.header_word == loaded_table.header_word,
+        "runtime table root resource or header-word position differs after the plan round trip");
+  Check(live_table.entries == loaded_table.entries &&
+            live_table.class_index == loaded_table.class_index,
+        "runtime table class children differ after the plan round trip");
+
+  // The compiled module's CompiledShaderInfo, the other half of a shader-store record (the
+  // renderer's ShaderModule::info in pipelineCache.h): round trip it through the same field
+  // codec IoModule uses (pipelineSerialization.cpp).
+  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
+                                                   specialization_live);
+  auto info = std::move(compiled.program).TakeCompiledInfo();
+  Check(info.info.uses_device_address,
+        "runtime-table indirect buffer shader must enable device addresses");
+  ShaderRecompiler::IR::Writer module_writer;
+  ShaderRecompiler::IR::IoAll(module_writer, info);
+  ShaderRecompiler::IR::Reader module_reader{module_writer.bytes};
+  ShaderRecompiler::IR::CompiledShaderInfo loaded_info;
+  ShaderRecompiler::IR::IoAll(module_reader, loaded_info);
+  Check(module_reader.ok && module_reader.bytes.empty(),
+        "compiled shader info failed to round trip through the module field codec");
+  Check(info.info == loaded_info.info,
+        "CompiledShaderInfo lost the runtime-table bit-30 mapping across the module round trip");
+
+  std::printf("TestIndirectBufferRuntimeTableSurvivesStoreRoundTrip: entries=%zu classes=%zu\n",
+              live_table.entries.size(), specialization_live.buffers.size() - 1u);
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -14444,6 +14572,7 @@ int main(int argc, char** argv) {
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
   TestIndirectBufferRuntimeTableCompilesAndValidates();
+  TestIndirectBufferRuntimeTableSurvivesStoreRoundTrip();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeBindingSizeOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
