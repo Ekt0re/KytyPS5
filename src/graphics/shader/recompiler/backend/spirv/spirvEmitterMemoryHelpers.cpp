@@ -720,7 +720,7 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		if (data_bits != 16u && IR::F16StoreClampEnabled()) data = EmitClampToHalfRangeBits(state, data);
 		const auto pair = EmitCompositeConstructF32x2(
 		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
-		return EmitPackHalf2x16(state, pair);
+		return EmitPackHalf2x16Native(state, pair);
 	}
 	return data;
 }

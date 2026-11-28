@@ -117,6 +117,87 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
 	return EmitOrU32(state, sign, magnitude);
 }
 
+uint32_t EmitF32BitsToF16RteBits(EmitterState& state, uint32_t bits) {
+	// Round to nearest even, keep half subnormals, overflow to infinity, quiet NaN: the guest's
+	// V_CVT_F16_F32 with MODE round-to-nearest and FP16 denormals on.
+	const auto abs  = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign = EmitAndConstant(
+	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits, ConstantU32(state, 16)),
+	    0x8000u);
+	const auto exp = Binary(state, spv::OpShiftRightLogical, TypeU32(state), abs,
+	                        ConstantU32(state, 23));
+	const auto mant = EmitAndConstant(state, abs, 0x007fffffu);
+	const auto one  = ConstantU32(state, 1);
+
+	// Half normal range: add 0xfff plus the lowest kept bit, drop 13 bits; a carry into the
+	// exponent is the correct result, and anything at or past 0x7c00 is infinity.
+	const auto odd     = EmitAndConstant(state,
+	                                     Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	                                            abs, ConstantU32(state, 13)),
+	                                     1u);
+	const auto rounded = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	                            Binary(state, spv::OpIAdd, TypeU32(state),
+	                                   Binary(state, spv::OpIAdd, TypeU32(state), abs,
+	                                          ConstantU32(state, 0x0fffu)),
+	                                   odd),
+	                            ConstantU32(state, 13));
+	const auto normal = EmitUMin32(
+	    state, Binary(state, spv::OpISub, TypeU32(state), rounded, ConstantU32(state, 0x1c000u)),
+	    ConstantU32(state, 0x7c00u));
+
+	// Half subnormal range: the significand in units of 2^-24 is sig >> (126 - exp); round that
+	// shift to nearest even. Shifts stay below 32; sig < 2^24 makes every shift past 24 give 0.
+	const auto sig   = EmitOrU32(state, mant, ConstantU32(state, 0x00800000u));
+	const auto shift = EmitUMin32(
+	    state, Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 126), exp),
+	    ConstantU32(state, 31));
+	const auto kept_odd = EmitAndConstant(
+	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), sig, shift), 1u);
+	const auto half_minus_one = Binary(
+	    state, spv::OpISub, TypeU32(state),
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), one,
+	           Binary(state, spv::OpISub, TypeU32(state), shift, one)),
+	    one);
+	const auto sub = Binary(
+	    state, spv::OpShiftRightLogical, TypeU32(state),
+	    Binary(state, spv::OpIAdd, TypeU32(state),
+	           Binary(state, spv::OpIAdd, TypeU32(state), sig, half_minus_one), kept_odd),
+	    shift);
+
+	const auto finite = Select(state, TypeU32(state),
+	                           EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u),
+	                           sub, normal);
+	const auto nan = EmitOrU32(state,
+	                           EmitAndConstant(state,
+	                                           Binary(state, spv::OpShiftRightLogical,
+	                                                  TypeU32(state), abs, ConstantU32(state, 13)),
+	                                           0x03ffu),
+	                           ConstantU32(state, 0x7e00u));
+	const auto special = Select(state, TypeU32(state),
+	                            EmitCompareU32Constant(state, spv::OpIEqual, mant, 0),
+	                            ConstantU32(state, 0x7c00u), nan);
+	const auto magnitude = Select(
+	    state, TypeU32(state),
+	    EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs, 0x7f800000u), special, finite);
+	return EmitOrU32(state, sign, magnitude);
+}
+
+uint32_t EmitPackHalf2x16(EmitterState& state, uint32_t arg0) {
+	if (IR::F16PackNativeEnabled()) {
+		return EmitPackHalf2x16Native(state, arg0);
+	}
+	const auto component = [&](uint32_t index) {
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, arg0, index);
+		return EmitF32BitsToF16RteBits(state, EmitBitcastF32ToU32(state, value));
+	};
+	const auto low  = component(0);
+	const auto high = component(1);
+	return EmitOrU32(state, low,
+	                 Binary(state, spv::OpShiftLeftLogical, TypeU32(state), high,
+	                        ConstantU32(state, 16)));
+}
+
 uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
 	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);

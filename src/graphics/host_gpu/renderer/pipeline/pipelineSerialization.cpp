@@ -142,6 +142,8 @@ uint64_t CodegenSwitches() {
 	if (ShaderRecompiler::IR::IndirectFormattedStoresEnabled()) switches |= 32u;
 	// FiniteBufferDescriptorsEnabled (ShaderIR.h).
 	if (ShaderRecompiler::IR::FiniteBufferDescriptorsEnabled()) switches |= uint64_t {1} << 32u;
+	// F16PackNativeEnabled (ShaderIR.h).
+	if (ShaderRecompiler::IR::F16PackNativeEnabled()) switches |= 16u;
 	return switches;
 }
 

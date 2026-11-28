@@ -285,6 +285,19 @@ struct ImageResource {
 	return enabled;
 }
 
+// Guest f16 ALU results (V_CVT_F16_F32, V_PK_*_F16, V_*_F16, V_FMA_MIX*_F16) round to nearest
+// even (MODE.FP_ROUND). GLSL.std.450 PackHalf2x16 leaves the rounding to the driver: RADV rounds
+// toward zero (v_cvt_pkrtz_f16_f32), so every emulated f16 operation lost up to one ulp toward
+// zero on AMD only. The translator therefore rounds in integer code; KYTY_F16_PACK_NATIVE=1 goes
+// back to the driver's PackHalf2x16 (a code generation switch with its own shader store).
+[[nodiscard]] inline bool F16PackNativeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F16_PACK_NATIVE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
 // "Image atomic operations are supported only on 32- and 64-bit-per pixel surfaces ... Atomic
 // operations treat the element as a single component of 32- or 64-bits" (RDNA ISA, Image
 // Instructions). The opcode types the operation, so any single-component 32-bit T# (64-bit for
