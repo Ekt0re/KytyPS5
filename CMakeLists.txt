@@ -646,7 +646,7 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
-)
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(audio_out2_port_tests common fmt::fmt kyty_spatial_audio)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
@@ -725,6 +725,7 @@ add_kyty_full_emulator_test(http_uri_parse_tests
 add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/RtcTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libRtc.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
 target_link_libraries(rtc_tests common kyty_test_gtest)
@@ -735,7 +736,8 @@ add_executable(playgo_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/libs/libPlayGo.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
 	"${KYTY_SOURCE_DIR}/loader/systemContent.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
 target_include_directories(playgo_tests PRIVATE ${inc_headers})
 
@@ -743,7 +745,8 @@ add_executable(vr_tracker2_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/VrTracker2Tests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libVrTracker2.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(vr_tracker2_tests common kyty_test_gtest)
 target_include_directories(vr_tracker2_tests PRIVATE ${inc_headers})
 
@@ -751,7 +754,8 @@ add_executable(font_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FontTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libFont.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(font_tests common SDL3::SDL3-static FFmpeg::ffmpeg kyty_test_gtest)
 target_include_directories(font_tests PRIVATE ${inc_headers})
 target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
@@ -865,7 +869,8 @@ add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(psml_tests common kyty_test_gtest)
 target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
@@ -1057,6 +1062,7 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		psml_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		shader_check
