@@ -300,6 +300,22 @@ bool SyncWarmUp() {
 	return sync;
 }
 
+// KYTY_PIPELINE_STORE_ORDER=1 (after simnJS 2332d2ac5, "compile first the pipelines of the
+// shaders the game used in earlier sessions"): the warm-up queues the store's pipelines for
+// background creation in the order the store recorded their modules and pipelines, which is the
+// order earlier runs first needed them, compute and graphics together. Otherwise compute
+// pipelines go first, in hash order, then graphics pipelines, in hash order. With a cold driver
+// (a new driver or executable, KYTY_PIPELINE_COLD_SALT) the game needs the pipelines in about the
+// store's order, and each one no worker has started yet is created on the command thread with the
+// guest clock held.
+bool StoreOrderWarmUp() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_PIPELINE_STORE_ORDER");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
+}
+
 // Decode time by part, summed over the warm-up's threads.
 std::atomic<uint64_t> g_decode_zstd_ns {0};
 std::atomic<uint64_t> g_decode_plan_ns {0};
@@ -368,6 +384,11 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
 	    Common::ParallelThreads()));
 	auto records  = std::span<const uint8_t>(bytes);
+	// KYTY_PIPELINE_STORE_ORDER: where each module and graphics pipeline is in the store.
+	struct {
+		std::unordered_map<uint64_t, size_t> modules;
+		std::unordered_map<GraphicsPipelineKey, size_t, GraphicsPipelineKeyHash> pipelines;
+	} store_order;
 	bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (RestampMode()) {
@@ -414,6 +435,14 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		for (; kept < loaded.size() && loaded[kept].ok; kept++) {
 			if (loaded[kept].module.stored != nullptr) {
 				stored.push_back(loaded[kept].module.stored);
+			}
+			if (StoreOrderWarmUp()) {
+				// The first record of each id or key counts.
+				if (static_cast<Record>(loaded[kept].type) == Record::Module) {
+					store_order.modules.try_emplace(loaded[kept].module.id, kept);
+				} else if (static_cast<Record>(loaded[kept].type) == Record::GraphicsPipeline) {
+					store_order.pipelines.try_emplace(loaded[kept].pipeline_key, kept);
+				}
 			}
 			if (RestampMode()) {
 				// What a partial restamp keeps or drops, record by record.
@@ -542,14 +571,15 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			}
 			return pipeline;
 		};
-		for (const auto* module: compute) {
+		const auto start_compute = [&](const ShaderModule* module) {
 			auto& pipeline = m_compute_pipelines[module->id];
 			CreatePipelineLayouts(m_graphics, pipeline, {&module, 1});
 			StartDeferredCompile(pipeline, [this, counted, layout = pipeline.pipeline_layout, module] {
 				return counted(CreateHostPipeline(m_graphics, layout, *module, m_driver_cache));
 			});
-		}
-		for (const auto& [key, stages]: graphics) {
+		};
+		const auto start_graphics = [&](const GraphicsPipelineKey*               key,
+		                                const std::array<const ShaderModule*, 4>& stages) {
 			auto& pipeline = m_graphics_pipelines.at(*key);
 			CreatePipelineLayouts(m_graphics, pipeline, stages);
 			StartDeferredCompile(pipeline,
@@ -557,6 +587,42 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 				                     return counted(CreateHostPipeline(m_graphics, layout, *key,
 				                                                       stages, m_driver_cache));
 			                     });
+		};
+		if (StoreOrderWarmUp()) {
+			// Store position, then compute before graphics; SIZE_MAX (not found) goes last.
+			struct Queued {
+				size_t position = SIZE_MAX;
+				size_t index    = 0; // In compute, or in graphics after compute.size().
+			};
+			std::vector<Queued> queued;
+			queued.reserve(compute.size() + graphics.size());
+			for (size_t i = 0; i < compute.size(); i++) {
+				const auto found = store_order.modules.find(compute[i]->id);
+				queued.push_back(
+				    {found != store_order.modules.end() ? found->second : SIZE_MAX, i});
+			}
+			for (size_t i = 0; i < graphics.size(); i++) {
+				const auto found = store_order.pipelines.find(*graphics[i].first);
+				queued.push_back({found != store_order.pipelines.end() ? found->second : SIZE_MAX,
+				                  compute.size() + i});
+			}
+			std::ranges::stable_sort(queued, [](const Queued& a, const Queued& b) {
+				return a.position < b.position;
+			});
+			for (const auto& entry: queued) {
+				if (entry.index < compute.size()) {
+					start_compute(compute[entry.index]);
+				} else {
+					const auto& [key, stages] = graphics[entry.index - compute.size()];
+					start_graphics(key, stages);
+				}
+			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader cache: {} compute and {} graphics pipelines queued in store order\n",
+			    compute.size(), graphics.size()));
+		} else {
+			for (const auto* module: compute) start_compute(module);
+			for (const auto& [key, stages]: graphics) start_graphics(key, stages);
 		}
 	}
 	OpenRecipes(path);
