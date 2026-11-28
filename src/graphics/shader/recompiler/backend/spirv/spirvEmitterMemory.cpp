@@ -1900,7 +1900,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	};
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
-		    if (mem.kind != IR::ResourceKind::Buffer || !FiniteBufferDescriptorsEnabled() ||
+		    if (mem.kind != IR::ResourceKind::Buffer || !IR::FiniteBufferDescriptorsEnabled() ||
 		        state.program.info.buffers[mem.resource].indirect_root != mem.resource)
 			    return emit_one(mem);
 		    const auto& buffer   = state.program.info.buffers[mem.resource];
