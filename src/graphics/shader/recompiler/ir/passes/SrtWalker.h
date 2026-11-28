@@ -141,6 +141,10 @@ std::vector<ScanCacheEntry>&             PlanScanCache(const ResourcePlan& plan)
 // state the command thread owns: walker loads that would fault are completed from the backing
 // (the fault handler asks SrtSpeculativeThread()), materialization failures are not logged and
 // its time is not counted as the command thread's.
+// Whether walkers compiled from now on capture each load's value (needed by WalkScratch::loads,
+// so by lookahead). Default: on when KYTY_LOOKAHEAD is set, else off (no extra work per load).
+// Set it before any plan is compiled.
+void SetSrtWalkerValueCapture(bool capture);
 void SetSrtSpeculativeThread(bool speculative);
 bool SrtSpeculativeThread();
 

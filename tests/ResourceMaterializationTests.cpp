@@ -1879,6 +1879,8 @@ void TestLookaheadRevalidation() {
 } // namespace
 
 int main() {
+  // Lookahead's walkers log their loads' values; every case below runs with it.
+  Libs::Graphics::ShaderRecompiler::IR::SetSrtWalkerValueCapture(true);
   TestWalkScratchCapturesLoadValues();
   TestLookaheadRevalidation();
   TestWalkerLoadsBypassSpecializationReader();

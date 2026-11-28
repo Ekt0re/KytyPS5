@@ -171,6 +171,18 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 }
 
 thread_local WalkScratch* t_walk_scratch = nullptr;
+// Walkers compiled while this is set capture each load's value next to its address (lookahead).
+// Off (KYTY_LOOKAHEAD unset), the walker code and its captures are as before.
+std::atomic<int> g_capture_values {-1};
+
+bool CaptureValues() {
+	int value = g_capture_values.load(std::memory_order_relaxed);
+	if (value < 0) {
+		value = std::getenv("KYTY_LOOKAHEAD") != nullptr ? 1 : 0;
+		g_capture_values.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
 thread_local bool         t_speculative  = false;
 
 const uint8_t* Scratch(const ResourcePlan& plan) {
@@ -1138,11 +1150,15 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		// Every guest load is mov eax, [r10] (41 8b 02), which the fault handler completes.
 		c.mov(c.eax, c.dword[c.r10]);
 		c.L(loaded);
-		// Each capture is the load's address and the value the walk used (lookahead logs both).
+		// Each capture is the load's address, with lookahead also the value the walk used.
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
-		c.mov(c.dword[c.r8 + 8], c.eax);
-		c.add(c.r8, 16);
+		if (CaptureValues()) {
+			c.mov(c.dword[c.r8 + 8], c.eax);
+			c.add(c.r8, 16);
+		} else {
+			c.add(c.r8, 8);
+		}
 		Store(node);
 	}
 	// Only buffer reads have a zero path.
@@ -1576,7 +1592,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	c.bt(c.rax, 32);
 	c.mov(c.eax, c.eax);
 	c.ret();
-	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + 2u * m_captures, 0u);
+	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + (CaptureValues() ? 2u : 1u) * m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
@@ -1622,6 +1638,10 @@ std::vector<ResourcePlan::SelectorKeys>& PlanSelectorKeys(const ResourcePlan& pl
 
 std::vector<ScanCacheEntry>& PlanScanCache(const ResourcePlan& plan) {
 	return t_walk_scratch != nullptr ? t_walk_scratch->scan_cache : plan.scan_cache;
+}
+
+void SetSrtWalkerValueCapture(bool capture) {
+	g_capture_values.store(capture ? 1 : 0, std::memory_order_relaxed);
 }
 
 void SetSrtSpeculativeThread(bool speculative) {
@@ -1700,15 +1720,18 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 		}
 	}
 	if (end == nullptr) return false;
-	// Captures are (address, value) qword pairs.
+	// Captures are addresses, or (address, value) qword pairs while values are captured.
 	const std::span captured {scratch.data() + plan.srt_captures / 8u, end};
-	const auto      count = captured.size() / 2u;
+	const size_t    stride = CaptureValues() ? 2u : 1u;
+	const auto      count  = captured.size() / stride;
+	// A walk that must log its loads needs their values.
+	if (t_walk_scratch != nullptr && stride == 1u) return false;
 	if (reads != nullptr) {
 		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
 		const auto first = reads->size();
 		reads->resize(first + count);
 		for (size_t i = 0; i < count; ++i) {
-			(*reads)[first + i] = {captured[2u * i], uint64_t {sizeof(uint32_t)}};
+			(*reads)[first + i] = {captured[stride * i], uint64_t {sizeof(uint32_t)}};
 		}
 	}
 	if (t_walk_scratch != nullptr) {
