@@ -348,6 +348,57 @@ auto EmitBufferAccess(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInf
 		if (selection != nullptr && selection->GetOpcode() == IR::ValueOpcode::GetBufferResourceIndex)
 			ReportHeapRow(ctx, buffer, selected, ctx.Arg(*selection, 0));
 	}
+	if (IsRuntimeTableIndirectBuffer(state, root_resource)) {
+		const auto entry = EmitLoadIndirectBufferTableEntry(state, selected,
+		                                                    buffer.indirect_mapping_offset);
+		const auto word = [&](uint32_t index) {
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), value, entry,
+			                          ConstantU32(state, index));
+			return value;
+		};
+		const auto bda_low = word(0u);
+		const auto bda_high = word(1u);
+		const auto byte_size = word(2u);
+		const auto meta = word(3u);
+		const auto class_ordinal = Binary(state, spv::OpBitwiseAnd, TypeU32(state), meta,
+		                                  ConstantU32(state, 0x00ffffffu));
+		const auto class_count = static_cast<uint32_t>(buffer.indirect_resources.size() - 1u);
+		const auto valid = Binary(state, spv::OpLogicalAnd, TypeBool(state),
+		    Binary(state, spv::OpINotEqual, TypeBool(state), class_ordinal,
+		           ConstantU32(state, 0u)),
+		    Binary(state, spv::OpULessThan, TypeBool(state), class_ordinal,
+		           ConstantU32(state, class_count + 1u)));
+		const auto class_access = [&](uint32_t item) {
+			mem.resource = buffer.indirect_resources[item + 1u];
+			const auto bits = IR::StorageBufferElementBits(state.program, mem);
+			const auto shift = bits == 8u ? 0u : bits == 16u ? 1u : bits == 64u ? 3u : 2u;
+			const MemoryResourceAccess resource {
+			    .kind = mem.kind, .object_pointer = PackU64(state, bda_low, bda_high),
+			    .length = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_size,
+			                     ConstantU32(state, shift)),
+			    .byte_offset = Binary(state, spv::OpShiftRightLogical, TypeU32(state), meta,
+			                          ConstantU32(state, 24u)),
+			    .element_bits = bits, .physical_address = true,
+			    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask
+			                                  : spv::MemoryAccessMaskNone};
+			return emit(mem, resource);
+		};
+		const auto selector = Binary(state, spv::OpISub, TypeU32(state), class_ordinal,
+		                             ConstantU32(state, 1u));
+		if constexpr (!has_result) {
+			EmitIfCondition(state, valid, [&] {
+				EmitIndexSwitch(state, selector, class_count, 0u, class_access);
+			});
+			return;
+		} else {
+			return EmitValueOrDefaultIfCondition(state, valid, TypeU32Composite(state, components),
+			    ConstantU32CompositeZero(state, components), [&] {
+				    return EmitIndexSwitch(state, selector, class_count,
+				                           TypeU32Composite(state, components), class_access);
+			    });
+		}
+	}
 	const auto representative = SharedIndirectBufferResource(state, root_resource);
 	const auto shared = representative != UINT32_MAX;
 	const auto empty_root = shared && buffer.packed_stride == 0u;

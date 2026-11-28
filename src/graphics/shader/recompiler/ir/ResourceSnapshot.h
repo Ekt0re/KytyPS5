@@ -50,11 +50,19 @@ struct UniformFill {
 };
 
 struct ResourceSnapshot {
-	std::vector<DescriptorValue> buffers;
-	std::vector<DescriptorValue> images;
-	std::vector<DescriptorValue> samplers;
-	std::vector<uint32_t>        flattened_srt;
-	std::vector<uint32_t>        user_data;
+	struct IndirectBufferTable {
+		uint32_t                     root_resource = 0;
+		uint32_t                     header_word   = 0;
+		std::vector<DescriptorValue> entries;
+		std::vector<uint32_t>        class_index;
+	};
+
+	std::vector<DescriptorValue>     buffers;
+	std::vector<DescriptorValue>     images;
+	std::vector<DescriptorValue>     samplers;
+	std::vector<uint32_t>            flattened_srt;
+	std::vector<uint32_t>            user_data;
+	std::vector<IndirectBufferTable> indirect_buffer_tables;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
 };

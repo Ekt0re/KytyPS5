@@ -14271,6 +14271,101 @@ void TestSpirvLoopIterationGuard() {
         "loop guard: expected one counter, one ballot-guarded return per loop header");
 }
 
+void TestIndirectBufferRuntimeTableCompilesAndValidates() {
+  using F = Prospero::BufferFormat;
+  const auto make_desc = [](uint64_t base, uint32_t stride, uint32_t records, F fmt,
+                            uint32_t swizzle) {
+    return std::array<uint32_t, 4>{
+        static_cast<uint32_t>(base),
+        static_cast<uint32_t>((base >> 32u) & 0xffffu) | (stride << 16u),
+        records,
+        swizzle | (static_cast<uint32_t>(fmt) << 12u),
+    };
+  };
+
+  std::vector<uint32_t> shader{
+      EncodeVop3Word0(0x182, 4),
+      EncodeVop3Word1(256u + 0u, 0, 0),
+      EncodeSop2(0x0e, 4, 4, 255),
+      0x00001fffu,
+      EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x0a, 8, 0),
+      4u << 25u,
+      0xbf8cc07fu,
+      EncodeVop1(0x01, 6u, 128u + 0u),
+      EncodeVop2(0x25, 5u, 128u + 1u, 0u),
+      EncodeMubuf0(0x03, 0u, true),
+      EncodeMubuf1(1u, 2u, 5u),
+      EncodeVop2(0x25, 6u, 256u + 1u, 6u),
+      EncodeMubuf0(0x07, 0u, true),
+      EncodeMubuf1(6u, 2u, 5u),
+      EncodeSopp(0x01),
+  };
+
+  constexpr uint32_t kRows = ShaderRecompiler::IR::MaxIndirectBufferCandidates + 904u;
+  std::vector<std::array<uint32_t, 4>> table_rows(kRows);
+  const std::array<F, 4> formats{F::k8UInt, F::k32Float, F::k8_8_8_8UNorm,
+                                  F::k32_32_32_32Float};
+  const std::array<uint32_t, 4> strides{16u, 16u, 32u, 64u};
+  const std::array<uint32_t, 4> swizzles{DstSel(4, 0, 0, 1), DstSel(4, 0, 0, 1),
+                                         DstSel(4, 5, 6, 7), DstSel(4, 5, 6, 7)};
+  table_rows[0] = {0u, 0u, 0u, 0u};
+  for (uint32_t row = 1u; row < kRows; ++row) {
+    const uint32_t cls = row % 4u;
+    table_rows[row] = make_desc(0x1005000000ull + static_cast<uint64_t>(row) * 0x10000ull,
+                                strides[cls], 1024u, formats[cls], swizzles[cls]);
+  }
+  const auto table_addr = reinterpret_cast<uint64_t>(table_rows.data());
+  std::array<uint32_t, 4> user_data{
+      static_cast<uint32_t>(table_addr),
+      static_cast<uint32_t>((table_addr >> 32u) & 0xffffu) | (16u << 16u),
+      kRows,
+      0x00005204u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.shader_hash = 0u;
+  ShaderComputeInputInfo compute = *options.input_info.compute;
+  compute.thread_ids_num = 1u;
+  compute.threads_num[0] = 64u;
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot snapshot;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data, .read_specialization_memory = ReadHostTestMemory};
+  Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization),
+        "runtime-table indirect buffer shader failed materialization");
+  Check(snapshot.indirect_buffer_tables.size() == 1u &&
+            snapshot.indirect_buffer_tables[0].entries.size() == kRows - 1u,
+        "runtime table did not capture every non-null buffer descriptor");
+  Check(specialization.buffers.size() == 5u,
+        "runtime table specialization must contain only root + four classes");
+
+  const auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
+                                                         specialization);
+  Check(compiled.program.info.uses_device_address,
+        "runtime-table indirect buffer shader must enable device addresses");
+  Check(compiled.program.bindings.descriptor_counts[static_cast<size_t>(
+            ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 0u,
+        "runtime-table indirect buffer shader must consume zero storage-buffer slots");
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+  tools.SetMessageConsumer([](spv_message_level_t, const char *,
+                              const spv_position_t &position, const char *message) {
+    std::fprintf(stderr, "runtime-table SPIR-V line %u: %s\n", position.line, message);
+  });
+  Check(tools.Validate(compiled.spirv.data(), compiled.spirv.size()),
+        "runtime-table indirect buffer shader failed Vulkan 1.3 validation");
+  Check(compiled.spirv.size() < 20'000u,
+        "runtime-table indirect buffer shader exceeded the compact word bound");
+  std::printf("TestIndirectBufferRuntimeTableCompilesAndValidates: entries=%zu classes=%zu words=%zu\n",
+              snapshot.indirect_buffer_tables[0].entries.size(),
+              specialization.buffers.size() - 1u, compiled.spirv.size());
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -14329,6 +14424,7 @@ int main(int argc, char** argv) {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestIndirectBufferRuntimeTableCompilesAndValidates();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeBindingSizeOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();

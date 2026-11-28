@@ -49,11 +49,18 @@ struct PreparedBindings {
 		uint64_t                              module = 0;
 	};
 
+	struct IndirectTableBinding {
+		uint32_t                  root_resource = 0;
+		uint32_t                  header_word   = 0;
+		std::vector<BufferSource> sources;
+	};
+
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
 	// Keep the resolved guest range through cache preparation; only the host buffer ID may
 	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
+	std::vector<IndirectTableBinding>     indirect_tables;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
 	std::vector<ImageSource>              image_sources;

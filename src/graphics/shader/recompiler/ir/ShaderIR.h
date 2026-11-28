@@ -31,6 +31,17 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 // Whole-table scans visit each row once; GTA VI keeps a 196608-row buffer heap.
 constexpr uint32_t MaxIndirectScalarTableRows = 262144u;
+// Distinct materialized buffer candidates before promotion to a runtime-indexed BDA table.
+constexpr uint32_t MaxIndirectBufferCandidates = 4096u;
+// Bit 30 marks a runtime-indexed indirect-buffer mapping. The mapping starts with a three-word
+// [table_bda_lo, table_bda_hi, entry_count] header; class children replace individual candidates.
+constexpr uint32_t IndirectBufferRuntimeTable = 0x40000000u;
+[[nodiscard]] constexpr bool IsIndirectBufferRuntimeTable(uint32_t mapping_offset) noexcept {
+	return (mapping_offset & IndirectBufferRuntimeTable) != 0u;
+}
+[[nodiscard]] constexpr uint32_t IndirectBufferMappingOffset(uint32_t mapping_offset) noexcept {
+	return mapping_offset & ~IndirectBufferRuntimeTable;
+}
 // Rows a shader can report selecting unbound, over all roots, and the rows one root binds.
 constexpr uint32_t HeapRowBits = 1u << 24u;
 constexpr uint32_t MaxHeapRows = 512u;

@@ -801,81 +801,90 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 
 void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
-	auto& cache = m_context.GetBufferCache();
+	auto&      cache    = m_context.GetBufferCache();
+	const auto& graphics = m_context.GetGraphics();
+	const auto resolve_source = [&](const ShaderRecompiler::IR::BufferResource& metadata,
+	                                 const ShaderRecompiler::IR::DescriptorValue& value,
+	                                 bool allow_unmapped, uint32_t resource, uint64_t shader)
+	    -> PreparedBindings::BufferSource {
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(value);
+		const auto address    = descriptor.Base48();
+		auto       size       = BufferBindingSize(metadata, descriptor);
+		if (address == 0 || size == 0) return {};
+		if (metadata.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
+		    (descriptor.NumRecords() == UINT32_MAX || size >= (uint64_t {1} << 30u)) &&
+		    Libs::LibKernel::Memory::TryClampRangeSize(address, size, true) == 0) {
+			return {};
+		}
+		if (descriptor.NumRecords() == UINT32_MAX) {
+			if (metadata.written) {
+				for (const auto* reader: stages) {
+					for (const auto [read_address, read_size]:
+					     reader->runtime->resources->specialization_reads) {
+						if (read_size == 0) continue;
+						if (read_address > address) {
+							size = std::min(size, read_address - address);
+						} else if (address - read_address < read_size) {
+							EXIT("scalar resource reads overlap a shader buffer write\n");
+						}
+					}
+				}
+			}
+			const auto limit =
+			    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+			    (graphics.StorageMinAlignment() - 1);
+			size = Libs::LibKernel::Memory::TryClampRangeSize(
+			    address, std::min({size, uint64_t {256} * 1024 * 1024, limit}));
+		} else if (size >= (uint64_t {1} << 30u) || allow_unmapped) {
+			size = Libs::LibKernel::Memory::TryClampRangeSize(address, size, true);
+		}
+		if (size == 0 || !GuestRange {address, size}.Valid()) {
+			if (!allow_unmapped) {
+				static std::atomic<uint32_t> logged {0};
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "GPU: buffer {} of shader 0x{:016x} names {} at 0x{:011x} (size 0x{:x}, "
+					    "records 0x{:x}, stride {}, {}); bound as null\n",
+					    resource, shader, size == 0 ? "unmapped memory" : "an invalid range",
+					    address, BufferBindingSize(metadata, descriptor), descriptor.NumRecords(),
+					    static_cast<uint32_t>(descriptor.Stride()),
+					    metadata.written ? "written" : "read"));
+				}
+			}
+			return {};
+		}
+		return {.address = address, .size = size, .id = cache.FindBuffer(address, size)};
+	};
 	for (auto* stage: stages) {
 		auto&       prepared = *stage;
 		const auto& program  = prepared.runtime->module->info;
 		const auto& snapshot = *prepared.runtime->resources;
 		const auto& layout   = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
-		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {
-			continue;
-		}
 		for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 			const auto& metadata = program.info.buffers[resource];
 			if (metadata.descriptor_index == UINT32_MAX) continue;
-			auto& source = prepared.buffer_sources[metadata.descriptor_index];
-			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
-			const auto address = descriptor.Base48();
-			auto size = BufferBindingSize(metadata, descriptor);
-			if (address == 0 || size == 0) {
-				source = {};
-				continue;
+			prepared.buffer_sources[metadata.descriptor_index] =
+			    resolve_source(metadata, snapshot.buffers[resource], false, resource,
+			                   program.shader_hash);
+		}
+		prepared.indirect_tables.clear();
+		prepared.indirect_tables.reserve(snapshot.indirect_buffer_tables.size());
+		for (const auto& table: snapshot.indirect_buffer_tables) {
+			if (table.root_resource >= program.info.buffers.size() ||
+			    table.entries.size() != table.class_index.size()) {
+				EXIT("invalid runtime indirect-buffer table\n");
 			}
-			// A table can hold rows no access selects, so a candidate may name unmapped memory.
-			if (metadata.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer &&
-			    (descriptor.NumRecords() == UINT32_MAX || size >= (uint64_t {1} << 30u)) &&
-			    Libs::LibKernel::Memory::TryClampRangeSize(address, size, true) == 0) {
-				source = {};
-				continue;
+			const auto& metadata = program.info.buffers[table.root_resource];
+			PreparedBindings::IndirectTableBinding binding;
+			binding.root_resource = table.root_resource;
+			binding.header_word   = table.header_word;
+			binding.sources.reserve(table.entries.size());
+			for (const auto& entry: table.entries) {
+				binding.sources.push_back(
+				    resolve_source(metadata, entry, true, table.root_resource, program.shader_hash));
 			}
-			if (descriptor.NumRecords() == UINT32_MAX) {
-				if (program.info.buffers[resource].written) {
-					// Sentinel write ranges end before tables captured by any bound stage.
-					for (const auto* reader: stages) {
-						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
-							if (read_size == 0) continue;
-							if (read_address > address) {
-								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
-							}
-						}
-					}
-				}
-				//  PPSA15246
-				const auto& graphics = m_context.GetGraphics();
-				const auto  limit =
-				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
-				    (graphics.StorageMinAlignment() - 1);
-				size = Libs::LibKernel::Memory::TryClampRangeSize(
-				    address, std::min({size, uint64_t {256} * 1024 * 1024, limit}));
-			} else if (size >= (uint64_t {1} << 30u)) {
-				//  PPSA18026
-				// Finite descriptors can span sparse PRT holes; oversized pool windows are mapped
-				// in pieces, so they end at their last committed range.
-				size = Libs::LibKernel::Memory::TryClampRangeSize(address, size, true);
-			}
-			// Like the indirect table rows above, any descriptor can name memory that is not
-			// mapped (the clamp returns 0) or, below 1 GiB where nothing is clamped, a range
-			// outside guest memory: typically a table entry the game has not written yet. It is
-			// bound as null, as those rows are, instead of ending the run here or in FindBuffer.
-			if (size == 0 || !GuestRange {address, size}.Valid()) {
-				static std::atomic<uint32_t> logged {0};
-				if (logged.fetch_add(1, std::memory_order_relaxed) < 16u) {
-					Log::WriteToConsoleAndLog(fmt::format(
-					    "GPU: buffer {} of shader 0x{:016x} names {} at 0x{:011x} (size 0x{:x}, "
-					    "records 0x{:x}, stride {}, {}); bound as null\n",
-					    resource, program.shader_hash,
-					    size == 0 ? "unmapped memory" : "an invalid range", address,
-					    BufferBindingSize(metadata, descriptor), descriptor.NumRecords(),
-					    static_cast<uint32_t>(descriptor.Stride()),
-					    metadata.written ? "written" : "read"));
-				}
-				source = {};
-				continue;
-			}
-			source = {address, size, cache.FindBuffer(address, size)};
+			prepared.indirect_tables.push_back(std::move(binding));
 		}
 	}
 }
@@ -908,10 +917,54 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	ShaderRecompiler::IR::PackBufferRuntimeStrides(program.info.buffers, layout, snapshot,
 	                                               prepared.shader_data);
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		if (BdaGuard::Mode() != 0) {
-			prepared.flattened_srt = NativeUpload(m_context, GuardHeapSlots(m_context, program, snapshot));
+		const std::span<const uint32_t> srt = BdaGuard::Mode() != 0
+		    ? GuardHeapSlots(m_context, program, snapshot)
+		    : std::span<const uint32_t>(snapshot.flattened_srt);
+		if (prepared.indirect_tables.empty()) {
+			prepared.flattened_srt = NativeUpload(m_context, srt);
 		} else {
-			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+			EXIT_IF(prepared.indirect_tables.size() != snapshot.indirect_buffer_tables.size());
+			std::vector<uint32_t> patched(srt.begin(), srt.end());
+			auto& cache = m_context.GetBufferCache();
+			auto& stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
+			for (size_t index = 0; index < prepared.indirect_tables.size(); ++index) {
+				const auto& binding = prepared.indirect_tables[index];
+				const auto& table = snapshot.indirect_buffer_tables[index];
+				if (binding.header_word + 2u >= patched.size() ||
+				    binding.sources.size() != table.entries.size() ||
+				    table.class_index.size() != table.entries.size()) {
+					EXIT("invalid runtime indirect-buffer table layout\n");
+				}
+				const auto& metadata = program.info.buffers[binding.root_resource];
+				std::vector<uint32_t> words(binding.sources.size() * 4u, 0u);
+				for (size_t item = 0; item < binding.sources.size(); ++item) {
+					const auto& source = binding.sources[item];
+					if (source.address == 0 || source.size == 0) continue;
+					auto [buffer, offset] = cache.ObtainBuffer(
+					    source.address, source.size, metadata.written,
+					    metadata.formatted || (metadata.read && Config::SyncRawImageBuffersEnabled()),
+					    source.id);
+					if (metadata.written) {
+						m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
+					}
+					const uint64_t host_bda = static_cast<uint64_t>(buffer->BufferDeviceAddress()) + offset;
+					const uint64_t aligned_bda = host_bda & ~uint64_t {3};
+					const auto byte_offset = static_cast<uint32_t>(host_bda & 3u);
+					const auto byte_size = static_cast<uint32_t>(
+					    std::min<uint64_t>(source.size + byte_offset, UINT32_MAX));
+					const auto class_ordinal = table.class_index[item] & 0x00ffffffu;
+					EXIT_IF(class_ordinal == 0u || class_ordinal >= program.info.buffers.size());
+					words[item * 4u + 0u] = static_cast<uint32_t>(aligned_bda);
+					words[item * 4u + 1u] = static_cast<uint32_t>(aligned_bda >> 32u);
+					words[item * 4u + 2u] = byte_size;
+					words[item * 4u + 3u] = (byte_offset << 24u) | class_ordinal;
+				}
+				const auto table_offset = stream.Copy(words.data(), words.size() * sizeof(uint32_t), 16);
+				const uint64_t table_bda = static_cast<uint64_t>(stream.BufferDeviceAddress()) + table_offset;
+				patched[binding.header_word] = static_cast<uint32_t>(table_bda);
+				patched[binding.header_word + 1u] = static_cast<uint32_t>(table_bda >> 32u);
+			}
+			prepared.flattened_srt = NativeUpload(m_context, patched);
 		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
@@ -964,19 +1017,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              DrawTargets&                       targets) {
-	bool uses_dma        = false;
-	bool uses_image_heap = false;
-	bool uses_heap_rows  = false;
+	bool uses_dma            = false;
+	bool uses_device_address = false;
+	bool uses_image_heap     = false;
+	bool uses_heap_rows      = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		if (stage->runtime->module->info.has_address_writes) {
 			m_context.GetBufferCache().NoteAddressWrites();
 		}
 		uses_dma |= stage->runtime->module->info.info.uses_dma;
+		uses_device_address |= stage->runtime->module->info.info.uses_device_address;
 		uses_heap_rows |= stage->runtime->module->info.info.uses_heap_rows;
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
-	if (uses_dma) {
+	if (uses_dma || uses_device_address) {
 		m_context.PrepareBda();
 	}
 	if (uses_heap_rows) {

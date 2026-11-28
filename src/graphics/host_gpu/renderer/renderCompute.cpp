@@ -862,7 +862,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	if (program.has_address_writes) {
 		m_context.GetBufferCache().NoteAddressWrites();
 	}
-	if (program.info.uses_dma) {
+	if (program.info.uses_dma || program.info.uses_device_address) {
 		m_context.PrepareBda();
 	}
 	if (program.info.uses_heap_rows) {
@@ -1137,7 +1137,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (program.has_address_writes) {
 		m_context.GetBufferCache().NoteAddressWrites();
 	}
-	if (program.info.uses_dma) {
+	if (program.info.uses_dma || program.info.uses_device_address) {
 		m_context.PrepareBda();
 	}
 	if (program.info.uses_heap_rows) {
