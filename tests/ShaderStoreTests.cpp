@@ -1,8 +1,10 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreFailureCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderLookupIndex.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 
 #include <filesystem>
+#include <span>
 #ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
@@ -195,6 +197,33 @@ void TestStoreLockSingleWriter() {
   std::filesystem::remove_all(dir, error);
 }
 
+void TestNegativeFailureRecordRoundTrip() {
+  using namespace Libs::Graphics;
+  FailureRecord written {.stage              = ShaderType::Compute,
+                         .hash               = 0x1234,
+                         .user_data_count    = 8,
+                         .static_state       = {1, 2, 3},
+                         .capability_version = kTranslatorCapabilityVersion,
+                         .reason             = "specialization failed"};
+  const auto bytes = SaveFailureRecord(written);
+  FailureRecord read;
+  Check(LoadFailureRecord(bytes, read), "a complete negative record loads");
+  Check(read.stage == written.stage && read.hash == written.hash &&
+            read.user_data_count == written.user_data_count &&
+            read.static_state == written.static_state &&
+            read.capability_version == written.capability_version && read.reason == written.reason,
+        "every field survives the store round trip");
+  Check(FailureCacheApplies(read.capability_version), "a current negative entry applies");
+  Check(!FailureCacheApplies(kTranslatorCapabilityVersion - 1),
+        "a failure from an older translator is retried");
+  Check(!FailureCacheApplies(kTranslatorCapabilityVersion + 1),
+        "a failure from a future translator is retried");
+  FailureRecord truncated;
+  Check(!LoadFailureRecord(std::span(bytes).first(bytes.size() - 1), truncated),
+        "a truncated negative record is refused");
+  Check(NormalizeFailureReason("") == "unspecified failure", "an empty reason is readable");
+}
+
 } // namespace
 
 int main() {
@@ -206,6 +235,7 @@ int main() {
   TestNothingIdentical();
   TestPlanOfTheFirstKeptRecord();
   TestEmpty();
+  TestNegativeFailureRecordRoundTrip();
   TestShaderLookupHashes();
   TestShaderLookupIndexCollisions();
   std::printf("ShaderStoreTests: all passed\n");

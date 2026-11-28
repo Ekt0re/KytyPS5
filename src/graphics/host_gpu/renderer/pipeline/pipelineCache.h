@@ -32,6 +32,8 @@
 #include <mutex>
 #include <queue>
 #include <span>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
@@ -443,6 +445,8 @@ private:
 		// Walked ahead of the command thread (KYTY_LOOKAHEAD): see PublishForLookahead.
 		bool                                         lookahead = false;
 		bool                                         lookahead_checked = false;
+		bool                                         logged_neg_hit  = false;
+		std::string                                  failure_reason;
 		// A program from the shader store whose resource plan is still in its first record.
 		std::shared_ptr<StoredModule>                stored_plan;
 		// Programs with calls: the resource plans of the earlier links call_source keeps, by link
@@ -682,6 +686,9 @@ private:
 	void StopStoreDecoders();
 	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
 	                 const std::vector<uint32_t>& spirv);
+	// Persists a translation failure as a negative record, unless the retry switch is set.
+	void StoreFailedProgram(const ProgramKey& key, std::string_view reason);
+	static bool RetryFailedShaders();
 	void StorePipeline(const GraphicsPipelineKey& key);
 	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
 	// Shader recipes (pipelineSerialization.cpp): the inputs of every stored module's translation,

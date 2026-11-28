@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/pipeline/materializationMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreFailureCache.h"
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -893,7 +894,13 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
                                               ShaderRecompiler::IR::PushData::Window& push_data) {
 	static const bool keep_going  = KeepGoingEnabled();
 	static const bool skip_failed = keep_going || std::getenv("KYTY_SKIP_FAILED_SHADERS") != nullptr;
-	if (!skip_failed) return GetProgramImpl(params, input_info, push_data);
+	// Off: exactly the old path, where a compile failure ends the process unless the caller
+	// installed a recovery point. KYTY_SHADER_STORE_NEGATIVE_CACHE=1 also installs the recovery
+	// point (it implies KYTY_SKIP_FAILED_SHADERS): the failing program is skipped and recorded, so
+	// the next boot does not translate it again.
+	if (!skip_failed && !ShaderStoreNegativeCacheEnabled()) {
+		return GetProgramImpl(params, input_info, push_data);
+	}
 	std::jmp_buf  recover;
 	const int64_t work_depth = Common::ShaderCompileStatus::ThreadDepth();
 	auto* const   previous   = Common::g_dbg_recover;
@@ -910,6 +917,8 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			PipelineCacheLog("KYTY_SKIP shader=0x{:016x} stage={}", hash,
 			                 ShaderRecompiler::StageName(stage));
 		}
+		// Only a key this program set may be skipped or stored: before GetProgramImpl sets it,
+		// m_lookup_key still names the previous program.
 		if (m_lookup_key_ready) {
 			if (const auto found = m_program_cache.find(m_lookup_key);
 			    found != m_program_cache.end() && found->second.lookahead) {
@@ -918,7 +927,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 				return nullptr;
 			}
 			m_program_cache.erase(m_lookup_key);
-			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+			auto& program = m_program_cache.emplace(m_lookup_key, Program {}).first->second;
+			program.skip_dispatch  = true;
+			program.failure_reason = NormalizeFailureReason(diag.text != nullptr ? diag.text : "");
+			if (m_lookup_key.stage != ShaderType::Unknown) {
+				StoreFailedProgram(m_lookup_key, program.failure_reason);
+			}
 		}
 		return nullptr;
 	}
@@ -988,6 +1002,12 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 		if (cached.skip_dispatch) {
 			static const bool keep_going = KeepGoingEnabled();
 			if (keep_going) NoteKeepGoingUse(params.hash);
+			if (ShaderStoreNegativeCacheEnabled() && !cached.logged_neg_hit) {
+				cached.logged_neg_hit = true;
+				PipelineCacheLog("Shader cache: negative entry for {} 0x{:016x}: {}\n",
+				                 ShaderRecompiler::StageName(m_lookup_key.stage), m_lookup_key.hash,
+				                 NormalizeFailureReason(cached.failure_reason));
+			}
 			return nullptr;
 		}
 		ShaderModule* module = nullptr;
@@ -1040,7 +1060,10 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
 			                 params.hash, source.unsupported_call_pc);
-			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+			auto& program = m_program_cache.emplace(m_lookup_key, Program {}).first->second;
+			program.skip_dispatch  = true;
+			program.failure_reason = "unsupported callable target";
+			StoreFailedProgram(m_lookup_key, program.failure_reason);
 			return nullptr;
 		}
 	}

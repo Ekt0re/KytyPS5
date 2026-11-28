@@ -6,6 +6,7 @@
 #include "common/shaderCompileStatus.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreFailureCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -50,7 +51,7 @@ using ShaderRecompiler::IR::IoAll;
 using ShaderRecompiler::IR::Reader;
 using ShaderRecompiler::IR::Writer;
 
-enum class Record : uint8_t { Module, GraphicsPipeline, TessellationLayout };
+enum class Record : uint8_t { Module, GraphicsPipeline, TessellationLayout, FailedProgram };
 
 // Precedes each record's zstd frame.
 struct Frame {
@@ -99,8 +100,10 @@ uint64_t BuildStamp() {
 //   - the module id formula (PipelineCache::CompileModule, ReplayRecipe);
 //   - what a translation is given (the CompileOptions of PipelineCache::GetProgramImpl and of the
 //     translations ahead, SpirvProfile's meaning for the same bytes).
-// Version 1 leaves the header as it was before the constant existed.
-constexpr uint64_t StoreFormatVersion = 1;
+// Version 1 leaves the header as it was before the constant existed. Version 2 adds the negative
+// FailedProgram record to the record stream; translator capability generations travel inside that
+// record and do not change the header again.
+constexpr uint64_t StoreFormatVersion = 2;
 
 static_assert(sizeof(PipelineStaticParameters) == 118 && sizeof(PipelineRenderingState) == 44 &&
                   sizeof(PipelineVertexInputState) == 354 && sizeof(GraphicsPipelineKey) == 548 &&
@@ -330,6 +333,8 @@ struct PipelineCache::LoadedRecord {
 	GraphicsPipelineKey                pipeline_key;
 	uint64_t                           layout_key = 0;
 	ShaderTessellationInputInfo        layout;
+	uint64_t                           capability_version = 0; // FailedProgram
+	std::string                        failure_reason;         // FailedProgram
 	bool                               ok = false;
 };
 
@@ -422,6 +427,10 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 						break;
 					case Record::TessellationLayout:
 						record.type = RestampRecord::Type::TessellationLayout;
+						break;
+					case Record::FailedProgram:
+						// A negative record has no modules to verify or restamp; its capability
+						// generation decides whether it applies to this translator.
 						break;
 				}
 				m_restamp_records.push_back(record);
@@ -609,6 +618,18 @@ void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& 
 			}
 			break;
 		}
+		case Record::FailedProgram: {
+			FailureRecord failure;
+			IoFailureRecord(reader, failure);
+			if (!complete()) {
+				return;
+			}
+			loaded.key               = {failure.stage, failure.hash, failure.user_data_count,
+			                           failure.static_state};
+			loaded.capability_version = failure.capability_version;
+			loaded.failure_reason     = std::move(failure.reason);
+			break;
+		}
 		default: return;
 	}
 	loaded.ok = true;
@@ -742,6 +763,18 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 		case Record::TessellationLayout:
 			m_tess_layouts.try_emplace(loaded.layout_key, loaded.layout);
 			break;
+		case Record::FailedProgram: {
+			// A failure from an older translator is no longer evidence that this one cannot
+			// translate the program. The retry switch ignores negative entries for this run.
+			if (!ShaderStoreNegativeCacheEnabled() || !FailureCacheApplies(loaded.capability_version) ||
+			    RetryFailedShaders()) {
+				break;
+			}
+			auto& program = m_program_cache.try_emplace(std::move(loaded.key)).first->second;
+			program.skip_dispatch   = true;
+			program.failure_reason  = NormalizeFailureReason(loaded.failure_reason);
+			break;
+		}
 	}
 }
 
@@ -839,6 +872,34 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 	IoAll(record, ShaderRecompiler::IR::SaveResourcePlan(program.resource_plan));
 	IoModule(record, module);
 	IoAll(record, spirv);
+	m_store.Append(std::move(record.bytes));
+}
+
+// KYTY_SHADER_STORE_RETRY_FAILED=1 ignores negative records for one run, so a translator fix can
+// be checked before its capability generation is bumped in the source.
+bool PipelineCache::RetryFailedShaders() {
+	static const bool retry = [] {
+		const char* env = std::getenv("KYTY_SHADER_STORE_RETRY_FAILED");
+		return env != nullptr && env[0] == '1';
+	}();
+	return retry;
+}
+
+void PipelineCache::StoreFailedProgram(const ProgramKey& key, std::string_view reason) {
+	if (!m_store || !ShaderStoreNegativeCacheEnabled() || RetryFailedShaders()) {
+		return;
+	}
+	FailureRecord failure {
+	    .stage              = key.stage,
+	    .hash               = key.hash,
+	    .user_data_count    = key.user_data_count,
+	    .static_state       = key.static_state,
+	    .capability_version = kTranslatorCapabilityVersion,
+	    .reason             = NormalizeFailureReason(reason),
+	};
+	Writer record;
+	IoAll(record, Record::FailedProgram);
+	IoFailureRecord(record, failure);
 	m_store.Append(std::move(record.bytes));
 }
 
