@@ -45,6 +45,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 #include <cstring>
 #include <iterator>
 #include <limits>
@@ -56,6 +57,10 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <vector>
+#include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdio>
 
 namespace Libs::Graphics {
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
@@ -788,7 +793,196 @@ BufferProbeRunner& GetBufferProbe() {
 } // namespace
 
 // Records the dispatch, at submission if its pipeline is still compiling.
+// KYTY_DUMP_CS=<hash>[,...] with KYTY_DUMP_CS_FRAME=<first frame> (diagnostic): for every
+// listed dispatch in frames [first, first+1], copy each bound storage buffer range before and
+// after the dispatch into a host buffer (KYTY_DUMP_CS_MB, default 1024) and write it, with an
+// index of descriptors, user data and dimensions, to kyty_cs_dump.{bin,txt} ~10 s later.
+namespace CsDump {
+struct State {
+	std::vector<uint64_t> hashes;
+	uint64_t              first_frame = 0;
+	vk::Buffer            buffer;
+	vk::DeviceMemory      memory;
+	uint8_t*              mapped   = nullptr;
+	uint64_t              capacity = 0;
+	uint64_t              used     = 0;
+	uint32_t              seq      = 0;
+	FILE*                 index    = nullptr;
+	std::atomic<int64_t>  last_ms {0};
+	bool                  writer_started = false;
+};
+static State& Get() {
+	static State state;
+	return state;
+}
+static bool Enabled() {
+	static const bool enabled = [] {
+		auto&       st   = Get();
+		const char* text = std::getenv("KYTY_DUMP_CS");
+		while (text != nullptr && *text != 0) {
+			char* end = nullptr;
+			st.hashes.push_back(std::strtoull(text, &end, 16));
+			if (end == text) break;
+			text = *end == ',' ? end + 1 : end;
+		}
+		const char* frame = std::getenv("KYTY_DUMP_CS_FRAME");
+		st.first_frame    = frame != nullptr ? std::strtoull(frame, nullptr, 10) : 0;
+		return !st.hashes.empty();
+	}();
+	return enabled;
+}
+static int64_t NowMs() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+static bool Allocate(GraphicContext& graphics) {
+	auto& st = Get();
+	if (st.mapped != nullptr) return true;
+	const char* mb = std::getenv("KYTY_DUMP_CS_MB");
+	st.capacity    = uint64_t {mb != nullptr ? std::strtoull(mb, nullptr, 10) : 1024u} << 20u;
+	vk::BufferCreateInfo info {};
+	info.size  = st.capacity;
+	info.usage = vk::BufferUsageFlagBits::eTransferDst;
+	st.buffer  = graphics.device.createBuffer(info).value;
+	const auto req = graphics.device.getBufferMemoryRequirements(st.buffer);
+	const auto& props = graphics.physical_device_memory_properties;
+	const auto want = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent;
+	uint32_t type = UINT32_MAX;
+	for (uint32_t i = 0; i < props.memoryTypeCount; i++) {
+		if ((req.memoryTypeBits & (1u << i)) != 0 && (props.memoryTypes[i].propertyFlags & want) == want) {
+			if (type == UINT32_MAX || (props.memoryTypes[i].propertyFlags & vk::MemoryPropertyFlagBits::eHostCached)) type = i;
+		}
+	}
+	if (type == UINT32_MAX) return false;
+	vk::MemoryAllocateInfo alloc {};
+	alloc.allocationSize  = req.size;
+	alloc.memoryTypeIndex = type;
+	st.memory             = graphics.device.allocateMemory(alloc).value;
+	(void)graphics.device.bindBufferMemory(st.buffer, st.memory, 0);
+	st.mapped = static_cast<uint8_t*>(graphics.device.mapMemory(st.memory, 0, st.capacity).value);
+	st.index  = std::fopen("kyty_cs_dump.txt", "w");
+	std::fprintf(stderr, "KYTY_DUMP_CS: %" PRIu64 " MB host buffer, frames %" PRIu64 "-%" PRIu64 "\n",
+	             st.capacity >> 20u, st.first_frame, st.first_frame + 1);
+	return st.mapped != nullptr && st.index != nullptr;
+}
+static void StartWriter() {
+	auto& st = Get();
+	if (st.writer_started) return;
+	st.writer_started = true;
+	std::thread([] {
+		auto& st = Get();
+		while (NowMs() - st.last_ms.load() < 10000) std::this_thread::sleep_for(std::chrono::seconds(1));
+		FILE* out = std::fopen("kyty_cs_dump.bin", "wb");
+		if (out != nullptr) {
+			std::fwrite(st.mapped, 1, st.used, out);
+			std::fclose(out);
+		}
+		std::fflush(st.index);
+		std::fprintf(stderr, "KYTY_DUMP_CS: wrote %" PRIu64 " bytes, %u dispatches\n", st.used, st.seq);
+	}).detach();
+}
+struct Copy {
+	vk::Buffer src;
+	uint64_t   src_offset;
+	uint64_t   size;
+	uint64_t   pre;
+	uint64_t   post;
+};
+// Plans the copies and writes the index line; returns no copies when this dispatch is not dumped.
+static std::vector<Copy> Plan(GraphicContext& graphics, uint64_t frame, uint64_t hash,
+                              const PreparedBindings& bindings, const ShaderRecompiler::IR::ResourceSnapshot& res,
+                              uint32_t gx, uint32_t gy, uint32_t gz, const uint32_t* threads) {
+	std::vector<Copy> copies;
+	if (!Enabled()) return copies;
+	auto& st = Get();
+	if (frame < st.first_frame || frame > st.first_frame + 1) return copies;
+	if (std::find(st.hashes.begin(), st.hashes.end(), hash) == st.hashes.end()) return copies;
+	if (!Allocate(graphics)) return copies;
+	uint64_t need = 0;
+	for (const auto& b: bindings.buffers) {
+		if (b.buffer && b.range != VK_WHOLE_SIZE) need += 2 * ((std::min<uint64_t>(b.range, 256ull << 20u) + 255u) & ~uint64_t {255});
+	}
+	if (st.used + need > st.capacity) return copies;
+	std::fprintf(st.index, "D seq=%u frame=%" PRIu64 " hash=%016" PRIx64 " groups=%u,%u,%u threads=%u,%u,%u\n",
+	             st.seq++, frame, hash, gx, gy, gz, threads[0], threads[1], threads[2]);
+	std::fprintf(st.index, "U");
+	for (auto u: res.user_data) std::fprintf(st.index, " %08x", u);
+	std::fprintf(st.index, "\nF");
+	for (auto u: res.flattened_srt) std::fprintf(st.index, " %08x", u);
+	std::fprintf(st.index, "\n");
+	for (size_t i = 0; i < res.buffers.size(); i++) {
+		std::fprintf(st.index, "V %zu", i);
+		for (uint32_t w = 0; w < res.buffers[i].dword_count; w++) std::fprintf(st.index, " %08x", res.buffers[i].dwords[w]);
+		std::fprintf(st.index, "\n");
+	}
+	for (size_t i = 0; i < bindings.buffers.size(); i++) {
+		const auto& b = bindings.buffers[i];
+		const uint64_t guest = i < bindings.buffer_sources.size() ? bindings.buffer_sources[i].address : 0;
+		const uint64_t gsize = i < bindings.buffer_sources.size() ? bindings.buffer_sources[i].size : 0;
+		if (!b.buffer || b.range == VK_WHOLE_SIZE) {
+			std::fprintf(st.index, "B %zu none guest=%" PRIx64 " gsize=%" PRIx64 "\n", i, guest, gsize);
+			continue;
+		}
+		Copy c {b.buffer, b.offset, std::min<uint64_t>(b.range, 256ull << 20u), 0, 0};
+		c.pre  = st.used;
+		st.used += (c.size + 255u) & ~uint64_t {255};
+		c.post = st.used;
+		st.used += (c.size + 255u) & ~uint64_t {255};
+		std::fprintf(st.index, "B %zu guest=%" PRIx64 " gsize=%" PRIx64 " size=%" PRIx64 " pre=%" PRIx64 " post=%" PRIx64 "\n",
+		             i, guest, gsize, c.size, c.pre, c.post);
+		copies.push_back(c);
+	}
+	st.last_ms.store(NowMs());
+	StartWriter();
+	return copies;
+}
+static void Record(vk::CommandBuffer command, const std::vector<Copy>& copies, bool post) {
+	if (copies.empty()) return;
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+	                        {}, barrier, nullptr, nullptr);
+	for (const auto& c: copies) {
+		vk::BufferCopy region {c.src_offset, post ? c.post : c.pre, c.size};
+		command.copyBuffer(c.src, Get().buffer, region);
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+	after.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+	                        {}, after, nullptr, nullptr);
+}
+} // namespace CsDump
+
+// KYTY_SKIP_CS=<hash>[,<hash>...] (diagnostic): record no dispatch for these compute shaders;
+// bindings and barriers stay. Counts are printed every 4096 skips.
+static bool SkipComputeDispatch(uint64_t hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> list;
+		const char*           text = std::getenv("KYTY_SKIP_CS");
+		while (text != nullptr && *text != 0) {
+			char* end = nullptr;
+			list.push_back(std::strtoull(text, &end, 16));
+			if (end == text) break;
+			text = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	if (hashes.empty() || std::find(hashes.begin(), hashes.end(), hash) == hashes.end()) {
+		return false;
+	}
+	static std::atomic<uint64_t> skipped {0};
+	if ((skipped.fetch_add(1, std::memory_order_relaxed) & 0xfffu) == 0) {
+		std::fprintf(stderr, "KYTY_SKIP_CS: skipped dispatches so far: %" PRIu64 " (last 0x%016" PRIx64 ")\n",
+		             skipped.load(std::memory_order_relaxed), hash);
+	}
+	return true;
+}
+
 template <typename Record>
+
 static void RecordDispatch(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
                            const Record& record) {
 	if (pipeline.pipeline) {
@@ -1266,11 +1460,16 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	auto* const    graphics = &m_context.GetGraphics();
 	const uint64_t cs_hash  = program.shader_hash;
+	const auto     dump     = CsDump::Plan(m_context.GetGraphics(), m_context.GetGpu().GetFrameNum(), cs_hash,
+	                                       bindings, resources, thread_group_x, thread_group_y,
+	                                       thread_group_z, input_info.threads_num);
 	const auto record = [=](vk::CommandBuffer command, vk::Pipeline handle) {
+		CsDump::Record(command, dump, false);
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
 		const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'C', cs_hash);
-		command.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		if (!SkipComputeDispatch(cs_hash)) command.dispatch(thread_group_x, thread_group_y, thread_group_z);
 		GpuBreadcrumbs::End(*graphics, command, crumb);
+		CsDump::Record(command, dump, true);
 	};
 	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
 	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
@@ -1535,7 +1734,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	                cs_hash  = program.shader_hash](vk::CommandBuffer command, vk::Pipeline handle) {
 		               command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
 		               const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'C', cs_hash);
-		               if (direct) {
+		               if (SkipComputeDispatch(cs_hash)) {
+		               } else if (direct) {
 			               command.dispatch(counts.x, counts.y, counts.z);
 		               } else {
 			               command.dispatchIndirect(args, offset);
