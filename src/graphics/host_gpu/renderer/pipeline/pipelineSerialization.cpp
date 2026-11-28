@@ -412,6 +412,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			if (RestampMode()) {
 				// What a partial restamp keeps or drops, record by record.
 				RestampRecord record;
+				bool          restamp_this = true;
 				switch (static_cast<Record>(loaded[kept].type)) {
 					case Record::Module: {
 						record.type      = RestampRecord::Type::Module;
@@ -429,12 +430,15 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 						record.type = RestampRecord::Type::TessellationLayout;
 						break;
 					case Record::FailedProgram:
-						// A negative record has no modules to verify or restamp; its capability
-						// generation decides whether it applies to this translator.
+						// A negative record has no modules to verify or restamp, and it belongs to
+						// the old translator: it is left out (not counted as a dropped module).
+						restamp_this = false;
 						break;
 				}
-				m_restamp_records.push_back(record);
-				m_restamp_frames.push_back(frames[kept]);
+				if (restamp_this) {
+					m_restamp_records.push_back(record);
+					m_restamp_frames.push_back(frames[kept]);
+				}
 			}
 			InsertRecord(std::move(loaded[kept]));
 			records = records.subspan(frames[kept].size());
@@ -741,6 +745,12 @@ bool PipelineCache::TakeStoredPlan(Program& program) {
 void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 	switch (static_cast<Record>(loaded.type)) {
 		case Record::Module: {
+			// A translated module supersedes a negative record for the same program, whichever
+			// came first (a KYTY_SHADER_STORE_RETRY_FAILED run appends the module after it).
+			if (const auto it = m_program_cache.find(loaded.key);
+			    it != m_program_cache.end() && it->second.skip_dispatch) {
+				m_program_cache.erase(it);
+			}
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(loaded.key));
 			if (inserted) {
 				loaded.module.stored->want_plan  = true;
@@ -770,7 +780,12 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 			    RetryFailedShaders()) {
 				break;
 			}
-			auto& program = m_program_cache.try_emplace(std::move(loaded.key)).first->second;
+			// A program with translated modules is not hidden by a failure.
+			const auto [entry, inserted] = m_program_cache.try_emplace(std::move(loaded.key));
+			if (!inserted) {
+				break;
+			}
+			auto& program = entry->second;
 			program.skip_dispatch   = true;
 			program.failure_reason  = NormalizeFailureReason(loaded.failure_reason);
 			break;
