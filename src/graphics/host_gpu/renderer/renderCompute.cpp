@@ -256,18 +256,21 @@ static void CacheDmaBases(RenderContext& context, const ShaderStageRuntime& stag
 	for (const auto [low, high]: info.user_address_bases) back(user[low], user[high]);
 }
 
-// Recognized traversals trace the mirror of the TLAS whose header address the shader loads from
-// scalar data.
+// Recognized traversals trace the mirrors of the TLASes whose header addresses the shader loads
+// from scalar data, one context each.
 static void PrepareRayQuery(RenderContext& context, const ShaderStageRuntime& stage,
                             PreparedBindings& bindings) {
 	const auto& program = stage.module->info;
-	const auto  dword   = program.bindings.ray_query_dword;
+	auto        dword   = program.bindings.ray_query_dword;
 	if (dword == ShaderRecompiler::IR::PushData::NoStart) return;
-	const auto& flat       = stage.resources->flattened_srt;
-	const auto [low, high] = program.info.ray_query_tlas;
-	const auto address = context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
-	bindings.shader_data[dword]     = static_cast<uint32_t>(address);
-	bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
+	const auto& flat = stage.resources->flattened_srt;
+	for (const auto [low, high]: program.info.ray_query_tlases) {
+		const auto address =
+		    context.GetRayTracing()->Prepare(flat[low] | uint64_t {flat[high]} << 32u);
+		bindings.shader_data[dword]     = static_cast<uint32_t>(address);
+		bindings.shader_data[dword + 1] = static_cast<uint32_t>(address >> 32u);
+		dword += 2u;
+	}
 }
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,

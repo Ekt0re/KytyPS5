@@ -802,9 +802,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
 	}
-	if (grow_depth) {
-		// The grown image keeps the pending HTile clears of every slice.
-		const auto metadata = m_surface_metas.find(info.metadata.range.address);
+	ApplyPendingMetaClears(cached_id);
+	// The replacement keeps the pending HTile clears of every slice, grown or not: freeing the
+	// cached image as their owner would drop them, and the next depth target over the range would
+	// then test against the previous frame's depth (GTA VI's static walls failed GREATER and
+	// vanished in alternate frames).
+	if (cached.info.metadata.kind == ImageMetadataKind::Htile) {
+		const auto metadata = m_surface_metas.find(cached.info.metadata.range.address);
 		if (metadata != m_surface_metas.end() && metadata->second.owner == cached_id) {
 			metadata->second.owner = replacement_id;
 		}
@@ -1775,6 +1779,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 	}
+	ApplyPendingMetaClears(id);
 	// Storage readback also queues the first GPU write since the CPU last wrote the image: an
 	// image rewritten every frame would otherwise be downloaded at every GL2 writeback. GPU data
 	// in the buffer cache over the whole image is not a CPU write. Read before RefreshImage
@@ -2426,6 +2431,52 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask.set();
 	return true;
+}
+
+void TextureCache::NoteMetaClearValue(uint64_t address, float depth, uint8_t stencil) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found != m_surface_metas.end()) {
+		found->second.clear_value = vk::ClearDepthStencilValue {depth, stencil};
+	}
+}
+
+void TextureCache::ApplyPendingMetaClears(ImageId id) {
+	const auto& image = m_slot_images[id];
+	if (image.info.metadata.kind != ImageMetadataKind::Htile || !image.info.IsDepth() ||
+	    image.depth_id) {
+		return;
+	}
+	const auto found = m_surface_metas.find(image.info.metadata.range.address);
+	if (found == m_surface_metas.end() || found->second.owner != id ||
+	    found->second.clear_mask.none()) {
+		return;
+	}
+	auto& meta    = found->second;
+	auto  aspects = vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth};
+	if (image.info.metadata.stencil_compressed && image.info.HasStencil()) {
+		aspects |= vk::ImageAspectFlagBits::eStencil;
+	}
+	aspects &= ImageAspectMask(image.backing.format);
+	const auto     layers = std::min<uint32_t>(image.backing.layers, meta.clear_mask.size());
+	vk::ClearValue clear {};
+	clear.depthStencil = meta.clear_value;
+	for (uint32_t layer = 0; layer < layers;) {
+		if (!meta.clear_mask.test(layer)) {
+			layer++;
+			continue;
+		}
+		uint32_t end = layer + 1;
+		while (end < layers && meta.clear_mask.test(end)) {
+			end++;
+		}
+		ClearImage(m_scheduler.Current(), id, image.backing.format,
+		           vk::ImageSubresourceRange {aspects, 0, 1, layer, end - layer}, clear);
+		for (uint32_t cleared = layer; cleared < end; cleared++) {
+			meta.clear_mask.reset(cleared);
+		}
+		layer = end;
+	}
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

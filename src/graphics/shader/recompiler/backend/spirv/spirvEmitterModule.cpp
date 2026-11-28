@@ -283,7 +283,8 @@ void DefineDescriptors(EmitterState& state) {
 	}
 	if (info.ray_query) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
-		bindings.memory_offset_dword += 2u;
+		bindings.memory_offset_dword +=
+		    2u * std::max<uint32_t>(static_cast<uint32_t>(info.ray_query_tlases.size()), 1u);
 	}
 	bindings.push_data_start_dword =
 	    state.push_data.StartFor(bindings.ShaderDataDwords(), state.program.stage);

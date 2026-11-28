@@ -38,6 +38,8 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	// Fragment shaders can run at the guest wave size (VK_EXT_subgroup_size_control).
 	bool                               fragment_subgroup_size_control_enabled = false;
+	// VK_KHR_maintenance5: a pipeline stage can take its SPIR-V inline instead of a module.
+	bool                               maintenance5_enabled                   = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               unified_image_layouts_enabled         = false;

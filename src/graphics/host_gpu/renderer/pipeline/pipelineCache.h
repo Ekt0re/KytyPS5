@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/pipeline/lookahead.h"
 #include "graphics/host_gpu/renderer/pipeline/materializationMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderLookupIndex.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCacheFile.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -131,8 +132,9 @@ static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 // A module record of the shader store, decoded on first use or by the store's background decoders
 // (pipelineSerialization.cpp): the store keeps only its key and pipeline fields decoded at start.
 struct StoredModule {
-	// The store's bytes, released once decoded, and the record's frame and fields in them.
-	std::shared_ptr<const std::vector<uint8_t>> store;
+	// The store's bytes (a read-only mapping of the file), released once decoded, and the record's
+	// frame and fields in them.
+	std::shared_ptr<const DriverCacheFile> store;
 	std::span<const uint8_t>                    frame;
 	uint32_t                                    plan_offset  = 0;
 	uint32_t                                    plan_size    = 0;
@@ -144,6 +146,10 @@ struct StoredModule {
 	bool                                        want_plan = false;
 	// A module the run does not use (KYTY_RT_OFF); its record may still give the plan.
 	bool                                        module_dropped = false;
+	// With maintenance5 the module never gets a handle: the driver keeps a copy of a module's
+	// SPIR-V for as long as the module lives (900 MB over PPSA38500's store), so pipeline creation
+	// decompresses it from the mapped store and passes it inline, and the store stays mapped.
+	bool                                        inline_code = false;
 	std::once_flag                              module_once;
 	std::once_flag                              plan_once;
 	std::atomic<bool>                           decoded      = false; // The module.
@@ -157,8 +163,10 @@ struct StoredModule {
 	std::vector<uint32_t>                       spirv;
 };
 // Safe on any thread: decodes the record's module once (a call during another thread's decode
-// waits for it) and returns its handle.
+// waits for it) and returns its handle; null for an inline one.
 vk::ShaderModule ResolveStoredModule(StoredModule& stored);
+// An inline module's SPIR-V, decompressed from the store.
+std::vector<uint32_t> StoredModuleSpirv(const StoredModule& stored);
 // The same for the resource plan of a program's first record; false when it cannot be decoded.
 bool ResolveStoredPlan(StoredModule& stored);
 
@@ -186,6 +194,7 @@ struct ShaderModule {
 	[[nodiscard]] vk::ShaderModule Handle() const {
 		return stored != nullptr ? ResolveStoredModule(*stored) : module;
 	}
+	[[nodiscard]] bool Inline() const { return stored != nullptr && stored->inline_code; }
 };
 
 // KYTY_FAILED_SPIRV_DUMP=1: modules keep their SPIR-V, written to the shader log folder's failed/
@@ -612,7 +621,7 @@ private:
 	size_t                                      m_replay_lacking = 0;
 	bool                                        m_replay_active  = false;
 	// Restamp(): the store's bytes and modules, and what the comparison found.
-	std::shared_ptr<const std::vector<uint8_t>> m_restamp_store;
+	std::shared_ptr<const DriverCacheFile>      m_restamp_store;
 	std::filesystem::path                       m_restamp_path;
 	std::vector<uint8_t>                        m_restamp_stamp;
 	ModuleMap                                   m_restamp_modules;

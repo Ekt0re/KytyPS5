@@ -507,11 +507,18 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	const bool pipeline_binary_extensions =
 	    HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
 	    HasExtension(available_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
-	if (pipeline_binary_extensions) {
+	// maintenance5 on its own lets pipelines take their SPIR-V inline, without shader modules.
+	const bool maintenance5_extension =
+	    HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+	if (maintenance5_extension) {
 		add(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+	}
+	if (!maintenance5_extension) {
+		supported.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
+	}
+	if (pipeline_binary_extensions) {
 		add(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 	} else {
-		supported.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
 		supported.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
 	}
 	// Diagnostic per-pipeline driver statistics (KYTY_PIPELINE_STATS, pipelineStats.h).
@@ -531,6 +538,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	physical_device.getFeatures2(&supported2);
 	graphics.pipeline_binary_enabled = pipeline_binary_extensions && maintenance5.maintenance5 &&
 	                                   pipeline_binary.pipelineBinaries;
+	graphics.maintenance5_enabled = maintenance5_extension && maintenance5.maintenance5;
 	LOGF("Vulkan pipeline binaries: %s\n", graphics.pipeline_binary_enabled ? "true" : "false");
 	graphics.pipeline_statistics_enabled =
 	    pipeline_stats_extension && pipeline_executable.pipelineExecutableInfo == VK_TRUE;
@@ -833,8 +841,10 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		     disable_internal_cache ? "disabled" : "kept");
 	}
 	if (!graphics.pipeline_binary_enabled) {
-		create.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
 		create.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+	}
+	if (!graphics.maintenance5_enabled) {
+		create.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
 	}
 	if (!disable_internal_cache) {
 		create.unlink<vk::DevicePipelineBinaryInternalCacheControlKHR>();

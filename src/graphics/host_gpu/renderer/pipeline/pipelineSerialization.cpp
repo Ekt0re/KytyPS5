@@ -354,16 +354,14 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (header.empty()) {
 		return;
 	}
-	const auto start      = std::chrono::steady_clock::now();
-	auto       store_data = std::make_shared<std::vector<uint8_t>>();
-	auto&      bytes      = *store_data;
-	if (Common::File file;
-	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
-		bytes.resize(file.Size());
-		uint32_t read = 0;
-		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
-		bytes.resize(read);
-	}
+	const auto start = std::chrono::steady_clock::now();
+	// Mapped, not read: the stored modules decode from it lazily, and many never are, so a heap
+	// copy held the whole store (about 450 MB for PPSA38500) for the session. Mapped pages are
+	// page cache the kernel can drop. The writer only appends past the records loaded here,
+	// truncates bytes no record spans and rewrites the stamp in place.
+	auto store_data = std::make_shared<const DriverCacheFile>(
+	    Common::File::IsFileExisting(path) ? DriverCacheFile::Map(path) : DriverCacheFile {});
+	const auto bytes = std::span<const uint8_t>(store_data->data, store_data->size);
 	const auto read_ms = MillisecondsSince(start);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
@@ -612,6 +610,7 @@ void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& 
 			}
 			stored->frame               = record;
 			stored->device              = m_graphics.device;
+			stored->inline_code         = m_graphics.maintenance5_enabled;
 			loaded.module.spirv_words   = stored->spirv_words;
 			loaded.module.stored        = std::move(stored);
 			break;
@@ -671,7 +670,17 @@ void FinishStoredPart(StoredModule& stored) {
 
 } // namespace
 
+std::vector<uint32_t> StoredModuleSpirv(const StoredModule& stored) {
+	const auto            raw = DecompressStored(stored);
+	std::vector<uint32_t> spirv(stored.spirv_words);
+	std::memcpy(spirv.data(), raw.data() + stored.spirv_offset, spirv.size() * sizeof(uint32_t));
+	return spirv;
+}
+
 vk::ShaderModule ResolveStoredModule(StoredModule& stored) {
+	if (stored.inline_code) {
+		return nullptr;
+	}
 	std::call_once(stored.module_once, [&] {
 		auto                  raw = DecompressStored(stored);
 		std::vector<uint32_t> spirv(stored.spirv_words);
