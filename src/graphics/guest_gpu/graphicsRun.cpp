@@ -199,6 +199,16 @@ void GuestGpu::Prescan(uint32_t queue_id, std::span<const uint32_t> commands) {
 	if (shadow != nullptr && setjmp(recover) != 0) {
 		// Ran into an error: the compute scan is redone without the shadow.
 		Common::g_dbg_recover = previous;
+		static const bool keep_going = [] {
+			const char* value = std::getenv("KYTY_KEEP_GOING");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		if (keep_going) {
+			const auto& diag = Common::LastFatalDiagnostic();
+			Log::WriteToConsoleAndLog(
+			    fmt::format("KYTY_KEEP_GOING prescan recovery escaped at {}:{}: {}\n",
+			                diag.file, diag.line, diag.text));
+		}
 		m_prescan_shadow->Reset();
 		PrescanComputeDispatches(commands, m_prescan_regs[queue_id], sink);
 		return;

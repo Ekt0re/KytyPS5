@@ -498,6 +498,21 @@ private:
 	// Modules compiled per stage.
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
+	bool                                   m_lookup_key_ready = false;
+	struct KeepGoingFailure {
+		static constexpr size_t MaxFrames = 16;
+		uint64_t                hash      = 0;
+		ShaderType              stage     = ShaderType::Unknown;
+		uint32_t                count     = 0;
+		std::array<uint64_t, MaxFrames> frames {};
+		uint8_t                 frame_count = 0;
+		char                    reason[256] {};
+		char                    file[128]   {};
+		int                     line        = 0;
+	};
+	static constexpr size_t MaxKeepGoingFailures = 64;
+	std::array<KeepGoingFailure, MaxKeepGoingFailures> m_keep_going_failures {};
+	size_t                                             m_keep_going_failure_count = 0;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
@@ -606,6 +621,9 @@ private:
 	template <typename InputInfo>
 	const ShaderModule* GetProgramImpl(const ShaderParams& params, InputInfo& input_info,
 	                               ShaderRecompiler::IR::PushData::Window& push_data);
+	void RecordKeepGoingFailure(uint64_t hash, ShaderType stage, std::string_view reason,
+	                            const char* file, int line);
+	void NoteKeepGoingUse(uint64_t hash);
 	std::string CompileReason(const ProgramKey& key, bool known_program,
 	                      const ShaderRecompiler::IR::ResourceSpecialization& spec,
 	                          ShaderRecompiler::IR::PushData::Window push_data, bool source_changed);

@@ -587,6 +587,10 @@ target_link_libraries(perf_summary_tests common kyty_test_gtest)
 add_executable(fault_stats_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FaultStatsTests.cpp")
 target_link_libraries(fault_stats_tests common kyty_test_gtest)
 
+add_executable(keep_going_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/KeepGoingTests.cpp")
+target_link_libraries(keep_going_tests common kyty_test_gtest)
+target_include_directories(keep_going_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -936,6 +940,7 @@ if(BUILD_TESTING)
 	add_test(NAME draw_indirect_count COMMAND $<TARGET_FILE:draw_indirect_count_tests>)
 	add_test(NAME perf_summary COMMAND $<TARGET_FILE:perf_summary_tests>)
 	add_test(NAME fault_stats COMMAND $<TARGET_FILE:fault_stats_tests>)
+	add_test(NAME keep_going COMMAND $<TARGET_FILE:keep_going_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME materialization_memo COMMAND $<TARGET_FILE:materialization_memo_tests>)
@@ -1099,6 +1104,7 @@ if(BUILD_TESTING)
 		draw_indirect_count_tests
 		perf_summary_tests
 		fault_stats_tests
+		keep_going_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		materialization_memo_tests

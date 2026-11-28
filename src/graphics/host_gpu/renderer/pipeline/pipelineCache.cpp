@@ -41,6 +41,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#if defined(__linux__)
+#include <execinfo.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
 #include <fmt/format.h>
 #include <limits>
 #include <ranges>
@@ -674,26 +679,129 @@ std::string PipelineCache::CompileReason(const ProgramKey& key, bool known_progr
 	return fmt::format("{} 0x{:016x} {}", stage, key.hash, reason);
 }
 
-// Diagnostic only (KYTY_SKIP_FAILED_SHADERS): a shader that cannot be compiled is skipped, so one
-// run shows later failures too. The picture is incomplete and leaks what the failure held.
+namespace {
+
+bool KeepGoingEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_KEEP_GOING");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+template <size_t N>
+uint8_t CaptureBacktrace(std::array<uint64_t, N>& frames) {
+#if defined(__linux__)
+	void*      raw[N] {};
+	const int  count = ::backtrace(raw, static_cast<int>(N));
+	const auto size  = count > 0 ? static_cast<uint8_t>(std::min<int>(count, static_cast<int>(N)))
+	                            : static_cast<uint8_t>(0);
+	for (uint8_t i = 0; i < size; ++i) frames[i] = reinterpret_cast<uint64_t>(raw[i]);
+	return size;
+#elif defined(_WIN32)
+	void*        raw[N] {};
+	const USHORT count = CaptureStackBackTrace(0, static_cast<ULONG>(N), raw, nullptr);
+	const auto   size  = static_cast<uint8_t>(std::min<USHORT>(count, static_cast<USHORT>(N)));
+	for (uint8_t i = 0; i < size; ++i) frames[i] = reinterpret_cast<uint64_t>(raw[i]);
+	return size;
+#else
+	(void)frames;
+	return 0;
+#endif
+}
+
+} // namespace
+
+void PipelineCache::NoteKeepGoingUse(uint64_t hash) {
+	for (size_t i = 0; i < m_keep_going_failure_count; ++i) {
+		auto& failure = m_keep_going_failures[i];
+		if (failure.hash != hash) continue;
+		// Powers of two only: enough to rank skipped shaders without flooding the log.
+		++failure.count;
+		if ((failure.count & (failure.count - 1u)) == 0u) {
+			PipelineCacheLog("KYTY_KEEP_GOING shader=0x{:016x} uses={}", hash, failure.count);
+		}
+		return;
+	}
+}
+
+void PipelineCache::RecordKeepGoingFailure(uint64_t hash, ShaderType stage, std::string_view reason,
+                                           const char* file, int line) {
+	for (size_t i = 0; i < m_keep_going_failure_count; ++i) {
+		if (m_keep_going_failures[i].hash == hash) {
+			NoteKeepGoingUse(hash);
+			return;
+		}
+	}
+
+	if (m_keep_going_failure_count >= MaxKeepGoingFailures) {
+		PipelineCacheLog("KYTY_KEEP_GOING shader=0x{:016x} stage={} dropped (ledger full)",
+		                 hash, ShaderRecompiler::StageName(stage));
+		return;
+	}
+
+	auto& failure = m_keep_going_failures[m_keep_going_failure_count++];
+	failure       = {};
+	failure.hash  = hash;
+	failure.stage = stage;
+	failure.count = 1;
+	failure.line  = line;
+	failure.frame_count = CaptureBacktrace(failure.frames);
+	const auto reason_size = std::min(reason.size(), sizeof(failure.reason) - 1);
+	std::memcpy(failure.reason, reason.data(), reason_size);
+	failure.reason[reason_size] = 0;
+	if (file != nullptr) {
+		const auto file_len = std::min(std::strlen(file), sizeof(failure.file) - 1);
+		std::memcpy(failure.file, file, file_len);
+		failure.file[file_len] = 0;
+	}
+
+	PipelineCacheLog("KYTY_KEEP_GOING shader=0x{:016x} stage={} at {}:{}: {}", hash,
+	                 ShaderRecompiler::StageName(stage), failure.file, failure.line,
+	                 failure.reason);
+	if (failure.frame_count != 0) {
+		std::string frames;
+		for (uint8_t i = 0; i < failure.frame_count; ++i) {
+			frames += fmt::format(" 0x{:016x}", failure.frames[i]);
+		}
+		PipelineCacheLog("KYTY_KEEP_GOING shader=0x{:016x} backtrace{}", hash, frames);
+	}
+}
+
+// Diagnostic only (KYTY_SKIP_FAILED_SHADERS / KYTY_KEEP_GOING): a shader that cannot be compiled
+// is skipped, so one run shows later failures too. The picture is incomplete and leaks what the
+// failure held.
 template <typename InputInfo>
 const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputInfo& input_info,
                                               ShaderRecompiler::IR::PushData::Window& push_data) {
-	static const bool skip_failed = std::getenv("KYTY_SKIP_FAILED_SHADERS") != nullptr;
+	static const bool keep_going  = KeepGoingEnabled();
+	static const bool skip_failed = keep_going || std::getenv("KYTY_SKIP_FAILED_SHADERS") != nullptr;
 	if (!skip_failed) return GetProgramImpl(params, input_info, push_data);
 	std::jmp_buf  recover;
 	const int64_t work_depth = Common::ShaderCompileStatus::ThreadDepth();
+	auto* const   previous   = Common::g_dbg_recover;
+	m_lookup_key_ready       = false;
 	if (setjmp(recover) != 0) {
+		Common::g_dbg_recover = previous;
 		Common::ShaderCompileStatus::Unwind(work_depth);
-		PipelineCacheLog("KYTY_SKIP shader=0x{:016x} stage={}", m_lookup_key.hash,
-		                 ShaderRecompiler::StageName(m_lookup_key.stage));
-		m_program_cache.erase(m_lookup_key);
-		m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+		const auto& diag = Common::LastFatalDiagnostic();
+		const auto  hash  = m_lookup_key_ready ? m_lookup_key.hash : params.hash;
+		const auto  stage = m_lookup_key_ready ? m_lookup_key.stage : ShaderType::Unknown;
+		if (keep_going) {
+			RecordKeepGoingFailure(hash, stage, diag.text, diag.file, diag.line);
+		} else {
+			PipelineCacheLog("KYTY_SKIP shader=0x{:016x} stage={}", hash,
+			                 ShaderRecompiler::StageName(stage));
+		}
+		if (m_lookup_key_ready) {
+			m_program_cache.erase(m_lookup_key);
+			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+		}
 		return nullptr;
 	}
 	Common::g_dbg_recover = &recover;
 	const auto* module    = GetProgramImpl(params, input_info, push_data);
-	Common::g_dbg_recover = nullptr;
+	Common::g_dbg_recover = previous;
 	return module;
 }
 
@@ -737,6 +845,7 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	m_lookup_key.hash            = params.hash;
 	m_lookup_key.user_data_count = params.user_data_count;
 	BuildStageStaticKey(input_info, m_lookup_key.static_state);
+	m_lookup_key_ready           = true;
 	auto entry = m_program_cache.find(m_lookup_key);
 	const auto bind = [&](const ShaderModule& module) {
 		input_info.stage = {.module = &module, .resources = &entry->second.resources};
@@ -753,7 +862,11 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	}
 	if (entry != m_program_cache.end() && !plan_lost) {
 		auto& cached = entry->second;
-		if (cached.skip_dispatch) return nullptr;
+		if (cached.skip_dispatch) {
+			static const bool keep_going = KeepGoingEnabled();
+			if (keep_going) NoteKeepGoingUse(params.hash);
+			return nullptr;
+		}
 		ShaderModule* module = nullptr;
 		if (cached.call_source) {
 			const auto link_before = cached.call_source->revision;
