@@ -1812,9 +1812,16 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		result.called_function_count =
 		    AddCalledFunctionStarts(segment_addr, segment_end, starts, &lea_count);
 		result.lea_function_count = lea_count;
-		for (size_t index = listed_count; index < starts.size(); ++index) {
-			result.called_inside_listed_count += IsInsideListedFunction(listed_ranges, starts[index]);
-		}
+		// A call or LEA target strictly inside a function .eh_frame lists is not a function of its
+		// own (a tail of that function, or a mislabelled address). As a start it would split the
+		// function, and each piece would be analysed without the branches of the other: a patch
+		// spanning several instructions in one piece could then cover a branch target of the other.
+		// Such starts are dropped; the listed function is analysed whole.
+		const auto dropped = std::ranges::remove_if(
+		    starts.begin() + static_cast<std::ptrdiff_t>(listed_count), starts.end(),
+		    [&](uintptr_t start) { return IsInsideListedFunction(listed_ranges, start); });
+		result.called_inside_listed_count = static_cast<uint64_t>(dropped.size());
+		starts.erase(dropped.begin(), dropped.end());
 	}
 	std::ranges::sort(starts);
 	const auto unique_end = std::ranges::unique(starts).begin();
@@ -2202,12 +2209,30 @@ std::optional<uint8_t> ReadCiePointerEncoding(const uint8_t* cie) {
 } // namespace
 
 bool DecodeEhFrameFunctionRanges(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
+                                 uint64_t image_addr, uint64_t image_size,
                                  std::vector<std::pair<uintptr_t, uintptr_t>>* ranges) {
-	if (ranges == nullptr || eh_frame_header_addr == 0 || eh_frame_header_size < 4 ||
-	    eh_frame_header_size > UINTPTR_MAX - eh_frame_header_addr) {
+	if (ranges == nullptr) {
 		return false;
 	}
 	ranges->clear();
+	if (eh_frame_header_addr == 0 || eh_frame_header_size < 4 ||
+	    eh_frame_header_size > UINTPTR_MAX - eh_frame_header_addr ||
+	    image_size > UINTPTR_MAX - image_addr) {
+		return false;
+	}
+	// The FDEs and CIEs the table points to are read only inside the module's image.
+	const auto* image_begin = reinterpret_cast<const uint8_t*>(image_addr);
+	const auto* image_end   = image_begin + image_size;
+	const auto  in_image    = [&](const uint8_t* record) {
+		if (record < image_begin || record > image_end ||
+		    static_cast<size_t>(image_end - record) < 2 * sizeof(uint32_t)) {
+			return false;
+		}
+		uint32_t record_length = 0;
+		std::memcpy(&record_length, record, sizeof(record_length));
+		return record_length != 0xffffffffu &&
+		       record_length <= static_cast<size_t>(image_end - record) - sizeof(uint32_t);
+	};
 	const auto* start             = reinterpret_cast<const uint8_t*>(eh_frame_header_addr);
 	const auto* end               = start + eh_frame_header_size;
 	const auto* cursor            = start;
@@ -2241,13 +2266,22 @@ bool DecodeEhFrameFunctionRanges(uint64_t eh_frame_header_addr, uint64_t eh_fram
 		const auto* fde    = reinterpret_cast<const uint8_t*>(fde_address);
 		uint32_t    length = 0;
 		uint32_t    cie_id = 0;
+		if (!in_image(fde)) {
+			continue;
+		}
 		std::memcpy(&length, fde, sizeof(length));
 		std::memcpy(&cie_id, fde + sizeof(length), sizeof(cie_id));
 		if (length == 0 || length == 0xffffffffu || cie_id == 0) {
 			continue;
 		}
+		if (cie_id > static_cast<size_t>(fde + sizeof(length) - image_begin)) {
+			continue;
+		}
 		const uint8_t* cie = fde + sizeof(length) - cie_id;
-		auto           it  = cie_encodings.find(cie);
+		if (!in_image(cie)) {
+			continue;
+		}
+		auto it = cie_encodings.find(cie);
 		if (it == cie_encodings.end()) {
 			it = cie_encodings.emplace(cie, ReadCiePointerEncoding(cie)).first;
 		}

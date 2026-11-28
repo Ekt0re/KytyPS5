@@ -2013,8 +2013,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		const auto patch_begin = std::chrono::steady_clock::now();
-		// Diagnostics for the summary line: the functions .eh_frame lists, with their ranges, and
-		// the code addresses only relocations name (and of those, the ones inside a listed range).
+		// The functions .eh_frame lists, with their ranges, and the code addresses only relocations
+		// name. Of those, the ones strictly inside a listed range (jump-table targets: GTA VI's
+		// eboot has 567 in two functions) are dropped, as PatchGuestInstructions() drops the call
+		// and LEA targets there: a start in the middle of a function would split its analysis.
 		std::vector<std::pair<uintptr_t, uintptr_t>> listed_ranges;
 		uint64_t                                     listed_count             = function_starts.size();
 		uint64_t                                     relocated_count          = 0;
@@ -2024,12 +2026,17 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
 			    module_name));
 		} else {
-			if (protect_memory_faults) {
-				DecodeEhFrameFunctionRanges(eh_frame_header_addr, eh_frame_header_size,
-				                            &listed_ranges);
-			}
+			DecodeEhFrameFunctionRanges(eh_frame_header_addr, eh_frame_header_size,
+			                            program->base_vaddr, program->base_size, &listed_ranges);
 			std::vector<uintptr_t> relocated;
 			AddRelocatedCodeAddresses(program, executable_segments, &function_starts, &relocated);
+			function_starts.erase(
+			    std::remove_if(function_starts.begin() + static_cast<std::ptrdiff_t>(listed_count),
+			                   function_starts.end(),
+			                   [&](uintptr_t start) {
+				                   return IsInsideListedFunction(listed_ranges, start);
+			                   }),
+			    function_starts.end());
 			std::vector<uintptr_t> listed(function_starts.begin(),
 			                              function_starts.begin() +
 			                                  static_cast<std::ptrdiff_t>(listed_count));
@@ -2090,7 +2097,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			const auto trampoline_area = program->base_vaddr + program->base_size_aligned;
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Red-zone patcher: {}: functions={} (eh_frame={}, relocations={}, calls={}, lea={}; "
-			    "inside a listed function: relocations={}, calls/lea={}), red_zone={}, memory={}, "
+			    "dropped inside a listed function: relocations={}, calls/lea={}), red_zone={}, memory={}, "
 			    "patched={}, short={}, stack={}, control={}, unrelocatable={}, "
 			    "trampolines={} bytes of {} at {:#x}, time={:.0f} ms\n",
 			    module_name, totals.function_count, listed_count, relocated_count,

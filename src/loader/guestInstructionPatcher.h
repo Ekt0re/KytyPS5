@@ -78,8 +78,11 @@ GuestInstructionPatchResult PatchGuestInstructions(
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);
 
-// The [start, end) range of every function .eh_frame lists, sorted by start (diagnostics only).
+// The [start, end) range of every function .eh_frame lists, sorted by start. The unwind records
+// are read only inside [image_addr, image_addr + image_size); a record outside it is left out.
+// PatchGuestInstructions() uses the ranges to drop discovered starts inside a listed function.
 bool DecodeEhFrameFunctionRanges(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
+                                 uint64_t image_addr, uint64_t image_size,
                                  std::vector<std::pair<uintptr_t, uintptr_t>>* ranges);
 
 // Whether address lies strictly inside one of the sorted ranges (not at its start).
