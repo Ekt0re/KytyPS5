@@ -1863,6 +1863,8 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
   using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
   using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
+  using ResetCommandBuffer = int (KYTY_SYSV_ABI *)(void *);
+  using ClearCommandBuffer = void * (KYTY_SYSV_ABI *)(void *);
   const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
   const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
   const auto construct_amm = reinterpret_cast<Unary>(find("EDq5bqCqYpA"));
@@ -1904,6 +1906,8 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
   const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
   const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
+  const auto reset_command_buffer = reinterpret_cast<ResetCommandBuffer>(find("baQO9ez2gL4"));
+  const auto clear_command_buffer = reinterpret_cast<ClearCommandBuffer>(find("ULvXMDz56po"));
   const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
   const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
   const auto wait_amm = reinterpret_cast<WaitSubmission>(find("HXymib4T8gc"));
@@ -2329,6 +2333,27 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
           "concurrent SetBuffer publishes one coherent header");
     destroy(header.header.data());
   }
+
+  // Lifecycle history is file-local; verify that recording it preserves the state machine the
+  // exports promise: append, submit, reset, append again and clear for reuse.
+  reset(1);
+  auto *life_cb     = buffers[0].header.data();
+  uint64_t life_fence = 0;
+  Result   life_result {1234, 5678};
+  uint32_t life_submission = 0;
+  Check(write_address(life_cb, &life_fence, 0x11) == OK && offset(life_cb) > 0,
+        "AMPR lifecycle: first append advances the offset");
+  Check(submit_apr(life_cb, 3, &life_result, &life_submission) == OK &&
+            wait_apr(life_submission) == OK,
+        "AMPR lifecycle: submit with history completes");
+  Check(reset_command_buffer(life_cb) == OK && offset(life_cb) == 0 &&
+            get_num_commands(life_cb) == 0,
+        "AMPR lifecycle: reset rewinds offset and command count");
+  Check(write_address(life_cb, &life_fence, 0x22) == OK && offset(life_cb) > 0,
+        "AMPR lifecycle: append after reset records the next event");
+  Check(clear_command_buffer(life_cb) == buffers[0].data.data() &&
+            set_buffer(life_cb, buffers[0].data.data(), sizeof(Buffer::data)) == OK,
+        "AMPR lifecycle: clear releases the buffer for reuse");
   for (auto &buffer : buffers) {
     destroy(buffer.header.data());
   }
