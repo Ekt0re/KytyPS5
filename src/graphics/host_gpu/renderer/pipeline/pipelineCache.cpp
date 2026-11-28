@@ -1055,7 +1055,6 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	options.back_code       = params.back_code;
 	options.instruction_words      = params.instruction_words;
 	options.back_instruction_words = params.back_instruction_words;
-	DumpShaderCapsule(params, input_info, options);
 	options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	ShaderRecompiler::ShaderSource source;

@@ -79,7 +79,9 @@ static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size,
 }
 
 uint64_t ShaderCodeHash(const uint32_t* binary, uint32_t size_bytes, uint32_t* hashed_bytes) {
-	const auto size = ShaderProgramSize(binary, size_bytes);
+	uint32_t instruction_bytes = 0;
+	const auto size = ShaderProgramSize(binary, size_bytes, &instruction_bytes);
+	(void)instruction_bytes;
 	if (hashed_bytes != nullptr) *hashed_bytes = size;
 	return XXH3_64bits(binary, size);
 }
