@@ -38,6 +38,7 @@
 #include <csetjmp>
 #include <cstdlib>
 #include <algorithm>
+#include <thread>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -1137,6 +1138,43 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 	return bind(module);
 }
 
+namespace {
+
+// Compile jobs running in every pool.
+std::atomic<uint32_t> g_running_jobs {0};
+
+// The host memory the kernel says it can still hand out, or UINT64_MAX where it cannot be read.
+uint64_t AvailableHostMemory() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	if (FILE* file = std::fopen("/proc/meminfo", "r")) {
+		char               line[128];
+		unsigned long long kib = 0;
+		bool               found = false;
+		while (!found && std::fgets(line, sizeof(line), file) != nullptr) {
+			found = std::sscanf(line, "MemAvailable: %llu kB", &kib) == 1;
+		}
+		std::fclose(file);
+		if (found) return uint64_t {kib} * 1024u;
+	}
+#endif
+	return UINT64_MAX;
+}
+
+// A driver compiling a large pipeline holds hundreds of MB while it runs, and a loading frame
+// starts dozens at once over the pools (PPSA38500's ray tracing ones pushed a 32 GB host into
+// the OOM killer). Under 2.5 GiB of available memory a job waits while another compiles; one
+// always runs, so compiles only queue up, none is skipped.
+void AwaitCompileMemory() {
+	constexpr uint64_t Headroom = 2560ull << 20;
+	for (uint32_t wait = 0; wait < 600 && g_running_jobs.load(std::memory_order_relaxed) != 0 &&
+	                        AvailableHostMemory() < Headroom;
+	     wait++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+}
+
+} // namespace
+
 PipelineWorkers::PipelineWorkers(): PipelineWorkers(Common::ParallelThreads()) {}
 
 PipelineWorkers::PipelineWorkers(size_t threads) {
@@ -1151,7 +1189,10 @@ PipelineWorkers::PipelineWorkers(size_t threads) {
 				queue.pop();
 				Common::ShaderCompileStatus::RemoveQueued();
 				lock.unlock();
+				AwaitCompileMemory();
+				g_running_jobs.fetch_add(1, std::memory_order_relaxed);
 				job();
+				g_running_jobs.fetch_sub(1, std::memory_order_relaxed);
 				lock.lock();
 			}
 		});
@@ -1904,6 +1945,16 @@ void PipelineCache::InitializeDriverCache() {
 		// pipelines a frame creates.
 		PipelineCacheLog("Vulkan pipeline cache: not used (lazy shader store)");
 		return;
+	}
+	// RADV keeps every pipeline it builds in its own disk cache and holds what a cache object
+	// loads in memory: PPSA38500's 700 MB file kept about 400 MB of the heap for nothing new.
+	// KYTY_DRIVER_CACHE=1 loads it anyway.
+	if (m_graphics.driver_id == vk::DriverId::eMesaRadv) {
+		const char* keep = std::getenv("KYTY_DRIVER_CACHE");
+		if (keep == nullptr || keep[0] != '1') {
+			PipelineCacheLog("Vulkan pipeline cache: not used (RADV's disk cache serves pipelines)");
+			return;
+		}
 	}
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	// Our own pipeline binaries: the driver's cache alone does not keep them across builds or past

@@ -413,6 +413,9 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	// an empty cell's 0xffffffff into its slice range and looped until the GPU reset.
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo pixel_subgroup_size {};
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo stage_subgroup_sizes[4] {};
+	// Inline stages' SPIR-V (StoredModule::inline_code), alive until the pipeline is created.
+	std::array<std::vector<uint32_t>, 4> inline_code;
+	vk::ShaderModuleCreateInfo           inline_info[4] {};
 	const auto subgroup_caps      = MakeSubgroupSizeCaps(graphics);
 	const bool stage_size_enabled = SubgroupStageSizeEnabled();
 	for (const auto* stage: stages) {
@@ -422,6 +425,12 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 			info       = {.stage  = NativeShaderStage(stage->info.stage),
 			              .module = stage->Handle(),
 			              .pName  = "main"};
+			if (stage->Inline()) {
+				inline_code[slot]          = StoredModuleSpirv(*stage->stored);
+				inline_info[slot].codeSize = inline_code[slot].size() * sizeof(uint32_t);
+				inline_info[slot].pCode    = inline_code[slot].data();
+				info.pNext                 = &inline_info[slot];
+			}
 			const auto wave_size = stage->info.wave_size;
 			if (stage_size_enabled) {
 				const bool emulated_wave64_on_32 =
@@ -432,6 +441,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 				    UsesSubgroupOps(stage->info.info), subgroup_caps);
 				if (decision.apply) {
 					stage_subgroup_sizes[slot].requiredSubgroupSize = decision.required_size;
+					stage_subgroup_sizes[slot].pNext                = const_cast<void*>(info.pNext);
 					info.pNext                                      = &stage_subgroup_sizes[slot];
 				} else if (decision.mismatch_warning) {
 					WarnSubgroupSizeMismatch(stage->info, decision, subgroup_caps);
@@ -441,6 +451,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 			           wave_size >= graphics.min_subgroup_size &&
 			           wave_size <= graphics.max_subgroup_size) {
 				pixel_subgroup_size.requiredSubgroupSize = wave_size;
+				pixel_subgroup_size.pNext                = const_cast<void*>(info.pNext);
 				info.pNext                               = &pixel_subgroup_size;
 			}
 		}
@@ -667,6 +678,14 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
 	comp_shader_stage_info.module = module.Handle();
 	comp_shader_stage_info.pName  = "main";
+	std::vector<uint32_t>      inline_code;
+	vk::ShaderModuleCreateInfo inline_info {};
+	if (module.Inline()) {
+		inline_code             = StoredModuleSpirv(*module.stored);
+		inline_info.codeSize    = inline_code.size() * sizeof(uint32_t);
+		inline_info.pCode       = inline_code.data();
+		comp_shader_stage_info.pNext = &inline_info;
+	}
 	const auto wave_size = module.info.wave_size;
 	if (SubgroupStageSizeEnabled()) {
 		const auto caps                 = MakeSubgroupSizeCaps(graphics);
@@ -677,6 +696,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 		    emulated_wave64_on_32, UsesSubgroupOps(module.info.info), caps);
 		if (decision.apply) {
 			comp_subgroup_size.requiredSubgroupSize = decision.required_size;
+			comp_subgroup_size.pNext                = const_cast<void*>(comp_shader_stage_info.pNext);
 			comp_shader_stage_info.pNext            = &comp_subgroup_size;
 		} else if (decision.mismatch_warning) {
 			WarnSubgroupSizeMismatch(module.info, decision, caps);
@@ -684,6 +704,7 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	} else if (graphics.compute_subgroup_size_control_enabled &&
 	           wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
+		comp_subgroup_size.pNext                = const_cast<void*>(comp_shader_stage_info.pNext);
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 
