@@ -426,6 +426,14 @@ int TranslateOne(const std::filesystem::path& path, const std::filesystem::path&
 		ShaderRecompiler::Spirv::Profile profile {};
 		profile.robust_buffer_access = true;
 		profile.ray_query            = true;
+		// SHADER_CHECK_MINMAX=othernan|exact: the float min/max lowering a probed host earns.
+		if (const char* minmax = std::getenv("SHADER_CHECK_MINMAX"); minmax != nullptr) {
+			if (std::strcmp(minmax, "exact") == 0) {
+				profile.float_min_max = ShaderRecompiler::Spirv::FloatMinMax::Exact;
+			} else if (std::strcmp(minmax, "othernan") == 0) {
+				profile.float_min_max = ShaderRecompiler::Spirv::FloatMinMax::OtherNanSelect;
+			}
+		}
 		options.profile              = &profile;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::PushData::Window       window;
