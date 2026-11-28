@@ -2,6 +2,7 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/renderer/cache/zeroCopyFence.h"
 
 #include <atomic>
 #include <chrono>
@@ -305,6 +306,113 @@ void TestRangeSet() {
         "range set subtraction did not preserve both exact tails");
 }
 
+// The sorted-block range set answers as the map version does, over random operations on many
+// intervals (block splits, joins and removals included).
+void TestRangeSetBlocksMatchMap() {
+  using Libs::Graphics::Detail::RangeSetBlocks;
+  using Libs::Graphics::Detail::RangeSetMap;
+  uint64_t state = 0x9e3779b97f4a7c15ull;
+  const auto next = [&state] {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+  };
+  const auto dump = [](const auto &set) {
+    std::vector<std::pair<uint64_t, uint64_t>> out;
+    set.ForEach([&](uint64_t begin, uint64_t end) { out.emplace_back(begin, end); });
+    return out;
+  };
+  for (int round = 0; round < 4; ++round) {
+    RangeSetMap map;
+    RangeSetBlocks blocks;
+    // Rounds alternate a dense space (many merges) and a sparse one (many intervals).
+    const uint64_t space = round % 2 == 0 ? 0x100000 : 0x10000000;
+    const uint64_t span = round % 2 == 0 ? 0x400 : 0x4000;
+    for (int op = 0; op < 200000; ++op) {
+      const uint64_t address = 0x1000 + next() % space;
+      const uint64_t size = 1 + next() % span;
+      switch (next() % 6) {
+      case 0:
+      case 1:
+      case 2:
+        Check(map.Add(address, size) == blocks.Add(address, size),
+              "range set blocks: Add reported another change");
+        break;
+      case 3:
+        Check(map.Subtract(address, size) == blocks.Subtract(address, size),
+              "range set blocks: Subtract reported another change");
+        break;
+      case 4: {
+        Check(map.Intersects(address, size) == blocks.Intersects(address, size) &&
+                  map.Contains(address, size) == blocks.Contains(address, size),
+              "range set blocks: queries differ");
+        std::vector<std::pair<uint64_t, uint64_t>> a, b;
+        map.ForEachInRange(address, size, [&](uint64_t x, uint64_t y) { a.emplace_back(x, y); });
+        blocks.ForEachInRange(address, size,
+                              [&](uint64_t x, uint64_t y) { b.emplace_back(x, y); });
+        Check(a == b, "range set blocks: clamped parts differ");
+        break;
+      }
+      default:
+        if (next() % 4096 == 0) {
+          map.Clear();
+          blocks.Clear();
+        }
+        break;
+      }
+      Check(map.Empty() == blocks.Empty(), "range set blocks: emptiness differs");
+      if (op % 20000 == 0) {
+        Check(dump(map) == dump(blocks), "range set blocks: sets differ");
+      }
+    }
+    Check(dump(map) == dump(blocks), "range set blocks: final sets differ");
+  }
+}
+
+// Prints the time per operation of both range sets on one stream of operations over ~65,000
+// intervals (a measurement, not a check).
+void BenchRangeSets() {
+  using Libs::Graphics::Detail::RangeSetBlocks;
+  using Libs::Graphics::Detail::RangeSetMap;
+  const auto run = [](auto &set) {
+    uint64_t state = 0x2545f4914f6cdd1dull;
+    uint64_t hits = 0;
+    const auto start = std::chrono::steady_clock::now();
+    constexpr int ops = 2000000;
+    for (int op = 0; op < ops; ++op) {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      // 65,536 page-aligned slots, ranges shorter than a page: the set grows to ~65,000
+      // intervals that rarely merge.
+      const uint64_t address = 0x10000 + (state % 0x10000000) / 0x1000 * 0x1000;
+      const uint64_t size = 0x100 + (state >> 40) % 0xe00;
+      const auto kind = (state >> 20) % 20;
+      if (kind < 6) {
+        set.Add(address, size);
+      } else if (kind == 6) {
+        set.Subtract(address, size);
+      } else if (kind < 14) {
+        hits += set.Intersects(address, size) ? 1 : 0;
+      } else {
+        hits += set.Contains(address, size) ? 1 : 0;
+      }
+    }
+    const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+    return std::pair{ns / ops, hits};
+  };
+  RangeSetMap map;
+  RangeSetBlocks blocks;
+  const auto [map_ns, map_hits] = run(map);
+  const auto [blocks_ns, blocks_hits] = run(blocks);
+  size_t intervals = 0;
+  blocks.ForEach([&](uint64_t, uint64_t) { intervals++; });
+  Check(map_hits == blocks_hits, "range set bench: answers differ");
+  std::printf("MemoryTrackerTests: range set map %.1f ns/op, blocks %.1f ns/op (%zu intervals)\n",
+              map_ns, blocks_ns, intervals);
+}
+
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
@@ -403,6 +511,43 @@ void TestCpuDirtyUpload() {
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
   tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  Release(memory);
+}
+
+void TestMaterializationStamps() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  namespace IR = Libs::Graphics::ShaderRecompiler::IR;
+
+  Check(tracker.Track(address, 64, 1) == nullptr,
+        "CPU-dirty pages cannot be stamped");
+  tracker.ForEachUploadRange(address, page_size * 2, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  auto cpu_stamp = tracker.Track(address, 64, 1);
+  Check(cpu_stamp != nullptr && cpu_stamp->Unchanged(), "clean CPU-owned range is stamped");
+  tracker.MarkRegionAsCpuModified(address, 64);
+  Check(!cpu_stamp->Unchanged(), "CPU dirtiness invalidates a stamp");
+  Check(IsWritable(memory), "taking a stamp left an extra write watch");
+
+  tracker.ForEachUploadRange(address, page_size * 2, false,
+                             [](uint64_t, uint64_t) noexcept {},
+                             []() noexcept {});
+  auto gpu_stamp = tracker.Track(address + page_size, 64, 1);
+  Check(gpu_stamp != nullptr && gpu_stamp->Unchanged(), "second clean page is stamped");
+  MarkGpuModified(tracker, address + page_size, 64);
+  Check(!gpu_stamp->Unchanged(), "GPU dirtiness invalidates a stamp");
+  tracker.UnmarkRegionAsGpuModified(address + page_size, 64);
+  Check(tracker.Track(address + page_size, 64, 1) != nullptr,
+        "a downloaded clean page can be stamped again");
+  Check(tracker.Track(address, page_size * 2, 1) == nullptr,
+        "the stamp page cap rejects a larger range");
+  tracker.MarkRegionAsCpuModified(address, page_size * 2);
+  Check(IsWritable(memory) && IsWritable(memory + page_size),
+        "materialization stamps retained write watches after dirtiness");
   Release(memory);
 }
 
@@ -1252,6 +1397,91 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size,
 
 } // namespace Libs::LibKernel::Memory
 
+// Zero-copy read fences: one per buffer and tick, looked up by range, released only by their own
+// tick, and the CPU writes that waited are counted per buffer (decaying with use).
+void TestZeroCopyFences() {
+  Libs::Graphics::ZeroCopyFences fences;
+  Check(fences.Find(0x1000, 0x10) == 0, "an empty registry reported a fence");
+  Check(fences.Record(0x1000, 0x3000, 5).fresh, "the first fence of a tick was skipped");
+  Check(!fences.Record(0x1000, 0x3000, 5).fresh, "a second fence in the same tick was not skipped");
+  Check(fences.Record(0x1000, 0x3000, 6).fresh, "a fence in a new tick was skipped");
+  Check(fences.Record(0x4000, 0x5000, 4).fresh, "a fence of another buffer was skipped");
+  Check(fences.Find(0x2ff0, 0x20) == 6 && fences.Find(0x3000, 0x1000) == 0 &&
+            fences.Find(0x0, 0x6000) == 6 && fences.Find(0x4800, 1) == 4,
+        "fence lookup missed or invented a meeting buffer");
+  fences.CountWait(0x1000, 1, 6);
+  fences.CountWait(0x1000, 1, 5); // an older tick than the fence's: not this fence's wait
+  Check(fences.Waits(0x1000) == 1 && fences.Waits(0x4000) == 0, "waits were not counted per buffer");
+  fences.Release(0x1000, 5);
+  Check(fences.Find(0x1000, 1) == 6, "an older tick released a newer fence");
+  fences.Release(0x1000, 6);
+  Check(fences.Find(0x1000, 1) == 0 && fences.Waits(0x1000) == 1,
+        "release did not drop the tick or lost the wait count");
+  for (uint32_t i = 0; i < 40; ++i) {
+    fences.CountWait(0x1000, 1, 0); // tick 0 never matches a live fence
+  }
+  for (uint64_t tick = 7; tick < 7 + 64; ++tick) {
+    fences.CountWait(0x1000, 1, tick - 1);
+    (void)fences.Record(0x1000, 0x3000, tick);
+  }
+  Check(fences.Waits(0x1000) < 64, "the wait count did not decay with use");
+  fences.CountSaved(0x1000);
+  fences.CountSaved(0x1000);
+  fences.CountSaved(0x9000); // no fence there: nothing to count
+  const auto recorded = fences.Record(0x1000, 0x3000, 200);
+  Check(fences.Saved(0x1000) == 2 && fences.Saved(0x4000) == 0 && recorded.saved == 2 &&
+            recorded.waits == fences.Waits(0x1000),
+        "spared read-backs were not counted per buffer or not reported by the fence");
+  fences.ResetCounts();
+  Check(fences.Waits(0x1000) == 0 && fences.Saved(0x1000) == 0 && fences.Find(0x1000, 1) == 200,
+        "ResetCounts kept counts or dropped the fence");
+  fences.Forget(0x1000);
+  Check(fences.Find(0x1000, 1) == 0 && fences.Waits(0x1000) == 0, "Forget kept the fence");
+}
+
+// A zero-copy write release changes only the GPU-written runs, which become readable and stay
+// write-watched; CPU-dirty and clean pages keep their protection.
+void TestZeroCopyPartialRelease() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
+  auto *memory = Allocate(4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  MarkGpuModified(tracker, address, page_size);
+  tracker.MarkRegionAsCpuModified(address + page_size, page_size);
+  MarkGpuModified(tracker, address + page_size * 3, page_size);
+  const auto clean_protection = Protection(memory + page_size * 2);
+  ResetProtectionLog();
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  Libs::Graphics::ReleaseGpuWrittenRuns(tracker, address, page_size * 4,
+                                        [&](uint64_t run, uint64_t bytes) {
+                                          runs.emplace_back(run, bytes);
+                                        });
+  Check(runs.size() == 2 && runs[0].first == address && runs[0].second == page_size &&
+            runs[1].first == address + page_size * 3 && runs[1].second == page_size,
+        "release did not report exactly the GPU-written runs");
+  Check(!tracker.IsRegionGpuModified(address, page_size * 4) &&
+            Protection(memory) == PAGE_READONLY &&
+            Protection(memory + page_size * 3) == PAGE_READONLY,
+        "released pages are not readable and write-watched");
+  Check(tracker.IsRegionCpuModified(address + page_size, page_size) &&
+            IsWritable(memory + page_size) &&
+            Protection(memory + page_size * 2) == clean_protection,
+        "release changed CPU-dirty or clean pages");
+  bool only_runs = !g_protection_log.empty();
+  for (const auto &call : g_protection_log) {
+    only_runs &= (call.address == address || call.address == address + page_size * 3) &&
+                 call.size == page_size;
+  }
+  Check(only_runs, "release changed protection outside the GPU-written runs");
+  ResetProtectionLog();
+  Libs::Graphics::ReleaseGpuWrittenRuns(tracker, address, page_size * 4,
+                                        [&](uint64_t, uint64_t) { Check(false, "a run reappeared"); });
+  Check(g_protection_calls == 0, "a second release changed protection");
+  tracker.MarkRegionAsCpuModified(address, page_size * 4);
+  Release(memory);
+}
+
 int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
@@ -1262,9 +1492,12 @@ int main(int argc, char **argv) {
   }
   TestGuestRange();
   TestRangeSet();
+  TestRangeSetBlocksMatchMap();
+  BenchRangeSets();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
+  TestMaterializationStamps();
   TestCleanUploadPreservesOwnership();
   TestRangeInvalidation();
   TestWriteFaultWindow();
@@ -1279,6 +1512,8 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestZeroCopyFences();
+  TestZeroCopyPartialRelease();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

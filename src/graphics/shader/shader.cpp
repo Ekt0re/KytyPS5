@@ -78,6 +78,12 @@ static uint32_t ShaderProgramSize(const uint32_t* binary, uint32_t size,
 	return static_cast<uint32_t>(end);
 }
 
+uint64_t ShaderCodeHash(const uint32_t* binary, uint32_t size_bytes, uint32_t* hashed_bytes) {
+	const auto size = ShaderProgramSize(binary, size_bytes);
+	if (hashed_bytes != nullptr) *hashed_bytes = size;
+	return XXH3_64bits(binary, size);
+}
+
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	EXIT_IF(g_shader_map == nullptr);
 

@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <span>
@@ -38,9 +39,15 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	// Fragment shaders can run at the guest wave size (VK_EXT_subgroup_size_control).
 	bool                               fragment_subgroup_size_control_enabled = false;
+	// VK_KHR_maintenance5: a pipeline stage can take its SPIR-V inline instead of a module.
+	bool                               maintenance5_enabled                   = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               unified_image_layouts_enabled         = false;
+	// KYTY_PIPELINE_STATS: pipelines are created with their driver statistics (pipelineStats.h).
+	bool                               pipeline_statistics_enabled           = false;
+	// VK_EXT_pipeline_creation_feedback: driver compile feedback for KYTY_PIPELINE_CREATE_STATS.
+	bool                               pipeline_creation_feedback_enabled    = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               maintenance8_enabled                  = false;
 	// VK_KHR_pipeline_binary with maintenance5 (PipelineBinaryStore).
@@ -58,6 +65,7 @@ struct GraphicContext {
 	bool                               r8g8_srgb_views                       = false;
 	bool                               r4g4b4a4_render_targets               = false;
 	bool                               conditional_rendering_enabled         = false;
+	bool                               draw_indirect_count_enabled           = false;
 	bool                               sampler_filter_minmax_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
@@ -67,12 +75,15 @@ struct GraphicContext {
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
+	// Full VkPhysicalDeviceSubgroupSizeControlProperties::requiredSubgroupSizeStages mask. Read by
+	// KYTY_SUBGROUP_STAGE_SIZE; the two existing per-stage booleans keep their earlier semantics.
+	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	uint32_t                           max_push_descriptors                  = 0;
 	uint32_t                           device_clock_period_ps                = 0;
 	vk::DescriptorSetLayout            image_heap_layout                     = nullptr;
 	// ImageHeapCapacity(*this) fills it in from the device limits on first use.
 	mutable uint32_t                   image_heap_capacity                   = 0;
-	Common::Mutex                      queue_mutex;
+	mutable Common::Mutex              queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
 	// KYTY_COPY_QUEUE (default 1; 0 = off): a queue of a compute/transfer family without graphics, for synchronous
@@ -124,7 +135,21 @@ struct GraphicContext {
 	}
 
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
+		// KYTY_COMPUTE_WAVE64_HALVES=1 (diagnostic): run wave64 compute programs as two 32-lane
+		// halves on a required 32-lane subgroup, as on NVIDIA, also where native wave64 exists.
+		if (ComputeWave64HalvesForced() && compute_subgroup_size_control_enabled &&
+		    min_subgroup_size <= 32u && max_subgroup_size >= 32u) {
+			return false;
+		}
 		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+	}
+
+	[[nodiscard]] static bool ComputeWave64HalvesForced() noexcept {
+		static const bool forced = [] {
+			const char* value = std::getenv("KYTY_COMPUTE_WAVE64_HALVES");
+			return value != nullptr && value[0] == '1';
+		}();
+		return forced;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {

@@ -138,6 +138,10 @@ void ReportDeviceLost(GraphicContext& graphics, const char* where) {
 	} else if (Requested()) {
 		text += "GPU breadcrumbs: requested but unavailable (no VK_AMD_buffer_marker)\n";
 	}
+	// Log the breadcrumbs before asking the driver for fault details: on a lost device that query
+	// can block or crash inside the driver, and the in-flight work must already be in the log.
+	Log::WriteToConsoleAndLog(text);
+	text.clear();
 	if (graphics.device_fault_enabled && graphics.device != nullptr) {
 		VkDeviceFaultCountsEXT counts {};
 		counts.sType = VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT;
@@ -170,7 +174,7 @@ void ReportDeviceLost(GraphicContext& graphics, const char* where) {
 			}
 		}
 	}
-	Log::WriteToConsoleAndLog(text);
+	if (!text.empty()) Log::WriteToConsoleAndLog(text);
 }
 
 } // namespace Libs::Graphics::GpuBreadcrumbs

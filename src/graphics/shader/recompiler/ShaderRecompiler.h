@@ -79,7 +79,24 @@ struct ShaderSource {
 	std::vector<std::pair<uint64_t, uint64_t>> reads;
 };
 
+// The compute programs with a guest BVH walk compiled with ray queries, by distinct shader hash,
+// for the "[RT]" summaries of RayTracing: those with a walk the recognizer drives with a ray query,
+// and those with a walk it leaves to the guest traversal (a program can be both), with the last
+// hash of the latter.
+enum class RayTracingProgramKind : uint32_t { Traced, Unrecognized };
+struct RayTracingPrograms {
+	uint64_t traced            = 0;
+	uint64_t unrecognized      = 0;
+	uint64_t last_unrecognized = 0;
+};
+void                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
+[[nodiscard]] RayTracingPrograms GetRayTracingPrograms();
+
 [[nodiscard]] const char* StageName(ShaderType stage);
+
+// Optional observer for IR pass durations (benchmarks); null by default, no effect on output.
+using PassTimingHook = void (*)(const char* pass_name, uint64_t nanoseconds);
+void SetPassTimingHook(PassTimingHook hook);
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

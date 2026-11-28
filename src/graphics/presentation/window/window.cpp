@@ -838,10 +838,38 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+	// KYTY_HIDDEN_WINDOW=1 (automated runs): the window exists and presents as usual, so frames
+	// and window captures keep working, but it is never seen, focused or listed in the taskbar.
+	// It has to be set up here, before the window is first shown: the shader warm-up keeps this
+	// thread from answering window messages for a long time right afterwards, so another process
+	// cannot restyle the window then.
+	const char* hidden_env    = std::getenv("KYTY_HIDDEN_WINDOW");
+	const bool  hidden_window = hidden_env != nullptr && hidden_env[0] != '\0' && hidden_env[0] != '0';
+	if (hidden_window) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN | SDL_WINDOW_UTILITY | SDL_WINDOW_NOT_FOCUSABLE);
+		SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+	}
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
+	}
+
+	if (hidden_window) {
+		// Alpha 1 of 255, not 0: the window stays a normal presentation target.
+		SDL_SetWindowOpacity(context.window, 1.5f / 255.0f);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// No "Not Responding" ghost copy while the warm-up runs; the ghost would be fully visible.
+		DisableProcessWindowsGhosting();
+		if (HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(context.window),
+		                                                        SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+		    hwnd != nullptr) {
+			// Click-through, and below every other window.
+			SetWindowLongPtrW(hwnd, GWL_EXSTYLE, GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT);
+			SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+		}
+#endif
+		SDL_ShowWindow(context.window);
 	}
 
 	RefreshDisplayLuminance(context.window);

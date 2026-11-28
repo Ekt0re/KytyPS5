@@ -5,9 +5,12 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <span>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -36,19 +39,42 @@ public:
 	// call made while every readback area is in flight waits for one if none holds its TLAS, and
 	// otherwise reads nothing back. Instance i has custom index i and SBT offset equal to the first
 	// prim record of its range, so a hit's record is that plus the primitive. The context and the
-	// mirrors serve the commands recorded before the next call. The guest page table must be
-	// synchronized first (PrepareBda).
-	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas);
+	// mirrors serve the commands recorded before the next call; the context, those recorded before
+	// the 16th call after it. The guest page table must be
+	// synchronized first (PrepareBda). `shader_hash`: the dispatch's program, for the "[RT]"
+	// summaries.
+	[[nodiscard]] vk::DeviceAddress Prepare(uint64_t tlas, uint64_t shader_hash = 0);
+
+	// A dispatch of a program that walks a guest BVH without a ray query: a walk the recognizer
+	// does not drive (see the "[RT]" summaries). `user_data`: its user SGPRs. With
+	// KYTY_RT_HEADER_PROBE=1 the first dispatch of each such program (64 at most) also logs the
+	// "PSR_BVHL" headers that the 64-bit values at user SGPR pointers + 0..0xf8 point to: the
+	// header format the program walks. The probe reads those bytes back from the GPU. On the
+	// execution thread, before the dispatch.
+	void NoteGuestDispatch(uint64_t shader_hash, std::span<const uint32_t> user_data);
+
+	// Writes the "[RT]" summary of the last 10 s to stdout, when a program walked a guest BVH or a
+	// dispatch traced without a valid TLAS context: the dispatches that traced with a ray query,
+	// those that walked a guest BVH (with the last program), the TLAS contexts the readbacks found
+	// valid and not valid (a header the mirror cannot read, or instances without a mirror yet),
+	// and the programs compiled so far (ShaderRecompiler::GetRayTracingPrograms()). Costs a clock
+	// read; called at every dispatch that walks a BVH and at every suspend point.
+	void ReportCoverage();
 
 	// Called at each suspend point. Every EvictFrames of them, the mirrors no call used since the
 	// last pass go: TLASes no call prepared, pairs no visible instance of a prepared TLAS named,
 	// and BLASes left without pairs. A BVH used again gets its mirror a few readbacks later.
 	void RunGarbageCollector();
 
+	// At each guest flip. The first call over a TLAS after one mirrors it; later calls before the
+	// next take that call's context: the guest refits its BVHs once a frame.
+	void NoteFlip() noexcept { ++m_flip; }
+
 private:
 	friend struct RayTracingTestAccess;
 
 	static constexpr uint32_t Areas       = 8;
+	static constexpr uint32_t Contexts    = 16;
 	static constexpr uint32_t EvictFrames = 64;
 
 	struct Structure {
@@ -114,7 +140,21 @@ private:
 		std::vector<uint32_t>   walks;    // Pair per walk result.
 		std::vector<uint32_t>   verified; // Pairs whose boxes were hashed again.
 		std::vector<uint32_t>   covered;  // Records hashed per BLAS.
+		uint64_t                shader_hash = 0; // The program of the dispatch.
 	};
+
+	// Counters of the "[RT]" summaries.
+	struct Coverage {
+		uint64_t traced       = 0; // Dispatches with a ray query.
+		uint64_t guest        = 0; // Dispatches that walk a guest BVH.
+		uint64_t valid        = 0; // Readbacks with a valid TLAS context.
+		uint64_t invalid      = 0; // Readbacks without one.
+		uint64_t unreadable   = 0; // Of these, those whose TLAS header the mirror cannot read.
+		uint64_t last_guest   = 0;
+		uint64_t last_invalid = 0;
+	};
+
+	void ProbeHeaders(uint64_t shader_hash, std::span<const uint32_t> user_data);
 
 	void Collect();
 	void Apply(Area& area);
@@ -124,8 +164,10 @@ private:
 	void Create(Structure& structure, const vk::AccelerationStructureGeometryKHR& geometry,
 	            vk::AccelerationStructureTypeKHR type, vk::BuildAccelerationStructureFlagsKHR flags,
 	            uint32_t capacity);
+	// A buffer of at least `size` bytes; one that grows takes the next power of two unless `exact`
+	// (acceleration structures and triangle buffers, which keep their size, and there are thousands).
 	void Reserve(std::unique_ptr<Buffer>& buffer, vk::BufferUsageFlags usage, uint64_t size,
-	             MemoryUsage memory = MemoryUsage::DeviceLocal);
+	             MemoryUsage memory = MemoryUsage::DeviceLocal, bool exact = false);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -144,12 +186,28 @@ private:
 	std::vector<std::array<uint32_t, 4>>              m_keys; // {BLAS low, high, root, pair}.
 	std::map<uint64_t, Tlas>                          m_tlases;
 	std::unique_ptr<Buffer>                           m_state;
+	// Copies of the context each call returns: a dispatch tracing several TLASes reads one per
+	// call, and the next call rewrites m_state. A TLAS keeps a slot of its own while there are
+	// free ones; the rest share the slots after them in turn.
+	std::unique_ptr<Buffer>                           m_contexts;
+	uint32_t                                          m_next_context = 0;
+	struct Prepared {
+		uint64_t flip = 0;
+		uint32_t slot = 0;
+	};
+	std::map<uint64_t, Prepared>                      m_prepared; // By TLAS header.
+	uint64_t                                          m_flip = 1;
 	std::unique_ptr<Buffer>                           m_scratch;
 	std::array<Area, Areas>                           m_areas;
 	uint32_t                                          m_next_area = 0;
 	uint64_t                                          m_serial    = 0;
 	uint64_t                                          m_applied = 0; // Serial of the last readback.
 	uint32_t                                          m_frame   = 0; // Suspend points seen.
+	Coverage                                          m_coverage;
+	Coverage                                          m_reported; // At the last summary.
+	uint64_t                                          m_reported_programs = 0;
+	std::chrono::steady_clock::time_point             m_report_time = std::chrono::steady_clock::now();
+	std::unordered_set<uint64_t>                      m_probed; // Programs whose headers were probed.
 };
 
 } // namespace Libs::Graphics

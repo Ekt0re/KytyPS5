@@ -8,15 +8,20 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
+#include "graphics/host_gpu/renderer/cache/hotReadbackTable.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/readbackBatch.h"
+#include "graphics/host_gpu/renderer/cache/readbackWait.h"
+#include "graphics/host_gpu/renderer/cache/recentGpuWrites.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/zeroCopyFence.h"
 
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -32,7 +37,7 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
-class BufferCache {
+class BufferCache final: public ShaderRecompiler::IR::MemoryChangeSource {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
 	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
@@ -72,6 +77,9 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	void                   BeginTracking() override;
+	[[nodiscard]] std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> Track(
+	    uint64_t address, uint64_t size, uint32_t max_pages) override;
 	// After a guest write fault: the clean pages of the window become CPU-modified too, so the
 	// guest's next writes there do not fault one page at a time.
 	void                   InvalidateWriteWindow(uint64_t vaddr, uint64_t size);
@@ -149,6 +157,16 @@ public:
 	void RecordPendingWrites();
 	// A program with address writes is bound; its writes can reach any range.
 	void NoteAddressWrites() noexcept { m_address_writes_pending = true; }
+	// At the end of a draw, dispatch, fill or copy: submits the command buffer when the operation
+	// wrote memory that readbacks keep waiting for (toggle rb_tick_wait; at most once per
+	// millisecond), so the readback that follows finds its writer submitted instead of flushing
+	// and waiting for everything recorded.
+	void FlushIfRequested();
+	// GPU thread: reads [vaddr, vaddr + size) (at most 256 bytes), taking the bytes the GPU wrote
+	// from the host-visible mirror of 64-byte lines the command thread reads again and again
+	// (toggle rb_mirror). False when the mirror does not hold the GPU's current bytes yet: the
+	// caller reads them back, and the lines are mirrored from the next submission on.
+	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
 	// Called on the GPU thread when a guest CPU write faults into GPU-written memory.
 	void SetCpuWriteListener(std::function<void(uint64_t, uint64_t)> listener) {
 		m_cpu_write_listener = std::move(listener);
@@ -206,6 +224,9 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// KYTY_INPLACE_READBACK: copies finished GPU writes from a host-visible mapping after waiting
+	// only for submitted ticks, without flushing the open command buffer or using a copy queue.
+	[[nodiscard]] bool ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// One buffer's ranges of a download, packed into the download buffer at dstOffset.
 	struct DownloadPart {
 		Buffer*                     buffer;
@@ -241,6 +262,16 @@ private:
 	// windows are returned to the CPU. True when the first buffer had bytes to copy.
 	[[nodiscard]] bool DownloadWindowBatch(BufferId first_id, uint64_t vaddr, uint64_t size,
 	                                       ReadbackBatch::Range first_window);
+	// KYTY_READBACK_HOT: when the batch must flush, add bounded dirty ranges of hot buffers and
+	// finished small writes to the same copy sequence. Returns the number of extra parts added.
+	[[nodiscard]] size_t CollectPiggybackDownloads(std::vector<DownloadPart>& parts,
+	                                               std::vector<ReadbackBatch::Range>& windows,
+	                                               uint64_t& total_size);
+	[[nodiscard]] BufferId FindHotBuffer(uint64_t address, uint64_t size) const;
+	[[nodiscard]] uint64_t EstimateDownloadBytes(uint64_t address, uint64_t size) const;
+	[[nodiscard]] bool        CanPiggyback(uint64_t address, uint64_t size) const;
+	void                      NoteHotReadback(uint64_t address, uint64_t size);
+	void                      NoteRecentWrite(uint64_t address, uint64_t size);
 	// GPU writes recorded in the current command buffer, or bound and not recorded yet. A
 	// synchronous download of ranges without such writes reads them in a detached submission
 	// behind the submitted work, without flushing the current command buffer.
@@ -249,6 +280,21 @@ private:
 	[[nodiscard]] bool CanDownloadDetached(uint64_t                        buffer_address,
 	                                       std::span<const vk::BufferCopy> copies);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	// Re-reads the rb_tick_wait and rb_mirror settings at most every 250 ms.
+	void               RefreshReadbackWaitToggles();
+	// KYTY_RB_TICK_WAIT / toggle rb_tick_wait (default on; KYTY_RB_TICK_WAIT=0 turns it off): copy-queue readbacks wait on the GPU
+	// for the tick that last wrote their bytes (ReadbackWait::WriteTicks) instead of every
+	// submitted tick, and operations writing ranges whose readbacks had to flush are submitted at
+	// once (ReadbackWait::HotWriters).
+	[[nodiscard]] bool TickWait() const noexcept { return m_tick_wait; }
+	// KYTY_RB_MIRROR / toggle rb_mirror (default off): see TryReadMirroredGpuWrites().
+	[[nodiscard]] bool Mirror() const noexcept { return m_mirror_on; }
+	// The submitted tick after which [vaddr, vaddr + size)'s GPU-written bytes are final: their
+	// writers and device-address writers. UnknownTick when a written part has no tick.
+	[[nodiscard]] uint64_t NeededTick(uint64_t vaddr, uint64_t size) const;
+	// Scheduler submit hook: copies the mirror's lines written in this command buffer.
+	static void        OnSubmit(void* self);
+	void               RecordMirrorCopies();
 
 	// Zero-copy guest memory (KYTY_ZERO_COPY=1, VK_EXT_external_memory_host). A buffer the CPU
 	// keeps faulting on is rebuilt over guest memory itself, so GPU writes land there. Its pages
@@ -274,6 +320,11 @@ private:
 	void               FenceZeroCopyRead(BufferId id, Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ReleaseZeroCopyReads(BufferId id, uint64_t vaddr, uint64_t size, uint64_t tick);
 	void               WaitZeroCopyReads(uint64_t vaddr, uint64_t size);
+	// True (and the buffer dropped to VRAM) when CPU writes keep waiting for its reads far more
+	// often than it spares read-backs, or zero-copy is switched off.
+	[[nodiscard]] bool ZeroCopyKeepsWaiting(BufferId id);
+	// Re-reads the zero-copy settings once per tick (runtime toggles zc_off, zc_ratio_b).
+	void               RefreshZeroCopyPolicy();
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -288,6 +339,7 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	RangeSet                                          m_pending_writes;
+	std::vector<uint8_t>                              m_in_place_scratch;
 	struct SyncWindow {
 		RangeSet writes;
 		uint64_t generation = 0;
@@ -298,9 +350,22 @@ private:
 	RangeSet                                          m_unsubmitted_writes;
 	uint64_t                                          m_unsubmitted_tick       = 0;
 	uint64_t                                          m_address_write_tick     = 0;
+	// Ported from TheCruZ KytyEmu d81455ac/2fdd7744 (readbackWait.h).
+	ReadbackWait::WriteTicks                          m_write_ticks;
+	ReadbackWait::HotWriters                          m_hot_writers;
+	ReadbackWait::FlushThrottle                       m_flush_throttle;
+	ReadbackWait::MirrorIndex                         m_mirror_index;
+	std::unique_ptr<Buffer>                           m_mirror;
+	bool                                              m_tick_wait_env = true;
+	bool                                              m_mirror_env    = false;
+	bool                                              m_tick_wait     = false;
+	bool                                              m_mirror_on     = false;
+	std::chrono::steady_clock::time_point             m_readback_wait_next {};
 	bool                                              m_address_writes_pending = false;
 	enum class DetachedReadback { Off, Submit, NoSubmit };
 	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;
+	// KYTY_INPLACE_READBACK (default 0): mapped game buffers use direct synchronous readback.
+	bool                                              m_inplace_readback = false;
 	// KYTY_BATCH_READBACK (default 1), overridden by the batch_readback toggle when present.
 	bool                                              m_batch_readback_env = true;
 	bool                                              m_batch_readback     = true;
@@ -310,6 +375,10 @@ private:
 	// KYTY_BATCH_READBACK_PREFETCH=KiB: a batch also copies this much on both sides of the window.
 	uint64_t                                          m_batch_prefetch = 0;
 	ReadbackBatch::NeighbourHistory                   m_readback_neighbours;
+	// KYTY_READBACK_HOT (default 0): bounded piggyback candidates for a flushing sync batch.
+	bool                                              m_hot_readback_enabled = false;
+	HotReadbackTable                                  m_hot_readbacks;
+	RecentGpuWriteRing                                m_recent_writes;
 	// Statistics only (KYTY_SYNC_STATS): bytes last downloaded, and hashes of uploaded pages.
 	RangeSet                                          m_stats_downloaded;
 	std::unordered_map<uint64_t, uint64_t>            m_stats_upload_hashes;
@@ -321,15 +390,18 @@ private:
 	// Guest ranges whose buffers are zero-copy; a buffer created over them imports guest memory.
 	RangeSet                                          m_zero_copy;
 	uint64_t                                          m_zero_copy_created = 0;
-	// Zero-copy read fences by buffer start: {end, tick}. Written on the GPU thread, read by
-	// faulting threads.
-	struct ZeroCopyFence {
-		uint64_t end  = 0;
-		uint64_t tick = 0;
+	ZeroCopyFences                                    m_zero_copy_fences;
+	// Ranges that went back to VRAM because the CPU kept waiting for their reads.
+	RangeSet                                          m_zero_copy_rejected;
+	uint32_t                                          m_zero_copy_rejected_logs = 0;
+	struct ZeroCopyPolicy {
+		uint64_t tick      = 0;
+		bool     known     = false;
+		bool     off       = false;
+		uint32_t ratio     = 0;
+		uint32_t min_waits = 1;
 	};
-	std::mutex                                        m_zero_copy_fence_mutex;
-	std::map<uint64_t, ZeroCopyFence>                 m_zero_copy_fences;
-	std::atomic<bool>                                 m_any_zero_copy_fence {false};
+	ZeroCopyPolicy                                    m_zero_copy_policy;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

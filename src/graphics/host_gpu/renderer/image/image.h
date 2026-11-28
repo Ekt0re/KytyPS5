@@ -54,6 +54,11 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	void ReleaseBacking();
+	// A parked image taken back into use (TextureCache::UnparkImage) for `image_info`, which has
+	// its shape: it keeps its Vulkan image, views and layout state, and is otherwise a new image (a
+	// new serial, no heap references or binding, flags as constructed). Caller holds the cache lock
+	// and registers it after.
+	void ResetForReuse(const ImageInfo& image_info);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
 	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
@@ -148,8 +153,9 @@ public:
 	static inline std::vector<HeapChange> heap_changes;
 	static inline std::atomic<uint64_t>   serials {0};
 
-	// Unique per image, unlike ImageId: freed slots are reused.
-	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	// Unique per image, unlike ImageId: freed slots are reused. Set again when a parked image is
+	// reused (ResetForReuse).
+	uint64_t         serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
@@ -165,6 +171,8 @@ public:
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// The tick of the image's last LRU touch, as its LRU entry holds it (see TouchImage()).
+	uint64_t         lru_tick           = 0;
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
 

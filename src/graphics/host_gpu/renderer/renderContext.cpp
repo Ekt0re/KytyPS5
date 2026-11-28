@@ -1,10 +1,13 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/faultStats.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
@@ -77,10 +80,12 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_resolve_cache(*this), m_texture_cache(graphics, m_command_scheduler, m_page_manager,
 	                                          m_buffer_cache, m_resolve_cache),
-      m_image_heap(*this, m_page_manager), m_pipeline_cache(graphics, &m_image_heap, shader_store),
+      m_image_heap(*this, m_page_manager),
+      m_pipeline_cache(graphics, &m_image_heap, shader_store, &m_buffer_cache),
       m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitFaultWindow();
+	Common::FaultStats::ConfigureStorm();
 	m_pipeline_cache.SetHeapRows(&m_buffer_cache.GetHeapRows());
 	if (graphics.ray_query_enabled) {
 		m_ray_tracing = std::make_unique<RayTracing>(*this);
@@ -123,12 +128,18 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	KYTY_PROFILER_BLOCK("RenderContext::HandleFault");
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// Fault count is taken at the existing PerfSummary site below; this timer and the hot-block
+	// table only add the cost and the address distribution, never a second count.
+	Common::PerfSummary::ScopedMicros fault_timer(Common::PerfSummary::Counter::FaultHandlerUs);
+	Common::FaultStats::SetFrame(static_cast<uint32_t>(GetGpu().GetFrameNum()));
+	Common::FaultStats::g_hot_blocks.Note(fault_vaddr);
 	// The access retries once the image write-backs over its page land.
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
 		return true;
@@ -140,6 +151,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	Common::PerfSummary::Add(access == PageFaultAccess::Write
 	                             ? Common::PerfSummary::Counter::WriteFaults
 	                             : Common::PerfSummary::Counter::ReadFaults);
+	using ReadbackOrigin::Origin;
+	const ReadbackOrigin::Scope origin(GuestGpu::IsGpuThread()
+	                                       ? (access == PageFaultAccess::Write ? Origin::CmdWrite
+	                                                                           : Origin::Pm4)
+	                                       : Origin::Guest,
+	                                   true);
 	if (access == PageFaultAccess::Write) {
 		{
 			Common::DebugCounters::ScopedTimer buffer_timer(Counter::SyncFaultBufferNs);
@@ -335,6 +352,7 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
+	KYTY_PROFILER_BLOCK("RenderContext::PrepareBda");
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	m_fault_process_pending = true;

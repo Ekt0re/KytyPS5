@@ -9,6 +9,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 #include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
+#include "graphics/host_gpu/renderer/pipeline/createStats.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 #include "graphics/host_gpu/renderer/recorder.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -413,13 +415,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderFloat8FeaturesEXT,
 	                   vk::PhysicalDeviceMaintenance5FeaturesKHR,
 	                   vk::PhysicalDevicePipelineBinaryFeaturesKHR,
-	                   vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR>
+	                   vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR,
+	                   vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
 	       image_atomic_int64, conditional_rendering, barycentric, compute_derivatives,
 	       acceleration_structure, ray_query, cooperative_matrix, float8, maintenance5,
-	       pipeline_binary, unified_layouts] = supported;
+	       pipeline_binary, unified_layouts, pipeline_executable] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	graphics.external_memory_host_enabled = add(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
@@ -504,19 +507,57 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	const bool pipeline_binary_extensions =
 	    HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) &&
 	    HasExtension(available_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
-	if (pipeline_binary_extensions) {
+	// maintenance5 on its own lets pipelines take their SPIR-V inline, without shader modules.
+	const bool maintenance5_extension =
+	    HasExtension(available_extensions, VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+	if (maintenance5_extension) {
 		add(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+	}
+	if (!maintenance5_extension) {
+		supported.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
+	}
+	if (pipeline_binary_extensions) {
 		add(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 	} else {
-		supported.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
 		supported.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+	}
+	// Diagnostic per-pipeline driver statistics (KYTY_PIPELINE_STATS, pipelineStats.h).
+	const bool pipeline_stats_extension =
+	    PipelineStats::Requested() && add(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+	if (!pipeline_stats_extension) {
+		supported.unlink<vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
+	}
+	// Creation feedback is only requested while the reporter is on. With the reporter off the
+	// extension is not even added to the device, matching the default device setup.
+	if (CreateStats::Enabled()) {
+		graphics.pipeline_creation_feedback_enabled =
+		    add(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
 	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	Dlss::AppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
 	graphics.pipeline_binary_enabled = pipeline_binary_extensions && maintenance5.maintenance5 &&
 	                                   pipeline_binary.pipelineBinaries;
+	graphics.maintenance5_enabled = maintenance5_extension && maintenance5.maintenance5;
 	LOGF("Vulkan pipeline binaries: %s\n", graphics.pipeline_binary_enabled ? "true" : "false");
+	graphics.pipeline_statistics_enabled =
+	    pipeline_stats_extension && pipeline_executable.pipelineExecutableInfo == VK_TRUE;
+	// A pipeline made from a stored binary has no statistics of its own compile.
+	if (graphics.pipeline_statistics_enabled && graphics.pipeline_binary_enabled) {
+		graphics.pipeline_binary_enabled = false;
+		LOGF("Vulkan pipeline binaries: off while KYTY_PIPELINE_STATS records statistics\n");
+	}
+	if (PipelineStats::Requested()) {
+		LOGF("Vulkan pipeline statistics: %s\n",
+		     graphics.pipeline_statistics_enabled
+		         ? "true"
+		         : "unavailable (VK_KHR_pipeline_executable_properties)");
+		Log::WriteToConsoleAndLog(
+		    fmt::format("KYTY_PIPELINE_STATS: {}\n",
+		                graphics.pipeline_statistics_enabled
+		                    ? "driver statistics are recorded for every new pipeline"
+		                    : "the device does not report pipeline statistics"));
+	}
 	const bool barycentric_supported = barycentric.fragmentShaderBarycentric == VK_TRUE;
 	const bool ray_query_enabled =
 	    acceleration_structure.accelerationStructure && ray_query.rayQuery;
@@ -527,10 +568,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
+	graphics.draw_indirect_count_enabled        = supported12.drawIndirectCount;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
 	features12.samplerFilterMinmax      = supported12.samplerFilterMinmax;
+	features12.drawIndirectCount        = graphics.draw_indirect_count_enabled;
 	if (!features12.shaderSharedInt64Atomics || !workgroup_layout.workgroupMemoryExplicitLayout) {
 		Log::WriteToConsoleAndLog(fmt::format(
 		    "WARNING: Native 64-bit LDS atomics are unavailable: shaderSharedInt64Atomics={}, "
@@ -575,6 +618,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	graphics.subgroup_size     = properties11.subgroupSize;
 	graphics.min_subgroup_size = subgroup_control.minSubgroupSize;
 	graphics.max_subgroup_size = subgroup_control.maxSubgroupSize;
+	graphics.required_subgroup_size_stages =
+	    supported13.subgroupSizeControl == VK_TRUE ? subgroup_stages : vk::ShaderStageFlags {};
 	graphics.compute_subgroup_size_control_enabled =
 	    supported13.subgroupSizeControl == VK_TRUE &&
 	    (subgroup_stages & vk::ShaderStageFlagBits::eCompute) &&
@@ -769,7 +814,9 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    vk::PhysicalDeviceMaintenance5FeaturesKHR {.maintenance5 = VK_TRUE},
 	    vk::PhysicalDevicePipelineBinaryFeaturesKHR {.pipelineBinaries = VK_TRUE},
 	    vk::DevicePipelineBinaryInternalCacheControlKHR {.disableInternalCache = VK_TRUE},
-	    vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR {.unifiedImageLayouts = VK_TRUE}};
+	    vk::PhysicalDeviceUnifiedImageLayoutsFeaturesKHR {.unifiedImageLayouts = VK_TRUE},
+	    vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR {.pipelineExecutableInfo =
+	                                                                   VK_TRUE}};
 	// The driver's internal pipeline cache is turned off where it can be: NVIDIA's keeps it per
 	// executable and its captured binaries then depend on it, so a rebuilt or renamed emulator got
 	// VK_PIPELINE_COMPILE_REQUIRED for every stored pipeline. Without it the stored binaries are
@@ -794,11 +841,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		     disable_internal_cache ? "disabled" : "kept");
 	}
 	if (!graphics.pipeline_binary_enabled) {
-		create.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
 		create.unlink<vk::PhysicalDevicePipelineBinaryFeaturesKHR>();
+	}
+	if (!graphics.maintenance5_enabled) {
+		create.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
 	}
 	if (!disable_internal_cache) {
 		create.unlink<vk::DevicePipelineBinaryInternalCacheControlKHR>();
+	}
+	if (!graphics.pipeline_statistics_enabled) {
+		create.unlink<vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR>();
 	}
 	if (!graphics.device_fault_enabled) create.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {

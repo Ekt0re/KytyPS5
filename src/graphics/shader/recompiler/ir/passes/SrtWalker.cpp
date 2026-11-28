@@ -82,7 +82,7 @@ bool IsRuntimeSelect(ValueOpcode op) {
 	       op == ValueOpcode::SelectF32;
 }
 
-bool IsRuntimeUniformOp(ValueOpcode op) {
+bool IsRuntimeUniformOpImpl(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::ConditionRef:
 		case ValueOpcode::BitCastU32F32:
@@ -170,8 +170,23 @@ uint32_t OutputOffset(const ResourcePlan& plan) {
 	return (ActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
 }
 
+thread_local WalkScratch* t_walk_scratch = nullptr;
+// Walkers compiled while this is set capture each load's value next to its address (lookahead).
+// Off (KYTY_LOOKAHEAD unset), the walker code and its captures are as before.
+std::atomic<int> g_capture_values {-1};
+
+bool CaptureValues() {
+	int value = g_capture_values.load(std::memory_order_relaxed);
+	if (value < 0) {
+		value = std::getenv("KYTY_LOOKAHEAD") != nullptr ? 1 : 0;
+		g_capture_values.store(value, std::memory_order_relaxed);
+	}
+	return value != 0;
+}
+thread_local bool         t_speculative  = false;
+
 const uint8_t* Scratch(const ResourcePlan& plan) {
-	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
+	return reinterpret_cast<const uint8_t*>(PlanSrtScratch(plan).data());
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
@@ -385,7 +400,7 @@ private:
 				return finish(false);
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
-		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
+		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOpImpl(op)) {
 			return finish(false);
 		}
 		return finish(ValidateArguments(*inst, true));
@@ -757,7 +772,8 @@ WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
 		}
 		default:
 			// The other runtime-uniform ops are strict; a U32x2 pair is only read through its extracts.
-			if (!IsRuntimeUniformOp(inst.GetOpcode()) || inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
+			if (!IsRuntimeUniformOpImpl(inst.GetOpcode()) ||
+			    inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
 				return {};
 			for (size_t i = 0; i < inst.NumArgs(); ++i) {
 				node.args.push_back(arg(inst.Arg(i)));
@@ -1135,9 +1151,15 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		// Every guest load is mov eax, [r10] (41 8b 02), which the fault handler completes.
 		c.mov(c.eax, c.dword[c.r10]);
 		c.L(loaded);
+		// Each capture is the load's address, with lookahead also the value the walk used.
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
-		c.add(c.r8, 8);
+		if (CaptureValues()) {
+			c.mov(c.dword[c.r8 + 8], c.eax);
+			c.add(c.r8, 16);
+		} else {
+			c.add(c.r8, 8);
+		}
 		Store(node);
 	}
 	// Only buffer reads have a zero path.
@@ -1571,7 +1593,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 	c.bt(c.rax, 32);
 	c.mov(c.eax, c.eax);
 	c.ret();
-	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
+	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + (CaptureValues() ? 2u : 1u) * m_captures, 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
@@ -1579,9 +1601,60 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 
 } // namespace
 
+bool IsRuntimeUniformOp(ValueOpcode opcode) {
+	return IsRuntimeUniformOpImpl(opcode);
+}
+
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
 	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
 	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+}
+
+void WalkScratch::Prepare(const ResourcePlan& plan) {
+	if (prepared == &plan) return;
+	prepared = &plan;
+	srt_scratch.assign(plan.srt_scratch.size(), 0u);
+	material_keys.clear();
+	// Extraction sizes the plan's key sets once; their size never changes afterwards.
+	selector_keys.assign(plan.selector_keys.size(), {});
+	scan_cache.clear();
+	loads.clear();
+}
+
+ScopedWalkScratch::ScopedWalkScratch(WalkScratch& scratch): m_previous(t_walk_scratch) {
+	t_walk_scratch = &scratch;
+}
+
+ScopedWalkScratch::~ScopedWalkScratch() {
+	t_walk_scratch = m_previous;
+}
+
+std::vector<uint64_t>& PlanSrtScratch(const ResourcePlan& plan) {
+	return t_walk_scratch != nullptr ? t_walk_scratch->srt_scratch : plan.srt_scratch;
+}
+
+std::vector<uint32_t>& PlanMaterialKeys(const ResourcePlan& plan) {
+	return t_walk_scratch != nullptr ? t_walk_scratch->material_keys : plan.material_keys;
+}
+
+std::vector<ResourcePlan::SelectorKeys>& PlanSelectorKeys(const ResourcePlan& plan) {
+	return t_walk_scratch != nullptr ? t_walk_scratch->selector_keys : plan.selector_keys;
+}
+
+std::vector<ScanCacheEntry>& PlanScanCache(const ResourcePlan& plan) {
+	return t_walk_scratch != nullptr ? t_walk_scratch->scan_cache : plan.scan_cache;
+}
+
+void SetSrtWalkerValueCapture(bool capture) {
+	g_capture_values.store(capture ? 1 : 0, std::memory_order_relaxed);
+}
+
+void SetSrtSpeculativeThread(bool speculative) {
+	t_speculative = speculative;
+}
+
+bool SrtSpeculativeThread() {
+	return t_speculative;
 }
 
 void SetSrtWalkerGuard(const void* counts, uint64_t slot_count, SrtGuardedLoad load) {
@@ -1616,8 +1689,10 @@ static const uint64_t* RunWalker(const ResourcePlan& plan, const SrtRuntime& run
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
+	auto& scratch = PlanSrtScratch(plan);
+	EXIT_IF(scratch.size() != plan.srt_scratch.size());
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
+	                                                     scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
 	return end;
 }
@@ -1627,36 +1702,50 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
 	if (g_guard_count.load(std::memory_order_relaxed)) g_guard_walks.fetch_add(1, std::memory_order_relaxed);
 	const auto* end = RunWalker(plan, runtime, flat);
-	if (g_guard_mode.load(std::memory_order_relaxed) == SrtWalkerGuardMode::Verify &&
+	auto& scratch = PlanSrtScratch(plan);
+	if (!t_speculative && g_guard_mode.load(std::memory_order_relaxed) == SrtWalkerGuardMode::Verify &&
 	    g_guard_counts.load(std::memory_order_relaxed) != g_guard_none) {
 		// The plain walk again: it must write the same flat SRT, scratch and captures. A guest
 		// write between the two walks can differ too; the count is an upper bound.
 		static thread_local std::vector<uint32_t> guarded_flat;
 		static thread_local std::vector<uint64_t> guarded_scratch;
 		guarded_flat    = flat;
-		guarded_scratch = plan.srt_scratch;
+		guarded_scratch = scratch;
 		const auto* guarded_end = end;
 		g_guard_counts.store(g_guard_none, std::memory_order_relaxed);
 		end = RunWalker(plan, runtime, flat);
 		g_guard_counts.store(g_guard_table, std::memory_order_relaxed);
 		g_guard_verified.fetch_add(1, std::memory_order_relaxed);
-		if (end != guarded_end || flat != guarded_flat || plan.srt_scratch != guarded_scratch) {
+		if (end != guarded_end || flat != guarded_flat || scratch != guarded_scratch) {
 			if (g_guard_mismatches.fetch_add(1, std::memory_order_relaxed) < 16) {
 				std::fprintf(stderr, "[walker-guard] MISMATCH shader %016llx: end %d flat %d scratch %d\n",
 				             static_cast<unsigned long long>(plan.shader_hash), end != guarded_end,
-				             flat != guarded_flat, plan.srt_scratch != guarded_scratch);
+				             flat != guarded_flat, scratch != guarded_scratch);
 			}
 		}
 	}
 	if (end == nullptr) return false;
+	// Captures are addresses, or (address, value) qword pairs while values are captured.
+	const std::span captured {scratch.data() + plan.srt_captures / 8u, end};
+	const size_t    stride = CaptureValues() ? 2u : 1u;
+	const auto      count  = captured.size() / stride;
+	// A walk that must log its loads needs their values.
+	if (t_walk_scratch != nullptr && stride == 1u) return false;
 	if (reads != nullptr) {
 		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
-		const std::span captured {plan.srt_scratch.data() + plan.srt_captures / 8u, end};
-		const auto      first = reads->size();
-		reads->resize(first + captured.size());
-		std::ranges::transform(captured, reads->data() + first, [](uint64_t address) {
-			return std::pair {address, uint64_t {sizeof(uint32_t)}};
-		});
+		const auto first = reads->size();
+		reads->resize(first + count);
+		for (size_t i = 0; i < count; ++i) {
+			(*reads)[first + i] = {captured[stride * i], uint64_t {sizeof(uint32_t)}};
+		}
+	}
+	if (t_walk_scratch != nullptr) {
+		auto&      loads = t_walk_scratch->loads;
+		const auto first = loads.size();
+		loads.resize(first + count);
+		for (size_t i = 0; i < count; ++i) {
+			loads[first + i] = {captured[2u * i], static_cast<uint32_t>(captured[2u * i + 1u])};
+		}
 	}
 	return true;
 }

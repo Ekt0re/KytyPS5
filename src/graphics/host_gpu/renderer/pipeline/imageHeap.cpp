@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/imageHeap.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 #include "graphics/host_gpu/renderer/resolveCache.h"
 
 #include "common/alignment.h"
@@ -382,6 +383,7 @@ bool ImageHeap::Refresh(Memory& memory) {
 		const auto [address, end] = PageRange(memory.base, memory.size, m_runs[run].first,
 		                                      m_runs[run].second);
 		m_scratch.resize((end - address) / 4u);
+		const ReadbackOrigin::Scope origin(ReadbackOrigin::Origin::Texture);
 		if (!LibKernel::Memory::TryReadBufferBacking(address, m_scratch.data(), end - address)) {
 			std::scoped_lock lock {m_mutex};
 			for (; run < m_runs.size(); ++run) {
@@ -1120,11 +1122,11 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 			return false;
 		}
 		image->Transit(image->ReadLayout(), vk::AccessFlagBits2::eShaderRead, std::nullopt,
-		               buffer.Handle());
+		               buffer.StateHandle());
 		return true;
 	});
-	buffer.Handle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
-	                                   nullptr);
+	buffer.StateHandle().bindDescriptorSets(bind_point, layout, IR::ImageHeapSet, 1, &m_set, 0,
+	                                        nullptr);
 }
 
 ImageHeap::GuardView ImageHeap::GuardFind(uint64_t slots) const {

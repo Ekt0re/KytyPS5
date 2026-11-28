@@ -14,6 +14,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+class Program;
 class Block;
 class Inst;
 
@@ -109,8 +110,8 @@ public:
 	[[nodiscard]] ValueOpcode             GetOpcode() const { return opcode; }
 	[[nodiscard]] Type                    GetType() const;
 	[[nodiscard]] bool                    MayHaveSideEffects() const;
-	[[nodiscard]] bool                    HasUses() const;
-	[[nodiscard]] size_t                  UseCount() const;
+	[[nodiscard]] bool                    HasUses() const { return !uses.empty(); }
+	[[nodiscard]] size_t                  UseCount() const { return uses.size(); }
 	[[nodiscard]] size_t                  NumArgs() const;
 	[[nodiscard]] size_t                  NumPhiBlocks() const;
 	[[nodiscard]] Value                   Arg(size_t index) const;
@@ -151,6 +152,7 @@ public:
 	}
 
 private:
+	friend void RemoveIdentities(Program& program);
 	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
 
 	template <typename Self>
@@ -189,12 +191,40 @@ inline bool Value::IsPhi() const {
 }
 
 inline Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+	Value current = *this;
+	while (current.IsIdentity()) {
+		current = current.inst->Arg(0);
+	}
+	EXIT_IF(current.type != Type::Opaque);
+	return current.inst;
 }
 
 inline Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+	Value current = *this;
+	while (current.IsIdentity()) {
+		current = current.inst->Arg(0);
+	}
+	return current;
+}
+
+inline bool Value::operator==(const Value& other) const {
+	if (type != other.type) {
+		return false;
+	}
+	switch (type) {
+		case Type::Void: return true;
+		case Type::Opaque: return inst == other.inst;
+		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
+		case Type::VectorReg: return vector_reg == other.vector_reg;
+		case Type::U1: return imm_u1 == other.imm_u1;
+		case Type::U8: return imm_u8 == other.imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16 == other.imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32 == other.imm_u32;
+		case Type::U64: return imm_u64 == other.imm_u64;
+		default: return false;
+	}
 }
 
 inline uint32_t Value::U32() const {

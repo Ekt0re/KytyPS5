@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/perfSummary.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/unifiedLayouts.h"
 #include "graphics/host_gpu/renderer/recorder.h"
@@ -130,7 +131,7 @@ vk::CommandBuffer CommandScheduler::BeginDetached() {
 	}
 	// With the command recorder, earlier ticks may still wait on its thread for their submission:
 	// the copy must follow them on the queue.
-	if (Recorder::Enabled() && m_master.SubmittedTick() + 1 < m_master.CurrentTick()) {
+	if (Recorder::Enabled() && m_master.SubmittedTick() < m_copy_wait_tick) {
 		Recorder::SyncAll();
 	}
 	vk::CommandBufferBeginInfo begin {};
@@ -171,8 +172,10 @@ void CommandScheduler::EndDetached() {
 }
 
 bool CommandScheduler::CanSubmitDetachedWithCurrent() const {
-	// The recorder ends and submits recorded buffers on its own thread, in its own order.
-	return !Recorder::Enabled() && !m_command.IsInvalid();
+	// The recorder ends and submits recorded buffers on its own thread, in its own order. A
+	// buffer it does not record (paused, KYTY_TOGGLE_FILE) is submitted here, so it can carry one.
+	return !m_command.IsInvalid() &&
+	       !(Recorder::Enabled() && Recorder::IsDeferred(static_cast<VkCommandBuffer>(m_command.m_buffer)));
 }
 
 void CommandScheduler::EndDetachedWithCurrent() {
@@ -227,7 +230,7 @@ vk::CommandBuffer CommandScheduler::BeginCopyQueue() {
 	}
 	// With the command recorder, earlier ticks may still wait on its thread for their submission:
 	// their timeline signals must be submitted before the copy waits on them.
-	if (Recorder::Enabled() && m_master.SubmittedTick() + 1 < m_master.CurrentTick()) {
+	if (Recorder::Enabled() && m_master.SubmittedTick() < m_copy_wait_tick) {
 		Recorder::SyncAll();
 	}
 	vk::CommandBufferBeginInfo begin {};
@@ -243,7 +246,7 @@ void CommandScheduler::EndCopyQueue() {
 	RequireVulkanSuccess(m_copy_command.end(), "end copy-queue command buffer");
 	// Every tick handed out before the open one: the same work a detached copy on the universal
 	// queue would follow, as a GPU-side wait on the master timeline (free when it has finished).
-	const uint64_t                wait_value = m_master.CurrentTick() - 1;
+	const uint64_t                wait_value = m_copy_wait_tick;
 	const vk::Semaphore           wait_semaphore = m_master.Handle();
 	const vk::PipelineStageFlags  wait_stage     = vk::PipelineStageFlagBits::eTransfer;
 	vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -341,6 +344,7 @@ void CommandScheduler::Flush() {
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Flush");
 	Submit(submit);
 	BeginNext();
 }
@@ -360,6 +364,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Wait");
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -542,6 +547,8 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 void CommandScheduler::Split(Common::UniqueFunction<void, vk::CommandBuffer>&& tail) {
 	EXIT_IF(m_command.IsInvalid());
+	m_command.OrderDispatches();
+	m_command.m_barriers.Reset();
 	m_segments.push_back({m_command.m_buffer, std::move(tail)});
 	m_command.m_rendering = false;
 	m_command.m_buffer    = nullptr;
@@ -623,16 +630,35 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 uint64_t CommandScheduler::SubmitWith(SubmitInfo submit, const DetachedPrefix* prefix) {
 	EXIT_IF(m_command.IsInvalid());
+	if (m_submit_hook != nullptr) {
+		m_submit_hook(m_submit_hook_data);
+	}
 
 	m_command.EndRendering();
+	// Upstream's dispatch ordering records its own barriers; the in-place readback barrier must be
+	// added after it and before the pending barrier batch is reset below.
+	m_command.OrderDispatches();
+	const auto host_barrier = [this](vk::CommandBuffer buffer) {
+		if (!m_inplace_readback) {
+			return;
+		}
+		const vk::MemoryBarrier to_host {.srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+		                                 .dstAccessMask = vk::AccessFlagBits::eHostRead};
+		buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eHost, {}, 1, &to_host, 0, nullptr,
+		                       0, nullptr);
+	};
 	std::vector<vk::CommandBuffer> buffers;
 	buffers.reserve(m_segments.size() + 1);
 	for (const auto& segment: m_segments) {
 		segment.tail(segment.buffer);
+		host_barrier(segment.buffer);
 		buffers.push_back(segment.buffer);
 	}
 	m_segments.clear();
+	host_barrier(m_command.m_buffer);
 	buffers.push_back(m_command.m_buffer);
+	m_command.m_barriers.Reset();
 	auto& graphics = m_graphics;
 	EXIT_IF(graphics.queue == nullptr);
 

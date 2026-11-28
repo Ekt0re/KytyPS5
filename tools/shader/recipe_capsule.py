@@ -4,8 +4,10 @@ offline without running the game.
 
 Usage: python tools/shader/recipe_capsule.py <recipes file> <out dir> <hex hash> [<hex hash> ...]
        python tools/shader/recipe_capsule.py <recipes file> <out dir> --stage <n>
+       python tools/shader/recipe_capsule.py <recipes file> <out dir> --all
        python tools/shader/recipe_capsule.py <recipes file> --list
---stage writes every shader of one stage (ShaderType: 1 VS, 2 PS, 3 CS, 4 MS). Each capsule gets
+--stage writes every shader of one stage (ShaderType: 1 VS, 2 PS, 3 CS, 4 MS). --all writes every
+code/variant record, which is the input to shader_check --corpus. Each capsule gets
 its variant record next to it (<capsule>.variant) for shader_check's resource specialization; use
 a recipes file written by the same build as shader_check, since the record layout follows the
 serializer.
@@ -103,7 +105,10 @@ def main():
     out = sys.argv[2]
     os.makedirs(out, exist_ok=True)
     targets = sys.argv[3:]
-    if targets[:1] == ["--stage"]:
+    if targets == ["--all"]:
+        # Every code record and every variant, in deterministic stage/hash order.
+        targets = ["%016x" % hh for (st, hh) in sorted(codes)]
+    elif targets[:1] == ["--stage"]:
         # Every shader of one stage (e.g. --stage 3 for compute).
         targets = ["%016x" % hh for (st, hh) in codes if st == int(targets[1])]
     for text in targets:

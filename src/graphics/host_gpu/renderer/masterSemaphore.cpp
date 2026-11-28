@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/perfSummary.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/gpuBreadcrumbs.h"
 
@@ -51,6 +52,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	Common::PerfSummary::ScopedMicros frame_timer(Common::PerfSummary::Counter::FrameWaitGpuUs);
 	for (auto submitted = m_submitted_tick.load(std::memory_order_acquire); submitted < tick;
 	     submitted      = m_submitted_tick.load(std::memory_order_acquire)) {
 		m_submitted_tick.wait(submitted, std::memory_order_acquire);

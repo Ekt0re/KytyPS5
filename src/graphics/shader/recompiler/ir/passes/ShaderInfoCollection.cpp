@@ -336,7 +336,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
-				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
+				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op) || memory.IsCoherentBufferPairStore(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
@@ -612,6 +612,9 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
 	                           std::ranges::any_of(info.images, uses_mapping) ||
 	                           std::ranges::any_of(info.samplers, uses_mapping);
+	info.uses_device_address |= std::ranges::any_of(info.buffers, [](const BufferResource& buffer) {
+		return buffer.live && IsIndirectBufferRuntimeTable(buffer.indirect_mapping_offset);
+	});
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
 	info.uses_heap_rows  = std::ranges::any_of(info.buffers, &BufferResource::heap_rows);
 	switch (program.stage) {

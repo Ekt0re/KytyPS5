@@ -24,6 +24,12 @@ class ComputePrescanSink {
 public:
 	virtual ~ComputePrescanSink()                                                   = default;
 	virtual void Found(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator) = 0;
+	// The same dispatch with its arguments: DISPATCH_DIRECT's dimensions, or (groups null) the
+	// address of an indirect dispatch's arguments, 0 when the scan does not know it.
+	virtual void FoundDispatch(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator,
+	                           const uint32_t* /*groups*/, uint64_t /*indirect_args*/) {
+		Found(regs, dispatch_initiator);
+	}
 	// With a `shadow` processor: a draw, with the graphics registers the shadow holds there.
 	virtual void FoundDraw(CommandProcessor& /*shadow*/, bool /*indirect*/) {}
 };

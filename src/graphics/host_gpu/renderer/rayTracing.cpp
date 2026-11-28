@@ -9,11 +9,15 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 
@@ -30,6 +34,7 @@ constexpr uint32_t RootLink     = 4u << 3 | 4u;
 constexpr uint32_t StateAbsent  = 1; // The job met a page no buffer backs.
 constexpr uint32_t GroupSize    = 64;
 constexpr uint64_t TriangleSize = 36;
+constexpr uint64_t BatchScratch = 128ull << 20;
 
 constexpr auto BuildInput = vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR;
 constexpr auto BlasFlags  = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace |
@@ -215,14 +220,14 @@ RayTracing::~RayTracing() {
 }
 
 void RayTracing::Reserve(std::unique_ptr<Buffer>& buffer, vk::BufferUsageFlags usage, uint64_t size,
-                         MemoryUsage memory) {
+                         MemoryUsage memory, bool exact) {
 	if (buffer && buffer->Size() >= size) {
 		return;
 	}
 	Retire(buffer);
 	buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, memory, 0,
 	                                  usage | vk::BufferUsageFlagBits::eShaderDeviceAddress,
-	                                  std::bit_ceil(size));
+	                                  exact ? size : std::bit_ceil(size));
 }
 
 void RayTracing::Create(Structure& structure, const vk::AccelerationStructureGeometryKHR& geometry,
@@ -238,7 +243,7 @@ void RayTracing::Create(Structure& structure, const vk::AccelerationStructureGeo
 	m_graphics.device.getAccelerationStructureBuildSizesKHR(
 	    vk::AccelerationStructureBuildTypeKHR::eDevice, &info, &capacity, &sizes);
 	Reserve(structure.buffer, vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR,
-	        sizes.accelerationStructureSize);
+	        sizes.accelerationStructureSize, MemoryUsage::DeviceLocal, true);
 	vk::AccelerationStructureCreateInfoKHR create {};
 	create.buffer = structure.buffer->Handle();
 	create.size   = sizes.accelerationStructureSize;
@@ -303,6 +308,13 @@ void RayTracing::Apply(Area& area) {
 	const auto* data = area.buffer->Mapped().data();
 	Context     context {};
 	std::memcpy(&context, data, sizeof(context));
+	if (context.valid != 0) {
+		++m_coverage.valid;
+	} else {
+		++m_coverage.invalid;
+		m_coverage.last_invalid = area.shader_hash;
+		m_coverage.unreadable += context.instances == ~0u ? 1u : 0u;
+	}
 	// Instance counts past the device limit keep the mirror invalid.
 	const auto it = m_tlases.find(area.tlas);
 	if (it != m_tlases.end() && context.instances > it->second.instance_slots &&
@@ -391,7 +403,12 @@ void RayTracing::Apply(Area& area) {
 	}
 }
 
-vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
+vk::DeviceAddress RayTracing::Prepare(uint64_t tlas, uint64_t shader_hash) {
+	if (const auto found = m_prepared.find(tlas);
+	    found != m_prepared.end() && found->second.flip == m_flip && m_contexts != nullptr) {
+		++m_coverage.traced;
+		return m_contexts->BufferDeviceAddress() + sizeof(Context) * found->second.slot;
+	}
 	Collect();
 	// A TLAS with no readback in flight waits for an area, so calls over other TLASes cannot take
 	// every area from it.
@@ -406,6 +423,8 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	if (readback) {
 		m_next_area = (m_next_area + 1) % Areas;
 	}
+	area.shader_hash = shader_hash;
+	++m_coverage.traced;
 	const auto serial = ++m_serial;
 
 	auto& top = m_tlases[tlas];
@@ -426,7 +445,7 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 		auto&      blas    = m_blases[index];
 		const auto records = blas.end - blas.begin;
 		if (records > blas.capacity) {
-			Reserve(blas.triangles, BuildInput, TriangleSize * records);
+			Reserve(blas.triangles, BuildInput, TriangleSize * records, MemoryUsage::DeviceLocal, true);
 			blas.capacity = static_cast<uint32_t>(blas.triangles->Size() / TriangleSize);
 		}
 		blases[index] = {blas.address, 0, blas.capacity};
@@ -448,7 +467,11 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_pointers;
 	geometries.reserve(m_pairs.size());
 	ranges.reserve(m_pairs.size());
-	uint64_t                             scratch_size = 0;
+	// BLAS builds go in batches whose scratch ranges are disjoint; a batch takes at most
+	// BatchScratch bytes of it (or one build), and the next reuses it after a barrier.
+	uint64_t                             scratch_size  = 0;
+	uint64_t                             batch_scratch = 0;
+	std::vector<size_t>                  batch_starts {0};
 	std::vector<GpuPair>                 pairs(m_pairs.size());
 	std::vector<std::array<uint32_t, 2>> box_chunks;
 	area.walks.clear();
@@ -498,10 +521,16 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 			info.dstAccelerationStructure  = pair.structure.handle;
 			info.geometryCount             = 1;
 			info.pGeometries               = &geometries.back();
-			info.scratchData.deviceAddress = scratch_size;
-			scratch_size += Common::AlignUp(update ? pair.structure.update_scratch
-			                                       : pair.structure.build_scratch,
-			                                m_scratch_alignment);
+			const auto need = Common::AlignUp(
+			    update ? pair.structure.update_scratch : pair.structure.build_scratch,
+			    m_scratch_alignment);
+			if (batch_scratch != 0 && batch_scratch + need > BatchScratch) {
+				batch_starts.push_back(builds.size());
+				batch_scratch = 0;
+			}
+			info.scratchData.deviceAddress = batch_scratch;
+			batch_scratch += need;
+			scratch_size = std::max(scratch_size, batch_scratch);
 			builds.push_back(info);
 			ranges.push_back({pair.count, 0, 0, 0});
 			range_pointers.push_back(&ranges.back());
@@ -627,16 +656,22 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	Barrier(command);
 	dispatch(Instances, (top.instance_slots + GroupSize - 1) / GroupSize);
 
-	// BLAS builds in one call over disjoint scratch ranges, then the TLAS over the first.
+	// BLAS builds a batch per call over disjoint scratch ranges, then the TLAS over the first.
 	Reserve(m_scratch, vk::BufferUsageFlagBits::eStorageBuffer,
-	        std::max(scratch_size, top.structure.build_scratch) + m_scratch_alignment);
+	        std::max(scratch_size, top.structure.build_scratch) + m_scratch_alignment,
+	        MemoryUsage::DeviceLocal, true);
 	const auto scratch = Common::AlignUp(m_scratch->BufferDeviceAddress(), m_scratch_alignment);
 	for (auto& info: builds) {
 		info.scratchData.deviceAddress += scratch;
 	}
-	if (!builds.empty()) {
-		command.buildAccelerationStructuresKHR(static_cast<uint32_t>(builds.size()), builds.data(),
-		                                       range_pointers.data());
+	for (size_t batch = 0; batch < batch_starts.size() && !builds.empty(); ++batch) {
+		const auto first = batch_starts[batch];
+		const auto end   = batch + 1 < batch_starts.size() ? batch_starts[batch + 1] : builds.size();
+		if (batch != 0) {
+			Barrier(command);
+		}
+		command.buildAccelerationStructuresKHR(static_cast<uint32_t>(end - first),
+		                                       builds.data() + first, range_pointers.data() + first);
 	}
 	Barrier(command);
 
@@ -660,15 +695,111 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 		command.copyBuffer(m_state->Handle(), area.buffer->Handle(), 1, &copy);
 		Barrier(command);
 	}
+	// A slot is rewritten only after the barrier the call rewriting it records first.
+	Reserve(m_contexts, vk::BufferUsageFlagBits::eTransferDst, sizeof(Context) * Contexts);
+	constexpr uint32_t Owned = Contexts / 2;
+	uint32_t           slot  = 0;
+	if (const auto found = m_prepared.find(tlas); found != m_prepared.end()) {
+		slot = found->second.slot;
+		found->second.flip = m_flip;
+	} else if (m_prepared.size() < Owned) {
+		slot = static_cast<uint32_t>(m_prepared.size());
+		m_prepared[tlas] = {m_flip, slot};
+	} else {
+		slot           = Owned + m_next_context;
+		m_next_context = (m_next_context + 1) % (Contexts - Owned);
+	}
+	const auto           context = sizeof(Context) * slot;
+	const vk::BufferCopy keep {0, context, sizeof(Context)};
+	command.copyBuffer(m_state->Handle(), m_contexts->Handle(), 1, &keep);
+	Barrier(command);
+
 	area.tick           = m_scheduler.CurrentTick();
 	area.serial         = serial;
 	area.tlas           = tlas;
 	area.instance_slots = top.instance_slots;
 	area.pairs          = m_pairs.size();
-	return state;
+	return m_contexts->BufferDeviceAddress() + context;
+}
+
+void RayTracing::NoteGuestDispatch(uint64_t shader_hash, std::span<const uint32_t> user_data) {
+	++m_coverage.guest;
+	m_coverage.last_guest = shader_hash;
+	// KYTY_RT_HEADER_PROBE=1 logs the BVH headers the first dispatch of each program that walks a
+	// guest BVH without a ray query can reach through its user SGPR pointers (a diagnostic: it
+	// reads them back from the GPU).
+	static const bool probe = [] {
+		const char* value = std::getenv("KYTY_RT_HEADER_PROBE");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (probe && m_probed.size() < 64 && m_probed.insert(shader_hash).second) {
+		ProbeHeaders(shader_hash, user_data);
+	}
+	ReportCoverage();
+}
+
+void RayTracing::ProbeHeaders(uint64_t shader_hash, std::span<const uint32_t> user_data) {
+	constexpr uint64_t Table = 0x100, Header = 0x100;
+	const auto read = [&](uint64_t address, uint64_t size) {
+		if (address == 0 || (address & 7u) != 0 || !m_context.IsMapped(address, size)) return false;
+		m_buffer_cache.ReadMemory(address, size);
+		return true;
+	};
+	const auto load = [](uint64_t address, uint64_t offset, auto value) {
+		std::memcpy(&value, reinterpret_cast<const void*>(address + offset), sizeof(value));
+		return value;
+	};
+	uint32_t found = 0;
+	for (uint32_t sgpr = 0; sgpr + 1 < user_data.size(); ++sgpr) {
+		const auto table = user_data[sgpr] | uint64_t {user_data[sgpr + 1]} << 32u;
+		if (!read(table, Table)) continue;
+		for (uint64_t offset = 0; offset < Table; offset += 8) {
+			const auto header = load(table, offset, uint64_t {});
+			if (!read(header, Header) || load(header, 0, uint32_t {}) != 0x5f525350u ||
+			    load(header, 4, uint32_t {}) != 0x4c485642u) {
+				continue;
+			}
+			++found;
+			std::printf("[RT] header probe: cs %016" PRIx64 " [s[%u:%u] + 0x%02" PRIx64
+			            "] = 0x%" PRIx64 ": PSR_BVHL version %u properties 0x%08x (%s) +0x28 0x%" PRIx64
+			            " +0x30 0x%" PRIx64 " +0x70 %u +0x74 %u\n",
+			            shader_hash, sgpr, sgpr + 1, offset, header, load(header, 0xfc, uint32_t {}),
+			            load(header, 0x18, uint32_t {}),
+			            (load(header, 0x18, uint32_t {}) & 0x40u) != 0 ? "BLAS" : "TLAS",
+			            load(header, 0x28, uint64_t {}), load(header, 0x30, uint64_t {}),
+			            load(header, 0x70, uint32_t {}), load(header, 0x74, uint32_t {}));
+		}
+	}
+	if (found == 0) {
+		std::printf("[RT] header probe: cs %016" PRIx64 ": no PSR_BVHL header behind %zu user SGPRs\n",
+		            shader_hash, user_data.size());
+	}
+	std::fflush(stdout);
+}
+
+void RayTracing::ReportCoverage() {
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_report_time < std::chrono::seconds(10)) return;
+	m_report_time    = now;
+	const auto  last = m_reported;
+	const auto& c    = m_coverage;
+	const auto  programs = ShaderRecompiler::GetRayTracingPrograms();
+	m_reported           = c;
+	const bool unrecognized = programs.unrecognized != m_reported_programs;
+	m_reported_programs     = programs.unrecognized;
+	if (c.guest == last.guest && c.invalid == last.invalid && !unrecognized) return;
+	std::printf("[RT] 10 s: dispatches traced %" PRIu64 ", walking a guest BVH %" PRIu64
+	            " (last cs %016" PRIx64 "); TLAS contexts valid %" PRIu64 ", not valid %" PRIu64
+	            " (header unreadable %" PRIu64 ", last cs %016" PRIx64 "); programs so far: traced %" PRIu64
+	            ", with walks left to the guest %" PRIu64 " (last cs %016" PRIx64 ")\n",
+	            c.traced - last.traced, c.guest - last.guest, c.last_guest, c.valid - last.valid,
+	            c.invalid - last.invalid, c.unreadable - last.unreadable, c.last_invalid,
+	            programs.traced, programs.unrecognized, programs.last_unrecognized);
+	std::fflush(stdout);
 }
 
 void RayTracing::RunGarbageCollector() {
+	ReportCoverage();
 	if (++m_frame % EvictFrames != 0) {
 		return;
 	}
@@ -678,6 +809,10 @@ void RayTracing::RunGarbageCollector() {
 		if (top.used) {
 			top.used = false;
 			return false;
+		}
+		// Its next call mirrors it again.
+		if (const auto prepared = m_prepared.find(entry.first); prepared != m_prepared.end()) {
+			prepared->second.flip = 0;
 		}
 		Retire(top.structure);
 		Retire(top.instances);

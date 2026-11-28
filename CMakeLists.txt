@@ -467,8 +467,14 @@ add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.c
 add_kyty_full_emulator_test(descriptor_heap_tests "${KYTY_TESTS_DIR}/DescriptorHeapTests.cpp")
 add_kyty_full_emulator_test(shader_check "${KYTY_TESTS_DIR}/shaderCheck.cpp")
 
-add_executable(spvbench EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader/spvbench.cpp")
-target_link_libraries(spvbench Vulkan::Headers ${CMAKE_DL_LIBS})
+add_executable(driver_repro EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader/driver_repro.cpp")
+target_link_libraries(driver_repro Vulkan::Headers ${CMAKE_DL_LIBS})
+if(WIN32)
+	target_link_libraries(driver_repro shell32)
+	# Compute pipeline creation from threads against processes (tools/shader/pipeline_bench.cpp).
+	add_executable(pipeline_bench EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/shader/pipeline_bench.cpp")
+	target_link_libraries(pipeline_bench Vulkan::Headers)
+endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -501,6 +507,12 @@ add_executable(trophy_system_tests EXCLUDE_FROM_ALL
 target_link_libraries(trophy_system_tests common Vulkan::Headers)
 target_include_directories(trophy_system_tests PRIVATE ${inc_headers})
 
+add_executable(render_target_bounds_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/RenderTargetBoundsTests.cpp"
+)
+target_link_libraries(render_target_bounds_tests kyty_test_gtest Vulkan::Headers)
+target_include_directories(render_target_bounds_tests PRIVATE ${inc_headers})
+
 add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
@@ -521,6 +533,38 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(async_plan_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AsyncPlanTests.cpp"
+)
+target_include_directories(async_plan_tests PRIVATE ${inc_headers})
+
+add_executable(wait_diagnostics_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/WaitDiagnosticsTests.cpp"
+)
+target_include_directories(wait_diagnostics_tests PRIVATE ${inc_headers})
+add_executable(subgroup_size_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SubgroupSizeTests.cpp"
+)
+target_include_directories(subgroup_size_tests PRIVATE ${inc_headers})
+add_executable(dispatch_limits_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DispatchLimitsTests.cpp"
+)
+target_include_directories(dispatch_limits_tests PRIVATE ${inc_headers})
+add_executable(driver_cache_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DriverCacheFileTests.cpp"
+)
+target_include_directories(driver_cache_file_tests PRIVATE ${inc_headers})
+
+add_executable(pipeline_create_stats_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PipelineCreateStatsTests.cpp"
+)
+target_include_directories(pipeline_create_stats_tests PRIVATE ${inc_headers})
+add_executable(buffer_probe_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BufferProbeTests.cpp"
+)
+target_link_libraries(buffer_probe_tests common kyty_test_gtest)
+target_include_directories(buffer_probe_tests PRIVATE ${inc_headers})
+
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
@@ -531,6 +575,7 @@ add_executable(shader_store_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/shaderStoreLock.cpp"
 )
+target_link_libraries(shader_store_tests xxhash)
 target_include_directories(shader_store_tests PRIVATE ${inc_headers})
 
 add_executable(readback_batch_tests EXCLUDE_FROM_ALL
@@ -538,13 +583,36 @@ add_executable(readback_batch_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(readback_batch_tests PRIVATE ${inc_headers})
 
+add_executable(readback_wait_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackWaitTests.cpp"
+)
+target_include_directories(readback_wait_tests PRIVATE ${inc_headers})
+add_executable(barrier_tracker_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BarrierTrackerTests.cpp"
+)
+target_link_libraries(barrier_tracker_tests common)
+target_include_directories(barrier_tracker_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
 target_include_directories(slot_vector_tests PRIVATE ${inc_headers})
 
-add_executable(common_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommonTests.cpp")
+add_executable(skip_taint_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SkipTaintTests.cpp")
+target_include_directories(skip_taint_tests PRIVATE ${inc_headers})
+
+add_executable(common_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CommonTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(common_tests common kyty_test_gtest)
+
+add_executable(perf_summary_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PerfSummaryTests.cpp")
+target_link_libraries(perf_summary_tests common kyty_test_gtest)
+add_executable(fault_stats_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FaultStatsTests.cpp")
+target_link_libraries(fault_stats_tests common kyty_test_gtest)
+
+add_executable(keep_going_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/KeepGoingTests.cpp")
+target_link_libraries(keep_going_tests common kyty_test_gtest)
+target_include_directories(keep_going_tests PRIVATE ${inc_headers})
 
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
@@ -568,6 +636,12 @@ add_executable(recorder_tests EXCLUDE_FROM_ALL
 target_link_libraries(recorder_tests fmt::fmt common)
 target_include_directories(recorder_tests PRIVATE ${inc_headers})
 
+add_executable(draw_indirect_count_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DrawIndirectCountTests.cpp"
+)
+target_link_libraries(draw_indirect_count_tests kyty_test_gtest Vulkan::Headers)
+target_include_directories(draw_indirect_count_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderVertexMetadata.cpp"
@@ -579,9 +653,25 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/guestReadLog.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/lookahead.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak xxhash)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
+
+add_executable(guest_read_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestReadLogTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/guestReadLog.cpp"
+)
+target_link_libraries(guest_read_log_tests xxhash)
+target_include_directories(guest_read_log_tests PRIVATE ${inc_headers})
+
+add_executable(materialization_memo_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/MaterializationMemoTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/materializationMemo.cpp"
+)
+target_link_libraries(materialization_memo_tests fmt::fmt xbyak::xbyak xxhash)
+target_include_directories(materialization_memo_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
@@ -599,7 +689,7 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
-)
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(audio_out2_port_tests common fmt::fmt kyty_spatial_audio)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
@@ -678,6 +768,7 @@ add_kyty_full_emulator_test(http_uri_parse_tests
 add_executable(rtc_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/RtcTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libRtc.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
 target_link_libraries(rtc_tests common kyty_test_gtest)
@@ -688,7 +779,8 @@ add_executable(playgo_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/libs/libPlayGo.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
 	"${KYTY_SOURCE_DIR}/loader/systemContent.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(playgo_tests common nlohmann_json::nlohmann_json kyty_test_gtest)
 target_include_directories(playgo_tests PRIVATE ${inc_headers})
 
@@ -696,7 +788,8 @@ add_executable(vr_tracker2_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/VrTracker2Tests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libVrTracker2.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(vr_tracker2_tests common kyty_test_gtest)
 target_include_directories(vr_tracker2_tests PRIVATE ${inc_headers})
 
@@ -704,7 +797,8 @@ add_executable(font_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/FontTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libFont.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(font_tests common SDL3::SDL3-static FFmpeg::ffmpeg kyty_test_gtest)
 target_include_directories(font_tests PRIVATE ${inc_headers})
 target_compile_definitions(font_tests PRIVATE KYTY_NOTO_SANS_DIR="${KYTY_NOTO_SANS_DIR}")
@@ -818,7 +912,8 @@ add_executable(psml_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PsmlTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libPsml.cpp"
 	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
-	"${KYTY_SOURCE_DIR}/loader/timer.cpp")
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libCallThunk.cpp")
 target_link_libraries(psml_tests common kyty_test_gtest)
 target_include_directories(psml_tests PRIVATE ${inc_headers})
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
@@ -851,6 +946,12 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_cfg_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --indirect-formatted-stores-only)
+	add_test(NAME shader_cfg_finite_buffer_descriptors
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --finite-buffer-descriptors-only)
+	add_test(NAME shader_corpus COMMAND $<TARGET_FILE:shader_check> --self-test)
+	add_test(NAME driver_repro COMMAND $<TARGET_FILE:driver_repro> --self-test)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
@@ -858,18 +959,49 @@ if(BUILD_TESTING)
 	add_test(NAME build_flags COMMAND $<TARGET_FILE:build_flags_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
+	add_test(NAME render_target_bounds COMMAND $<TARGET_FILE:render_target_bounds_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME async_plan COMMAND $<TARGET_FILE:async_plan_tests>)
+	add_test(NAME wait_diagnostics COMMAND $<TARGET_FILE:wait_diagnostics_tests>)
+	add_test(NAME subgroup_size COMMAND $<TARGET_FILE:subgroup_size_tests>)
+	add_test(NAME dispatch_limits COMMAND $<TARGET_FILE:dispatch_limits_tests>)
+	add_test(NAME driver_cache_file COMMAND $<TARGET_FILE:driver_cache_file_tests>)
+	add_test(NAME pipeline_create_stats COMMAND $<TARGET_FILE:pipeline_create_stats_tests>)
+	add_test(NAME buffer_probe COMMAND $<TARGET_FILE:buffer_probe_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)
+	add_test(NAME skip_taint COMMAND $<TARGET_FILE:skip_taint_tests>)
+	add_test(NAME readback_wait COMMAND $<TARGET_FILE:readback_wait_tests>)
+	add_test(NAME barrier_tracker COMMAND $<TARGET_FILE:barrier_tracker_tests>)
 	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
+	add_test(NAME draw_indirect_count COMMAND $<TARGET_FILE:draw_indirect_count_tests>)
+	add_test(NAME perf_summary COMMAND $<TARGET_FILE:perf_summary_tests>)
+	add_test(NAME fault_stats COMMAND $<TARGET_FILE:fault_stats_tests>)
+	add_test(NAME keep_going COMMAND $<TARGET_FILE:keep_going_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
+	add_test(NAME resource_materialization_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:resource_materialization_tests> --indirect-formatted-stores-only)
+	add_test(NAME resource_materialization_indirect_formatted_stores_off
+		COMMAND $<TARGET_FILE:resource_materialization_tests> --indirect-formatted-stores-off-only)
+	add_test(NAME materialization_memo COMMAND $<TARGET_FILE:materialization_memo_tests>)
+	add_test(NAME guest_read_log COMMAND $<TARGET_FILE:guest_read_log_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
+	add_test(NAME resource_tracking_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --indirect-formatted-stores-only)
+	add_test(NAME resource_tracking_indirect_formatted_stores_off
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --indirect-formatted-stores-off-only)
+	add_test(NAME resource_tracking_finite_buffer_descriptors
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --finite-buffer-descriptors-only)
+	add_test(NAME resource_tracking_finite_buffer_descriptors_off
+		COMMAND $<TARGET_FILE:resource_tracking_tests> --finite-buffer-descriptors-off-only)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
+	add_test(NAME kernel_file_system_ampr COMMAND $<TARGET_FILE:kernel_file_system_tests> --ampr-only)
+	set_tests_properties(kernel_file_system_ampr PROPERTIES ENVIRONMENT "KYTY_AMPR_LOG=1")
 	add_test(NAME win_read_efault COMMAND $<TARGET_FILE:win_read_efault_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
@@ -893,6 +1025,10 @@ if(BUILD_TESTING)
 	add_test(NAME vr_tracker2 COMMAND $<TARGET_FILE:vr_tracker2_tests>)
 	add_test(NAME user_service COMMAND $<TARGET_FILE:user_service_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_recompiler_compute_indirect_formatted_stores
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-formatted-stores-only)
+	add_test(NAME shader_recompiler_compute_finite_buffer_descriptors
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --finite-buffer-descriptors-only)
 	add_test(NAME image_heap COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-heap-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
@@ -914,6 +1050,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --mul-hi24-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
+	add_test(NAME shader_recompiler_scalar_twins
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scalar-twins-only)
+	add_test(NAME shader_recompiler_vopc_twins
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --vopc-twins-only)
+	add_test(NAME shader_recompiler_sdwa_twins
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sdwa-twins-only)
 	add_test(NAME graphics_pipeline_rasterization
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --polygon-mode-only)
 	add_test(NAME graphics_draw_offsets
@@ -936,6 +1078,10 @@ if(BUILD_TESTING)
 		set_tests_properties(virtual_memory_allocation_vk_backing_memfd PROPERTIES
 			ENVIRONMENT "KYTY_VK_GUEST_BACKING=1;KYTY_VK_GUEST_BACKING_MAX_MB=0")
 	endif()
+	add_test(NAME large_memory_budget
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --large-memory-budget-only)
+	add_test(NAME base_memory_budget
+		COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --base-memory-budget-only)
 	add_test(NAME psml COMMAND $<TARGET_FILE:psml_tests>)
 	add_test(NAME pssr COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --pssr-only)
 	add_test(NAME guest_red_zone_patcher
@@ -994,8 +1140,11 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
 	add_custom_target(kyty_tests DEPENDS
+		psml_tests
 		ime_dialog_tests
 		shader_cfg_tests
+		shader_check
+		driver_repro
 		descriptor_heap_tests
 		scalar_provenance_tests
 		image_page_table_tests
@@ -1004,15 +1153,30 @@ if(BUILD_TESTING)
 		build_flags_tests
 		archive_file_tests
 		trophy_system_tests
+		render_target_bounds_tests
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
+		async_plan_tests
+		wait_diagnostics_tests
+		driver_cache_file_tests
+		pipeline_create_stats_tests
+		buffer_probe_tests
 		lru_cache_tests
 		readback_batch_tests
+		skip_taint_tests
+		readback_wait_tests
+		barrier_tracker_tests
 		shader_store_tests
 		common_tests
+		draw_indirect_count_tests
+		perf_summary_tests
+		fault_stats_tests
+		keep_going_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
+		materialization_memo_tests
+		guest_read_log_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests

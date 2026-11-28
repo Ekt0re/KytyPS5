@@ -1,5 +1,6 @@
 #include "libs/libs.h"
 
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/errno.h"
 #include "loader/symbolDatabase.h"
@@ -112,7 +113,13 @@ LIB_DEFINE(InitUsbd_1);
 LIB_DEFINE(InitUserService_1);
 LIB_DEFINE(InitWebBrowserDialog_1);
 
+
 void InitAll(Loader::SymbolDatabase* s) {
+	const auto& filter     = Config::GetTraceCallsFilter();
+	g_trace_calls_enabled  = filter.enabled;
+	g_trace_all            = filter.all;
+	g_trace_libraries      = filter.libraries;
+	g_fp_env_check_enabled = Common::FpEnvCheckEnabled();
 	InitAudio_1(s);
 	InitConvertKeycode_1(s);
 	LibAmpr::InitAmpr_1(s);

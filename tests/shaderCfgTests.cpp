@@ -19,6 +19,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
+#include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -30,6 +31,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "libs/agc.h"
+#include "spirv-tools/libspirv.h"
 #include "spirv-tools/libspirv.hpp"
 #include "xxhash.h"
 #include "SrtWalkerTestMemory.h"
@@ -37,6 +39,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -44,12 +47,14 @@
 #include <deque>
 #include <initializer_list>
 #include <iterator>
+#include <map>
 #include <span>
 #include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -62,9 +67,14 @@
 namespace Libs::Graphics {
 namespace {
 
+bool g_continue_on_failure = false;
+
 void Check(bool value, const char *text) {
   if (!value) {
     std::fprintf(stderr, "ShaderCfgTests: failed: %s\n", text);
+    if (g_continue_on_failure) {
+      return;
+    }
     std::abort();
   }
 }
@@ -142,7 +152,123 @@ struct TestCompileResult {
   ShaderRecompiler::IR::ResourceSnapshot resources;
 };
 
-TestCompileResult RecompileForTest(
+struct PassBench {
+  bool enabled = false;
+  unsigned repeat = 0;
+  std::string baseline;
+  std::string dump_dir;
+  std::vector<std::pair<uint64_t, size_t>> digests;
+  std::map<std::string, std::pair<uint64_t, uint64_t>> passes;
+  std::map<std::string, uint64_t> current;
+  std::map<std::pair<size_t, std::string>, uint64_t> best;
+  uint64_t translate_ns = 0;
+  bool measuring = false;
+};
+PassBench g_pass_bench;
+
+void PassBenchHook(const char* name, uint64_t ns) {
+  if (!g_pass_bench.measuring) return;
+  g_pass_bench.current[name] += ns;
+}
+
+uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+void PassBenchRecord(std::span<const uint32_t> spirv) {
+  const auto index = g_pass_bench.digests.size();
+  g_pass_bench.digests.emplace_back(
+      XXH64(spirv.data(), spirv.size_bytes(), 0), spirv.size());
+  if (!g_pass_bench.dump_dir.empty()) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "/%05zu.spv", index);
+    if (auto* file = std::fopen((g_pass_bench.dump_dir + name).c_str(), "wb")) {
+      std::fwrite(spirv.data(), sizeof(uint32_t), spirv.size(), file);
+      std::fclose(file);
+    }
+  }
+}
+
+template <typename Compile>
+void PassBenchRepeat(const Compile& compile) {
+  g_pass_bench.measuring = true;
+  const auto shader = g_pass_bench.digests.size();
+  uint64_t best_total = UINT64_MAX;
+  for (unsigned i = 0; i < g_pass_bench.repeat; i++) {
+    g_pass_bench.current.clear();
+    const auto begin = NowNs();
+    (void)compile();
+    best_total = std::min(best_total, NowNs() - begin);
+    for (const auto& [name, ns] : g_pass_bench.current) {
+      auto [it, inserted] = g_pass_bench.best.try_emplace({shader, name}, ns);
+      if (!inserted) it->second = std::min(it->second, ns);
+    }
+  }
+  if (best_total != UINT64_MAX) g_pass_bench.translate_ns += best_total;
+  g_pass_bench.measuring = false;
+}
+
+int PassBenchReport() {
+  if (!g_pass_bench.enabled) return 0;
+  std::printf("PASSBENCH shaders=%zu repeat=%u total_ms=%.1f\n",
+              g_pass_bench.digests.size(), g_pass_bench.repeat,
+              static_cast<double>(g_pass_bench.translate_ns) / 1e6);
+  for (const auto& [key, ns] : g_pass_bench.best) {
+    auto& entry = g_pass_bench.passes[key.second];
+    entry.first += ns;
+    entry.second++;
+  }
+  for (const auto& [name, entry] : g_pass_bench.passes) {
+    std::printf("PASSBENCH pass %-24s best_ms=%9.2f shaders=%llu\n",
+                name.c_str(), static_cast<double>(entry.first) / 1e6,
+                static_cast<unsigned long long>(entry.second));
+  }
+  uint64_t combined = 0;
+  for (const auto& digest : g_pass_bench.digests) {
+    combined = XXH64(&digest, sizeof(digest), combined);
+  }
+  std::printf("PASSBENCH digest=%016llx\n", static_cast<unsigned long long>(combined));
+  if (g_pass_bench.baseline.empty()) return 0;
+  std::vector<std::pair<uint64_t, size_t>> base;
+  if (auto* file = std::fopen(g_pass_bench.baseline.c_str(), "r")) {
+    unsigned long long hash = 0;
+    unsigned long long words = 0;
+    while (std::fscanf(file, "%llx %llu", &hash, &words) == 2) {
+      base.emplace_back(static_cast<uint64_t>(hash), static_cast<size_t>(words));
+    }
+    std::fclose(file);
+  }
+  if (base.empty()) {
+    if (auto* file = std::fopen(g_pass_bench.baseline.c_str(), "w")) {
+      for (const auto& digest : g_pass_bench.digests) {
+        std::fprintf(file, "%016llx %zu\n",
+                     static_cast<unsigned long long>(digest.first), digest.second);
+      }
+      std::fclose(file);
+    }
+    std::printf("PASSBENCH baseline recorded\n");
+    return 0;
+  }
+  size_t mismatches = 0;
+  if (base.size() != g_pass_bench.digests.size()) {
+    std::printf("PASSBENCH MISMATCH count baseline=%zu now=%zu\n", base.size(),
+                g_pass_bench.digests.size());
+    mismatches++;
+  }
+  for (size_t i = 0; i < std::min(base.size(), g_pass_bench.digests.size()); i++) {
+    if (base[i] != g_pass_bench.digests[i]) {
+      if (++mismatches <= 10) std::printf("PASSBENCH MISMATCH shader %zu\n", i);
+    }
+  }
+  std::printf("PASSBENCH compare %s mismatches=%zu\n",
+              mismatches == 0 ? "IDENTICAL" : "DIFFERENT", mismatches);
+  return mismatches == 0 ? 0 : 1;
+}
+
+TestCompileResult RecompileForTestOnce(
     std::span<const uint32_t> code,
     const ShaderRecompiler::CompileOptions &options,
     ShaderRecompiler::IR::PushData::Window push_data = {}) {
@@ -163,6 +289,19 @@ TestCompileResult RecompileForTest(
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
+}
+
+TestCompileResult RecompileForTest(
+    std::span<const uint32_t> code,
+    const ShaderRecompiler::CompileOptions &options,
+    ShaderRecompiler::IR::PushData::Window push_data = {}) {
+  auto result = RecompileForTestOnce(code, options, push_data);
+  if (g_pass_bench.enabled) {
+    PassBenchRecord(result.spirv);
+    PassBenchRepeat(
+        [&] { return RecompileForTestOnce(code, options, push_data); });
+  }
+  return result;
 }
 
 void CompilePixelRuntime(const ShaderParams &params,
@@ -7559,6 +7698,141 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
   }
 }
 
+void TestIndirectFormattedStoreTypedIr() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  const auto run = [](ValueOpcode opcode, uint32_t bits, uint32_t components,
+                      uint32_t dwords, F format, uint32_t swizzle) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.user_data_count = 16u;
+    auto storage = std::make_unique<Block>();
+    auto *block = storage.get();
+    program.block_storage.push_back(std::move(storage));
+    program.blocks.push_back(block);
+    block->terminator.kind = CFG::TerminatorKind::Return;
+    std::array<Value, 4> table_words;
+    for (uint32_t word = 0; word < table_words.size(); ++word)
+      table_words[word] = Value(&block->AppendNewInst(
+          ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(word))}));
+    const auto table = Value(&block->AppendNewInst(
+        ValueOpcode::GetBufferResource, {table_words[0], table_words[1], table_words[2], table_words[3]}));
+    const auto lane = Value(&block->AppendNewInst(ValueOpcode::LaneId));
+    const auto key = Value(&block->AppendNewInst(
+        ValueOpcode::ReadFirstLane, {lane, Value(true)}));
+    const auto offset = Value(&block->AppendNewInst(
+        ValueOpcode::ShiftLeftLogical32, {key, Value(4u)}));
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      program.memory_info.push_back({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
+                                     .component_index = word, .component_count = 4u});
+      auto &read = block->AppendNewInst(ValueOpcode::ReadConstBuffer, {table, offset});
+      read.SetFlags(MemoryFlags{.index = static_cast<uint32_t>(word)});
+      words[word] = Value(&read);
+    }
+    const auto handle = Value(&block->AppendNewInst(
+        ValueOpcode::GetBufferResource, {words[0], words[1], words[2], words[3]}));
+    // StoreBufferU32 takes one packed dword, also for two 16-bit components.
+    Value data = Value(42u);
+    if (opcode == ValueOpcode::StoreBufferU32x2)
+      data = Value(&block->AppendNewInst(ValueOpcode::CompositeConstructU32x2,
+                                        {Value(42u), Value(43u)}));
+    else if (opcode == ValueOpcode::StoreBufferU32x3)
+      data = Value(&block->AppendNewInst(ValueOpcode::CompositeConstructU32x3,
+                                        {Value(42u), Value(43u), Value(44u)}));
+    program.memory_info.push_back({.kind = ResourceKind::Buffer, .data_dwords = dwords,
+                                   .data_bits = bits, .component_count = components,
+                                   .formatted = true, .idxen = true, .coherent = true});
+    block->AppendNewInst(opcode,
+        {handle, lane, Value(0u), Value(0u), data, Value(true)})
+        .SetFlags(MemoryFlags{.index = static_cast<uint32_t>(program.memory_info.size() - 1u)});
+    ShaderComputeInputInfo compute{};
+    TrackResources(program, {}, {}, {.compute = &compute});
+    Check(program.info.buffers.size() == 1u && program.info.buffers[0].written,
+          "indirect formatted typed-IR store was not tracked as a write");
+    const auto plan = ExtractResourcePlan(program);
+    std::array<uint32_t, 8> descriptors{};
+    for (uint32_t row = 0; row < 2u; ++row) {
+      const auto first = row * 4u;
+      descriptors[first] = 0x1000u + row * 0x1000u;
+      descriptors[first + 1] = 16u << 16u;
+      descriptors[first + 2] = 16u;
+      descriptors[first + 3] = uint32_t(format) << 12u | swizzle;
+    }
+    const auto address = reinterpret_cast<uint64_t>(descriptors.data());
+    // The table V#: base (48 bits) with the 16-byte stride in word 1, two records, dst_sel.
+    const std::array<uint32_t, 16> user_data{static_cast<uint32_t>(address),
+        (static_cast<uint32_t>(address >> 32u) & 0xffffu) | (16u << 16u), 2u, 0x5204u};
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_specialization_memory = ReadHostTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "indirect formatted typed-IR store did not materialize");
+    ApplyResourceSpecialization(program, specialization);
+    ShaderRecompiler::TranslateResult translated;
+    translated.program = std::move(program);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data = user_data;
+    const auto compiled = CompileProgram(std::move(translated), options, specialization);
+    CheckSpirvBinaryValidates(compiled.spirv);
+  };
+  run(ValueOpcode::StoreBufferU32x3, 32u, 3u, 3u, F::k32_32_32_32Float,
+      Libs::Graphics::DstSel(4, 5, 6, 7));
+  run(ValueOpcode::StoreBufferU32, 16u, 2u, 1u, F::k16_16Float,
+      Libs::Graphics::DstSel(4, 5, 0, 1));
+  run(ValueOpcode::StoreBufferU32x2, 16u, 4u, 2u, F::k16_16_16_16Float,
+      Libs::Graphics::DstSel(4, 5, 6, 7));
+}
+
+void TestFiniteBufferDescriptorPhiAtomic() {
+  constexpr uint32_t no_offset_register = 125u << 25u;
+  constexpr uint32_t first_descriptor_offset = 16u;
+  constexpr uint32_t second_descriptor_offset = 32u;
+  constexpr uint32_t s_load_dwordx4_s20_from_s0 = EncodeSmem0(0x02, 20, 0);
+  constexpr uint32_t s4_descriptor = 4u / 4u;
+  constexpr uint32_t s20_descriptor = 20u / 4u;
+  constexpr uint32_t buffer_load_dword = 0x0c;
+  constexpr uint32_t buffer_atomic_add = 0x32;
+  constexpr uint32_t v_cmp_lt_u32_vcc_1_v1 = EncodeVopc(0xc1, 129, 1);
+  constexpr uint32_t s_cbranch_vccz_over_second_load = EncodeSopp(0x06, 2);
+  constexpr uint32_t op_atomic_iadd = 234u;
+  const uint32_t shader[] = {
+      s_load_dwordx4_s20_from_s0, no_offset_register | first_descriptor_offset,
+      EncodeMubuf0(buffer_load_dword, 0, false), EncodeMubuf1(1, s4_descriptor, 0),
+      v_cmp_lt_u32_vcc_1_v1,
+      s_cbranch_vccz_over_second_load,
+      s_load_dwordx4_s20_from_s0, no_offset_register | second_descriptor_offset,
+      EncodeMubuf0(buffer_atomic_add, 0, false), EncodeMubuf1(0, s20_descriptor, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> table{};
+  table[first_descriptor_offset / 4u] = 0x2000u;
+  table[first_descriptor_offset / 4u + 2u] = 4u;
+  table[second_descriptor_offset / 4u] = 0x3000u;
+  table[second_descriptor_offset / 4u + 2u] = 4u;
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  const std::array<uint32_t, 8> user_data{static_cast<uint32_t>(table_address),
+                                          static_cast<uint32_t>(table_address >> 32u), 0u, 0u,
+                                          0x4000u, 0u, 4u, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  for (const uint32_t second_stride : {0u, 4u}) {
+    table[second_descriptor_offset / 4u + 1u] = second_stride << 16u;
+    const auto result = RecompileForTest(shader, options);
+    const auto &buffers = result.program.info.buffers;
+    Check(!result.program.info.uses_dma && buffers.size() == 3u,
+          "finite Phi atomic did not bind both candidate buffers");
+    Check(std::ranges::count_if(buffers, [](const auto &buffer) { return buffer.atomic; }) == 2,
+          "a finite Phi candidate is not tracked as atomically written");
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto atomics = SpirvInstructionOpcodeCount(result.spirv, op_atomic_iadd);
+    Check(second_stride == 0u ? atomics >= 1u : atomics == 2u,
+          "finite Phi atomic does not act on the chosen buffer");
+  }
+}
+
 void TestCapturedBufferAtomicsX2() {
   using ShaderRecompiler::IR::ValueOpcode;
   struct Case {
@@ -14112,10 +14386,23 @@ void TestSpirvLoopIterationGuard() {
       EncodeSopp(0x02, 0xfffcu),   // continue/backedge
       EncodeSopp(0x01),
   };
-  const auto options = MakeCompileOptions(ShaderType::Compute);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.shader_hash = Spirv::LoopIterationShaderHash();
   const auto plain = RecompileForTest(shader, options).spirv;
   Spirv::SetLoopIterationLimitDefault(1000);
   const auto guarded = RecompileForTest(shader, options).spirv;
+  if (options.shader_hash != 0) {
+    // Another hash, compiled with and without the limit: the guard must leave it alone. (The
+    // hash itself may reach the module, so it is not compared with `plain`.)
+    auto other = options;
+    other.shader_hash ^= 1;
+    const auto other_limited = RecompileForTest(shader, other).spirv;
+    Spirv::SetLoopIterationLimitDefault(0);
+    const auto other_plain = RecompileForTest(shader, other).spirv;
+    Spirv::SetLoopIterationLimitDefault(1000);
+    Check(other_limited == other_plain,
+          "loop guard: unrelated shader changed when a single hash was selected");
+  }
   Spirv::SetLoopIterationLimitDefault(0);
   CheckSpirvBinaryValidates(plain);
   CheckSpirvBinaryValidates(guarded);
@@ -14134,11 +14421,290 @@ void TestSpirvLoopIterationGuard() {
         "loop guard: expected one counter, one ballot-guarded return per loop header");
 }
 
+void TestIndirectBufferRuntimeTableCompilesAndValidates() {
+  using F = Prospero::BufferFormat;
+  const auto make_desc = [](uint64_t base, uint32_t stride, uint32_t records, F fmt,
+                            uint32_t swizzle) {
+    return std::array<uint32_t, 4>{
+        static_cast<uint32_t>(base),
+        static_cast<uint32_t>((base >> 32u) & 0xffffu) | (stride << 16u),
+        records,
+        swizzle | (static_cast<uint32_t>(fmt) << 12u),
+    };
+  };
+
+  std::vector<uint32_t> shader{
+      EncodeVop3Word0(0x182, 4),
+      EncodeVop3Word1(256u + 0u, 0, 0),
+      EncodeSop2(0x0e, 4, 4, 255),
+      0x00001fffu,
+      EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x0a, 8, 0),
+      4u << 25u,
+      0xbf8cc07fu,
+      EncodeVop1(0x01, 6u, 128u + 0u),
+      EncodeVop2(0x25, 5u, 128u + 1u, 0u),
+      EncodeMubuf0(0x03, 0u, true),
+      EncodeMubuf1(1u, 2u, 5u),
+      EncodeVop2(0x25, 6u, 256u + 1u, 6u),
+      EncodeMubuf0(0x07, 0u, true),
+      EncodeMubuf1(6u, 2u, 5u),
+      EncodeSopp(0x01),
+  };
+
+  constexpr uint32_t kRows = ShaderRecompiler::IR::MaxIndirectBufferCandidates + 904u;
+  std::vector<std::array<uint32_t, 4>> table_rows(kRows);
+  // The 8-bit class exercises descriptor-free physical subword loads and stores.
+  const std::array<F, 4> formats{F::k8UInt, F::k32Float, F::k8_8_8_8UNorm,
+                                  F::k32_32_32_32Float};
+  const std::array<uint32_t, 4> strides{16u, 16u, 32u, 64u};
+  const std::array<uint32_t, 4> swizzles{DstSel(4, 0, 0, 1), DstSel(4, 0, 0, 1),
+                                         DstSel(4, 5, 6, 7), DstSel(4, 5, 6, 7)};
+  table_rows[0] = {0u, 0u, 0u, 0u};
+  for (uint32_t row = 1u; row < kRows; ++row) {
+    const uint32_t cls = row % 4u;
+    table_rows[row] = make_desc(0x1005000000ull + static_cast<uint64_t>(row) * 0x10000ull,
+                                strides[cls], 1024u, formats[cls], swizzles[cls]);
+  }
+  const auto table_addr = reinterpret_cast<uint64_t>(table_rows.data());
+  std::array<uint32_t, 4> user_data{
+      static_cast<uint32_t>(table_addr),
+      static_cast<uint32_t>((table_addr >> 32u) & 0xffffu) | (16u << 16u),
+      kRows,
+      0x00005204u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.shader_hash = 0u;
+  ShaderComputeInputInfo compute = *options.input_info.compute;
+  compute.thread_ids_num = 1u;
+  compute.threads_num[0] = 64u;
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+  ShaderRecompiler::IR::ResourceSnapshot snapshot;
+  ShaderRecompiler::IR::ResourceSpecialization specialization;
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data, .read_specialization_memory = ReadHostTestMemory};
+  Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization),
+        "runtime-table indirect buffer shader failed materialization");
+  Check(snapshot.indirect_buffer_tables.size() == 1u &&
+            snapshot.indirect_buffer_tables[0].entries.size() == kRows - 1u,
+        "runtime table did not capture every non-null buffer descriptor");
+  Check(specialization.buffers.size() == 5u,
+        "runtime table specialization must contain only root + four classes");
+
+  const auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
+                                                         specialization);
+  Check(compiled.program.info.uses_device_address,
+        "runtime-table indirect buffer shader must enable device addresses");
+  Check(compiled.program.bindings.descriptor_counts[static_cast<size_t>(
+            ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] == 0u,
+        "runtime-table indirect buffer shader must consume zero storage-buffer slots");
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+  tools.SetMessageConsumer([](spv_message_level_t, const char *,
+                              const spv_position_t &position, const char *message) {
+    std::fprintf(stderr, "runtime-table SPIR-V line %u: %s\n", position.line, message);
+  });
+  auto *context = spvContextCreate(SPV_ENV_VULKAN_1_3);
+  spv_diagnostic diagnostic = nullptr;
+  const auto validation = spvValidateBinary(context, compiled.spirv.data(), compiled.spirv.size(),
+                                            &diagnostic);
+  if (diagnostic != nullptr) {
+    std::fprintf(stderr, "runtime-table diagnostic index=%zu line=%zu column=%zu: %s\n",
+                 diagnostic->position.index, diagnostic->position.line,
+                 diagnostic->position.column, diagnostic->error);
+    const auto index = std::min(diagnostic->position.index, compiled.spirv.size());
+    std::fprintf(stderr, "runtime-table diagnostic words at %zu:", index);
+    for (size_t word = index; word < std::min(compiled.spirv.size(), index + 12u); ++word) {
+      std::fprintf(stderr, " %08x", compiled.spirv[word]);
+    }
+    std::fputc('\n', stderr);
+  }
+  spvDiagnosticDestroy(diagnostic);
+  spvContextDestroy(context);
+  Check(validation == SPV_SUCCESS,
+        "runtime-table indirect buffer shader failed Vulkan 1.3 validation");
+  Check(compiled.spirv.size() < 20'000u,
+        "runtime-table indirect buffer shader exceeded the compact word bound");
+  std::printf("TestIndirectBufferRuntimeTableCompilesAndValidates: entries=%zu classes=%zu words=%zu\n",
+              snapshot.indirect_buffer_tables[0].entries.size(),
+              specialization.buffers.size() - 1u, compiled.spirv.size());
+}
+
+// The shader store persists a program's ResourcePlan (reread every run to re-materialize
+// resources from live SRT state) and, per compiled module, its CompiledShaderInfo (what the
+// renderer drives descriptor/table setup from, ShaderModule::info in pipelineCache.h). Both
+// travel through the generic KYTY_IO_FIELDS field-by-field codec in ir/Serialize.h. This test
+// proves the bit-30 runtime-table mapping, the table's header-word position and its class
+// children survive both round trips unchanged, using the same 5000-row/four-class fixture as
+// TestIndirectBufferRuntimeTableCompilesAndValidates.
+void TestIndirectBufferRuntimeTableSurvivesStoreRoundTrip() {
+  using F = Prospero::BufferFormat;
+  const auto make_desc = [](uint64_t base, uint32_t stride, uint32_t records, F fmt,
+                            uint32_t swizzle) {
+    return std::array<uint32_t, 4>{
+        static_cast<uint32_t>(base),
+        static_cast<uint32_t>((base >> 32u) & 0xffffu) | (stride << 16u),
+        records,
+        swizzle | (static_cast<uint32_t>(fmt) << 12u),
+    };
+  };
+
+  std::vector<uint32_t> shader{
+      EncodeVop3Word0(0x182, 4),
+      EncodeVop3Word1(256u + 0u, 0, 0),
+      EncodeSop2(0x0e, 4, 4, 255),
+      0x00001fffu,
+      EncodeSop2(0x1e, 4, 4, 132),
+      EncodeSmem0(0x0a, 8, 0),
+      4u << 25u,
+      0xbf8cc07fu,
+      EncodeVop1(0x01, 6u, 128u + 0u),
+      EncodeVop2(0x25, 5u, 128u + 1u, 0u),
+      EncodeMubuf0(0x03, 0u, true),
+      EncodeMubuf1(1u, 2u, 5u),
+      EncodeVop2(0x25, 6u, 256u + 1u, 6u),
+      EncodeMubuf0(0x07, 0u, true),
+      EncodeMubuf1(6u, 2u, 5u),
+      EncodeSopp(0x01),
+  };
+
+  constexpr uint32_t kRows = ShaderRecompiler::IR::MaxIndirectBufferCandidates + 904u;
+  std::vector<std::array<uint32_t, 4>> table_rows(kRows);
+  const std::array<F, 4> formats{F::k8UInt, F::k32Float, F::k8_8_8_8UNorm,
+                                  F::k32_32_32_32Float};
+  const std::array<uint32_t, 4> strides{16u, 16u, 32u, 64u};
+  const std::array<uint32_t, 4> swizzles{DstSel(4, 0, 0, 1), DstSel(4, 0, 0, 1),
+                                         DstSel(4, 5, 6, 7), DstSel(4, 5, 6, 7)};
+  table_rows[0] = {0u, 0u, 0u, 0u};
+  for (uint32_t row = 1u; row < kRows; ++row) {
+    const uint32_t cls = row % 4u;
+    table_rows[row] = make_desc(0x1005000000ull + static_cast<uint64_t>(row) * 0x10000ull,
+                                strides[cls], 1024u, formats[cls], swizzles[cls]);
+  }
+  const auto table_addr = reinterpret_cast<uint64_t>(table_rows.data());
+  std::array<uint32_t, 4> user_data{
+      static_cast<uint32_t>(table_addr),
+      static_cast<uint32_t>((table_addr >> 32u) & 0xffffu) | (16u << 16u),
+      kRows,
+      0x00005204u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.shader_hash = 0u;
+  ShaderComputeInputInfo compute = *options.input_info.compute;
+  compute.thread_ids_num = 1u;
+  compute.threads_num[0] = 64u;
+  options.input_info.compute = &compute;
+  options.user_data = user_data;
+
+  auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  const auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+
+  // The on-disk record of a program (PipelineCache::ResolveStoredPlan reads it back through
+  // LoadResourcePlan every run before re-materializing). Round trip it through bytes.
+  const auto stored_plan_bytes = ShaderRecompiler::IR::SaveResourcePlan(plan);
+  ShaderRecompiler::IR::ResourcePlan loaded_plan;
+  Check(ShaderRecompiler::IR::LoadResourcePlan(stored_plan_bytes, loaded_plan),
+        "runtime-table resource plan failed to load back from the store bytes");
+  Check(plan.info == loaded_plan.info,
+        "runtime-table ShaderInfo (the bit-30 mapping_offset tag) did not survive the "
+        "resource-plan round trip");
+
+  const ShaderRecompiler::IR::SrtRuntime runtime{
+      .user_data = user_data, .read_specialization_memory = ReadHostTestMemory};
+  ShaderRecompiler::IR::ResourceSnapshot snapshot_live, snapshot_loaded;
+  ShaderRecompiler::IR::ResourceSpecialization specialization_live, specialization_loaded;
+  Check(ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot_live,
+                                                   specialization_live),
+        "runtime-table materialization from the live plan failed");
+  Check(ShaderRecompiler::IR::MaterializeResources(loaded_plan, runtime, snapshot_loaded,
+                                                   specialization_loaded),
+        "runtime-table materialization from the round-tripped plan failed");
+
+  Check(specialization_live.buffers == specialization_loaded.buffers,
+        "runtime-table specialization (root + class children) differs after the plan round trip");
+  Check(snapshot_live.indirect_buffer_tables.size() == 1u &&
+            snapshot_loaded.indirect_buffer_tables.size() == 1u,
+        "runtime table missing from a materialization");
+  const auto& live_table   = snapshot_live.indirect_buffer_tables[0];
+  const auto& loaded_table = snapshot_loaded.indirect_buffer_tables[0];
+  Check(live_table.root_resource == loaded_table.root_resource &&
+            live_table.header_word == loaded_table.header_word,
+        "runtime table root resource or header-word position differs after the plan round trip");
+  Check(live_table.entries == loaded_table.entries &&
+            live_table.class_index == loaded_table.class_index,
+        "runtime table class children differ after the plan round trip");
+
+  // The compiled module's CompiledShaderInfo, the other half of a shader-store record (the
+  // renderer's ShaderModule::info in pipelineCache.h): round trip it through the same field
+  // codec IoModule uses (pipelineSerialization.cpp).
+  auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
+                                                   specialization_live);
+  auto info = std::move(compiled.program).TakeCompiledInfo();
+  Check(info.info.uses_device_address,
+        "runtime-table indirect buffer shader must enable device addresses");
+  ShaderRecompiler::IR::Writer module_writer;
+  ShaderRecompiler::IR::IoAll(module_writer, info);
+  ShaderRecompiler::IR::Reader module_reader{module_writer.bytes};
+  ShaderRecompiler::IR::CompiledShaderInfo loaded_info;
+  ShaderRecompiler::IR::IoAll(module_reader, loaded_info);
+  Check(module_reader.ok && module_reader.bytes.empty(),
+        "compiled shader info failed to round trip through the module field codec");
+  Check(info.info == loaded_info.info,
+        "CompiledShaderInfo lost the runtime-table bit-30 mapping across the module round trip");
+
+  std::printf("TestIndirectBufferRuntimeTableSurvivesStoreRoundTrip: entries=%zu classes=%zu\n",
+              live_table.entries.size(), specialization_live.buffers.size() - 1u);
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char** argv) {
   using namespace Libs::Graphics;
+
+  for (int i = 1; i < argc; i++) {
+    const std::string arg = argv[i];
+    if (arg.rfind("--pass-bench", 0) == 0) {
+      g_pass_bench.enabled = true;
+      g_pass_bench.repeat = arg.size() > 12 && arg[12] == '='
+                                ? static_cast<unsigned>(std::atoi(arg.c_str() + 13))
+                                : 1u;
+    } else if (arg == "--pass-continue") {
+      g_continue_on_failure = true;
+    } else if (arg.rfind("--pass-baseline=", 0) == 0) {
+      g_pass_bench.baseline = arg.substr(16);
+    } else if (arg.rfind("--pass-dump=", 0) == 0) {
+      g_pass_bench.dump_dir = arg.substr(12);
+    }
+  }
+  if (g_pass_bench.enabled) {
+    ShaderRecompiler::SetPassTimingHook(PassBenchHook);
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "1");
+#else
+    setenv("KYTY_INDIRECT_FORMATTED_STORES", "1", 1);
+#endif
+    EnsureConfigInitialized();
+    TestIndirectFormattedStoreTypedIr();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--finite-buffer-descriptors-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_FINITE_BUFFER_DESCRIPTORS", "1");
+#else
+    setenv("KYTY_FINITE_BUFFER_DESCRIPTORS", "1", 1);
+#endif
+    EnsureConfigInitialized();
+    TestFiniteBufferDescriptorPhiAtomic();
+    return 0;
+  }
 
   EnsureConfigInitialized();
   // The fixtures measure the translator's own control flow and size; the loop guard has its own
@@ -14173,6 +14739,8 @@ int main() {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestIndirectBufferRuntimeTableCompilesAndValidates();
+  TestIndirectBufferRuntimeTableSurvivesStoreRoundTrip();
   TestNewShaderRecompilerFormattedStoreUsesRuntimeBindingSizeOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
@@ -14370,6 +14938,6 @@ int main() {
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 
-  return 0;
+  return PassBenchReport();
 }
 

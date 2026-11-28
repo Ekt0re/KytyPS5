@@ -2,9 +2,11 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/faultStats.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +17,7 @@
 
 namespace Libs::Graphics {
 
-class MemoryTracker final {
+class MemoryTracker final: public ShaderRecompiler::IR::MemoryChangeSource {
 public:
 	explicit MemoryTracker(PageManager& page_manager);
 	~MemoryTracker();
@@ -24,6 +26,8 @@ public:
 
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> Track(
+	    uint64_t address, uint64_t size, uint32_t max_pages) override;
 	void               MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	// Drops the write watch of the range's pages that hold no CPU- or GPU-modified data.
@@ -33,6 +37,13 @@ public:
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			// Pages another thread already released (or the storm rule holds open) need no lock:
+			// CPU-dirty and GPU-dirty never overlap, so there is nothing to flush or change.
+			if (Common::FaultStats::StormEnabled() &&
+			    manager->IsAllModified<DirtySource::Cpu>(offset, bytes)) {
+				Common::PerfSummary::Add(Common::PerfSummary::Counter::FaultFastSkips);
+				return;
+			}
 			const bool should_flush = [&] {
 				// Perform both the GPU modification check and CPU state change with the lock in
 				// case the GPU thread is racing to mark the page modified. If a flush is needed,
@@ -96,7 +107,8 @@ public:
 				return;
 			}
 			manager->lock.lock();
-			manager->ForEachModifiedRange<DirtySource::Cpu, true>(offset, bytes, range_func);
+			manager->ForEachModifiedRange<DirtySource::Cpu, true>(
+			    offset, bytes, range_func, !is_written && Common::FaultStats::StormEnabled());
 			if (!is_written) {
 				manager->lock.unlock();
 			}

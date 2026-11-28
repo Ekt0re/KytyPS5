@@ -6,6 +6,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
+#include "common/frameHoles.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
@@ -38,6 +39,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -434,6 +436,20 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 	return vs.es_regs.data_addr != 0;
 }
 
+static std::vector<uint64_t> CollectDrawTargetAddresses(const HW::Context& context) {
+	std::vector<uint64_t> addrs;
+	const uint32_t        mask = context.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; ++slot) {
+		if (((mask >> slot) & 1u) == 0u) continue;
+		const auto addr = context.GetRenderTarget(slot).base.addr;
+		if (addr != 0) addrs.push_back(addr);
+	}
+	const auto& depth = context.GetDepthRenderTarget();
+	const auto  zaddr = depth.z_write_base_addr != 0 ? depth.z_write_base_addr : depth.z_read_base_addr;
+	if (zaddr != 0) addrs.push_back(zaddr);
+	return addrs;
+}
+
 struct DrawCallInfo {
 	bool     indexed        = true;
 	uint32_t index_count    = 0;
@@ -441,6 +457,52 @@ struct DrawCallInfo {
 
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
+
+// Discovery retains the guest extent, but the attachment can be a view into a smaller cache image.
+// Bound the render pass to both the described image and the allocation that really backs it.
+static vk::Extent2D ClampToBacking(const Image& image, uint32_t base_level, vk::Extent2D extent,
+                                   uint64_t address, const char* kind) {
+	vk::Extent3D backing = image.info.extent;
+	if (image.backing.image != nullptr) {
+		backing.width  = std::min(backing.width, image.backing.extent.width);
+		backing.height = std::min(backing.height, image.backing.extent.height);
+	}
+	const auto available = ClampRenderArea(extent, backing, base_level);
+	if (available.width == extent.width && available.height == extent.height) {
+		return extent;
+	}
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		LOGF("Render target: %s 0x%016" PRIx64 " extent=%ux%u bounded to image=%ux%u level=%u\n",
+		     kind, address, extent.width, extent.height, available.width, available.height, base_level);
+	}
+	return available;
+}
+
+static uint32_t ClampLayersToBacking(const Image& image, const ImageViewInfo& view,
+                                     uint64_t address, const char* kind) {
+	const bool slice_view = image.backing.image_type == vk::ImageType::e3D &&
+	                        (view.type == vk::ImageViewType::e2D || view.type == vk::ImageViewType::e2DArray);
+	uint32_t available = slice_view ? std::max(image.info.extent.depth >> view.base_level, 1u)
+	                                : image.info.resources.layers;
+	if (image.backing.image != nullptr) {
+		const uint32_t allocated = slice_view
+		                               ? std::max(image.backing.extent.depth >> view.base_level, 1u)
+		                               : image.backing.layers;
+		available               = std::min(available, allocated);
+	}
+	const uint32_t clamped = ClampRenderLayers(view.base_layer, view.layer_count, available);
+	if (view.layer_count == clamped) {
+		return view.layer_count;
+	}
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1, std::memory_order_relaxed) < 32u) {
+		LOGF("Render target: %s 0x%016" PRIx64
+		     " layers=%u+%u bounded to image layers=%u\n",
+		     kind, address, view.base_layer, view.layer_count, available);
+	}
+	return clamped;
+}
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
@@ -471,10 +533,12 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle(), true);
-		const auto extent       = target.Extent();
-		state.width             = std::min(state.width, extent.width);
-		state.height            = std::min(state.height, extent.height);
-		state.num_layers        = std::min(state.num_layers, view.layer_count);
+		const auto extent = ClampToBacking(image, view.base_level, target.Extent(),
+		                                   target.desc.info.data.address, "color");
+		state.width       = std::min(state.width, extent.width);
+		state.height      = std::min(state.height, extent.height);
+		state.num_layers  = std::min(
+		    state.num_layers, ClampLayersToBacking(image, view, target.desc.info.data.address, "color"));
 		state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
 		auto& attachment            = state.color_attachments[target.target_slot];
 		attachment.image_view   = image_view;
@@ -484,6 +548,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
 		const auto  aspects    = depth.desc.view_info.aspect;
+		if (metadata.kind == ImageMetadataKind::Htile) {
+			cache.NoteMetaClearValue(metadata.range.address, depth.depth_clear_value,
+			                         depth.stencil_clear_value);
+		}
 		const bool meta_clear =
 		    metadata.kind == ImageMetadataKind::Htile &&
 		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
@@ -542,9 +610,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
 		                                     view.layer_count},
 		              buffer.Handle(), true);
-		state.width               = std::min(state.width, depth.desc.info.extent.width);
-		state.height              = std::min(state.height, depth.desc.info.extent.height);
-		state.num_layers          = std::min(state.num_layers, view.layer_count);
+		const auto depth_extent =
+		    ClampToBacking(image, view.base_level,
+		                   {depth.desc.info.extent.width, depth.desc.info.extent.height},
+		                   depth.desc.info.data.address, "depth");
+		state.width      = std::min(state.width, depth_extent.width);
+		state.height     = std::min(state.height, depth_extent.height);
+		state.num_layers = std::min(
+		    state.num_layers, ClampLayersToBacking(image, view, depth.desc.info.data.address, "depth"));
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
 		attachment.image_layout   = image.binding.attachment_host_layout;
@@ -843,6 +916,10 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
 	// Vertex programs the host cannot run are not compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::FailedShader,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return false;
 	}
 	// An empty screen scissor rasterizes nothing in any viewport, so only vertex-stage buffer
@@ -910,6 +987,11 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 
 	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), targets.depth, buffer, draw.index_count, 0);
+		// Enabled() first: the target list is only built when the report is on.
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NoTargets,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return false;
 	}
 
@@ -1075,6 +1157,28 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	if (CopyDepthToColor(buffer, draw, emit, state)) {
 		return;
 	}
+	// KYTY_SKIP_TAINT: an indirect draw whose records a skipped dispatch was to write reads stale
+	// counts; large counts can launch far more groups than the device supports. The draw writes
+	// nothing tracked, so nothing new becomes tainted.
+	if (SkipTaintEnabled() && !m_skip_taint.Empty() && emit.indirect.address != 0 &&
+	    emit.indirect.count != 0) {
+		const uint64_t record = draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                     : sizeof(vk::DrawIndirectCommand);
+		const uint64_t size =
+		    static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride + record;
+		const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count());
+		if (m_skip_taint.ReadsTainted({{emit.indirect.address, size, true, false}}, now)) {
+			static std::atomic<uint32_t> log_count {0};
+			if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("[skip] indirect draw reads records a skipped dispatch was to write; skipped "
+				     "(tainted ranges=%zu)\n",
+				     m_skip_taint.Size());
+			}
+			return;
+		}
+	}
 	const auto  vertex_stages = state.VertexStages();
 	const bool  mesh_active   = state.vertex_info[0].stage.module->info.stage == ShaderType::Mesh;
 	const bool  mesh_task     = state.vertex_info[0].stage.module->mesh_task;
@@ -1147,11 +1251,25 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
+	std::pair<Buffer*, uint64_t> count_buffer {};
 	if (emit.indirect.address != 0) {
-		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
-		                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
-		                                : sizeof(vk::DrawIndirectCommand));
-		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
+		const auto size = IndirectDrawRecordsSize(
+		    emit.indirect.count, emit.indirect.stride,
+		    draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+		                 : sizeof(vk::DrawIndirectCommand));
+		auto& buffer_cache = m_context.GetBufferCache();
+		if (emit.indirect.count_address != 0) {
+			EXIT_NOT_IMPLEMENTED(!m_context.GetGraphics().draw_indirect_count_enabled);
+			// Discover both ranges first so acquiring the second cannot merge and invalidate the first.
+			const auto args_id  = buffer_cache.FindBuffer(emit.indirect.address, size);
+			const auto count_id = buffer_cache.FindBuffer(emit.indirect.count_address, sizeof(uint32_t));
+			args_buffer  = buffer_cache.ObtainBuffer(emit.indirect.address, size, false, false, args_id);
+			count_buffer = buffer_cache.ObtainBuffer(emit.indirect.count_address, sizeof(uint32_t),
+			                                         false, false, count_id);
+			EXIT_IF((count_buffer.second & 3u) != 0);
+		} else {
+			args_buffer = buffer_cache.ObtainBuffer(emit.indirect.address, size, false);
+		}
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
 	vk::PipelineStageFlags shader_write_stages = {};
@@ -1175,8 +1293,45 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	const bool depth_writes =
 	    static_cast<bool>(m_targets.depth.image_id) &&
 	    static_cast<bool>(m_targets.depth.AttachmentWriteAspects());
-	const bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
-	                       (async_mode >= 2 || !depth_writes);
+	// state.deferrable (KYTY_DEFER_NEW_TARGETS, off by default) deliberately lets depth writers
+	// into targets not seen redrawn be skipped during a presented-frame stall in mode 1: an opt-in
+	// trade of possible depth/shadow holes for not stalling (see GetGraphicsPrograms).
+	bool skippable = async_mode != 0 && !full_screen && !shader_write_stages &&
+	                 (async_mode == 2 || !depth_writes || state.deferrable);
+	// Counted only for the draws the switch made skippable (depth writers in mode 1).
+	const bool deferred_by_switch = state.deferrable && depth_writes && async_mode != 2;
+	// KYTY_ASYNC_PIPELINES=3 (after simnJS e8d094827, "compile the pipelines of UI, layer and
+	// small draws without skipping them"): mode 1, but a draw the game may make only once into a
+	// cached layer is never skipped, since it would be lost for good: draws of pipelines of at
+	// most 12000 SPIR-V words in all (a few milliseconds of driver time), draws without depth test
+	// or write whose vertex stages total at most 8000 words (UI and 2D layers), draws whose color
+	// targets are all at most 1024 pixels wide and high (glyph atlases, cached layers), draws to a
+	// linear image (the CPU reads those back) and draws a guest occlusion query counts. A draw
+	// that finds its pipeline compiling waits up to 20 ms for it once before it is skipped.
+	if (skippable && async_mode == 3) {
+		const auto& dc           = buffer.GetRegisters().GetDepthControl();
+		size_t      vertex_words = 0;
+		for (const auto& stage: vertex_stages) {
+			if (stage.stage.module != nullptr) vertex_words += stage.stage.module->spirv_words;
+		}
+		const size_t pixel_words = state.ps_active && state.ps_input_info.stage.module != nullptr
+		                               ? state.ps_input_info.stage.module->spirv_words
+		                               : 0;
+		const bool depth_used = static_cast<bool>(m_targets.depth.image_id) &&
+		                        (dc.z_enable || dc.z_write_enable);
+		bool small_targets = m_targets.color_count != 0;
+		bool linear        = static_cast<bool>(m_targets.depth.image_id) &&
+		              !m_targets.depth.desc.info.IsTiled();
+		for (uint32_t i = 0; i < m_targets.color_count; i++) {
+			const auto& extent = m_targets.colors[i].desc.info.extent;
+			small_targets      = small_targets && extent.width <= 1024 && extent.height <= 1024;
+			linear             = linear || !m_targets.colors[i].desc.info.IsTiled();
+		}
+		if (vertex_words + pixel_words <= 12000 || (!depth_used && vertex_words <= 8000) ||
+		    small_targets || linear) {
+			skippable = false;
+		}
+	}
 	// A draw that waits may start with an unoptimized pipeline (KYTY_FAST_PIPELINES).
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets,
 	                                                                  false, !skippable);
@@ -1254,6 +1409,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	buffer.BeginRendering(rendering);
 	auto&         occlusion_queries = m_context.GetOcclusionQueries();
 	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
+	// KYTY_ASYNC_PIPELINES=3: a skipped draw would count no samples.
+	if (async_mode == 3 && occlusion_query >= 0) skippable = false;
 	const auto&    last_vertex = vertex_stages.back().stage;
 	const uint64_t vs_hash = last_vertex.module != nullptr ? last_vertex.module->info.shader_hash : 0;
 	const uint64_t ps_hash = state.ps_active && state.ps_input_info.stage.module != nullptr
@@ -1274,13 +1431,51 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		     draw.index_count, draw.instance_count, emit.indirect.count, mesh_groups,
 		     mesh_task ? 1 : 0, static_cast<uint32_t>(ucfg.GetPrimType()), m_targets.color_count,
 		     static_cast<bool>(m_targets.depth.image_id) ? 1 : 0);
+		// With KYTY_DUMP_CS_ADDR ranges: the resources of every vertex stage that binds one, to
+		// replay the stage offline on dumped buffers.
+		for (uint32_t i = 0; i < vertex_stages.size() && !ShaderTrace::WatchRanges().empty(); i++) {
+			const auto& sources = bindings.vertex[i].buffer_sources;
+			bool        hit     = false;
+			std::string ranges;
+			for (const auto& source: sources) {
+				hit = hit || ShaderTrace::Watched(source.address, source.size);
+				ranges += fmt::format(" {:x}+{:x}", source.address, source.size);
+			}
+			if (i == 0 && !mesh_active) {
+				const auto& input = state.vertex_info[0];
+				for (int v = 0; v < input.buffers_num; v++) {
+					const auto size = VertexBufferDescriptorSize(v, input);
+					hit = hit || (size != 0 && ShaderTrace::Watched(input.buffers[v].addr, size));
+					ranges += fmt::format(" vb{}={:x}+{:x}", v, input.buffers[v].addr, size);
+				}
+			}
+			const auto* res = vertex_stages[i].stage.resources;
+			if (!hit || res == nullptr) continue;
+			std::string text = fmt::format("TRACE-RES f={} stage={} hash=0x{:016x} idx_addr=0x{:x} idx_size={} "
+			                               "vertex_offset={} first_instance={}\nTRACE-RES B{}\nTRACE-RES U",
+			                               frame, i, vertex_stages[i].stage.module->info.shader_hash,
+			                               index_source.address, index_source.guest_element_size,
+			                               emit.vertex_offset, emit.first_instance, ranges);
+			for (auto u: res->user_data) text += fmt::format(" {:08x}", u);
+			text += "\nTRACE-RES F";
+			for (auto u: res->flattened_srt) text += fmt::format(" {:08x}", u);
+			for (size_t b = 0; b < res->buffers.size(); b++) {
+				text += fmt::format("\nTRACE-RES V {}", b);
+				for (uint32_t w = 0; w < res->buffers[b].dword_count; w++)
+					text += fmt::format(" {:08x}", res->buffers[b].dwords[w]);
+			}
+			LOGF("%s\n", text.c_str());
+		}
 	}
 	auto* const    graphics = &m_context.GetGraphics();
 	const auto record = [=, &occlusion_queries, primitive = ucfg.GetPrimType(),
 	                     args   = args_buffer.first != nullptr ? args_buffer.first->Handle()
 	                                                           : vk::Buffer {},
-	                     offset = args_buffer.second](vk::CommandBuffer command,
-	                                                  vk::Pipeline      handle) {
+	                     offset = args_buffer.second,
+	                     count  = count_buffer.first != nullptr ? count_buffer.first->Handle()
+	                                                          : vk::Buffer {},
+	                     count_offset = count_buffer.second](vk::CommandBuffer command,
+	                                                        vk::Pipeline      handle) {
 		command.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
 		const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'D', vs_hash, ps_hash);
 		if (mesh_task) {
@@ -1289,6 +1484,14 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			command.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 		} else if (!args) {
 			EmitDrawPrimitives(primitive, command, draw, emit);
+		} else if (count) {
+			if (draw.indexed) {
+				command.drawIndexedIndirectCount(args, offset, count, count_offset,
+				                                 emit.indirect.count, emit.indirect.stride);
+			} else {
+				command.drawIndirectCount(args, offset, count, count_offset, emit.indirect.count,
+				                          emit.indirect.stride);
+			}
 		} else if (draw.indexed) {
 			command.drawIndexedIndirect(args, offset, emit.indirect.count, emit.indirect.stride);
 		} else {
@@ -1297,15 +1500,22 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		GpuBreadcrumbs::End(*graphics, command, crumb);
 		occlusion_queries.End(command, occlusion_query);
 	};
+	if (!pipeline.pipeline && skippable && async_mode == 3) {
+		PipelineCache::GraceWait(pipeline, std::chrono::milliseconds {20});
+	}
 	if (pipeline.pipeline) {
 		record(vk_buffer, pipeline.pipeline);
 	} else {
 		m_context.GetCommandScheduler().Split(
-		    [record, skippable, &occlusion_queries, occlusion_query,
-		     pending = pipeline.Pending()](vk::CommandBuffer command) {
+		    [this, record, skippable, stall_deferrable = deferred_by_switch, &occlusion_queries,
+		     occlusion_query, pending = pipeline.Pending()](vk::CommandBuffer command) {
 			    if (skippable && !pending.Ready()) {
 				    occlusion_queries.End(command, occlusion_query);
 				    PipelineCache::NoteSkippedDraw();
+				    Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::PipelineBuilding);
+				    if (stall_deferrable) {
+					    m_context.GetPipelineCache().NoteDeferredNewTarget();
+				    }
 			    } else {
 				    record(command, pending.Get());
 			    }
@@ -1322,6 +1532,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	m_context.GetBufferCache().FlushIfRequested();
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:
@@ -1345,7 +1556,9 @@ static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        
 	if (indirect.address != 0) {
 		if (!vs.indirect_draw ||
 		    ucfg.GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy ||
-		    vs.indirect_offsets != indirect.offsets) {
+		    vs.indirect_offsets != indirect.offsets ||
+		    (indirect.count_address != 0 && vs.stage.module != nullptr &&
+		     vs.stage.module->info.stage == ShaderType::Mesh)) {
 			return std::nullopt;
 		}
 		return DrawEmitInfo {.indirect = indirect};
@@ -1367,6 +1580,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	auto& sh_ctx = buffer.GetShaders();
 
 	Common::LockGuard lock(m_context.GetMutex());
+	DrainSkippedDispatches(buffer);
 	if (args.index_count == 0 || (args.instance_count == 0 && args.indirect.address == 0)) {
 		return true;
 	}
@@ -1378,6 +1592,10 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return true;
 	}
 
@@ -1458,6 +1676,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	auto& sh_ctx = buffer.GetShaders();
 
 	Common::LockGuard lock(m_context.GetMutex());
+	DrainSkippedDispatches(buffer);
 	if (args.indirect.address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
 		return true;
 	}
@@ -1469,6 +1688,10 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		if (Common::FrameHoles::Enabled()) {
+			Common::FrameHoles::NoteDrawSkip(Common::FrameHoles::DrawSkipReason::NullShader,
+			                                 CollectDrawTargetAddresses(buffer.GetRegisters()));
+		}
 		return true;
 	}
 

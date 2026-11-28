@@ -22,6 +22,9 @@ namespace {
 
 namespace Pm4 = Libs::Graphics::Pm4;
 
+bool g_metadata_less   = false;
+bool g_expect_large   = true;
+
 TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 	static Common::Subsystems subsystems;
 	Common::InitializeThreads();
@@ -93,10 +96,28 @@ TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 		}
 	}
 
+	if (g_metadata_less) {
+		options.pro_enabled = true;
+		Config::Load(options);
+		{
+			std::ofstream file(path);
+			file << R"({"attribute3":0,)"
+			        R"("kernel":{"flexibleMemorySize":3221225472,"cpuPageTableSize":134217728,)"
+			        R"("gpuPageTableSize":0},"amm":{"pagetableMemorySizeInMib":96}})";
+			ASSERT_TRUE(file.good());
+		}
+		testing::internal::CaptureStdout();
+		Loader::SystemContentLoadParamSfo(path);
+		std::filesystem::remove(path);
+		EXPECT_FALSE(Loader::SystemContentIsTrinityMode());
+		EXPECT_EQ(testing::internal::GetCapturedStdout(),
+		          "[PS5] title Trinity support=no\n");
+	}
+
 	using namespace Libs::LibKernel::Memory;
 	subsystems.Initialize<Lifecycle>();
 	constexpr uint64_t mib = 1024 * 1024;
-	constexpr uint64_t backing = (12800 + 1216 - 64 - 96) * mib;
+	const uint64_t backing = (12800 + (g_expect_large ? 1216 : 0) - 64 - 96) * mib;
 	constexpr uint64_t flexible = 3072 * mib;
 	EXPECT_EQ(TestGuestBackingSize(), backing);
 	EXPECT_EQ(KernelGetDirectMemorySize(), backing - flexible);
@@ -122,7 +143,9 @@ TEST(Trinity, ModeQueriesPacketsAndMemoryAgree) {
 
 } // namespace
 
-int RunTrinityTests() {
+int RunTrinityTests(bool metadata_less, bool expect_large) {
+	g_metadata_less = metadata_less;
+	g_expect_large   = expect_large;
 	int argc = 1;
 	char name[] = "trinity_tests";
 	char* argv[] = {name, nullptr};

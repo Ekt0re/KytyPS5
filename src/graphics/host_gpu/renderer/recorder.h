@@ -7,7 +7,7 @@
 #include <cstdint>
 
 // Vulkan command recording and submission of the GPU thread on a thread of their own (on by
-// request: KYTY_RECORDER=1 turns it on). The recording part is ported from
+// by default: KYTY_RECORDER=0 turns it off). The recording part is ported from
 // batatinhafcbatatinha-pixel/KytyPS5 28a3ca930 and 833cbc96b, which ported it from AnyPS5
 // (glue/Recorder.cpp), both GPL-2.0. See recorder.cpp.
 namespace Libs::Graphics::Recorder {

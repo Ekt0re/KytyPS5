@@ -128,6 +128,25 @@ struct ReadbackPathInput {
 	bool fuse = false;
 };
 
+// KYTY_INPLACE_READBACK: a synchronous read may copy finished writes straight from a persistently
+// mapped device-local buffer. Keep the experiment bounded and never bypass an open producer.
+constexpr uint64_t MaxInPlaceReadback = 512 * 1024;
+
+struct InPlaceReadbackInput {
+	bool     enabled           = false;
+	bool     host_readable     = false;
+	uint64_t dirty_bytes       = 0;
+	bool     unsubmitted_write = false;
+	uint64_t write_tick        = 0;
+	uint64_t current_tick      = 0;
+};
+
+[[nodiscard]] constexpr bool CanReadInPlace(InPlaceReadbackInput input) noexcept {
+	return input.enabled && input.host_readable && input.dirty_bytes != 0 &&
+	       input.dirty_bytes <= MaxInPlaceReadback && !input.unsubmitted_write &&
+	       input.write_tick < input.current_tick;
+}
+
 [[nodiscard]] constexpr ReadbackPath ChooseReadbackPath(ReadbackPathInput input) noexcept {
 	if (!input.detached) {
 		// The producer is in the open command buffer: it has to be submitted first anyway.

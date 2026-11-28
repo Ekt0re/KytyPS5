@@ -155,7 +155,7 @@ void InstallFakes() {
 
 int main() {
 	InstallFakes();
-	setenv("KYTY_RECORDER", "1", 1); // off by default
+	setenv("KYTY_RECORDER", "1", 1);
 	Recorder::Install();
 	Expect(Recorder::Enabled(), "recorder installed");
 	auto& d = VULKAN_HPP_DEFAULT_DISPATCHER;

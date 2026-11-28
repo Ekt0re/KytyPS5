@@ -3,13 +3,28 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <string>
+
+namespace Common::FrameHoles {
+struct Snapshot;
+}
 
 // KYTY_PERF_SUMMARY=1: a work-based performance summary on stdout, one "PerfSummary ..." line
 // every 10 s (KYTY_PERF_SUMMARY=n: every n s, n >= 2) and one "PerfSummary total ..." line at exit.
 // It counts work per guest frame (flip) rather than frames per second, so that two builds can be
 // compared while other programs load the machine: CPU time and retired instructions of the GPU
 // command thread, and how often the expensive paths ran. Off, a counter costs one relaxed load.
+// KYTY_FRAME_COST=1 also prints one [frame] line per interval (5 s by default): presented frames
+// and the wall-time split into GPU wait, guest wait and resource materialisation, plus a one-shot
+// module-miss warning. It uses this same reporter, never a second thread. Off by default.
+// KYTY_FAULT_STATS=1 also prints [fault] rate lines from this same reporter (5 s by default):
+// write/read fault rates, handler/protection/lock-wait cost and the hottest 64 KiB blocks. The
+// fault-storm thresholds come from KYTY_FAULT_STORM_FAULTS/_FRAMES/_HOLD and are off by default.
+// KYTY_FRAME_HOLES=1 also prints one [frame-holes] line per incomplete frame from this same
+// reporter: skipped draws and dispatches by reason and the affected target addresses. The frame
+// number is the existing flip counter, never a second one. Off by default.
 namespace Common::PerfSummary {
 
 enum class Counter {
@@ -34,6 +49,12 @@ enum class Counter {
 	HeapLookups,    // Texture lookups those made.
 	HeapRangeSkips, // Lookups saved because the image set changed only at other addresses.
 	DepthRecreates, // Depth images replaced by one of another format, layout or binding kind.
+	DepthRecreateUs,   // Microseconds those replacements took on the GPU thread.
+	ImagesCreated,     // Cached images created (a Vulkan image each).
+	ImagesDestroyed,   // Cached images destroyed (their Vulkan image released at tick end).
+	ParkHits,          // Depth replacements that took a parked image back (no image created).
+	ParkMisses,        // Depth replacements with parking on that found no parked image of the shape.
+	ParkCapEvictions,  // Parked images destroyed because the pool was at its image or MiB cap.
 	ImageBarriers,     // Image memory barriers of cached images (Image::GetBarriers).
 	LayoutTransitions, // Those that change the layout.
 	// Synchronous buffer readbacks (BufferCache::ReadMemory on the GPU thread), per phase.
@@ -75,13 +96,123 @@ enum class Counter {
 	RbCqSubmits,      // Copy-queue submissions.
 	RbCqFenceUs,      // ... microseconds waiting for their fence (part of rb_path_cq_wait_us).
 	RbCqGpuBusy,      // Copy-queue downloads that found submitted graphics work unfinished.
+	// Zero-copy guest memory (KYTY_ZERO_COPY=1, BufferCache).
+	ZcResolveUs,  // Microseconds returning GPU-written zero-copy pages on a CPU fault (with waits).
+	ZcReleaseUs,  // ... returning them when their last write completed.
+	ZcFences,     // Read fences (one per buffer and tick).
+	ZcFenceSkips, // Binds that found this tick's fence already in place.
+	ZcFenceUs,    // Microseconds in read fences.
+	ZcReadWaits,  // CPU writes that waited for a GPU read in flight.
+	ZcWaitUs,     // ... their microseconds.
+	ZcWaitDrops,  // Buffers moved back to VRAM because the CPU kept waiting.
+	ZcStateKiB,   // KiB whose tracking state the zero-copy steps changed.
+	ZcOpenWaits,  // Read waits for the open tick (the GPU thread submits it, the writer waits).
+	ZcSaved,      // Read-backs zero-copy spared (GPU writes released in place, faults resolved).
+	// KYTY_FRAME_COST=1: wall-time split of a presented frame, printed by the existing reporter.
+	// Presented frames are Counter::Flips, which videoOut already counts; do not count them twice.
+	FrameWaitGpuUs,     // Microseconds waiting on the GPU (MasterSemaphore::Wait).
+	FrameWaitGuestUs,   // Microseconds the guest command thread waited on blocked queues.
+	FrameMaterializeUs, // Microseconds in IR resource materialisation.
+	FrameModuleLookups, // Shader-module lookups (Program::FindModule).
+	FrameModuleHits,    // Lookups that found a module.
+	FrameModuleMisses,  // Lookups that did not find one.
+	// KYTY_FAULT_STATS=1: cost and outcomes of the write-fault path. WriteFaults/ReadFaults above
+	// are counted at the existing RenderContext::HandleFault site and are not counted again here.
+	FaultHandlerUs,   // Microseconds in HandleFault (all paths).
+	FaultInvalidateUs, // ... in BufferCache::InvalidateMemory (part of the handler).
+	FaultProtectUs,   // ... in guest memory protection (part of the handler).
+	FaultLockWaitUs,  // ... waiting for a region tracking lock.
+	FaultFastSkips,   // Faults on already CPU-dirty pages: no lock was taken.
+	FaultStormMarked, // Pages the fault-storm rule marked as always dirty.
+	FaultStormKept,   // Marked pages kept unwatched this interval.
+	FaultStormExpired, // Marked pages that were re-armed this interval.
+	// KYTY_RECORDER=1: the recording thread (recorder.cpp).
+	RecRecords,  // Commands queued for it.
+	RecDrains,   // Waits until it replayed everything queued (any thread, mostly the GPU thread).
+	RecDrainUs,  // Their microseconds.
+	// Readbacks by origin (who asked): ReadMemory requests run on the GPU thread, synchronous
+	// downloads they made (one GPU wait each) and microseconds from recording to the end of the wait.
+	// guest = guest-thread faults and reads, srt = SRT walker loads, pm4 = other command-thread read
+	// faults (the PM4 parser), cmdwr = command-thread write faults, args = indirect dispatch/draw
+	// arguments, shader = command-thread backing reads (ReadGuestMemory, shader constants),
+	// tex = color metadata and image heap reads, other = unmaps and the rest.
+	RbOGuestCalls,
+	RbOGuestWaits,
+	RbOGuestWaitUs,
+	RbOSrtCalls,
+	RbOSrtWaits,
+	RbOSrtWaitUs,
+	RbOPm4Calls,
+	RbOPm4Waits,
+	RbOPm4WaitUs,
+	RbOCmdwrCalls,
+	RbOCmdwrWaits,
+	RbOCmdwrWaitUs,
+	RbOArgsCalls,
+	RbOArgsWaits,
+	RbOArgsWaitUs,
+	RbOShaderCalls,
+	RbOShaderWaits,
+	RbOShaderWaitUs,
+	RbOTexCalls,
+	RbOTexWaits,
+	RbOTexWaitUs,
+	RbOOtherCalls,
+	RbOOtherWaits,
+	RbOOtherWaitUs,
+	// KYTY_RB_TICK_WAIT / toggle rb_tick_wait and KYTY_RB_MIRROR / toggle rb_mirror (BufferCache,
+	// ported from TheCruZ KytyEmu d81455ac).
+	RbTickEarly,   // Copy-queue readbacks that waited for their writer's tick, older than the last submitted.
+	RbTickSkipped, // ... submitted ticks they did not wait for (sum).
+	RbHotNotes,    // Readbacks that flushed for a writer still being recorded (made its range hot).
+	RbHotFlushes,  // Submissions requested after an operation wrote hot ranges or mirrored lines.
+	RbMirrorHits,  // Reads answered from the readback mirror (no readback).
+	RbMirrorMisses, // Mirror reads that fell back to a readback.
+	RbMirrorWaitUs, // Microseconds mirror hits waited for the copy's tick.
+	RbMirrorCopies, // Mirror lines copied at the end of command buffers.
+	// KYTY_LOOKAHEAD=1|verify (toggle lookahead): resource walks resolved ahead of the command thread.
+	LaJobs,         // Draw and dispatch programs queued for a walk ahead.
+	LaResolved,     // Walks ahead that produced a resolution.
+	LaResolveFails, // Walks ahead that failed (unreadable memory, torn reads, failed walk).
+	LaResolveHeap,  // Walks ahead dropped because the walk needs the image heap or heap rows.
+	LaResolveUs,    // Microseconds the resolve thread spent walking.
+	LaDropped,      // Jobs and resolutions dropped unused (too old, table full).
+	LaLookups,      // Command-thread materializations of programs walked ahead.
+	LaHits,         // ... that used a resolution.
+	LaMissNone,     // ... that found no resolution for their inputs.
+	LaMissChanged,  // ... whose resolution read bytes that changed since.
+	LaMissGpu,      // ... whose resolution read bytes the GPU owns now.
+	LaMissUnread,   // ... whose resolution read bytes that cannot be read now.
+	LaRevalidateUs, // Microseconds of command-thread revalidation (hits and misses).
+	LaRevalidateBytes, // Bytes it compared.
+	LaVerified,     // KYTY_LOOKAHEAD=verify: hits walked inline again and compared.
+	LaVerifyMismatches, // ... whose resources or specialization differed.
+	Count
+};
+
+// Levels rather than counts: each summary line reports the highest level set in its interval
+// (the total line: in the whole run).
+enum class Gauge {
+	ParkedMiB, // Memory of the texture cache's parked images.
+	DeviceMiB, // Device-local memory the emulator uses (VK_EXT_memory_budget), at each suspend point.
 	Count
 };
 
 namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
+inline std::atomic<bool>     g_frame_holes {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
+inline std::atomic<uint64_t> g_gauge_peaks[static_cast<int>(Gauge::Count)] {};
 } // namespace Detail
+
+inline void SetGauge(Gauge gauge, uint64_t value) noexcept {
+	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
+		auto& peak = Detail::g_gauge_peaks[static_cast<int>(gauge)];
+		auto  seen = peak.load(std::memory_order_relaxed);
+		while (seen < value && !peak.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+		}
+	}
+}
 
 inline void Add(Counter counter, uint64_t value = 1) noexcept {
 	if (Detail::g_enabled.load(std::memory_order_relaxed)) {
@@ -92,6 +223,46 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 [[nodiscard]] inline bool Enabled() noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
 }
+
+// Presented frames, counted once in videoOut. Used to number completed frames for the hole line.
+[[nodiscard]] inline uint64_t Frames() noexcept {
+	return Detail::g_counters[static_cast<int>(Counter::Flips)].load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline bool FrameHolesEnabled() noexcept {
+	return Detail::g_frame_holes.load(std::memory_order_relaxed);
+}
+
+// A flip hands its completed frame's counts to the reporter; the queued lines are printed by the
+// reporter's existing writer at the next interval. Lines are bounded and dropped when full.
+void NoteFrameHolesFrame(uint64_t frame);
+
+namespace Detail {
+
+// Pure formatters for the [frame] line. They take interval totals (not per-frame values) so the
+// reporter and the unit test can share exactly the same arithmetic. The returned strings end in
+// a newline; `FormatFrameWarning` returns an empty string until the miss streak is long enough.
+std::string FormatFrameLine(double secs, uint64_t frames, uint64_t wait_gpu_us,
+                            uint64_t wait_guest_us, uint64_t materialize_us,
+                            uint64_t module_lookups, uint64_t module_hits,
+                            uint64_t module_misses);
+std::string FormatFrameWarning(uint64_t hits, uint64_t misses, double sustained_seconds);
+struct FaultBlock {
+	uint64_t address; // Aligned down to 64 KiB.
+	uint64_t count;
+};
+
+// Pure formatters shared by the reporter and the unit test. Values are interval totals; rates and
+// milliseconds per second are derived from `secs`. Returned strings end in a newline.
+std::string FormatFaultLine(double secs, uint64_t writes, uint64_t reads, uint64_t handler_us,
+                            uint64_t invalidate_us, uint64_t protect_us, uint64_t lock_wait_us,
+                            uint64_t fast_skips, uint64_t marked, uint64_t kept, uint64_t expired);
+std::string FormatFaultHotLine(const FaultBlock* blocks, size_t count, uint64_t dropped);
+
+// Pure formatter for the [frame-holes] line, shared by the reporter and the unit test.
+std::string FormatFrameHolesLine(uint64_t frame, const FrameHoles::Snapshot& snapshot);
+
+} // namespace Detail
 
 // Adds the microseconds of its lifetime to `counter` (no clock read while the summary is off).
 class ScopedMicros {
@@ -124,6 +295,9 @@ void Start();
 // Called once on the GPU command thread: its CPU time, instructions and context switches are
 // the per-frame cost the summary reports.
 void RegisterGpuThread();
+
+// Called once on the recording thread (KYTY_RECORDER=1): its CPU time is reported as rec_cpu_ms.
+void RegisterRecorderThread();
 
 } // namespace Common::PerfSummary
 

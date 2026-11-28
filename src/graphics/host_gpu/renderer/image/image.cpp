@@ -273,6 +273,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	m_scheduler.OrderDispatches();
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
@@ -780,6 +781,26 @@ uint64_t Image::HashGuestEdges() const {
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
 	ReleaseBacking();
+}
+
+void Image::ResetForReuse(const ImageInfo& image_info) {
+	EXIT_IF(registered || !stencil_ids.empty());
+	info                 = image_info;
+	serial               = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
+	usage                = {};
+	binding              = {};
+	track_addr           = 0;
+	track_addr_end       = 0;
+	depth_id             = {};
+	stencil_subresources = {0, info.resources.levels, 0, info.resources.layers};
+	tick_accessed_last   = 0;
+	lru_id               = 0;
+	heap_refs.store(0u, std::memory_order_relaxed);
+	m_maybe_cpu_hash  = 0;
+	m_cpu_dirty       = !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
+	m_maybe_cpu_dirty = false;
+	m_gpu_modified    = false;
+	m_buffer_modified = false;
 }
 
 void Image::ReleaseBacking() {

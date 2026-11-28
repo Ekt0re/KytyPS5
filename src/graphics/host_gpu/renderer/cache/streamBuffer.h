@@ -40,7 +40,8 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+	       bool host_readable = false);
 	// Zero-copy: a buffer over guest memory itself, imported from `host_pointer` (the backing
 	// alias of [cpu_address, cpu_address + size)) with VK_EXT_external_memory_host. GPU writes land
 	// in guest memory and CPU writes are visible to the GPU without uploads. Handle() is null when
@@ -62,6 +63,12 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	// A device-local buffer with a persistent host mapping (KYTY_INPLACE_READBACK).
+	[[nodiscard]] bool               IsHostReadable() const noexcept {
+		return m_usage == MemoryUsage::DeviceLocal && !m_mapped.empty();
+	}
+	// The caller has waited for the GPU writes it reads.
+	void ReadMapped(uint64_t offset, uint64_t size, void* destination) const;
 	[[nodiscard]] bool               IsZeroCopy() const noexcept { return m_zero_copy; }
 	[[nodiscard]] uint64_t           HostPointer() const noexcept { return m_host_pointer; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
@@ -97,12 +104,20 @@ public:
 	uint64_t last_write_tick    = 0;
 	// KYTY_RB_QUEUE_PROBE: the newest tick that bound this buffer for writing (statistics only).
 	uint64_t probe_write_tick   = 0;
+
+	// KYTY_INPLACE_READBACK: the newest tick that recorded a GPU write to this buffer.
+	uint64_t readback_write_tick = 0;
+
 	// Zero-copy: the tick whose completion already returns this buffer's pages to the CPU.
 	uint64_t release_tick       = 0;
 	// Zero-copy: the newest tick that records a GPU read of this buffer, and the tick whose
 	// completion already lifts the write protection that read put on its pages.
 	uint64_t last_read_tick     = 0;
 	uint64_t read_release_tick  = 0;
+	// Zero-copy: recent CPU writes that waited for its reads, as of its last read fence.
+	uint32_t read_waits         = 0;
+	// Zero-copy: recent read-backs it spared, as of its last read fence.
+	uint32_t read_saved         = 0;
 	// Zero-copy: LibKernel::Memory::BackingGeneration() when the import was last known valid.
 	uint64_t backing_generation = 0;
 

@@ -6508,6 +6508,95 @@ void TestBoundedFormattedBufferStore() {
                "finite store accepted an unproved induction or indexed byte offset");
 }
 
+void TestIndirectFormattedStoreTracking(bool enabled) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  struct Case {
+    ValueOpcode opcode;
+    uint32_t dwords;
+    uint32_t bits;
+    uint32_t components;
+    bool control;
+  };
+  const auto make = [&](Case test, bool indexed = true, uint32_t offset = 0u) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    auto* entry = f.block;
+    auto* header = f.AddBlock();
+    auto* body = f.AddBlock();
+    auto* latch = f.AddBlock();
+    auto* exit = f.AddBlock();
+    const auto branch = [](Block* from, Block* to) {
+      from->AddBranch(to);
+      from->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    branch(entry, header);
+    branch(body, latch);
+    branch(latch, header);
+    header->AddBranch(body);
+    header->AddBranch(exit);
+    header->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                         .true_block = body, .false_block = exit};
+    exit->terminator.kind = CFG::TerminatorKind::Return;
+    const auto count = f.UserData(4u);
+    auto& phi = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, f.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(1u)}, 0, latch));
+    header->condition = f.Emit(ValueOpcode::SLessThan32, {Value(&phi), count}, 0, header);
+    f.block = body;
+    std::array<Value, 4> table_words;
+    for (uint32_t word = 0; word < table_words.size(); ++word) table_words[word] = f.UserData(word);
+    const auto table = f.Buffer(table_words);
+    const auto key_offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&phi), Value(4u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word)
+      words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, key_offset},
+          f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
+                       .component_index = word, .component_count = 4u}, 0x40u + word * 4u));
+    Value data = test.bits == 16u ? Value(uint16_t{42u}) : Value(42u);
+    if (test.opcode == ValueOpcode::StoreBufferU32x2)
+      data = f.Emit(ValueOpcode::CompositeConstructU32x2, {Value(42u), Value(43u)});
+    else if (test.opcode == ValueOpcode::StoreBufferU32x3)
+      data = f.Emit(ValueOpcode::CompositeConstructU32x3, {Value(42u), Value(43u), Value(44u)});
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    f.Emit(test.opcode,
+        {f.Buffer(words), lane, Value(offset), Value(0u), data, Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer, .data_dwords = test.dwords,
+                     .data_bits = test.bits, .component_count = test.components,
+                     .formatted = true, .idxen = indexed, .coherent = true}, 0x80u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  const std::array positive{
+      Case{ValueOpcode::StoreBufferU32x3, 3u, 32u, 3u, false},
+      Case{ValueOpcode::StoreBufferU32x2, 2u, 32u, 2u, false},
+      Case{ValueOpcode::StoreBufferU32, 1u, 16u, 1u, false},
+      Case{ValueOpcode::StoreBufferU32, 1u, 16u, 2u, false},
+      Case{ValueOpcode::StoreBufferU32x2, 2u, 16u, 3u, false},
+      Case{ValueOpcode::StoreBufferU32x2, 2u, 16u, 4u, false},
+      Case{ValueOpcode::StoreBufferU32, 1u, 32u, 1u, true}};
+  for (const auto test : positive) {
+    if (enabled || test.control) {
+      auto fixture = make(test);
+      Check(fixture->program.info.buffers.size() == 1u &&
+                fixture->program.info.buffers[0].written,
+            "supported indirect formatted store was not tracked as a write");
+    } else {
+      CheckFatal([&] { make(test); }, "not a valid runtime value",
+                 "switch-off formatted store tracking changed legacy behavior");
+    }
+  }
+  if (!enabled) return;
+  for (const auto test : {Case{ValueOpcode::StoreBufferU8, 1u, 8u, 1u, false},
+                          Case{ValueOpcode::StoreBufferU32x2, 2u, 16u, 2u, false},
+                          Case{ValueOpcode::StoreBufferU32x3, 2u, 32u, 3u, false}})
+    CheckFatal([&] { make(test); }, "not a valid runtime value",
+               "unsupported formatted store shape was accepted");
+  CheckFatal([&] { make(positive.front(), false); }, "not a valid runtime value",
+             "non-indexed formatted table store was accepted");
+  CheckFatal([&] { make(positive.front(), true, 4u); }, "not a valid runtime value",
+             "formatted table store with a nonzero offset was accepted");
+}
+
 std::unique_ptr<Fixture> MakeBufferRecordFixture(uint32_t step = 1u, bool bypass = false,
                                                   bool gpu_selected = false, uint32_t bias = 0u,
                                                   bool split_offsets = false,
@@ -7767,6 +7856,301 @@ void TestGpuSelectedFormattedRecordStore() {
               indirect->key_count == Value(32u),
           "lane-varying or multiple-axis first incorrectly narrowed the finite descriptor domain");
   }
+}
+
+void TestFiniteBufferWritesOff() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture f;
+  auto* entry = f.block;
+  auto* alternate = f.AddBlock();
+  auto* merge = f.AddBlock();
+  entry->AddBranch(alternate);
+  entry->AddBranch(merge);
+  alternate->AddBranch(merge);
+  entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                       .true_block = alternate, .false_block = merge};
+  alternate->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+  merge->terminator.kind = CFG::TerminatorKind::Return;
+  std::array<Value, 4> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    phi.AddPhiOperand(entry, Value(0x1000u + word));
+    phi.AddPhiOperand(alternate, Value(0x3000u + word));
+    words[word] = Value(&phi);
+  }
+  f.block = merge;
+  f.Emit(ValueOpcode::BufferAtomicIAdd32,
+         {f.Buffer(words), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+         f.AddMemory({.kind = ResourceKind::Buffer}, 0x20u));
+  CheckFatal([&] { f.PlanAndTrack(); }, "not a valid runtime value",
+             "switch-off finite buffer planning changed legacy behavior");
+}
+
+void TestFiniteBufferRefusalShapeAndRollback() {
+  Fixture rejected;
+  const auto lane = rejected.Emit(ValueOpcode::LaneId);
+  const auto active = rejected.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+  const auto condition = rejected.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+  const auto selected = rejected.Emit(ValueOpcode::SelectU32,
+      {condition, rejected.UserData(0u), rejected.UserData(4u)});
+  const auto wrapped = rejected.Emit(ValueOpcode::IAdd32, {selected, rejected.UserData(8u)});
+  std::array<Value, 4> words{
+      rejected.Emit(ValueOpcode::ReadFirstLane, {wrapped, active}),
+      Value(16u << 16u), Value(1u), Value(0x4dfacu)};
+  rejected.Emit(ValueOpcode::BufferAtomicIAdd32,
+      {rejected.Buffer(words), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+      rejected.AddMemory({.kind = ResourceKind::Buffer}, 0x40u));
+  const auto values_before = rejected.program.value_storage.size();
+  const auto sources_before = rejected.program.descriptor_sources.size();
+  const auto buffers_before = rejected.program.info.buffers.size();
+  const auto instructions_before =
+      std::ranges::distance(rejected.program.blocks.front()->Instructions());
+  CheckFatal([&] { rejected.PlanAndTrack(); }, "bad_dword=0",
+             "finite buffer refusal did not identify the non-finite descriptor word");
+  Check(rejected.program.value_storage.size() == values_before &&
+            rejected.program.descriptor_sources.size() == sources_before &&
+            rejected.program.info.buffers.size() == buffers_before &&
+            std::ranges::distance(rejected.program.blocks.front()->Instructions()) == instructions_before,
+        "rejected finite descriptor enumeration partially mutated the IR");
+  {
+    Fixture valid;
+    const auto choose = valid.Emit(ValueOpcode::IEqual32, {valid.Emit(ValueOpcode::LaneId), Value(0u)});
+    std::array<Value, 4> descriptors;
+    for (uint32_t word = 0; word < descriptors.size(); ++word)
+      descriptors[word] = valid.Emit(ValueOpcode::SelectU32,
+          {choose, Value(0x1000u + word), Value(0x3000u + word)});
+    valid.Emit(ValueOpcode::BufferAtomicIAdd32,
+        {valid.Buffer(descriptors), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        valid.AddMemory({.kind = ResourceKind::Buffer}, 0x40u));
+    valid.PlanAndTrack();
+    Check(valid.program.info.buffers.size() == 1u,
+          "valid finite descriptor failed after a rejected scratch graph was destroyed");
+  }
+}
+
+void TestFiniteBufferAtomic() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto Build = [](Fixture& fixture, ValueOpcode atomic, Value data) {
+    auto* entry = fixture.block;
+    auto* reloaded = fixture.AddBlock();
+    auto* merge = fixture.AddBlock();
+    entry->AddBranch(reloaded);
+    entry->AddBranch(merge);
+    reloaded->AddBranch(merge);
+    std::array<Value, 8> descriptors;
+    for (uint32_t word = 0; word < descriptors.size(); ++word)
+      descriptors[word] = fixture.UserData(word);
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    entry->condition = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+    entry->terminator = {.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = reloaded, .false_block = merge};
+    reloaded->terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = merge};
+    merge->terminator.kind = CFG::TerminatorKind::Return;
+    fixture.block = merge;
+    std::array<Value, 4> chosen;
+    for (uint32_t word = 0; word < chosen.size(); ++word) {
+      auto& phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(entry, descriptors[word]);
+      phi.AddPhiOperand(reloaded, descriptors[word + 4u]);
+      chosen[word] = Value(&phi);
+    }
+    const auto handle = fixture.Buffer(chosen, 0x980);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(atomic, {handle, Value(0u), Value(0u), Value(0u), data, Value(true)},
+                 fixture.AddMemory(memory, 0x980));
+    return std::pair{handle, merge};
+  };
+  Fixture fixture;
+  auto* entry = fixture.block;
+  const auto [handle, merge] = Build(fixture, ValueOpcode::BufferAtomicIAdd32, Value(1u));
+  fixture.PlanAndTrack();
+  const auto& tracked = fixture.program.memory_info[0];
+  Check(tracked.kind == ResourceKind::Buffer &&
+            tracked.resource < fixture.program.info.buffers.size(),
+        "atomic on a Phi of two buffer descriptors was not bound as a buffer");
+  const auto root = tracked.resource;
+  const auto& finite = fixture.program
+      .descriptor_sources[fixture.program.info.buffers[root].source].indirect_descriptor;
+  Check(fixture.program.info.buffers[root].atomic && finite && finite->sources.size() == 2,
+        "finite buffer plan lost a descriptor or its atomic use");
+  const auto* selection = handle.Instruction()->Arg(0).TryInstruction();
+  Check(selection != nullptr && selection->GetOpcode() == ValueOpcode::GetBufferResourceIndex,
+        "finite buffer handle does not select its candidate");
+  const auto* key = selection->Arg(0).TryInstruction();
+  Check(key != nullptr && key->GetOpcode() == ValueOpcode::Phi && key->Parent() == merge &&
+            key->PhiBlock(0) == entry && key->PhiBlock(1) != entry &&
+            key->Arg(0).U32() == 0 && key->Arg(1).U32() == 1,
+        "finite buffer key does not follow the descriptor Phis");
+  const auto plan = ExtractResourcePlan(fixture.program);
+  const std::array<uint32_t, 8> user_data{0x1000, 16u << 16u, 1, 0x4dfac,
+                                          0x3000, 16u << 16u, 1, 0x4dfac};
+  TestMemory memory;
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite buffer descriptors could not materialize");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  const auto& candidates = fixture.program.info.buffers[root].indirect_resources;
+  Check(candidates.size() == 2 && std::ranges::max(candidates) < snapshot.buffers.size(),
+        "finite buffer specialization lost a candidate");
+  Check(snapshot.buffers[candidates[0]].dwords[0] == 0x1000 &&
+            snapshot.buffers[candidates[1]].dwords[0] == 0x3000,
+        "finite buffer candidates do not hold the two descriptors in key order");
+  Check(std::ranges::all_of(candidates, [&](uint32_t candidate) {
+          return fixture.program.info.buffers[candidate].atomic;
+        }),
+        "finite buffer candidate is not tracked as atomically written");
+
+  Fixture wide;
+  Build(wide, ValueOpcode::BufferAtomicIAdd64, Value(uint64_t{1}));
+  CheckFatal([&] { wide.PlanAndTrack(); }, "not a valid runtime value",
+             "finite buffer planning accepted a 64-bit atomic without candidate selection");
+}
+
+void TestFiniteBufferAtomicSelect() {
+  const auto build = [](Fixture& fixture, bool mismatched) {
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    auto condition = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      if (mismatched && word == 2u)
+        condition = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+      words[word] = fixture.Emit(ValueOpcode::SelectU32,
+          {condition, fixture.UserData(word), fixture.UserData(word + 4u)});
+    }
+    const auto handle = fixture.Buffer(words, 0x9a0);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        fixture.AddMemory(memory, 0x9a0));
+    return handle;
+  };
+  Fixture fixture;
+  const auto handle = build(fixture, false);
+  fixture.PlanAndTrack();
+  const auto root = fixture.program.memory_info[0].resource;
+  const auto& finite = fixture.program
+      .descriptor_sources[fixture.program.info.buffers[root].source].indirect_descriptor;
+  Check(finite && finite->sources.size() == 2,
+        "two-way select between two buffer descriptors was not planned as finite");
+  const auto* selection = handle.Instruction()->Arg(0).TryInstruction();
+  const auto* key = selection == nullptr ? nullptr : selection->Arg(0).TryInstruction();
+  Check(selection != nullptr && selection->GetOpcode() == ValueOpcode::GetBufferResourceIndex &&
+            key != nullptr && key->GetOpcode() == ValueOpcode::SelectU32 &&
+            key->Arg(0).TryInstruction() != nullptr &&
+            key->Arg(0).TryInstruction()->GetOpcode() == ValueOpcode::IEqual32 &&
+            key->Arg(1).U32() == 0 && key->Arg(2).U32() == 1,
+        "finite buffer key does not follow the descriptor selects");
+  const std::array<uint32_t, 8> user_data{0x1000, 16u << 16u, 1, 0x4dfac,
+                                          0x3000, 16u << 16u, 1, 0x4dfac};
+  TestMemory memory;
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(ExtractResourcePlan(fixture.program), runtime, snapshot,
+                             specialization),
+        "finite buffer descriptors behind a select could not materialize");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  const auto& candidates = fixture.program.info.buffers[root].indirect_resources;
+  Check(candidates.size() == 2 && snapshot.buffers[candidates[0]].dwords[0] == 0x1000 &&
+            snapshot.buffers[candidates[1]].dwords[0] == 0x3000,
+        "two-way select lost one of its descriptor candidates");
+
+  Fixture mismatched;
+  build(mismatched, true);
+  CheckFatal([&] { mismatched.PlanAndTrack(); },
+             "buffer descriptor is not a valid runtime value "
+             "(shape GetBufferResource->SelectU32->GetUserData",
+             "serial selects with different conditions were accepted as one finite descriptor");
+}
+
+void TestFiniteBufferAtomicNestedSelect() {
+  const auto build = [](Fixture& fixture, bool mismatched) {
+    const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto outer = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
+    const auto inner = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(1u)});
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      const auto condition = mismatched && word == 2u
+          ? fixture.Emit(ValueOpcode::IEqual32, {lane, Value(2u)}) : inner;
+      const auto first = fixture.Emit(ValueOpcode::SelectU32,
+          {condition, fixture.UserData(word * 2u), fixture.UserData(word * 2u + 1u)});
+      const auto second = fixture.Emit(ValueOpcode::SelectU32,
+          {condition, fixture.UserData(word * 2u + 8u), fixture.UserData(word * 2u + 9u)});
+      words[word] = fixture.Emit(ValueOpcode::SelectU32, {outer, first, second});
+    }
+    const auto handle = fixture.Buffer(words, 0x9c0);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::BufferAtomicIAdd32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        fixture.AddMemory(memory, 0x9c0));
+  };
+  Fixture fixture;
+  build(fixture, false);
+  fixture.PlanAndTrack();
+  const auto root = fixture.program.memory_info[0].resource;
+  const auto& finite = fixture.program
+      .descriptor_sources[fixture.program.info.buffers[root].source].indirect_descriptor;
+  Check(finite && finite->sources.size() == 4,
+        "select of selects with aligned inner conditions was not planned as finite");
+  Fixture mismatched;
+  build(mismatched, true);
+  CheckFatal([&] { mismatched.PlanAndTrack(); },
+             "buffer descriptor is not a valid runtime value "
+             "(shape GetBufferResource->SelectU32->SelectU32",
+             "serial selects with different inner conditions were merged");
+}
+
+void TestFiniteBufferBounds() {
+  const auto make = [](uint32_t selects, bool unique_candidates, uint32_t wrappers) {
+    auto fixture = std::make_unique<Fixture>();
+    auto& f = *fixture;
+    const auto lane = f.Emit(ValueOpcode::LaneId);
+    const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(16u)});
+    const auto predicate = f.Emit(ValueOpcode::ReadFirstLane, {lane, active});
+    std::vector<Value> conditions(selects + 1u);
+    for (uint32_t index = 1u; index <= selects; ++index)
+      conditions[index] = f.Emit(ValueOpcode::IEqual32, {predicate, Value(index)});
+    const auto descriptor = [](uint32_t index) {
+      const auto base = 0x1000u + index * 0x100u;
+      return std::array<Value, 4>{Value(base), Value(16u << 16u), Value(1u), Value(0x4dfacu)};
+    };
+    std::array<Value, 4> words = descriptor(0u);
+    for (uint32_t index = 1u; index <= selects; ++index) {
+      const auto candidate = descriptor(unique_candidates ? index : index & 1u);
+      for (uint32_t word = 0; word < words.size(); ++word)
+        words[word] = f.Emit(ValueOpcode::SelectU32,
+            {conditions[index], words[word], candidate[word]});
+    }
+    for (uint32_t index = 0; index < wrappers; ++index)
+      for (auto& word: words) word = f.Emit(ValueOpcode::IAdd32, {word, Value(0u)});
+    f.Emit(ValueOpcode::BufferAtomicIAdd32,
+        {f.Buffer(words), Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+        f.AddMemory({.kind = ResourceKind::Buffer}, 0x40u));
+    f.PlanAndTrack();
+    return fixture;
+  };
+  Check(make(63u, true, 0u)->program.info.buffers.size() == 1u,
+        "sixty-four finite buffer candidates were not accepted");
+  CheckFatal([&] { make(64u, true, 0u); }, "exceeded_candidates_bound(>64)",
+             "sixty-five finite buffer candidates were accepted");
+  Check(make(64u, false, 0u)->program.info.buffers.size() == 1u,
+        "sixty-four finite buffer choices were not accepted");
+  CheckFatal([&] { make(65u, false, 0u); }, "exceeded_choices_bound(>64)",
+             "sixty-five finite buffer choices were accepted");
+  Check(make(1u, true, 16u)->program.info.buffers.size() == 1u,
+        "finite buffer expression at depth sixteen was not accepted");
+  CheckFatal([&] { make(1u, true, 17u); }, "depth_limit",
+             "finite buffer expression beyond depth sixteen was accepted");
 }
 
 void TestFiniteBufferSelection() {
@@ -9984,7 +10368,7 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -9993,6 +10377,52 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-only") == 0) {
+#ifdef _WIN32
+      _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "1");
+#else
+      setenv("KYTY_INDIRECT_FORMATTED_STORES", "1", 1);
+#endif
+      Run("indirect formatted stores", [] { TestIndirectFormattedStoreTracking(true); });
+      std::cout << "indirect formatted store tracking tests passed\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-off-only") == 0) {
+#ifdef _WIN32
+      _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "0");
+#else
+      setenv("KYTY_INDIRECT_FORMATTED_STORES", "0", 1);
+#endif
+      Run("indirect formatted stores off", [] { TestIndirectFormattedStoreTracking(false); });
+      Run("legacy bounded formatted store", TestBoundedFormattedBufferStore);
+      std::cout << "indirect formatted store switch-off tests passed\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--finite-buffer-descriptors-only") == 0) {
+#ifdef _WIN32
+      _putenv_s("KYTY_FINITE_BUFFER_DESCRIPTORS", "1");
+#else
+      setenv("KYTY_FINITE_BUFFER_DESCRIPTORS", "1", 1);
+#endif
+      Run("finite buffer atomic", TestFiniteBufferAtomic);
+      Run("finite buffer select", TestFiniteBufferAtomicSelect);
+      Run("finite buffer nested select", TestFiniteBufferAtomicNestedSelect);
+      Run("finite buffer refusal", TestFiniteBufferRefusalShapeAndRollback);
+      Run("finite buffer bounds", TestFiniteBufferBounds);
+      std::cout << "finite buffer descriptor tests passed\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--finite-buffer-descriptors-off-only") == 0) {
+#ifdef _WIN32
+      _putenv_s("KYTY_FINITE_BUFFER_DESCRIPTORS", "0");
+#else
+      setenv("KYTY_FINITE_BUFFER_DESCRIPTORS", "0", 1);
+#endif
+      Run("finite buffer writes off", TestFiniteBufferWritesOff);
+      Run("legacy finite buffer selection", TestFiniteBufferSelection);
+      std::cout << "finite buffer descriptor switch-off tests passed\n";
+      return 0;
+    }
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
@@ -10032,6 +10462,7 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("writable descriptor phi", TestWritableDescriptorPhi);
     Run("bounded formatted buffer store", TestBoundedFormattedBufferStore);
+    Run("indirect formatted stores off", [] { TestIndirectFormattedStoreTracking(false); });
     Run("bounded buffer records", [] {
       for (const uint32_t components : {0u, 2u, 3u, 4u}) TestBoundedBufferRecords(components);
       TestGuardedWaterfallBufferRecords();
@@ -10042,6 +10473,7 @@ int main() {
     Run("packed material buffer store", TestPackedMaterialBufferStore);
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
+    Run("finite buffer writes off", TestFiniteBufferWritesOff);
     Run("guarded carried buffer key", TestGuardedCarriedBufferKey);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
     Run("conditional sampler phi", TestConditionalSamplerPhi);

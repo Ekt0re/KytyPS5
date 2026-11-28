@@ -15,9 +15,12 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_set>
@@ -89,6 +92,9 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// The DB clear values a depth target over the HTile range was last bound with: its pending
+	// clears read as them.
+	void NoteMetaClearValue(uint64_t address, float depth, uint8_t stencil);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -105,6 +111,7 @@ private:
 		std::bitset<8192> clear_mask;
 		// The depth image that last acquired this HTile range.
 		ImageId owner;
+		vk::ClearDepthStencilValue clear_value {};
 	};
 
 	struct OverlapResult {
@@ -136,6 +143,57 @@ private:
 	static_assert(sizeof(Bucket) == 64);
 
 	using ImagePageTable = MultiLevelPageTable<Bucket, 20, 44, 14>;
+
+	// Number of registered images covering each page. Written under m_lock, read without it: a
+	// write to pages no image covers has nothing to invalidate, so it need not take the lock.
+	// Leaves are allocated on first registration to keep the sparse 24-bit page space cheap.
+	class RegisteredPageCounts final {
+	public:
+		RegisteredPageCounts(): m_leaves(std::make_unique<std::atomic<Leaf*>[]>(kLeafCount)) {}
+		~RegisteredPageCounts() {
+			for (size_t i = 0; i < kLeafCount; i++) {
+				delete m_leaves[i].load(std::memory_order_relaxed);
+			}
+		}
+		KYTY_CLASS_NO_COPY(RegisteredPageCounts);
+
+		void Add(size_t page, int32_t delta) {
+			auto& slot = m_leaves[page >> kLeafBits];
+			auto* leaf = slot.load(std::memory_order_relaxed);
+			if (leaf == nullptr) {
+				leaf = new Leaf {};
+				slot.store(leaf, std::memory_order_release);
+			}
+			(*leaf)[page & (kLeafSize - 1)].fetch_add(static_cast<uint32_t>(delta),
+			                                          std::memory_order_release);
+		}
+
+		[[nodiscard]] bool Any(size_t first, size_t last_exclusive) const noexcept {
+			for (auto page = first; page < last_exclusive; page++) {
+				const auto* leaf = m_leaves[page >> kLeafBits].load(std::memory_order_acquire);
+				if (leaf == nullptr) {
+					// Skip to the next leaf.
+					page = ((page >> kLeafBits) + 1) * kLeafSize - 1;
+					continue;
+				}
+				if ((*leaf)[page & (kLeafSize - 1)].load(std::memory_order_acquire) != 0) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+	private:
+		static constexpr size_t kLeafBits  = 10;
+		static constexpr size_t kLeafSize  = size_t {1} << kLeafBits;
+		static constexpr size_t kLeafCount = ImagePageTable::kPageCount / kLeafSize;
+		using Leaf                         = std::array<std::atomic<uint32_t>, kLeafSize>;
+
+		std::unique_ptr<std::atomic<Leaf*>[]> m_leaves;
+	};
+	// Whether a page of the range has a registered image, without the lock (an image registers its
+	// pages before it is tracked). True when the page counts are switched off.
+	[[nodiscard]] bool MayHaveImages(uint64_t address, uint64_t size) const noexcept;
 
 	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
@@ -219,7 +277,32 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	// DeleteImage without the release of the slot: frees its stencil associations, drops its
+	// download and HTile ownership and unregisters it. Caller holds m_lock.
+	void                      DetachImage(ImageId id);
 	void                      FreeImage(ImageId id);
+	// Parked images (PS5, GTA VI's depth "repoint storm": ResolveDepthOverlap converts the same
+	// depth image between D16, D16S8 and R16 dozens of times a frame). With parking on, the image
+	// a depth conversion replaces is kept, detached and unregistered, instead of destroyed, and a
+	// later conversion to the same shape (SameParkedShape) takes it back instead of creating an
+	// image. Parked images are destroyed beyond the image or MiB cap (oldest first), after
+	// m_park_max_frames suspend points, when their memory is unmapped, when parking is switched
+	// off, and all at once when an image cannot be allocated. Callers hold m_lock.
+	struct ParkedImage {
+		ImageId  id;
+		uint64_t gc_tick = 0;
+		uint64_t bytes   = 0;
+	};
+	// Parks the image if parking is on and it qualifies, otherwise frees it.
+	void                  RetireImage(ImageId id);
+	[[nodiscard]] ImageId UnparkImage(const ImageInfo& info);
+	void                  DiscardParkedImage(const ParkedImage& parked);
+	// Discards the parked images over the range, or (size 0) those parked too long.
+	void                  DiscardParkedImages(uint64_t address, uint64_t size);
+	void                  DiscardAllParkedImages();
+	// Destroys every parked image now (after the GPU is done with them); false if none was.
+	[[nodiscard]] bool    ReleaseParkedImages();
+	[[nodiscard]] static bool SameParkedShape(const ImageInfo& parked, const ImageInfo& wanted);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);
 	void                      TrackImageHead(ImageId id);
@@ -232,6 +315,20 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	[[nodiscard]] static bool ParkImagesDefault() {
+		static const bool park = [] {
+			const char* value = std::getenv("KYTY_PARK_IMAGES");
+			return value == nullptr || value[0] != '0';
+		}();
+		return park;
+	}
+	[[nodiscard]] static uint64_t ParkEnvValue(const char* name, uint64_t fallback) {
+		const char* value = std::getenv(name);
+		if (value == nullptr || value[0] == '\0') {
+			return fallback;
+		}
+		return std::strtoull(value, nullptr, 10);
+	}
 	[[nodiscard]] static bool        ShareDepthStencilDefault() {
 		static const bool share = [] {
 			const char* value = std::getenv("KYTY_DEPTH_STENCIL_SHARE");
@@ -261,6 +358,9 @@ private:
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	// Caller holds m_lock. A fast-cleared depth image reads as cleared through any view, so the
+	// pending HTile clears of its slices are applied before it is sampled, stored to or copied.
+	void ApplyPendingMetaClears(ImageId id);
 	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
 	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
 	// render area.
@@ -275,6 +375,9 @@ private:
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
+	// False only for a valid range whose pages have no registered image. An invalid range keeps the
+	// original path so it still fails its usual validation.
+	[[nodiscard]] bool MayCoverImages(uint64_t address, uint64_t size) const noexcept;
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	[[nodiscard]] bool DownloadQueuedImages();
@@ -289,6 +392,7 @@ private:
 	ResolveCache&                                     m_resolve_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	RegisteredPageCounts                              m_registered_pages;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;
@@ -303,6 +407,19 @@ private:
 	// renders the depth aspect of the depth/stencil image at its address instead of replacing
 	// it with a depth-only image. With it on, the runtime toggle depth_split=1 turns it off again.
 	bool     m_share_depth_stencil     = ShareDepthStencilDefault();
+	// Keep images that depth conversions replace for reuse (see ParkedImage). On by default
+	// (world A/B pk_ab: depth conversion time -44 %, -6 % GPU-thread time per operation);
+	// KYTY_PARK_IMAGES=0 turns it off. Runtime toggles, re-read at each suspend point:
+	// park_off=1 turns it off, park_images=1 turns it on.
+	// KYTY_PARK_MAX (images, default 256), KYTY_PARK_MB (default 128) and KYTY_PARK_FRAMES
+	// (suspend points a parked image is kept, default 30) bound the pool.
+	bool                     m_park_images      = ParkImagesDefault();
+	uint64_t                 m_park_max_count   = ParkEnvValue("KYTY_PARK_MAX", 256);
+	uint64_t                 m_park_max_bytes   = ParkEnvValue("KYTY_PARK_MB", 128) << 20u;
+	uint64_t                 m_park_max_frames  = ParkEnvValue("KYTY_PARK_FRAMES", 30);
+	uint64_t                 m_parked_bytes     = 0;
+	uint64_t                 m_park_cap_hits    = 0;
+	std::vector<ParkedImage> m_parked_images; // Oldest first.
 	bool     m_readback_linear_images  = false;
 	bool     m_readback_tiled_images   = false;
 	bool     m_readback_storage_images = false;

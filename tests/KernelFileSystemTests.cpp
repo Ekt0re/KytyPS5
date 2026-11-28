@@ -1816,11 +1816,21 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   using WriteCounter = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint8_t, uint64_t,
                                            uint8_t, uint32_t);
   using WriteCounterOnCompletion = int (KYTY_SYSV_ABI *)(void *, uint8_t, uint32_t);
-  using MeasureWaitCounter = int (KYTY_SYSV_ABI *)(uint8_t, uint8_t, uint64_t, uint8_t,
-                                                  uint8_t, uint64_t, uint8_t);
-  using MeasureWriteCounter = int (KYTY_SYSV_ABI *)(uint8_t, uint8_t, uint64_t, uint8_t, uint32_t);
-  using MeasureWriteCounterOnCompletion = int (KYTY_SYSV_ABI *)(uint8_t, uint32_t);
+  using MeasureWaitCounter = uint64_t (KYTY_SYSV_ABI *)(uint8_t, uint8_t, uint64_t, uint8_t,
+                                                      uint8_t, uint64_t, uint8_t);
+  using MeasureWriteCounter = uint64_t (KYTY_SYSV_ABI *)(uint8_t, uint8_t, uint64_t, uint8_t);
+  using MeasureWriteCounterOnCompletion = uint64_t (KYTY_SYSV_ABI *)(uint8_t, uint32_t);
+  using MeasureWaitAddress = uint64_t (KYTY_SYSV_ABI *)(volatile uint64_t *, uint64_t,
+                                                       uint8_t, uint8_t);
+  using MeasureKernelEvent = uint64_t (KYTY_SYSV_ABI *)(uint64_t, uint64_t, uint64_t,
+                                                       uint64_t, uint64_t, uint64_t);
   using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
+  using WriteFromTime = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint32_t);
+  using WriteFromTimeCompletion = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *);
+  using WriteFromCounter = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint8_t, uint32_t);
+  using WriteFromCounterCompletion = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint8_t);
+  using MeasureFromTimeCompletion = uint64_t (KYTY_SYSV_ABI *)(volatile uint64_t *);
+  using MeasureFromCounterCompletion = uint64_t (KYTY_SYSV_ABI *)(volatile uint64_t *, uint8_t);
   using WriteImmediately = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
                                                uint32_t);
   using MeasureWriteAddress = uint64_t (KYTY_SYSV_ABI *)(volatile uint64_t *, uint64_t);
@@ -1828,12 +1838,33 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
                                                            uint32_t);
   using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
                                        void *, uint64_t, uint64_t);
+  using GetBufferBase = void *(KYTY_SYSV_ABI *)(void *);
+  using GetNumCommands = uint32_t (KYTY_SYSV_ABI *)(void *);
+  using GetSize = uint64_t (KYTY_SYSV_ABI *)(void *);
+  using AmmMap = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, int32_t, int32_t);
+  using AmmMapWithMask = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, int32_t, int32_t,
+                                               uint8_t);
+  using AmmMapDirect = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t, int32_t,
+                                             int32_t);
+  using AmmMapDirectWithMask = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t,
+                                                     int32_t, int32_t, uint8_t);
+  using AmmUnmap = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t);
+  using MeasureAmmMap = int64_t (KYTY_SYSV_ABI *)(uint64_t, uint64_t, int32_t, int32_t);
+  using MeasureAmmMapWithMask = int64_t (KYTY_SYSV_ABI *)(uint64_t, uint64_t, int32_t,
+                                                          int32_t, uint8_t);
+  using MeasureAmmMapDirect = int64_t (KYTY_SYSV_ABI *)(uint64_t, uint64_t, uint64_t,
+                                                        int32_t, int32_t);
+  using MeasureAmmMapDirectWithMask = int64_t (KYTY_SYSV_ABI *)(uint64_t, uint64_t, uint64_t,
+                                                                int32_t, int32_t, uint8_t);
+  using MeasureAmmUnmap = int64_t (KYTY_SYSV_ABI *)(uint64_t, uint64_t);
   using WriteKernelEvent = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint64_t,
                                                uint64_t, uint64_t);
   struct Result { int32_t result; uint32_t error_offset; };
   using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
   using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
   using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
+  using ResetCommandBuffer = int (KYTY_SYSV_ABI *)(void *);
+  using ClearCommandBuffer = void * (KYTY_SYSV_ABI *)(void *);
   const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
   const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
   const auto construct_amm = reinterpret_cast<Unary>(find("EDq5bqCqYpA"));
@@ -1849,16 +1880,56 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   const auto measure_write_counter = reinterpret_cast<MeasureWriteCounter>(find("I-Qm+MEso5c"));
   const auto measure_counter_on_completion =
       reinterpret_cast<MeasureWriteCounterOnCompletion>(find("4muPEJ-x5N8"));
+  const auto measure_wait_address = reinterpret_cast<MeasureWaitAddress>(find("0BMj1hgG+kE"));
+  const auto measure_kernel_event =
+      reinterpret_cast<MeasureKernelEvent>(find("sSAUCCU1dv4"));
   const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
+  const auto write_from_time = reinterpret_cast<WriteFromTime>(find("bt3LHR9xjK4"));
+  const auto write_from_time_completion =
+      reinterpret_cast<WriteFromTimeCompletion>(find("FI2JD0jAHCs"));
+  const auto write_from_counter = reinterpret_cast<WriteFromCounter>(find("t4ExS+SwLjs"));
+  const auto write_from_counter_completion =
+      reinterpret_cast<WriteFromCounterCompletion>(find("gSF5OsXdfIg"));
+  const auto write_from_counter_pair =
+      reinterpret_cast<WriteFromCounter>(find("enZm-6GjWqw"));
+  const auto write_from_counter_pair_completion =
+      reinterpret_cast<WriteFromCounterCompletion>(find("ZLWtNUP6R5E"));
+  const auto measure_from_time_completion =
+      reinterpret_cast<MeasureFromTimeCompletion>(find("x7SQEXfeovg"));
+  const auto measure_from_counter_completion =
+      reinterpret_cast<MeasureFromCounterCompletion>(find("32AcaTaBPSY"));
+  const auto measure_from_counter_pair_completion =
+      reinterpret_cast<MeasureFromCounterCompletion>(find("vxC58+DRk-U"));
   const auto write_immediately = reinterpret_cast<WriteImmediately>(find("j0+3uJMxYJY"));
   const auto measure_write_address = reinterpret_cast<MeasureWriteAddress>(find("C+IEj+BsAFM"));
   const auto measure_write_immediately = reinterpret_cast<MeasureWriteImmediately>(find("4fgtGfXDrFc"));
   const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
   const auto write_event = reinterpret_cast<WriteKernelEvent>(find("H896Pt-yB4I"));
   const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
+  const auto reset_command_buffer = reinterpret_cast<ResetCommandBuffer>(find("baQO9ez2gL4"));
+  const auto clear_command_buffer = reinterpret_cast<ClearCommandBuffer>(find("ULvXMDz56po"));
   const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
   const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
   const auto wait_amm = reinterpret_cast<WaitSubmission>(find("HXymib4T8gc"));
+  const auto get_buffer_base = reinterpret_cast<GetBufferBase>(find("RPCAhx-aabE"));
+  const auto get_num_commands = reinterpret_cast<GetNumCommands>(find("gzndltBEzWc"));
+  const auto get_size = reinterpret_cast<GetSize>(find("tZDDEo2tE5k"));
+  const auto amm_map = reinterpret_cast<AmmMap>(find("JEVYGhDc97M"));
+  const auto amm_map_with_mask = reinterpret_cast<AmmMapWithMask>(find("ojBkmG7+CgE"));
+  const auto amm_map_direct = reinterpret_cast<AmmMapDirect>(find("8TBE+9XCZbI"));
+  const auto amm_map_direct_with_mask =
+      reinterpret_cast<AmmMapDirectWithMask>(find("kOfZlhbVAkc"));
+  const auto amm_unmap = reinterpret_cast<AmmUnmap>(find("M-VFI2DJWQA"));
+  const auto measure_amm_map = reinterpret_cast<MeasureAmmMap>(find("6hbai6KIXkk"));
+  const auto measure_amm_map_with_mask =
+      reinterpret_cast<MeasureAmmMapWithMask>(find("m+fYyX8oFqw"));
+  const auto measure_amm_map_direct =
+      reinterpret_cast<MeasureAmmMapDirect>(find("ZFDZoN9IbVU"));
+  const auto measure_amm_map_direct_with_mask =
+      reinterpret_cast<MeasureAmmMapDirectWithMask>(find("KUjtdPZJo5I"));
+  const auto measure_amm_allocate =
+      reinterpret_cast<MeasureAmmMap>(find("2yYv9QWB3hU"));
+  const auto measure_amm_unmap = reinterpret_cast<MeasureAmmUnmap>(find("Ayg6PIon2wA"));
   struct Buffer {
     std::array<uint64_t, 5> header {};
     std::array<uint32_t, 256> data {};
@@ -1905,6 +1976,65 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
                 fence == literal.value,
             "bounded write preserves all sixty-four literal bits");
     }
+  }
+  struct WaitLiteral { uint64_t value; uint32_t size; };
+  constexpr std::array wait_literals {
+      WaitLiteral{0, 8}, WaitLiteral{1, 12}, WaitLiteral{UINT32_MAX, 12},
+      WaitLiteral{uint64_t{1} << 32, 16}};
+  for (const auto &literal : wait_literals) {
+    reset(1, literal.size);
+    auto *command_buffer = buffers[0].header.data();
+    uint64_t fence = ~literal.value;
+    Check(measure_wait_address(&fence, literal.value, 0, 0) == literal.size &&
+              wait_address(command_buffer, &fence, literal.value, 0, 0) == OK &&
+              offset(command_buffer) == literal.size,
+          "address wait fits exactly its measured command size");
+    Check(wait_address(command_buffer, &fence, literal.value, 0, 0) ==
+                  Libs::LibKernel::KERNEL_ERROR_EBUSY &&
+              offset(command_buffer) == literal.size,
+          "rejected address wait preserves the command buffer offset");
+  }
+  reset(1, 20);
+  auto *event_buffer = buffers[0].header.data();
+  constexpr uint64_t event_queue = 0x123456789abcull;
+  constexpr uint64_t event_data = 0xfedcba9876543210ull;
+  constexpr std::array<uint32_t, 5> event_words {
+      0x408u | static_cast<uint32_t>((event_queue >> 16u) & 0xffff0000ull),
+      static_cast<uint32_t>(event_queue), 0x12345678u,
+      static_cast<uint32_t>(event_data), static_cast<uint32_t>(event_data >> 32u)};
+  Check(measure_kernel_event(0, 0, 0, 0, 0, 0) == sizeof(event_words) &&
+            write_event(event_buffer, event_queue, 0x12345678, event_data, 0, 0) == OK &&
+            offset(event_buffer) == sizeof(event_words) &&
+            std::equal(event_words.begin(), event_words.end(), buffers[0].data.begin()),
+        "kernel event uses its packed twenty-byte record");
+  Check(write_event(event_buffer, event_queue, 0x12345678, event_data, 0, 0) ==
+                Libs::LibKernel::KERNEL_ERROR_EFAULT &&
+            offset(event_buffer) == sizeof(event_words),
+        "rejected kernel event preserves the command buffer offset");
+  reset(1, 16);
+  auto *time_buffer = buffers[0].header.data();
+  uint64_t time_fence = 1;
+  Check(measure_from_time_completion(&time_fence) == 8 &&
+            write_from_time(time_buffer, &time_fence, 0) == OK && offset(time_buffer) == 8 &&
+            write_from_time_completion(time_buffer, &time_fence) == OK &&
+            offset(time_buffer) == 16,
+        "time-counter address writes use eight-byte records");
+  for (const uint8_t index : std::array<uint8_t, 4> {0, 3, 4, 255}) {
+    const uint32_t size = index < 4 ? 8u : 12u;
+    reset(1, size * 3);
+    auto *command_buffer = buffers[0].header.data();
+    uint64_t fence = 1;
+    Check(measure_from_counter_completion(&fence, index) == size &&
+              measure_from_counter_pair_completion(&fence, index) == size &&
+              write_from_counter(command_buffer, &fence, index, 0) == OK &&
+              offset(command_buffer) == size &&
+              write_from_counter_completion(command_buffer, &fence, index) == OK &&
+              offset(command_buffer) == size * 2 &&
+              write_from_counter_pair_completion(command_buffer, &fence, index) == OK &&
+              offset(command_buffer) == size * 3 &&
+              write_from_counter_pair(command_buffer, &fence, index, 0) ==
+                  Libs::LibKernel::KERNEL_ERROR_EBUSY,
+          "counter-derived address writes use their measured record size");
   }
   reset(1, 24);
   auto *short_batch = buffers[0].header.data();
@@ -2000,7 +2130,11 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   };
   check_counter_size(wait_counter, measure_wait_counter, 7, 1, 0xff, 1, 0, 0, 0);
   check_counter_size(wait_counter, measure_wait_counter, 7, 1, 0x100, 1, 0, 0, 0);
-  check_counter_size(write_counter, measure_write_counter, 7, 1, 0xfff, 0, 0);
+  const auto counter_start = offset(counter_header);
+  Check(write_counter(counter_header, 7, 1, 0xfff, 0, 0) == OK &&
+            static_cast<int>(offset(counter_header) - counter_start) ==
+                measure_write_counter(7, 1, 0xfff, 0),
+        "counter write occupies its measured byte count");
   check_counter_size(write_counter_on_completion, measure_counter_on_completion, 7, 0x1000);
   Check(offset(counter_header) == sizeof(counter_words) &&
             std::equal(counter_words.begin(), counter_words.end(), counter_buffer.data.begin()),
@@ -2015,18 +2149,53 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
             offset(counter_header) == sizeof(counter_words),
         "counter write rejected inside an APR map");
   constexpr uint64_t wide = uint64_t{1} << 32;
-  constexpr int invalid_counter = Libs::LibKernel::KERNEL_ERROR_EINVAL;
+  constexpr uint64_t invalid_counter =
+      static_cast<uint32_t>(Libs::LibKernel::KERNEL_ERROR_EINVAL);
   Check(measure_wait_counter(7, 0, 0, 1, 1, 0xffff, 0) == 8 &&
             measure_wait_counter(7, 0, 0, 1, 1, 0x10000, 0) == 12 &&
             measure_wait_counter(7, 0, wide, 1, 1, wide, 0) == 20 &&
             measure_wait_counter(7, 0, wide, 1, 0, 0, 0) == 12 &&
-            measure_write_counter(7, 0, wide, 0, 0) == 12 &&
+            measure_wait_counter(7, 1, 0x10000, 1, 0, 0, 0) == 8 &&
+            measure_write_counter(7, 0, wide, 0) == 12 &&
+            measure_write_counter(7, 2, 0x10000, 0) == 8 &&
             measure_counter_on_completion(7, 0xfff) == 4,
         "counter measurements account for wide operands, masks and immediate boundaries");
   Check(measure_wait_counter(7, 1, 0, 7, 0, 0, 0) == invalid_counter &&
-            measure_write_counter(7, 1, 0, 5, 0) == invalid_counter &&
+            measure_write_counter(7, 1, 0, 5) == invalid_counter &&
             measure_counter_on_completion(128, 0) == invalid_counter,
-        "counter measurements return the signed error for invalid parameters");
+        "counter measurements return the error value for invalid parameters");
+  reset(1, 8);
+  auto *wide_wait = buffers[0].header.data();
+  Check(wait_counter(wide_wait, 7, 1, 0x10000, 1, 0, 0, 0) == OK &&
+            offset(wide_wait) == 8 &&
+            wait_counter(wide_wait, 7, 1, 0x10000, 1, 0, 0, 0) ==
+                Libs::LibKernel::KERNEL_ERROR_EBUSY &&
+            offset(wide_wait) == 8,
+        "seventeen-bit counter wait uses the eight-byte record");
+  constexpr uint64_t map_va = 0x100000;
+  constexpr uint64_t direct_offset = 0x200000;
+  constexpr uint32_t map_sizes[] = {12, 16, 16, 20, 12};
+  Check(measure_amm_map(map_va, 0x4000, 11, 3) == map_sizes[0] &&
+            measure_amm_map_with_mask(map_va, 0x4000, 11, 3, 1) == map_sizes[1] &&
+            measure_amm_map_direct(map_va, direct_offset, 0x4000, 11, 3) == map_sizes[2] &&
+            measure_amm_map_direct_with_mask(map_va, direct_offset, 0x4000, 11, 3, 1) ==
+                map_sizes[3] &&
+            measure_amm_allocate(map_va, 0x4000, 11, 3) == 16 &&
+            measure_amm_unmap(map_va, 0x4000) == map_sizes[4],
+        "AMM measurements use the native packed map record sizes");
+  reset(0, 76);
+  auto *amm_buffer = buffers[0].header.data();
+  Check(amm_map(amm_buffer, map_va, 0x4000, 11, 3) == OK && offset(amm_buffer) == 12 &&
+            amm_map_with_mask(amm_buffer, map_va, 0x4000, 11, 3, 1) == OK &&
+            offset(amm_buffer) == 28 &&
+            amm_map_direct(amm_buffer, map_va, direct_offset, 0x4000, 11, 3) == OK &&
+            offset(amm_buffer) == 44 &&
+            amm_map_direct_with_mask(amm_buffer, map_va, direct_offset, 0x4000, 11, 3, 1) == OK &&
+            offset(amm_buffer) == 64 && amm_unmap(amm_buffer, map_va, 0x4000) == OK &&
+            offset(amm_buffer) == 76 &&
+            amm_unmap(amm_buffer, map_va, 0x4000) == Libs::LibKernel::KERNEL_ERROR_EBUSY &&
+            offset(amm_buffer) == 76,
+        "AMM map commands fill exactly the packed record budget");
   constexpr std::array counter_comparisons {
       Comparison{1, 0, 0, 1}, Comparison{1, 0, 0, 1},
       Comparison{4, 0x7ffffffe, 0x7fffffff, 0x80000000},
@@ -2131,6 +2300,60 @@ void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
   std::atomic_ref(cpu_fence).store(1, std::memory_order_release);
   Check(wait_amm(ids[0]) == OK && amm_done == 1,
         "AMM observes an external CPU fence store without a submission notification");
+  std::array<std::array<uint32_t, 16>, 4> candidates {};
+  for (size_t round = 0; round < 16; ++round) {
+    Buffer header {};
+    construct(header.header.data());
+    Check(get_size(header.header.data()) == 0, "initialize concurrent command buffer header");
+    std::atomic<bool> start {false};
+    std::array<int, 4> results {};
+    std::array<std::thread, 4> threads;
+    for (size_t i = 0; i < threads.size(); ++i) {
+      threads[i] = std::thread([&, i] {
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        results[i] = set_buffer(header.header.data(), candidates[i].data(),
+                                sizeof(candidates[i]));
+      });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads) thread.join();
+    size_t winner = results.size();
+    for (size_t i = 0; i < results.size(); ++i) {
+      if (results[i] == OK) {
+        Check(winner == results.size(), "only one concurrent SetBuffer succeeds");
+        winner = i;
+      } else {
+        Check(results[i] == Libs::LibKernel::KERNEL_ERROR_EBUSY,
+              "losing concurrent SetBuffer reports EBUSY");
+      }
+    }
+    Check(winner != results.size() && get_size(header.header.data()) == sizeof(candidates[0]) &&
+              offset(header.header.data()) == 0 && get_num_commands(header.header.data()) == 0 &&
+              get_buffer_base(header.header.data()) == candidates[winner].data(),
+          "concurrent SetBuffer publishes one coherent header");
+    destroy(header.header.data());
+  }
+
+  // Lifecycle history is file-local; verify that recording it preserves the state machine the
+  // exports promise: append, submit, reset, append again and clear for reuse.
+  reset(1);
+  auto *life_cb     = buffers[0].header.data();
+  uint64_t life_fence = 0;
+  Result   life_result {1234, 5678};
+  uint32_t life_submission = 0;
+  Check(write_address(life_cb, &life_fence, 0x11) == OK && offset(life_cb) > 0,
+        "AMPR lifecycle: first append advances the offset");
+  Check(submit_apr(life_cb, 3, &life_result, &life_submission) == OK &&
+            wait_apr(life_submission) == OK,
+        "AMPR lifecycle: submit with history completes");
+  Check(reset_command_buffer(life_cb) == OK && offset(life_cb) == 0 &&
+            get_num_commands(life_cb) == 0,
+        "AMPR lifecycle: reset rewinds offset and command count");
+  Check(write_address(life_cb, &life_fence, 0x22) == OK && offset(life_cb) > 0,
+        "AMPR lifecycle: append after reset records the next event");
+  Check(clear_command_buffer(life_cb) == buffers[0].data.data() &&
+            set_buffer(life_cb, buffers[0].data.data(), sizeof(Buffer::data)) == OK,
+        "AMPR lifecycle: clear releases the buffer for reuse");
   for (auto &buffer : buffers) {
     destroy(buffer.header.data());
   }
@@ -3163,6 +3386,16 @@ int main(int argc, char** argv) {
     TestNpAuthEmulation();
     subsystems.Destroy();
     std::printf("KernelFileSystemTests: network cases passed\n");
+    return 0;
+  }
+
+  if (argc == 2 && std::string_view(argv[1]) == "--ampr-only") {
+    TempDirectory temporary;
+    FileSystem::Initialize();
+    CheckAprPaths(temporary.Path());
+    FileSystem::Shutdown();
+    subsystems.Destroy();
+    std::printf("KernelFileSystemTests: AMPR cases passed\n");
     return 0;
   }
 

@@ -4,6 +4,8 @@
 
 #include "common/alignment.h"
 #include "common/debugCounters.h"
+#include "common/memAccount.h"
+#include "common/faultStats.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -48,6 +50,7 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 	va_end(args);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	Common::MemAccount::PrintExit("page-manager-fatal");
 	std::_Exit(322);
 }
 
@@ -192,7 +195,10 @@ struct PageManager::Impl {
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::SyncProtectCalls,
 		                                         Common::DebugCounters::Counter::SyncProtectNs);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncProtectBytes, size);
-		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
+		const auto started = Common::FaultStats::NowNs();
+		const bool ok = Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode);
+		Common::FaultStats::NoteProtect(Common::FaultStats::NowNs() - started);
+		if (!ok) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
 		}

@@ -219,6 +219,7 @@ public:
 		ExcludeFromCoreDumps();
 #endif
 #endif
+		Common::MemAccount::NoteGuestBacking(m_size);
 	}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
@@ -474,6 +475,7 @@ public:
 			    std::memcpy(m_backing_base + offset, source + (start - vaddr), bytes);
 		    },
 		    [](uint64_t, uint64_t) {});
+		NoteContentChange(vaddr, size);
 	}
 
 	// Needs no lock: page entries are atomic and buckets live as long as the store.
@@ -511,6 +513,35 @@ public:
 			}
 		}
 		return false;
+	}
+
+	// Content writes and guest protection changes are tracked separately from page binding. A
+	// materialization stamp uses this to notice direct backing publications that bypass page faults.
+	void EnableContentTracking() noexcept {
+		m_content_tracking.store(true, std::memory_order_release);
+	}
+	[[nodiscard]] uint64_t ContentGeneration() const noexcept {
+		return m_content_generation.load(std::memory_order_acquire);
+	}
+	[[nodiscard]] bool ContentChangedSince(uint64_t generation, uint64_t vaddr,
+	                                       uint64_t size) const {
+		if (!m_content_tracking.load(std::memory_order_acquire)) return true;
+		std::lock_guard lock(m_content_changes_mutex);
+		const auto      now = m_content_generation.load(std::memory_order_acquire);
+		if (generation > now || now - generation >= m_content_changes.size()) return true;
+		for (auto g = generation + 1u; g <= now; ++g) {
+			const auto& change = m_content_changes[g % m_content_changes.size()];
+			if (change.generation != g || (change.start < vaddr + size && vaddr < change.end)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	void NoteContentChange(uint64_t vaddr, uint64_t size) {
+		if (size == 0 || !m_content_tracking.load(std::memory_order_acquire)) return;
+		std::lock_guard lock(m_content_changes_mutex);
+		const auto      generation = m_content_generation.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+		m_content_changes[generation % m_content_changes.size()] = {generation, vaddr, vaddr + size};
 	}
 
 	// The alias address of [vaddr, vaddr + size) when one contiguous backing run holds all of it,
@@ -960,6 +991,10 @@ private:
 	};
 	mutable std::mutex                                           m_changes_mutex;
 	std::array<PageChange, 1024>                                 m_changes {};
+	std::atomic<bool>                                            m_content_tracking {false};
+	std::atomic<uint64_t>                                        m_content_generation {1};
+	mutable std::mutex                                           m_content_changes_mutex;
+	std::array<PageChange, 1024>                                 m_content_changes {};
 };
 
 // Callers change it with the state lock held exclusively and query it under the operation lock or
@@ -1047,6 +1082,14 @@ public:
 	[[nodiscard]] bool     BackingChangedSince(uint64_t generation, uint64_t vaddr,
 	                                           uint64_t size) const {
 		return m_backing->ChangedSince(generation, vaddr, size);
+	}
+	void EnableBackingContentTracking() { m_backing->EnableContentTracking(); }
+	[[nodiscard]] uint64_t BackingContentGeneration() const {
+		return m_backing->ContentGeneration();
+	}
+	[[nodiscard]] bool BackingContentChangedSince(uint64_t generation, uint64_t vaddr,
+	                                              uint64_t size) const {
+		return m_backing->ContentChangedSince(generation, vaddr, size);
 	}
 
 	// See GuestBackingStore::ContiguousAlias; 0 also when a private mapping overlaps the range.
@@ -1316,6 +1359,7 @@ private:
 			if (!VirtualMemory::Protect(range_start, range_end - range_start, mode)) {
 				return false;
 			}
+			m_backing->NoteContentChange(range_start, range_end - range_start);
 		}
 		return true;
 	}
@@ -1352,14 +1396,35 @@ private:
 	}
 
 	[[nodiscard]] bool OverlapsPrivateUnlocked(uint64_t vaddr, uint64_t size) const {
+		// Backing-store writes and reads ask this for a few bytes at a time, mostly within the
+		// mapping they asked for last (labels, query results, WRITE_DATA): remember, per thread,
+		// the last shared mapping that held the whole range until the mappings change.
+		struct LastShared {
+			uint64_t    space      = 0;
+			uint64_t    generation = 0;
+			uint64_t    begin      = 0;
+			uint64_t    end        = 0;
+		};
+		thread_local LastShared last;
+		const auto generation = m_mapped_generation;
+		if (last.space == m_address_space_id && last.generation == generation && vaddr >= last.begin &&
+		    vaddr + size <= last.end) {
+			return false;
+		}
 		auto mapping = m_mapped.upper_bound(vaddr);
 		if (mapping != m_mapped.begin()) {
 			--mapping;
 		}
 		for (; mapping != m_mapped.end() && mapping->second.vaddr < vaddr + size; ++mapping) {
 			const auto& region = mapping->second;
-			if (region.type == MappingType::Private && region.vaddr + region.size > vaddr) {
+			if (region.vaddr + region.size <= vaddr) {
+				continue;
+			}
+			if (region.type == MappingType::Private) {
 				return true;
+			}
+			if (region.vaddr <= vaddr && vaddr + size <= region.vaddr + region.size) {
+				last = {m_address_space_id, generation, region.vaddr, region.vaddr + region.size};
 			}
 		}
 		return false;
@@ -1387,6 +1452,7 @@ private:
 	}
 
 	void AddMappedUnlocked(uint64_t vaddr, uint64_t size, MappingType type) {
+		++m_mapped_generation;
 		m_mapped.emplace(vaddr, MappedRegion {vaddr, size, type});
 	}
 
@@ -1399,6 +1465,7 @@ private:
 			const auto original_end = original.vaddr + original.size;
 			const auto part_end     = std::min(end, original_end);
 			m_mapped.erase(it);
+			++m_mapped_generation;
 			if (original.vaddr < current) {
 				AddMappedUnlocked(original.vaddr, current - original.vaddr, original.type);
 			}
@@ -1690,6 +1757,10 @@ private:
 
 	std::map<uint64_t, uint64_t>               m_free;
 	std::map<uint64_t, MappedRegion>            m_mapped;
+	// Advances on every change of m_mapped (under the exclusive lock; read under either).
+	uint64_t                                   m_mapped_generation = 0;
+	inline static std::atomic<uint64_t>        s_next_address_space_id {1};
+	const uint64_t m_address_space_id = s_next_address_space_id.fetch_add(1, std::memory_order_relaxed);
 	std::vector<std::pair<uint64_t, uint64_t>> m_owned;
 	uint64_t                                   m_granularity = 0x10000;
 	GuestBackingStore*                         m_backing     = nullptr;

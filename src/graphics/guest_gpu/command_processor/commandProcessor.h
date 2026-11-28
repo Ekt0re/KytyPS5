@@ -44,6 +44,17 @@ public:
 		return cursor.offset_dw < cursor.commands.size() ? cursor.commands.data() + cursor.offset_dw
 		                                                 : nullptr;
 	}
+	// Where the packet under the cursor sits, for the wait reporter (note: guest addresses).
+	void DiagnosticPacketLocation(uint64_t& buffer, uint32_t& offset_dw) const noexcept {
+		buffer    = 0;
+		offset_dw = 0;
+		if (m_buffer_stack.empty()) {
+			return;
+		}
+		const auto& cursor = m_buffer_stack.back();
+		buffer             = reinterpret_cast<uint64_t>(cursor.commands.data());
+		offset_dw          = cursor.offset_dw;
+	}
 
 private:
 	friend class CommandProcessor;
@@ -119,6 +130,11 @@ public:
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);
 	void MemSemaphore(uint64_t* counter, bool signal, bool write);
+	// For the stall reporter (waitDiagnostics.h); the queue slot follows the event id.
+	[[nodiscard]] uint32_t DiagnosticsSlot() const;
+	void NoteWaitPoll(const void* address, bool is64, uint32_t func, uint64_t ref, uint64_t mask,
+	                  uint64_t value);
+	void NoteLabelWrite(const void* address, uint64_t value, uint32_t size);
 	void WriteData(uint64_t dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void GetLodStats(volatile uint32_t* dst, uint32_t size, bool reset);
@@ -159,6 +175,11 @@ private:
 	// read only when a later draw inherits it.
 	uint32_t m_num_instances      = 1;
 	uint64_t m_num_instances_addr = 0;
+	// A GPU-counted multi-draw defers the count read until NUM_INSTANCES is inherited.
+	uint64_t m_num_instances_count_addr = 0;
+	uint64_t m_num_instances_args_addr  = 0;
+	uint32_t m_num_instances_max_count  = 0;
+	uint32_t m_num_instances_stride     = 0;
 
 	const int      m_interrupt_event_id;
 	const uint32_t m_flush_draws                 = Config::GetFlushDraws();

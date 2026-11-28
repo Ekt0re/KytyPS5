@@ -1,16 +1,30 @@
+#include "graphics/host_gpu/renderer/cache/hotReadbackTable.h"
 #include "graphics/host_gpu/renderer/cache/readbackBatch.h"
+#include "graphics/host_gpu/renderer/cache/recentGpuWrites.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 namespace {
 
+using Libs::Graphics::HotReadbackTable;
+using Libs::Graphics::HotReadbackTicks;
+using Libs::Graphics::MaxHotReadbackEntries;
+using Libs::Graphics::RecentGpuWriteCapacity;
+using Libs::Graphics::RecentGpuWriteRing;
+using Libs::Graphics::RecentWriteMaxBytes;
+using Libs::Graphics::TRACKER_PAGE_SIZE;
 using Libs::Graphics::ReadbackBatch::AccessWindow;
+using Libs::Graphics::ReadbackBatch::CanReadInPlace;
 using Libs::Graphics::ReadbackBatch::ChooseReadbackPath;
+using Libs::Graphics::ReadbackBatch::InPlaceReadbackInput;
+using Libs::Graphics::ReadbackBatch::MaxInPlaceReadback;
 using Libs::Graphics::ReadbackBatch::ReadbackPath;
 using Libs::Graphics::ReadbackBatch::NeighbourHistory;
 using Libs::Graphics::ReadbackBatch::Range;
@@ -130,7 +144,81 @@ void TestNeighbourHistory() {
 	Check(!history.Note(21 * Window, Window), "only the last 8 windows count");
 }
 
+void TestHotReadbackTable() {
+	HotReadbackTable table;
+	for (uint64_t i = 0; i < MaxHotReadbackEntries; ++i) {
+		table.Note(0x10000 + i * 0x4000, 0x4000, i + 10);
+	}
+	Check(table.Size() == MaxHotReadbackEntries, "hot table reaches its fixed cap");
+	table.Note(0x10000, 0x8000, 1000);
+	table.Note(0x9000000, 0x4000, 1001);
+	Check(table.Size() == MaxHotReadbackEntries, "a full hot table evicts instead of growing");
+	uint64_t tick = 0;
+	Check(table.TickOf(0x10000, tick) && tick == 1000, "hot refresh updates the existing entry");
+	Check(!table.TickOf(0x14000, tick), "the oldest entry was evicted");
+	size_t kept = 0;
+	table.ForEachHot(1001 + HotReadbackTicks, [&](uint64_t, uint64_t) { ++kept; });
+	Check(kept == 1 && table.Size() == 1, "hot entries expire after the tick window");
+}
+
+void TestRecentGpuWriteRing() {
+	RecentGpuWriteRing ring;
+	ring.Note(0x20000, 0, 1);
+	ring.Note(0x20000, RecentWriteMaxBytes + 1, 1);
+	Check(ring.Size() == 0, "empty and oversized writes stay out of the recent ring");
+	ring.Note(0x20100, 0x80, 5);
+	ring.Note(0x20100, 0x80, 7);
+	Check(ring.Size() == 1, "the newest duplicate refreshes its tick");
+	ring.Note(0x30000, 0x100, 12);
+	Check(ring.Size() == 2, "distinct recent writes are retained");
+	std::vector<std::tuple<uint64_t, uint64_t, bool>> seen;
+	ring.ForEachNewest(10, [&](uint64_t address, uint64_t size, bool finished) {
+		seen.emplace_back(address, size, finished);
+		return true;
+	});
+	Check(seen.size() == 2, "recent ring walks newest first");
+	Check(seen[0] == std::make_tuple(0x30000ull, TRACKER_PAGE_SIZE, false),
+	      "an unfinished write is marked and rounded to its page");
+	Check(seen[1] == std::make_tuple(0x20000ull, TRACKER_PAGE_SIZE, true),
+	      "a finished write is marked and rounded to its page");
+	for (uint64_t i = 0; i < RecentGpuWriteCapacity + 1; ++i) {
+		ring.Note(0x40000 + i * 0x1000, 0x100, i + 20);
+	}
+	Check(ring.Size() == RecentGpuWriteCapacity, "recent ring wraps at its fixed capacity");
+}
+
 } // namespace
+
+void TestInPlaceReadbackPath() {
+	const InPlaceReadbackInput ready {.enabled           = true,
+	                                  .host_readable     = true,
+	                                  .dirty_bytes       = 64 * KiB,
+	                                  .write_tick        = 2,
+	                                  .current_tick      = 3};
+	Check(CanReadInPlace(ready), "finished writes in a mapped buffer can be read in place");
+	Check(!CanReadInPlace({}), "in-place readback defaults off");
+	Check(!CanReadInPlace({.host_readable = true, .dirty_bytes = 1, .current_tick = 1}),
+	      "the feature switch is required");
+	Check(!CanReadInPlace({.enabled = true, .dirty_bytes = 1, .current_tick = 1}),
+	      "an unmappable buffer uses the copy path");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .current_tick = 1}),
+	      "a clean range needs no readback");
+	Check(CanReadInPlace({.enabled = true, .host_readable = true,
+	                      .dirty_bytes = MaxInPlaceReadback, .current_tick = 1}),
+	      "the in-place byte cap is inclusive");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true,
+	                       .dirty_bytes = MaxInPlaceReadback + 1, .current_tick = 1}),
+	      "an oversized read uses the copy path");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .dirty_bytes = 1,
+	                       .unsubmitted_write = true, .current_tick = 1}),
+	      "an open producer is never bypassed");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .dirty_bytes = 1,
+	                       .write_tick = 1, .current_tick = 1}),
+	      "the current tick is not submitted");
+	Check(!CanReadInPlace({.enabled = true, .host_readable = true, .dirty_bytes = 1,
+	                       .write_tick = 2, .current_tick = 1}),
+	      "a future write tick is rejected");
+}
 
 void TestReadbackPath() {
 	// detached, copy_queue, fuse
@@ -150,6 +238,7 @@ void TestReadbackPath() {
 }
 
 int main() {
+	TestInPlaceReadbackPath();
 	TestReadbackPath();
 	TestAccessWindow();
 	TestSplitOneBuffer();
@@ -157,6 +246,8 @@ int main() {
 	TestSplitUnalignedBuffers();
 	TestSplitEmptyFirst();
 	TestNeighbourHistory();
+	TestHotReadbackTable();
+	TestRecentGpuWriteRing();
 	std::printf("ReadbackBatchTests: all passed\n");
 	return 0;
 }

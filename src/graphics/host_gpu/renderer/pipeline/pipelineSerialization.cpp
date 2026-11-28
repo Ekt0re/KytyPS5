@@ -1,10 +1,12 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "common/faultReport.h"
 #include "common/logging/log.h"
 #include "common/parallelFor.h"
 #include "common/shaderCompileStatus.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreFailureCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/Serialize.h"
@@ -22,9 +24,11 @@
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
+#include <utility>
 #include <xxhash.h>
 #include <zstd.h>
 
@@ -49,7 +53,7 @@ using ShaderRecompiler::IR::IoAll;
 using ShaderRecompiler::IR::Reader;
 using ShaderRecompiler::IR::Writer;
 
-enum class Record : uint8_t { Module, GraphicsPipeline, TessellationLayout };
+enum class Record : uint8_t { Module, GraphicsPipeline, TessellationLayout, FailedProgram };
 
 // Precedes each record's zstd frame.
 struct Frame {
@@ -98,8 +102,10 @@ uint64_t BuildStamp() {
 //   - the module id formula (PipelineCache::CompileModule, ReplayRecipe);
 //   - what a translation is given (the CompileOptions of PipelineCache::GetProgramImpl and of the
 //     translations ahead, SpirvProfile's meaning for the same bytes).
-// Version 1 leaves the header as it was before the constant existed.
-constexpr uint64_t StoreFormatVersion = 1;
+// Version 1 leaves the header as it was before the constant existed. Version 2 adds the negative
+// FailedProgram record to the record stream; translator capability generations travel inside that
+// record and do not change the header again.
+constexpr uint64_t StoreFormatVersion = 2;
 
 static_assert(sizeof(PipelineStaticParameters) == 118 && sizeof(PipelineRenderingState) == 44 &&
                   sizeof(PipelineVertexInputState) == 354 && sizeof(GraphicsPipelineKey) == 548 &&
@@ -132,6 +138,14 @@ uint64_t CodegenSwitches() {
 	if (env("KYTY_EXEC_SELECTS")[0] == '0' || env("KYTY_EXEC_SELECT_ELIM")[0] == '0') {
 		switches |= 8u;
 	}
+	// IndirectFormattedStoresEnabled (ShaderIR.h).
+	if (ShaderRecompiler::IR::IndirectFormattedStoresEnabled()) switches |= 32u;
+	// FiniteBufferDescriptorsEnabled (ShaderIR.h).
+	if (ShaderRecompiler::IR::FiniteBufferDescriptorsEnabled()) switches |= uint64_t {1} << 32u;
+	// F16PackNativeEnabled (ShaderIR.h).
+	if (ShaderRecompiler::IR::F16PackNativeEnabled()) switches |= 16u;
+	// GraphicContext::ComputeWave64HalvesForced.
+	if (env("KYTY_COMPUTE_WAVE64_HALVES")[0] == '1') switches |= 32u;
 	return switches;
 }
 
@@ -146,6 +160,7 @@ uint64_t CodegenSwitchKey() {
 	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
 		constexpr uint64_t LoopLimitStamp = 0x6c6f6f706c696d00ull;
 		key ^= LoopLimitStamp ^ (uint64_t {limit} * 0xff51afd7ed558ccdull);
+		key ^= ShaderRecompiler::Spirv::LoopIterationShaderHash() * 0xc2b2ae3d27d4eb4full;
 	}
 	return key;
 }
@@ -174,7 +189,7 @@ template <class S, class Module> void IoModule(S& io, Module& stage) {
 	// The handle and the SPIR-V report fields come from the SPIR-V; stored programs have no
 	// function code.
 	auto& [id, handle, info, specialization, function_code, rect_parameters, mesh_task, spirv_words,
-	       spirv, stored] = stage;
+	       spirv, stored, specialization_hash, function_code_hash] = stage;
 	IoAll(io, id, info, specialization, rect_parameters, mesh_task);
 }
 
@@ -189,6 +204,9 @@ std::string ShaderStoreVariant() {
 	if (const auto limit = ShaderRecompiler::Spirv::LoopIterationLimit();
 	    limit != ShaderRecompiler::Spirv::DefaultLoopIterationLimit) {
 		variant += fmt::format("-loop{}", limit);
+		if (const auto shader = ShaderRecompiler::Spirv::LoopIterationShaderHash(); shader != 0) {
+			variant += fmt::format("-{:016x}", shader);
+		}
 	}
 	return variant;
 }
@@ -212,6 +230,8 @@ bool ShaderStoreWriter::Open(const std::filesystem::path& path, std::span<const 
 
 ShaderStoreWriter::ShaderStoreWriter() {
 	m_thread = std::jthread([this](std::stop_token stop) {
+		Common::FaultReport::SetThreadTag("store write", "store-writer");
+		Common::FaultReport::RegisterThreadStack();
 		std::unique_lock lock(m_mutex);
 		// Once stop is requested the wait returns false only when the queue is empty.
 		while (m_ready.wait(lock, stop, [this] { return !m_jobs.empty(); })) {
@@ -257,6 +277,24 @@ bool PrecompileMode() {
 	return g_precompile_mode.load(std::memory_order_relaxed);
 }
 
+// KYTY_PRECOMPILE_SHARD=<i>/<n> (measuring driver throughput across processes, after simnJS
+// 78959548d's helper processes): a precompile creates only the stored pipelines whose module id
+// (compute) or key hash (graphics) is i modulo n, and runs without writing the store, so n
+// precompiles of one store can run at once. {0, 1} otherwise.
+std::pair<uint64_t, uint64_t> PrecompileShard() {
+	static const std::pair<uint64_t, uint64_t> shard = []() -> std::pair<uint64_t, uint64_t> {
+		const char* env = std::getenv("KYTY_PRECOMPILE_SHARD");
+		uint64_t    i = 0, n = 0;
+		if (env == nullptr || std::sscanf(env, "%llu/%llu", reinterpret_cast<unsigned long long*>(&i),
+		                                  reinterpret_cast<unsigned long long*>(&n)) != 2 ||
+		    n < 2 || i >= n) {
+			return {0, 1};
+		}
+		return {i, n};
+	}();
+	return PrecompileMode() ? shard : std::pair<uint64_t, uint64_t> {0, 1};
+}
+
 // --restamp-shader-store: the store of another stamp is checked against this translator.
 std::atomic<bool>   g_restamp_mode {false};
 std::atomic<size_t> g_restamp_sample {0};
@@ -284,6 +322,22 @@ bool SyncWarmUp() {
 		return env != nullptr && env[0] == '1';
 	}();
 	return sync;
+}
+
+// KYTY_PIPELINE_STORE_ORDER=1 (after simnJS 2332d2ac5, "compile first the pipelines of the
+// shaders the game used in earlier sessions"): the warm-up queues the store's pipelines for
+// background creation in the order the store recorded their modules and pipelines, which is the
+// order earlier runs first needed them, compute and graphics together. Otherwise compute
+// pipelines go first, in hash order, then graphics pipelines, in hash order. With a cold driver
+// (a new driver or executable, KYTY_PIPELINE_COLD_SALT) the game needs the pipelines in about the
+// store's order, and each one no worker has started yet is created on the command thread with the
+// guest clock held.
+bool StoreOrderWarmUp() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_PIPELINE_STORE_ORDER");
+		return env != nullptr && env[0] == '1';
+	}();
+	return enabled;
 }
 
 // Decode time by part, summed over the warm-up's threads.
@@ -327,6 +381,8 @@ struct PipelineCache::LoadedRecord {
 	GraphicsPipelineKey                pipeline_key;
 	uint64_t                           layout_key = 0;
 	ShaderTessellationInputInfo        layout;
+	uint64_t                           capability_version = 0; // FailedProgram
+	std::string                        failure_reason;         // FailedProgram
 	bool                               ok = false;
 };
 
@@ -338,22 +394,25 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	if (header.empty()) {
 		return;
 	}
-	const auto start      = std::chrono::steady_clock::now();
-	auto       store_data = std::make_shared<std::vector<uint8_t>>();
-	auto&      bytes      = *store_data;
-	if (Common::File file;
-	    Common::File::IsFileExisting(path) && file.Open(path, Common::File::Mode::Read)) {
-		bytes.resize(file.Size());
-		uint32_t read = 0;
-		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
-		bytes.resize(read);
-	}
+	const auto start = std::chrono::steady_clock::now();
+	// Mapped, not read: the stored modules decode from it lazily, and many never are, so a heap
+	// copy held the whole store (about 450 MB for PPSA38500) for the session. Mapped pages are
+	// page cache the kernel can drop. The writer only appends past the records loaded here,
+	// truncates bytes no record spans and rewrites the stamp in place.
+	auto store_data = std::make_shared<const DriverCacheFile>(
+	    Common::File::IsFileExisting(path) ? DriverCacheFile::Map(path) : DriverCacheFile {});
+	const auto bytes = std::span<const uint8_t>(store_data->data, store_data->size);
 	const auto read_ms = MillisecondsSince(start);
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "Shader cache: compiling shaders and pipelines from {} ({:.1f} MB) with {} threads\n",
 	    Common::PathToString(path), static_cast<double>(bytes.size()) / 1'000'000.0,
 	    Common::ParallelThreads()));
 	auto records  = std::span<const uint8_t>(bytes);
+	// KYTY_PIPELINE_STORE_ORDER: where each module and graphics pipeline is in the store.
+	struct {
+		std::unordered_map<uint64_t, size_t> modules;
+		std::unordered_map<GraphicsPipelineKey, size_t, GraphicsPipelineKeyHash> pipelines;
+	} store_order;
 	bool reusable =
 	    records.size() >= header.size() && std::ranges::equal(records.first(header.size()), header);
 	if (RestampMode()) {
@@ -401,9 +460,18 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			if (loaded[kept].module.stored != nullptr) {
 				stored.push_back(loaded[kept].module.stored);
 			}
+			if (StoreOrderWarmUp()) {
+				// The first record of each id or key counts.
+				if (static_cast<Record>(loaded[kept].type) == Record::Module) {
+					store_order.modules.try_emplace(loaded[kept].module.id, kept);
+				} else if (static_cast<Record>(loaded[kept].type) == Record::GraphicsPipeline) {
+					store_order.pipelines.try_emplace(loaded[kept].pipeline_key, kept);
+				}
+			}
 			if (RestampMode()) {
 				// What a partial restamp keeps or drops, record by record.
 				RestampRecord record;
+				bool          restamp_this = true;
 				switch (static_cast<Record>(loaded[kept].type)) {
 					case Record::Module: {
 						record.type      = RestampRecord::Type::Module;
@@ -420,9 +488,16 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 					case Record::TessellationLayout:
 						record.type = RestampRecord::Type::TessellationLayout;
 						break;
+					case Record::FailedProgram:
+						// A negative record has no modules to verify or restamp, and it belongs to
+						// the old translator: it is left out (not counted as a dropped module).
+						restamp_this = false;
+						break;
 				}
-				m_restamp_records.push_back(record);
-				m_restamp_frames.push_back(frames[kept]);
+				if (restamp_this) {
+					m_restamp_records.push_back(record);
+					m_restamp_frames.push_back(frames[kept]);
+				}
 			}
 			InsertRecord(std::move(loaded[kept]));
 			records = records.subspan(frames[kept].size());
@@ -480,6 +555,16 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			compute.push_back(module);
 		}
 	}
+	if (const auto [shard, shards] = PrecompileShard(); shards > 1) {
+		// The other shards' pipelines are left to the other processes.
+		std::erase_if(compute, [&](const ShaderModule* module) { return module->id % shards != shard; });
+		std::erase_if(graphics, [&](const auto& entry) {
+			return GraphicsPipelineKeyHash {}(*entry.first) % shards != shard;
+		});
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader precompile: shard {} of {}: {} compute and {} graphics pipelines\n", shard, shards,
+		    compute.size(), graphics.size()));
+	}
 	const bool sync = SyncWarmUp();
 	if (RestampMode()) {
 		// Nothing is created: a restamp only compares modules.
@@ -520,14 +605,15 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 			}
 			return pipeline;
 		};
-		for (const auto* module: compute) {
+		const auto start_compute = [&](const ShaderModule* module) {
 			auto& pipeline = m_compute_pipelines[module->id];
 			CreatePipelineLayouts(m_graphics, pipeline, {&module, 1});
 			StartDeferredCompile(pipeline, [this, counted, layout = pipeline.pipeline_layout, module] {
 				return counted(CreateHostPipeline(m_graphics, layout, *module, m_driver_cache));
 			});
-		}
-		for (const auto& [key, stages]: graphics) {
+		};
+		const auto start_graphics = [&](const GraphicsPipelineKey*               key,
+		                                const std::array<const ShaderModule*, 4>& stages) {
 			auto& pipeline = m_graphics_pipelines.at(*key);
 			CreatePipelineLayouts(m_graphics, pipeline, stages);
 			StartDeferredCompile(pipeline,
@@ -535,6 +621,42 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 				                     return counted(CreateHostPipeline(m_graphics, layout, *key,
 				                                                       stages, m_driver_cache));
 			                     });
+		};
+		if (StoreOrderWarmUp()) {
+			// Store position, then compute before graphics; SIZE_MAX (not found) goes last.
+			struct Queued {
+				size_t position = SIZE_MAX;
+				size_t index    = 0; // In compute, or in graphics after compute.size().
+			};
+			std::vector<Queued> queued;
+			queued.reserve(compute.size() + graphics.size());
+			for (size_t i = 0; i < compute.size(); i++) {
+				const auto found = store_order.modules.find(compute[i]->id);
+				queued.push_back(
+				    {found != store_order.modules.end() ? found->second : SIZE_MAX, i});
+			}
+			for (size_t i = 0; i < graphics.size(); i++) {
+				const auto found = store_order.pipelines.find(*graphics[i].first);
+				queued.push_back({found != store_order.pipelines.end() ? found->second : SIZE_MAX,
+				                  compute.size() + i});
+			}
+			std::ranges::stable_sort(queued, [](const Queued& a, const Queued& b) {
+				return a.position < b.position;
+			});
+			for (const auto& entry: queued) {
+				if (entry.index < compute.size()) {
+					start_compute(compute[entry.index]);
+				} else {
+					const auto& [key, stages] = graphics[entry.index - compute.size()];
+					start_graphics(key, stages);
+				}
+			}
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Shader cache: {} compute and {} graphics pipelines queued in store order\n",
+			    compute.size(), graphics.size()));
+		} else {
+			for (const auto* module: compute) start_compute(module);
+			for (const auto& [key, stages]: graphics) start_graphics(key, stages);
 		}
 	}
 	OpenRecipes(path);
@@ -588,6 +710,7 @@ void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& 
 			}
 			stored->frame               = record;
 			stored->device              = m_graphics.device;
+			stored->inline_code         = m_graphics.maintenance5_enabled;
 			loaded.module.spirv_words   = stored->spirv_words;
 			loaded.module.stored        = std::move(stored);
 			break;
@@ -604,6 +727,18 @@ void PipelineCache::DecodeRecord(std::span<const uint8_t> record, LoadedRecord& 
 			if (!complete()) {
 				return;
 			}
+			break;
+		}
+		case Record::FailedProgram: {
+			FailureRecord failure;
+			IoFailureRecord(reader, failure);
+			if (!complete()) {
+				return;
+			}
+			loaded.key               = {failure.stage, failure.hash, failure.user_data_count,
+			                           failure.static_state};
+			loaded.capability_version = failure.capability_version;
+			loaded.failure_reason     = std::move(failure.reason);
 			break;
 		}
 		default: return;
@@ -635,7 +770,17 @@ void FinishStoredPart(StoredModule& stored) {
 
 } // namespace
 
+std::vector<uint32_t> StoredModuleSpirv(const StoredModule& stored) {
+	const auto            raw = DecompressStored(stored);
+	std::vector<uint32_t> spirv(stored.spirv_words);
+	std::memcpy(spirv.data(), raw.data() + stored.spirv_offset, spirv.size() * sizeof(uint32_t));
+	return spirv;
+}
+
 vk::ShaderModule ResolveStoredModule(StoredModule& stored) {
+	if (stored.inline_code) {
+		return nullptr;
+	}
 	std::call_once(stored.module_once, [&] {
 		auto                  raw = DecompressStored(stored);
 		std::vector<uint32_t> spirv(stored.spirv_words);
@@ -709,6 +854,7 @@ bool PipelineCache::TakeStoredPlan(Program& program) {
 		return false;
 	}
 	// Decoded once; no other thread touches the plan any more.
+	program.materialization_memo.Clear();
 	program.resource_plan = std::move(stored->plan);
 	return true;
 }
@@ -716,6 +862,12 @@ bool PipelineCache::TakeStoredPlan(Program& program) {
 void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 	switch (static_cast<Record>(loaded.type)) {
 		case Record::Module: {
+			// A translated module supersedes a negative record for the same program, whichever
+			// came first (a KYTY_SHADER_STORE_RETRY_FAILED run appends the module after it).
+			if (const auto it = m_program_cache.find(loaded.key);
+			    it != m_program_cache.end() && it->second.skip_dispatch) {
+				m_program_cache.erase(it);
+			}
 			const auto [program, inserted] = m_program_cache.try_emplace(std::move(loaded.key));
 			if (inserted) {
 				loaded.module.stored->want_plan  = true;
@@ -730,7 +882,7 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 				if (stored.parts_left.fetch_sub(1) == 1) stored.store.reset();
 				break;
 			}
-			program->second.modules.push_back(std::move(loaded.module));
+			program->second.Adopt(std::move(loaded.module));
 			break;
 		}
 		// WarmUp creates the pipeline once every record is loaded.
@@ -738,6 +890,23 @@ void PipelineCache::InsertRecord(LoadedRecord&& loaded) {
 		case Record::TessellationLayout:
 			m_tess_layouts.try_emplace(loaded.layout_key, loaded.layout);
 			break;
+		case Record::FailedProgram: {
+			// A failure from an older translator is no longer evidence that this one cannot
+			// translate the program. The retry switch ignores negative entries for this run.
+			if (!ShaderStoreNegativeCacheEnabled() || !FailureCacheApplies(loaded.capability_version) ||
+			    RetryFailedShaders()) {
+				break;
+			}
+			// A program with translated modules is not hidden by a failure.
+			const auto [entry, inserted] = m_program_cache.try_emplace(std::move(loaded.key));
+			if (!inserted) {
+				break;
+			}
+			auto& program = entry->second;
+			program.skip_dispatch   = true;
+			program.failure_reason  = NormalizeFailureReason(loaded.failure_reason);
+			break;
+		}
 	}
 }
 
@@ -781,6 +950,8 @@ void PipelineCache::StartStoreDecoders(std::vector<std::shared_ptr<StoredModule>
 	for (size_t i = 0; i < count; i++) {
 		decoders->threads.emplace_back([state = decoders.get(), left, start] {
 			LowerThreadPriority();
+			Common::FaultReport::SetThreadTag("store decode", "store-decode");
+			Common::FaultReport::RegisterThreadStack();
 			while (true) {
 				const auto index = state->next++;
 				if (index >= state->records.size()) break;
@@ -833,6 +1004,34 @@ void PipelineCache::StoreModule(const ProgramKey& key, const Program& program,
 	IoAll(record, ShaderRecompiler::IR::SaveResourcePlan(program.resource_plan));
 	IoModule(record, module);
 	IoAll(record, spirv);
+	m_store.Append(std::move(record.bytes));
+}
+
+// KYTY_SHADER_STORE_RETRY_FAILED=1 ignores negative records for one run, so a translator fix can
+// be checked before its capability generation is bumped in the source.
+bool PipelineCache::RetryFailedShaders() {
+	static const bool retry = [] {
+		const char* env = std::getenv("KYTY_SHADER_STORE_RETRY_FAILED");
+		return env != nullptr && env[0] == '1';
+	}();
+	return retry;
+}
+
+void PipelineCache::StoreFailedProgram(const ProgramKey& key, std::string_view reason) {
+	if (!m_store || !ShaderStoreNegativeCacheEnabled() || RetryFailedShaders()) {
+		return;
+	}
+	FailureRecord failure {
+	    .stage              = key.stage,
+	    .hash               = key.hash,
+	    .user_data_count    = key.user_data_count,
+	    .static_state       = key.static_state,
+	    .capability_version = kTranslatorCapabilityVersion,
+	    .reason             = NormalizeFailureReason(reason),
+	};
+	Writer record;
+	IoAll(record, Record::FailedProgram);
+	IoFailureRecord(record, failure);
 	m_store.Append(std::move(record.bytes));
 }
 
@@ -1380,7 +1579,7 @@ void PipelineCache::MergeReplayed() {
 		}
 		done.module.module = CompileSPV(done.spirv, m_graphics.device);
 		RetainModuleSpirv(done.module, done.spirv);
-		const auto& module = program.modules.emplace_back(std::move(done.module));
+		const auto& module = program.Adopt(std::move(done.module));
 		StoreModule(entry->first, program, module, done.spirv);
 		m_replay_merged++;
 		if (module.info.stage == ShaderType::Compute && !m_compute_pipelines.contains(module.id)) {
@@ -1413,7 +1612,8 @@ void PipelineCache::SetPrecompileMode() {
 bool PipelineCache::Precompile() {
 	using Clock      = std::chrono::steady_clock;
 	const auto start = Clock::now();
-	if (!m_store) {
+	// A shard (KYTY_PRECOMPILE_SHARD) only reads the store: the other shards' processes share it.
+	if (!m_store && PrecompileShard().second < 2) {
 		Log::WriteToConsoleAndLog(
 		    "Shader precompile: no shader store (a Release build and a title id are needed, and no "
 		    "other process may be writing it)\n");

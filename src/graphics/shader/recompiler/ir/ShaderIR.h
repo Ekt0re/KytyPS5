@@ -31,9 +31,24 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 constexpr uint32_t MaxIndirectDescriptorProbes = 65536u;
 // Whole-table scans visit each row once; GTA VI keeps a 196608-row buffer heap.
 constexpr uint32_t MaxIndirectScalarTableRows = 262144u;
+// Distinct materialized buffer candidates before promotion to a runtime-indexed BDA table.
+constexpr uint32_t MaxIndirectBufferCandidates = 4096u;
+// Bit 30 marks a runtime-indexed indirect-buffer mapping. The mapping starts with a three-word
+// [table_bda_lo, table_bda_hi, entry_count] header; class children replace individual candidates.
+constexpr uint32_t IndirectBufferRuntimeTable = 0x40000000u;
+[[nodiscard]] constexpr bool IsIndirectBufferRuntimeTable(uint32_t mapping_offset) noexcept {
+	return (mapping_offset & IndirectBufferRuntimeTable) != 0u;
+}
+[[nodiscard]] constexpr uint32_t IndirectBufferMappingOffset(uint32_t mapping_offset) noexcept {
+	return mapping_offset & ~IndirectBufferRuntimeTable;
+}
 // Rows a shader can report selecting unbound, over all roots, and the rows one root binds.
 constexpr uint32_t HeapRowBits = 1u << 24u;
 constexpr uint32_t MaxHeapRows = 512u;
+
+constexpr uint32_t MaxFiniteBufferChoices    = 64u;
+constexpr uint32_t MaxFiniteBufferCandidates = 64u;
+constexpr uint32_t MaxFiniteBufferExprDepth  = 16u;
 
 enum class ResourceKind {
 	None,
@@ -88,6 +103,18 @@ struct MemoryInfo {
 	[[nodiscard]] bool IsCoherentBufferPairLoad(ValueOpcode opcode) const {
 		return kind == ResourceKind::Buffer && opcode == ValueOpcode::LoadBufferU32x2 && coherent &&
 		       !typed && !formatted && data_bits == 32u;
+	}
+
+	// KYTY_COHERENT_PAIR_STORE (default 1): a GLC/DLC DWORD pair store is one 64-bit atomic
+	// store (see StoreRawBufferPair()); 0 stores the two DWORDs apart, as before. Read once;
+	// part of the generated code, so change KYTY_SHADER_CACHE_STAMP when switching it.
+	[[nodiscard]] bool IsCoherentBufferPairStore(ValueOpcode opcode) const {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_COHERENT_PAIR_STORE");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled && kind == ResourceKind::Buffer && opcode == ValueOpcode::StoreBufferU32x2 &&
+		       coherent && !typed && !formatted && data_bits == 32u;
 	}
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
@@ -234,6 +261,38 @@ struct ImageResource {
 [[nodiscard]] inline bool F16StoreClampEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_F16_STORE_CLAMP");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
+// KYTY_INDIRECT_FORMATTED_STORES=1: admit the remaining indirect formatted store shapes and
+// exact byte-to-record bound conversion. Read once; A/B runs need separate shader caches.
+[[nodiscard]] inline bool IndirectFormattedStoresEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_INDIRECT_FORMATTED_STORES");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+// Read once; finite descriptor plans change generated code, so A/B runs need separate caches.
+[[nodiscard]] inline bool FiniteBufferDescriptorsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FINITE_BUFFER_DESCRIPTORS");
+		return value != nullptr && value[0] == '1' && value[1] == '\0';
+	}();
+	return enabled;
+}
+
+// Guest f16 ALU results (V_CVT_F16_F32, V_PK_*_F16, V_*_F16, V_FMA_MIX*_F16) round to nearest
+// even (MODE.FP_ROUND). GLSL.std.450 PackHalf2x16 leaves the rounding to the driver: RADV rounds
+// toward zero (v_cvt_pkrtz_f16_f32), so every emulated f16 operation lost up to one ulp toward
+// zero on AMD only. The translator therefore rounds in integer code; KYTY_F16_PACK_NATIVE=1 goes
+// back to the driver's PackHalf2x16 (a code generation switch with its own shader store).
+[[nodiscard]] inline bool F16PackNativeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_F16_PACK_NATIVE");
 		return value != nullptr && value[0] != '\0' && value[0] != '0';
 	}();
 	return enabled;
@@ -651,7 +710,8 @@ struct ShaderInfo {
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<std::array<uint32_t, 2>> address_bases; // Flattened SRT slots of global bases.
 	std::vector<std::array<uint32_t, 2>> user_address_bases; // User data dwords of global bases.
-	std::array<uint32_t, 2>          ray_query_tlas {}; // Flattened SRT slots of the TLAS header.
+	// Flattened SRT slots of the TLAS header each ray query context traces.
+	std::vector<std::array<uint32_t, 2>> ray_query_tlases;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
 	std::vector<uint32_t>            user_data_registers;

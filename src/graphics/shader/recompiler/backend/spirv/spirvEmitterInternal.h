@@ -114,6 +114,9 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	// A native 64-wide subgroup's same-address LDS stores keep the last active lane's value.
 	bool                                             lds_last_lane_stores    = false;
+	// Waves of one workgroup pass values through buffers they both write and read with plain
+	// loads after S_BARRIER (SpirvEmitter.cpp): those accesses bypass the per-CU cache.
+	bool                                             workgroup_buffer_coherence = false;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;
@@ -197,6 +200,7 @@ uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint3
 uint32_t TypeFunction(EmitterState& state);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePhysicalU32BufferPointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_class, uint32_t dwords);
@@ -419,7 +423,9 @@ uint32_t StorageBufferRuntimeStride(EmitterState& state, const IR::MemoryInfo& m
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 uint32_t LoadFlattenedSrt(EmitterState& state, uint32_t index);
+bool     EmptyIndirectBufferCandidate(const EmitterState& state, uint32_t resource);
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource);
+bool IsRuntimeTableIndirectBuffer(const EmitterState& state, uint32_t resource);
 
 void EmitMemoryBindings(EmitterState& state);
 
@@ -434,11 +440,16 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	bool                  non_uniform      = false;
+	bool                  physical_address = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
+// Loads [bda_lo, bda_hi, byte_size, meta] for a runtime-table ordinal, or uvec4(0) for ordinal 0
+// and out-of-range ordinals.
+uint32_t EmitLoadIndirectBufferTableEntry(EmitterState& state, uint32_t selected,
+                                          uint32_t mapping_offset);
 // Slot word of an image heap byte offset; offsets past the heap select the null element.
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
@@ -541,6 +552,7 @@ inline constexpr auto EmitFAbsValue = EmitGlsl<GLSLstd450FAbs, IR::Type::F32, ui
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits);
+uint32_t EmitF32BitsToF16RteBits(EmitterState& state, uint32_t bits);
 
 void EmitProgram(EmitterState& state);
 

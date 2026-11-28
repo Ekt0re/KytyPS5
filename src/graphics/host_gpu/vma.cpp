@@ -17,13 +17,118 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/memAccount.h"
+#include "common/perfAb.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cinttypes>
+#include <condition_variable>
+#include <cstdlib>
+#include <fmt/format.h>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// KYTY_ASYNC_IMAGE_DESTROY=1 sends deleted images to a worker thread that destroys them in
+// batches, instead of destroying them on the calling thread: releasing the memory of a large
+// render target takes 0.2 to 0.4 ms in the driver, on the thread that records the draws. Off by
+// default: GTA VI deletes few images (about 8 a second in the world, under 0.1 ms/s).
+bool AsyncImageDestroy() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_ASYNC_IMAGE_DESTROY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+class ImageGraveyard final {
+public:
+	ImageGraveyard() = default;
+	~ImageGraveyard() {
+		Flush();
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+	ImageGraveyard(const ImageGraveyard&)            = delete;
+	ImageGraveyard& operator=(const ImageGraveyard&) = delete;
+
+	void Push(VmaAllocator allocator, VkImage image, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) {
+				m_thread = std::thread([this] { Run(); });
+			}
+			m_items.push_back({allocator, image, allocation});
+			m_used = true;
+		}
+		m_wake.notify_one();
+	}
+
+	// Returns once every image pushed so far is destroyed; whether any image was ever pushed (the
+	// worker may have finished one between a failed allocation and this call).
+	bool Flush() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_items.empty() && !m_busy; });
+		return m_used;
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkImage       image;
+		VmaAllocation allocation;
+	};
+
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_items.empty(); });
+			if (m_items.empty()) {
+				return;
+			}
+			batch.swap(m_items);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) {
+				vmaDestroyImage(item.allocator, item.image, item.allocation);
+			}
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+
+	std::mutex              m_mutex;
+	std::condition_variable m_wake;
+	std::condition_variable m_idle;
+	std::vector<Item>       m_items;
+	bool                    m_busy = false;
+	bool                    m_stop = false;
+	bool                    m_used = false;
+	std::thread             m_thread;
+};
+
+ImageGraveyard& Graveyard() {
+	static ImageGraveyard graveyard;
+	return graveyard;
+}
+
+} // namespace
 
 bool GraphicContext::CreateAllocator() {
 	KYTY_PROFILER_FUNCTION();
@@ -52,6 +157,22 @@ bool GraphicContext::CreateAllocator() {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
 	}
+	Common::MemAccount::SetExternal("vk", [this] {
+		if (allocator == nullptr) return std::string("none");
+		VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+		vmaGetHeapBudgets(allocator, budgets);
+		uint64_t device_bytes = 0;
+		uint64_t host_bytes   = 0;
+		for (uint32_t i = 0; i < physical_device_memory_properties.memoryHeapCount; i++) {
+			const bool dev = static_cast<bool>(
+			    physical_device_memory_properties.memoryHeaps[i].flags &
+			    vk::MemoryHeapFlagBits::eDeviceLocal);
+			(dev ? device_bytes : host_bytes) += budgets[i].usage;
+		}
+		return fmt::format("device={:.0f}MiB host={:.0f}MiB",
+		                   static_cast<double>(device_bytes) / 1048576.0,
+		                   static_cast<double>(host_bytes) / 1048576.0);
+	});
 	return true;
 }
 
@@ -59,7 +180,9 @@ void GraphicContext::DestroyAllocator() {
 	if (allocator == nullptr) {
 		return;
 	}
+	Common::MemAccount::ClearExternal("vk");
 	BdaGuard::Shutdown(); // Buffers KYTY_BDA_GUARD=2 kept alive.
+	Graveyard().Flush();
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
 }
@@ -159,9 +282,16 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 
 	vk::Image::CType native_image = VK_NULL_HANDLE;
-	const auto        result       = static_cast<vk::Result>(
-	    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
-	                   &alloc_info, &native_image, &image.allocation, nullptr));
+	const auto        create       = [&] {
+		return static_cast<vk::Result>(
+		    vmaCreateImage(allocator, static_cast<const vk::ImageCreateInfo::NativeType*>(image_info),
+		                   &alloc_info, &native_image, &image.allocation, nullptr));
+	};
+	auto result = create();
+	if (result != vk::Result::eSuccess && Graveyard().Flush()) {
+		// Images the worker destroyed (or still held) may have freed memory since: try again.
+		result = create();
+	}
 	image.image = native_image;
 	if (result != vk::Result::eSuccess) {
 		LogMemoryBudget();
@@ -186,7 +316,11 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	vmaDestroyImage(allocator, image.image, image.allocation);
+	if (Common::PerfAb::Apply(AsyncImageDestroy())) {
+		Graveyard().Push(allocator, image.image, image.allocation);
+	} else {
+		vmaDestroyImage(allocator, image.image, image.allocation);
+	}
 	image.image      = nullptr;
 	image.allocation = nullptr;
 }

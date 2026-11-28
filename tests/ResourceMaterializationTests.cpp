@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/Serialize.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/host_gpu/renderer/pipeline/lookahead.h"
 #include "SrtWalkerTestMemory.h"
 
 #include <vector>
@@ -9,7 +10,10 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <array>
+#include <cstring>
 
 namespace {
 
@@ -1366,6 +1370,72 @@ void TestIndirectStorageSwizzles() {
         "indirect storage candidates sharing one swizzle were incompatible");
 }
 
+void TestIndexedRawByteBounds(bool broad_conversion) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using F = Libs::Graphics::Prospero::BufferFormat;
+  const auto make = [](uint32_t stride, uint32_t bytes, uint32_t swizzle, bool add_tid,
+                      uint32_t extent) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = program.resource_tracking_complete = true;
+    for (const uint32_t base : {0x10000u, 0x20000u}) {
+      DescriptorSource source;
+      source.dword_count = 4u;
+      source.dwords.fill(Value(0u));
+      source.dwords[0] = Value(base);
+      source.dwords[1] = Value(stride << 16u);
+      source.dwords[2] = Value(bytes);
+      source.dwords[3] = Value(uint32_t(F::k32UInt) << 12u | swizzle |
+                               (add_tid ? 1u << 23u : 0u) | (3u << 28u));
+      program.descriptor_sources.push_back(source);
+    }
+    DescriptorSource root;
+    root.dword_count = 4u;
+    root.dwords.fill(Value(0u));
+    auto& indirect = root.indirect_descriptor.emplace(DescriptorSource::IndirectDescriptor{});
+    indirect.sources = {0, 1};
+    indirect.indexed = true;
+    program.descriptor_sources.push_back(root);
+    program.info.buffers.push_back({.source = 2u, .max_byte_extent = extent,
+                                    .read = true, .written = true, .raw = true});
+    return Extract(program);
+  };
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{};
+  const auto materialize = [&](uint32_t stride, uint32_t bytes, uint32_t swizzle,
+                               bool add_tid, uint32_t extent) {
+    return MaterializeResources(make(stride, bytes, swizzle, add_tid, extent), runtime,
+                                snapshot, specialization);
+  };
+  const auto identity = Libs::Graphics::DstSel(4, 5, 6, 7);
+  Check(materialize(4u, 4096u, identity, false, 4u) == broad_conversion,
+        "indexed byte-bound conversion did not match the switch state");
+  if (broad_conversion) {
+    Check(snapshot.buffers.size() == 2u &&
+              std::ranges::all_of(snapshot.buffers, [](const auto& buffer) {
+                return buffer.dwords[2] == 1024u && (buffer.dwords[3] >> 28u) == 0u;
+              }),
+          "exact byte bounds were not converted to record bounds for every candidate");
+  }
+  Check(!materialize(4u, 4095u, identity, false, 4u),
+        "non-divisible byte bounds were rounded into record bounds");
+  Check(!materialize(0u, 4096u, identity, false, 4u),
+        "zero-stride byte bounds were converted");
+  Check(!materialize(6u, 4098u, identity, false, 4u),
+        "misaligned records were accepted after byte-bound conversion");
+  Check(!materialize(4u | (1u << 15u), 4096u, identity, false, 4u),
+        "swizzled byte bounds were converted");
+  Check(!materialize(4u, 4096u, identity, true, 4u),
+        "broad ADD_TID byte bounds were converted");
+  Check(materialize(1u, 4096u, identity, false, 1u) &&
+            snapshot.buffers.size() == 2u &&
+            std::ranges::all_of(snapshot.buffers, [](const auto& buffer) {
+              return buffer.dwords[2] == 4096u && (buffer.dwords[3] >> 28u) == 0u;
+            }),
+        "legacy stride-one byte bounds changed");
+}
+
 // GPU-selected indexed V#s with ADD_TID: compute stages keep the bit for the emitter, which adds the
 // lane to the index and to its bound; other stages and byte-offset roots reject it.
 void TestIndexedAddTidIndirectBuffers() {
@@ -1764,7 +1834,143 @@ void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
 
 } // namespace Common
 
-int main() {
+namespace {
+
+// The walker logs each guest load's address with the value it used, into a thread's own scratch;
+// the plan's scratch and its last walk's results stay as they were.
+void TestWalkScratchCapturesLoadValues() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  uint32_t dword = 0x12345678u;
+  auto plan = Extract(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, snapshot, specialization) &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0x12345678u},
+        "plain walk of the capture plan failed");
+  const auto own_scratch = plan.srt_scratch;
+  dword = 0x0badf00du;
+  WalkScratch scratch;
+  scratch.Prepare(plan);
+  ResourceSnapshot ahead;
+  {
+    ScopedWalkScratch scoped(scratch);
+    Check(MaterializeResources(plan, {}, ahead, specialization) &&
+              ahead.flattened_srt == std::vector<uint32_t>{0x0badf00du},
+          "walk with a thread's scratch failed");
+  }
+  Check(scratch.loads.size() == 1 && scratch.loads[0].first == reinterpret_cast<uint64_t>(&dword) &&
+            scratch.loads[0].second == 0x0badf00du,
+        "walker did not capture the load's address and value");
+  Check(plan.srt_scratch == own_scratch, "a walk with a thread's scratch wrote the plan's scratch");
+  // The plan's own walk captured the old value.
+  Check(own_scratch.size() >= plan.srt_captures / 8u + 2u &&
+            own_scratch[plan.srt_captures / 8u] == reinterpret_cast<uint64_t>(&dword) &&
+            static_cast<uint32_t>(own_scratch[plan.srt_captures / 8u + 1u]) == 0x12345678u,
+        "the plan's own walk did not capture its load");
+}
+
+uint8_t g_lookahead_gpu_owned = 0;
+
+// Resolutions made ahead are used only while every logged read holds and the GPU owns none of it.
+void TestLookaheadRevalidation() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Lookahead;
+  using Libs::Graphics::LookaheadJob;
+  static uint32_t dword = 0x11112222u;
+  auto plan = Extract(SrtProgram(reinterpret_cast<uint64_t>(&dword)));
+  const Lookahead::Hooks hooks{
+      .read = [](uint64_t address, void *data, uint64_t size) {
+        std::memcpy(data, reinterpret_cast<const void *>(address), size);
+        return true;
+      },
+      .view = [](uint64_t address, uint64_t) { return reinterpret_cast<const void *>(address); },
+      .gpu_owned = [](uint64_t, uint64_t) { return g_lookahead_gpu_owned != 0; },
+  };
+  Lookahead lookahead(Lookahead::Mode::On, hooks, false);
+  const int program = 0;
+  const std::array<uint32_t, 2> user_data{7u, 9u};
+  const auto queue = [&] {
+    LookaheadJob job;
+    job.program = &program;
+    job.plan = &plan;
+    job.user_data_count = 2;
+    job.user_data[0] = user_data[0];
+    job.user_data[1] = user_data[1];
+    lookahead.Enqueue(std::move(job));
+    lookahead.ResolvePending();
+  };
+  const SrtRuntime runtime{.user_data = user_data};
+  Lookahead::Outcome outcome{};
+  queue();
+  auto resolution = lookahead.Take(&program, runtime, outcome);
+  ResourceSnapshot inline_snapshot;
+  ResourceSpecialization inline_specialization;
+  Check(MaterializeResources(plan, runtime, inline_snapshot, inline_specialization),
+        "inline walk failed");
+  Check(resolution != nullptr && outcome == Lookahead::Outcome::Hit &&
+            Lookahead::SameResult(resolution->resources, resolution->specialization,
+                                  inline_snapshot, inline_specialization),
+        "an unchanged resolution was not used or differs from the inline walk");
+  Check(lookahead.Take(&program, runtime, outcome) == nullptr &&
+            outcome == Lookahead::Outcome::MissNone,
+        "a resolution was used twice");
+  queue();
+  dword = 0x33334444u;
+  Check(lookahead.Take(&program, runtime, outcome) == nullptr &&
+            outcome == Lookahead::Outcome::MissChanged,
+        "a resolution whose read changed was used");
+  queue();
+  g_lookahead_gpu_owned = 1;
+  Check(lookahead.Take(&program, runtime, outcome) == nullptr &&
+            outcome == Lookahead::Outcome::MissGpu,
+        "a resolution over GPU-owned bytes was used");
+  g_lookahead_gpu_owned = 0;
+  queue();
+  const std::array<uint32_t, 2> other{7u, 10u};
+  const int other_program = 0;
+  Check(lookahead.Take(&program, {.user_data = other}, outcome) == nullptr &&
+            lookahead.Take(&other_program, runtime, outcome) == nullptr &&
+            outcome == Lookahead::Outcome::MissNone,
+        "a resolution was used for other inputs");
+  Check(lookahead.Take(&program, runtime, outcome) != nullptr && outcome == Lookahead::Outcome::Hit,
+        "the remaining resolution was not found");
+  queue();
+  lookahead.SetActive(false);
+  lookahead.SetActive(true);
+  Check(lookahead.Take(&program, runtime, outcome) == nullptr, "switching off kept resolutions");
+  // A walk ahead that needs the image heap is given up: here, a plan that fails is dropped.
+  const auto stats = lookahead.GetStats();
+  Check(stats.resolved == 5 && stats.failed == 0 && stats.heap == 0, "resolver stats are wrong");
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  // Lookahead's walkers log their loads' values; every case below runs with it.
+  Libs::Graphics::ShaderRecompiler::IR::SetSrtWalkerValueCapture(true);
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "1");
+#else
+    setenv("KYTY_INDIRECT_FORMATTED_STORES", "1", 1);
+#endif
+    TestIndexedRawByteBounds(true);
+    std::puts("indirect formatted store tests passed");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-formatted-stores-off-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_INDIRECT_FORMATTED_STORES", "0");
+#else
+    setenv("KYTY_INDIRECT_FORMATTED_STORES", "0", 1);
+#endif
+    TestIndexedRawByteBounds(false);
+    TestIndexedAddTidIndirectBuffers();
+    std::puts("indirect formatted store switch-off tests passed");
+    return 0;
+  }
+  TestWalkScratchCapturesLoadValues();
+  TestLookaheadRevalidation();
   TestWalkerLoadsBypassSpecializationReader();
   TestWalkerGuardServesWatchedLoads();
   TestNativeNestedSrtRefresh();
@@ -1788,6 +1994,7 @@ int main() {
   TestRuntimeStrideSharesEmptyBufferModule();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestIndirectStorageSwizzles();
+  TestIndexedRawByteBounds(false);
   TestIndexedAddTidIndirectBuffers();
   TestStorageFillSwizzle();
   TestSignedStorageSpecialization();

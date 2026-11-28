@@ -8,10 +8,13 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
+#include "graphics/host_gpu/renderer/pipeline/createStats.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineBinaryStore.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineStats.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipeline/subgroupSize.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -25,15 +28,39 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
+#include <optional>
+#include <set>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Owns a creation-feedback chain for as long as the create call runs. Constructed only when the
+// reporter is on and the device enabled VK_EXT_pipeline_creation_feedback; an empty optional
+// leaves the create info's pNext chain exactly as upstream builds it.
+struct CreationFeedback {
+	vk::PipelineCreationFeedback                        total {};
+	std::array<vk::PipelineCreationFeedback, 8>         stages {};
+	vk::PipelineCreationFeedbackCreateInfo              info {};
+
+	explicit CreationFeedback(uint32_t stage_count) {
+		info.pPipelineCreationFeedback          = &total;
+		info.pipelineStageCreationFeedbackCount = stage_count;
+		info.pPipelineStageCreationFeedbacks    = stages.data();
+	}
+};
+
+} // namespace
 
 bool RetainModuleSpirv() {
 	static const bool enabled = [] {
@@ -283,12 +310,7 @@ static vk::Format InputFormat(uint8_t raw_format, uint32_t used_components) {
 
 // Under RenderDoc (--rd), pipelines carry their guest shader hashes, so a captured draw or
 // dispatch maps back to the guest program.
-static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
-                         std::span<const ShaderModule* const> stages) {
-	if (!Config::RenderDocEnabled() || pipeline == nullptr ||
-	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
-		return;
-	}
+static std::string PipelineName(std::span<const ShaderModule* const> stages) {
 	std::string name;
 	for (const auto* stage: stages) {
 		if (stage == nullptr) continue;
@@ -296,11 +318,62 @@ static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
 		name += fmt::format("{}_{:016x}", ShaderRecompiler::StageName(stage->info.stage),
 		                    stage->info.shader_hash);
 	}
+	return name;
+}
+
+// Also records the pipeline's driver statistics (KYTY_PIPELINE_STATS).
+static void NamePipeline(GraphicContext& graphics, vk::Pipeline pipeline,
+                         std::span<const ShaderModule* const> stages) {
+	if (graphics.pipeline_statistics_enabled && pipeline != nullptr) {
+		PipelineStats::Record(graphics, pipeline, PipelineName(stages));
+	}
+	if (!Config::RenderDocEnabled() || pipeline == nullptr ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
+		return;
+	}
+	const auto                      name = PipelineName(stages);
 	vk::DebugUtilsObjectNameInfoEXT info {};
 	info.objectType   = vk::ObjectType::ePipeline;
 	info.objectHandle = reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline));
 	info.pObjectName  = name.c_str();
 	(void)graphics.device.setDebugUtilsObjectNameEXT(&info);
+}
+
+static bool UsesSubgroupOps(const ShaderRecompiler::IR::ShaderInfo& info) noexcept {
+	return info.subgroup_ballot || info.subgroup_vote || info.subgroup_barrier ||
+	       info.subgroup_shuffle || info.subgroup_arithmetic ||
+	       info.subgroup_local_invocation_id || info.pixel_valid_mask;
+}
+
+static SubgroupSizeCaps MakeSubgroupSizeCaps(const GraphicContext& graphics) noexcept {
+	return {
+	    .default_size     = graphics.subgroup_size,
+	    .min_size         = graphics.min_subgroup_size,
+	    .max_size         = graphics.max_subgroup_size,
+	    .supported_stages =
+	        static_cast<vk::ShaderStageFlags::MaskType>(graphics.required_subgroup_size_stages),
+	};
+}
+
+static void WarnSubgroupSizeMismatch(const ShaderRecompiler::IR::CompiledShaderInfo& info,
+                                     const SubgroupSizeDecision&                     decision,
+                                     const SubgroupSizeCaps&                         caps) {
+	static std::mutex                              mutex;
+	static std::set<std::pair<uint64_t, uint32_t>> warned;
+	const std::pair<uint64_t, uint32_t>            key {info.shader_hash,
+	                                                    static_cast<uint32_t>(info.stage)};
+	{
+		std::scoped_lock lock(mutex);
+		if (!warned.insert(key).second) {
+			return;
+		}
+	}
+	LOGF("!!! SUBGROUP SIZE MISMATCH shader=0x%016" PRIx64
+	     " stage=%s guest_wave=%u expected_subgroup=%u host_default=%u"
+	     " supported_range=[%u,%u] supported_stages=0x%08x\n",
+	     info.shader_hash, ShaderRecompiler::StageName(info.stage), info.wave_size,
+	     decision.expected_size, caps.default_size, caps.min_size, caps.max_size,
+	     caps.supported_stages);
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -339,17 +412,46 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	// ballot bits of lanes 0-31; GTA VI's clustered-light shader (PS 0x02defa99cc8f3d1e) then took
 	// an empty cell's 0xffffffff into its slice range and looped until the GPU reset.
 	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo pixel_subgroup_size {};
+	vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo stage_subgroup_sizes[4] {};
+	// Inline stages' SPIR-V (StoredModule::inline_code), alive until the pipeline is created.
+	std::array<std::vector<uint32_t>, 4> inline_code;
+	vk::ShaderModuleCreateInfo           inline_info[4] {};
+	const auto subgroup_caps      = MakeSubgroupSizeCaps(graphics);
+	const bool stage_size_enabled = SubgroupStageSizeEnabled();
 	for (const auto* stage: stages) {
 		if (stage != nullptr) {
-			auto& info = shader_stages[shader_stage_count++];
+			const auto slot = shader_stage_count++;
+			auto& info = shader_stages[slot];
 			info       = {.stage  = NativeShaderStage(stage->info.stage),
 			              .module = stage->Handle(),
 			              .pName  = "main"};
+			if (stage->Inline()) {
+				inline_code[slot]          = StoredModuleSpirv(*stage->stored);
+				inline_info[slot].codeSize = inline_code[slot].size() * sizeof(uint32_t);
+				inline_info[slot].pCode    = inline_code[slot].data();
+				info.pNext                 = &inline_info[slot];
+			}
 			const auto wave_size = stage->info.wave_size;
-			if (info.stage == vk::ShaderStageFlagBits::eFragment &&
-			    graphics.fragment_subgroup_size_control_enabled &&
-			    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+			if (stage_size_enabled) {
+				const bool emulated_wave64_on_32 =
+				    stage->info.stage == ShaderType::Mesh && wave_size == 64u &&
+				    graphics.subgroup_size == 32u;
+				const auto decision = ResolveStageSubgroupSize(
+				    static_cast<uint32_t>(info.stage), wave_size, emulated_wave64_on_32,
+				    UsesSubgroupOps(stage->info.info), subgroup_caps);
+				if (decision.apply) {
+					stage_subgroup_sizes[slot].requiredSubgroupSize = decision.required_size;
+					stage_subgroup_sizes[slot].pNext                = const_cast<void*>(info.pNext);
+					info.pNext                                      = &stage_subgroup_sizes[slot];
+				} else if (decision.mismatch_warning) {
+					WarnSubgroupSizeMismatch(stage->info, decision, subgroup_caps);
+				}
+			} else if (info.stage == vk::ShaderStageFlagBits::eFragment &&
+			           graphics.fragment_subgroup_size_control_enabled &&
+			           wave_size >= graphics.min_subgroup_size &&
+			           wave_size <= graphics.max_subgroup_size) {
 				pixel_subgroup_size.requiredSubgroupSize = wave_size;
+				pixel_subgroup_size.pNext                = const_cast<void*>(info.pNext);
 				info.pNext                               = &pixel_subgroup_size;
 			}
 		}
@@ -519,16 +621,59 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	if (!optimize) {
 		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
+	if (graphics.pipeline_statistics_enabled) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
+
+	auto&       stats = CreateStats::Global();
+	const bool  on    = CreateStats::Enabled();
+	std::optional<CreationFeedback> feedback;
+	if (on && graphics.pipeline_creation_feedback_enabled) {
+		feedback.emplace(shader_stage_count);
+		// pipeline_info.pNext already points at rendering_info.
+		rendering_info.pNext = &feedback->info;
+	}
+	std::chrono::steady_clock::time_point begin;
+	if (on) {
+		begin = std::chrono::steady_clock::now();
+		CreateStats::Enter(stats);
+	}
 
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
+	const auto create_start = std::chrono::steady_clock::now();
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
 	const auto result =
 	    PipelineBinaryStore::Get().CreateGraphics(graphics, driver_cache, pipeline_info, &pipeline);
+	// The driver fills the feedback during the create call, so read it afterwards.
+	const auto feedback_flags =
+	    feedback ? feedback->total.flags : vk::PipelineCreationFeedbackFlags {};
+	const auto driver_ns = feedback ? feedback->total.duration : 0;
+	if (on) {
+		CreateStats::Leave(
+		    stats, stats.graphics,
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                              std::chrono::steady_clock::now() - begin)
+		                              .count()),
+		    static_cast<bool>(feedback_flags & vk::PipelineCreationFeedbackFlagBits::eValid),
+		    static_cast<bool>(feedback_flags &
+		                      vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit),
+		    driver_ns);
+	}
 	if (result != vk::Result::eSuccess) {
 		ExitPipelineFailure("vkCreateGraphicsPipelines", result, stages);
 	}
 	NamePipeline(graphics, pipeline, stages);
+	// Diagnostic for scripts/pipeline-ab.py and compile-report.py: slow driver creations.
+	if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	        std::chrono::steady_clock::now() - create_start).count(); ms >= 200) {
+		std::string ids;
+		for (const auto* stage: stages) {
+			if (stage != nullptr) ids += fmt::format(" {:016x}", stage->id);
+		}
+		std::printf("GraphicsPipeline: modules=%s driver_ms=%lld (%s)\n", ids.c_str(),
+		            static_cast<long long>(ms), PipelineBinaryStore::LastSource());
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -544,10 +689,35 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	comp_shader_stage_info.stage  = vk::ShaderStageFlagBits::eCompute;
 	comp_shader_stage_info.module = module.Handle();
 	comp_shader_stage_info.pName  = "main";
+	std::vector<uint32_t>      inline_code;
+	vk::ShaderModuleCreateInfo inline_info {};
+	if (module.Inline()) {
+		inline_code             = StoredModuleSpirv(*module.stored);
+		inline_info.codeSize    = inline_code.size() * sizeof(uint32_t);
+		inline_info.pCode       = inline_code.data();
+		comp_shader_stage_info.pNext = &inline_info;
+	}
 	const auto wave_size = module.info.wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
-		comp_subgroup_size.requiredSubgroupSize = wave_size;
+	if (SubgroupStageSizeEnabled()) {
+		const auto caps                 = MakeSubgroupSizeCaps(graphics);
+		const bool emulated_wave64_on_32 =
+		    wave_size == 64u && !graphics.SupportsComputeWave64();
+		const auto decision = ResolveStageSubgroupSize(
+		    static_cast<uint32_t>(vk::ShaderStageFlagBits::eCompute), wave_size,
+		    emulated_wave64_on_32, UsesSubgroupOps(module.info.info), caps);
+		if (decision.apply) {
+			comp_subgroup_size.requiredSubgroupSize = decision.required_size;
+			comp_subgroup_size.pNext                = const_cast<void*>(comp_shader_stage_info.pNext);
+			comp_shader_stage_info.pNext            = &comp_subgroup_size;
+		} else if (decision.mismatch_warning) {
+			WarnSubgroupSizeMismatch(module.info, decision, caps);
+		}
+	} else if (graphics.compute_subgroup_size_control_enabled &&
+	           wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+		// A wave64 program emitted as halves needs the 32-lane subgroup it was emitted for.
+		comp_subgroup_size.requiredSubgroupSize =
+		    wave_size == 64u && !graphics.SupportsComputeWave64() ? 32u : wave_size;
+		comp_subgroup_size.pNext                = const_cast<void*>(comp_shader_stage_info.pNext);
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
 
@@ -558,20 +728,59 @@ vk::Pipeline CreateHostPipeline(GraphicContext& graphics, vk::PipelineLayout lay
 	if (!optimize) {
 		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	}
+	if (graphics.pipeline_statistics_enabled) {
+		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
+	}
 	info.stage  = comp_shader_stage_info;
 	info.layout = layout;
 
+	auto&       stats = CreateStats::Global();
+	const bool  on    = CreateStats::Enabled();
+	std::optional<CreationFeedback> feedback;
+	if (on && graphics.pipeline_creation_feedback_enabled) {
+		feedback.emplace(1);
+		info.pNext = &feedback->info;
+	}
+	std::chrono::steady_clock::time_point begin;
+	if (on) {
+		begin = std::chrono::steady_clock::now();
+		CreateStats::Enter(stats);
+	}
+
 	vk::Pipeline pipeline;
 	Common::ShaderCompileStatus::Work compile_work;
+	const auto create_start = std::chrono::steady_clock::now();
 	// Through our own pipeline binaries when the device has them (PipelineBinaryStore).
 	const auto result =
 	    PipelineBinaryStore::Get().CreateCompute(graphics, driver_cache, info, &pipeline);
+	// The driver fills the feedback during the create call, so read it afterwards.
+	const auto feedback_flags =
+	    feedback ? feedback->total.flags : vk::PipelineCreationFeedbackFlags {};
+	const auto driver_ns = feedback ? feedback->total.duration : 0;
+	if (on) {
+		CreateStats::Leave(
+		    stats, stats.compute,
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                              std::chrono::steady_clock::now() - begin)
+		                              .count()),
+		    static_cast<bool>(feedback_flags & vk::PipelineCreationFeedbackFlagBits::eValid),
+		    static_cast<bool>(feedback_flags &
+		                      vk::PipelineCreationFeedbackFlagBits::eApplicationPipelineCacheHit),
+		    driver_ns);
+	}
 	if (result != vk::Result::eSuccess) {
 		const ShaderModule* modules[] = {&module};
 		ExitPipelineFailure("vkCreateComputePipelines", result, modules);
 	}
 	const auto* stage = &module;
 	NamePipeline(graphics, pipeline, {&stage, 1});
+	// Diagnostic for scripts/pipeline-ab.py and compile-report.py: slow driver creations.
+	if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	        std::chrono::steady_clock::now() - create_start).count(); ms >= 200) {
+		std::printf("ComputePipeline: module=%016llx driver_ms=%lld (%s)\n",
+		            static_cast<unsigned long long>(module.id), static_cast<long long>(ms),
+		            PipelineBinaryStore::LastSource());
+	}
 	return pipeline;
 }
 

@@ -1,7 +1,10 @@
+#include "graphics/host_gpu/renderer/pipeline/shaderStoreFailureCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderLookupIndex.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreRestamp.h"
 
 #include <filesystem>
+#include <span>
 #ifndef _WIN32
 #include <sys/wait.h>
 #include <unistd.h>
@@ -111,6 +114,52 @@ void TestEmpty() {
   Check(selection.keep.empty() && selection.modules_kept == 0, "empty store");
 }
 
+void TestShaderLookupHashes() {
+  using Libs::Graphics::HashShaderValue;
+  using Libs::Graphics::HashShaderWords;
+  using Libs::Graphics::ShaderRecompiler::IR::ResourceSpecialization;
+
+  ResourceSpecialization first;
+  first.buffers.push_back({.packed_stride = 16});
+  const auto second = first;
+  Check(HashShaderValue(first) == HashShaderValue(second), "equal specializations hash equally");
+
+  auto changed = first;
+  changed.buffers[0].packed_stride = 32;
+  Check(HashShaderValue(first) != HashShaderValue(changed), "specialization hash covers fields");
+
+  const std::vector<uint32_t> code{1, 2, 3};
+  const auto same_code = code;
+  Check(HashShaderWords(code) == HashShaderWords(same_code), "equal callee code hashes equally");
+  Check(HashShaderWords(code) != HashShaderWords(std::vector<uint32_t>{1, 2, 4}),
+        "callee-code hash covers words");
+}
+
+void TestShaderLookupIndexCollisions() {
+  struct Module {
+    uint32_t value;
+  };
+  using Libs::Graphics::ShaderLookupIndex;
+
+  ShaderLookupIndex<Module> index;
+  Module first{1};
+  Module second{2};
+  Module other_hash{3};
+  Check(index.Empty(), "lookup index starts empty");
+  Check(index.Find(7, [](const Module &) { return true; }) == nullptr,
+        "empty lookup index misses");
+
+  index.Add(7, &first);
+  index.Add(7, &second);
+  index.Add(9, &other_hash);
+  Check(index.Size() == 3, "lookup index keeps every module path");
+  Check(index.Find(7, [](const Module &module) { return module.value == 2; }) == &second,
+        "hash collision is resolved by the full match");
+  Check(index.Find(7, [](const Module &module) { return module.value == 3; }) == nullptr,
+        "a candidate with another hash is not considered");
+  Check(index.Find(8, [](const Module &) { return true; }) == nullptr, "unknown hash misses");
+}
+
 // A game and a precompile of one stamp must not both write its store.
 void TestStoreLockSingleWriter() {
   using Libs::Graphics::ShaderStoreLock;
@@ -148,6 +197,33 @@ void TestStoreLockSingleWriter() {
   std::filesystem::remove_all(dir, error);
 }
 
+void TestNegativeFailureRecordRoundTrip() {
+  using namespace Libs::Graphics;
+  FailureRecord written {.stage              = ShaderType::Compute,
+                         .hash               = 0x1234,
+                         .user_data_count    = 8,
+                         .static_state       = {1, 2, 3},
+                         .capability_version = kTranslatorCapabilityVersion,
+                         .reason             = "specialization failed"};
+  const auto bytes = SaveFailureRecord(written);
+  FailureRecord read;
+  Check(LoadFailureRecord(bytes, read), "a complete negative record loads");
+  Check(read.stage == written.stage && read.hash == written.hash &&
+            read.user_data_count == written.user_data_count &&
+            read.static_state == written.static_state &&
+            read.capability_version == written.capability_version && read.reason == written.reason,
+        "every field survives the store round trip");
+  Check(FailureCacheApplies(read.capability_version), "a current negative entry applies");
+  Check(!FailureCacheApplies(kTranslatorCapabilityVersion - 1),
+        "a failure from an older translator is retried");
+  Check(!FailureCacheApplies(kTranslatorCapabilityVersion + 1),
+        "a failure from a future translator is retried");
+  FailureRecord truncated;
+  Check(!LoadFailureRecord(std::span(bytes).first(bytes.size() - 1), truncated),
+        "a truncated negative record is refused");
+  Check(NormalizeFailureReason("") == "unspecified failure", "an empty reason is readable");
+}
+
 } // namespace
 
 int main() {
@@ -159,6 +235,9 @@ int main() {
   TestNothingIdentical();
   TestPlanOfTheFirstKeptRecord();
   TestEmpty();
+  TestNegativeFailureRecordRoundTrip();
+  TestShaderLookupHashes();
+  TestShaderLookupIndexCollisions();
   std::printf("ShaderStoreTests: all passed\n");
   return 0;
 }

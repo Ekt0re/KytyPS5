@@ -1,8 +1,10 @@
 #include "kernel/memory.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 #include "kernel/vulkanGuestBacking.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/memAccount.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -907,6 +909,18 @@ bool BackingChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->BackingChangedSince(generation, vaddr, size);
 }
 
+void EnableBackingContentTracking() {
+	g_guest_address_space->EnableBackingContentTracking();
+}
+
+uint64_t BackingContentGeneration() {
+	return g_guest_address_space->BackingContentGeneration();
+}
+
+bool BackingContentChangedSince(uint64_t generation, uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space->BackingContentChangedSince(generation, vaddr, size);
+}
+
 const void* TryGetBackingView(uint64_t vaddr, uint64_t size) {
 	return g_guest_address_space->TryGetBackingView(vaddr, size);
 }
@@ -930,10 +944,22 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			const Graphics::ReadbackOrigin::Scope origin(Graphics::ReadbackOrigin::Origin::Shader,
+			                                             true);
+			// rb_mirror: small repeated reads take the GPU's bytes from the readback mirror.
+			if (buffers.TryReadMirroredGpuWrites(vaddr, data, size)) {
+				return true;
+			}
 			buffers.ReadMemory(vaddr, size);
 		}
 	}
 	return TryReadBacking(vaddr, data, size);
+}
+
+bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
+	if (!Graphics::GuestGpu::IsGpuThread()) return true;
+	return GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
 void ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size) {
@@ -1119,6 +1145,14 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 static int ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size,
                                         VirtualRangeType type = VirtualRangeType::Reserved);
 
+static bool LargeMemoryBudgetEnabled() {
+	static const bool enabled = [] {
+		const char* env = std::getenv("KYTY_LARGE_MEMORY_BUDGET");
+		return env != nullptr && env[0] == '1' && env[1] == '\0';
+	}();
+	return enabled;
+}
+
 void Initialize() {
 	const auto params = Loader::SystemContentGetMemoryParams();
 	if (params.flexible_size != 0) {
@@ -1130,8 +1164,11 @@ void Initialize() {
 	const auto table_overhead = g_cpu_table_memory + g_gpu_table_memory +
 	                            std::max(params.amm_table_memory, INCLUDED_TABLE_MEMORY) -
 	                            3 * INCLUDED_TABLE_MEMORY;
-	const auto memory_budget = GUEST_MEMORY_BUDGET +
-	                           (Loader::SystemContentIsTrinityMode() ? 1216ull * 1024ull * 1024ull : 0);
+	// Extended mode grants an additional 1216 MiB. A package can lack the metadata flag while
+	// still requiring that budget, so allow an explicit opt-in without changing the default.
+	const bool large_memory =
+	    Loader::SystemContentIsTrinityMode() || LargeMemoryBudgetEnabled();
+	const auto memory_budget = GUEST_MEMORY_BUDGET + (large_memory ? 1216ull * 1024ull * 1024ull : 0);
 	EXIT_IF(g_flexible_memory_size + table_overhead >= memory_budget - RESERVED_CACHE_SIZE);
 	g_guest_memory_size = memory_budget - RESERVED_CACHE_SIZE - table_overhead;
 	LOGF("\t flexible memory size = %" PRIu64 " MiB, direct memory size = %" PRIu64 " MiB\n",

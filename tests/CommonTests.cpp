@@ -2,19 +2,25 @@
 #include "common/assert.h"
 #include "common/config.h"
 #include "common/emulatorConfig.h"
+#include "common/faultReport.h"
 #include "common/file.h"
+#include "common/fpEnv.h"
+#include "common/guestPark.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/memAccount.h"
 #include "common/platform/sysDbg.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "libs/libs.h"
 
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
@@ -25,6 +31,10 @@
 
 #ifdef __linux__
 #include <sched.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 
 namespace {
@@ -103,6 +113,125 @@ TEST(HostException, GuestSignalWaitsUntilTheFaultHandlerReturns) {
 		    std::_Exit(installs && mapped && g_dispatched == 1 ? 0 : 1);
 	    },
 	    testing::ExitedWithCode(0), "");
+}
+#endif
+
+size_t CountOf(const char* text, const char* needle) {
+	size_t count = 0;
+	for (const char* p = text; (p = std::strstr(p, needle)) != nullptr; p++) {
+		count++;
+	}
+	return count;
+}
+
+#if defined(__linux__)
+int g_fault_pipe = -1;
+
+// Writes the host fault report to the pipe the parent reads, then ends the child.
+bool ReportAndExit(const Common::HostException::ExceptionInfo& info) {
+	Common::FaultReport::Registers regs {};
+	regs.pc  = info.exception_address;
+	regs.rsp = info.rsp;
+	regs.rbp = info.rbp;
+	Common::FaultReport::WriteHostContext(
+	    regs,
+	    {[](void*, const char* text) { (void)!::write(g_fault_pipe, text, std::strlen(text)); },
+	     nullptr});
+	std::_Exit(0);
+}
+
+extern "C" __attribute__((noinline, used)) void KytyFaultReportTestNullWrite(volatile int* p) {
+	*p = 1;
+	asm volatile("" ::: "memory");
+}
+
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	int fds[2];
+	ASSERT_EQ(::pipe(fds), 0);
+	const pid_t child = ::fork();
+	ASSERT_GE(child, 0);
+	if (child == 0) {
+		::close(fds[0]);
+		g_fault_pipe = fds[1];
+		Common::FaultReport::RefreshModules();
+		Common::HostException::InstallHandler(ReportAndExit);
+		std::thread worker([] {
+			Common::FaultReport::SetThreadTag("fault test tag", "fault-test-worker");
+			Common::FaultReport::RegisterThreadStack();
+			KytyFaultReportTestNullWrite(nullptr);
+		});
+		worker.join();
+		std::_Exit(2);
+	}
+	::close(fds[1]);
+	std::string text;
+	char        buffer[4096];
+	for (ssize_t n; (n = ::read(fds[0], buffer, sizeof(buffer))) > 0;) {
+		text.append(buffer, static_cast<size_t>(n));
+	}
+	::close(fds[0]);
+	int status = 0;
+	::waitpid(child, &status, 0);
+	const size_t frames = CountOf(text.c_str(), " bt[") + CountOf(text.c_str(), " fp[");
+	EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << "status " << status;
+	EXPECT_NE(text.find("fault-test-worker"), std::string::npos) << text;
+	EXPECT_NE(text.find("doing: fault test tag"), std::string::npos) << text;
+	EXPECT_NE(text.find("common_tests+0x"), std::string::npos) << text;
+	EXPECT_NE(text.find("[KytyFaultReportTestNullWrite+0x"), std::string::npos) << text;
+	EXPECT_GE(frames, 3u) << text;
+}
+#elif defined(_WIN32)
+__declspec(noinline) void KytyFaultReportTestCapture(std::string* out) {
+	CONTEXT ctx {};
+	RtlCaptureContext(&ctx);
+	Common::FaultReport::Registers regs {};
+	regs.pc             = ctx.Rip;
+	regs.rsp            = ctx.Rsp;
+	regs.rbp            = ctx.Rbp;
+	regs.native_context = &ctx;
+	Common::FaultReport::WriteHostContext(
+	    regs, {[](void* user, const char* text) { static_cast<std::string*>(user)->append(text); },
+	           out});
+}
+
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	Common::FaultReport::RefreshModules();
+	std::string text;
+	std::thread worker([&] {
+		Common::FaultReport::SetThreadTag("fault test tag", "fault-test-worker");
+		KytyFaultReportTestCapture(&text);
+	});
+	worker.join();
+	EXPECT_NE(text.find("fault-test-worker"), std::string::npos) << text;
+	EXPECT_NE(text.find("doing: fault test tag"), std::string::npos) << text;
+	EXPECT_NE(text.find("common_tests"), std::string::npos) << text;
+	EXPECT_NE(text.find("+0x"), std::string::npos) << text;
+	EXPECT_GE(CountOf(text.c_str(), " bt["), 2u) << text;
+}
+#elif defined(__APPLE__)
+__attribute__((noinline)) void KytyFaultReportTestCapture(std::string* out) {
+	Common::FaultReport::Registers regs {};
+	regs.pc = reinterpret_cast<uint64_t>(&KytyFaultReportTestCapture);
+	Common::FaultReport::WriteHostContext(
+	    regs, {[](void* user, const char* text) { static_cast<std::string*>(user)->append(text); },
+	           out});
+}
+
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	std::string text;
+	std::thread worker([&] {
+		Common::FaultReport::SetThreadTag("fault test tag", "fault-test-worker");
+		KytyFaultReportTestCapture(&text);
+	});
+	worker.join();
+	EXPECT_NE(text.find("fault-test-worker"), std::string::npos) << text;
+	EXPECT_NE(text.find("doing: fault test tag"), std::string::npos) << text;
+	EXPECT_NE(text.find("common_tests+0x"), std::string::npos) << text;
+	EXPECT_GE(CountOf(text.c_str(), " bt["), 2u) << text;
+}
+#else
+TEST(FaultReport, WorkerThreadFaultNamesModuleFunctionAndFrames) {
+	GTEST_SKIP() << "Host fault symbolization is not available on this platform";
 }
 #endif
 
@@ -352,6 +481,267 @@ TEST(Thread, ReservesTheFastestCoreAndRestoresTheProcessAffinity) {
 	EXPECT_TRUE(CPU_EQUAL(&restored, &reserved));
 }
 #endif
+
+TEST(MemAccount, ParseProcStatusAndZramFootprint) {
+	const auto memory = Common::MemAccount::ParseProcStatus(
+	    "VmRSS:\t 1000 kB\nVmSwap:\t 1000 kB\nVmHWM:\t 1200 kB\n"
+	    "RssAnon:\t 600 kB\nRssFile:\t 300 kB\nRssShmem:\t 100 kB\n");
+	EXPECT_TRUE(memory.available);
+	EXPECT_EQ(memory.rss, 1000u * 1024u);
+	EXPECT_EQ(memory.swap, 1000u * 1024u);
+	EXPECT_EQ(memory.peak_rss, 1200u * 1024u);
+	EXPECT_EQ(memory.rss_anon, 600u * 1024u);
+	EXPECT_EQ(memory.rss_file, 300u * 1024u);
+	EXPECT_EQ(memory.rss_shmem, 100u * 1024u);
+	EXPECT_FALSE(Common::MemAccount::ParseProcStatus("no matching keys").available);
+
+	const auto zram = Common::MemAccount::ParseZramMmStat("8000 2000 2400 0 3000 5 0 0 0\n");
+	EXPECT_TRUE(zram.known);
+	EXPECT_EQ(zram.orig, 8000u);
+	EXPECT_EQ(zram.compressed, 2400u);
+	Common::MemAccount::ProcessMemory p;
+	p.available = true;
+	p.rss       = 1000;
+	p.swap      = 1000;
+	EXPECT_EQ(Common::MemAccount::Footprint(p, zram), 1300u);
+	EXPECT_EQ(Common::MemAccount::Footprint(p, {}), 2000u);
+	EXPECT_FALSE(Common::MemAccount::ParseZramMmStat("garbage").known);
+}
+
+TEST(MemAccount, FormatLineAndGrowthCoverInjectedAndUnavailableFigures) {
+	Common::MemAccount::Sample sample;
+	sample.process.available        = true;
+	sample.process.rss              = 3ull << 30;
+	sample.process.private_bytes    = 2ull << 30;
+	sample.process.swap             = 1ull << 30;
+	sample.process.peak_rss         = 4ull << 30;
+	sample.process.rss_shmem        = 1ull << 30;
+	sample.process.sys_commit_used  = 10ull << 30;
+	sample.process.sys_commit_total = 32ull << 30;
+	sample.heap                     = {.known = true, .in_use = 512ull << 20, .free_held = 64ull << 20};
+	sample.owners                   = {{"shader-store", 256ull << 20, 42}};
+	sample.zram                     = {.known = true, .orig = 4ull << 30, .compressed = 1ull << 30};
+	sample.guest_committed          = 16ull << 30;
+	sample.external                 = {{"vk", "device=800MiB host=128MiB"}};
+
+	const auto line = Common::MemAccount::FormatLine(sample, "now");
+	EXPECT_NE(line.find("[mem] now "), std::string::npos) << line;
+	EXPECT_NE(line.find("rss=3072MiB private=2048MiB swap=1024MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("counted=256MiB unaccounted=2816MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("shader-store=256MiB(42)"), std::string::npos) << line;
+	EXPECT_NE(line.find("heap-in-use=512MiB heap-free-held=64MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("footprint=3328MiB zram=4096MiB->1024MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("sys-commit=10240MiB/32768MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("guest: committed=16384MiB touched=1024MiB"), std::string::npos) << line;
+	EXPECT_NE(line.find("vk: device=800MiB host=128MiB"), std::string::npos) << line;
+
+	Common::MemAccount::Sample unavailable;
+	const auto                 na_line = Common::MemAccount::FormatLine(unavailable, "na");
+	EXPECT_NE(na_line.find("rss=not-available"), std::string::npos) << na_line;
+
+	const std::vector<std::pair<std::string, uint64_t>> before {
+	    {"heap-in-use", 100ull << 20}, {"shader-store", 10ull << 20}};
+	const std::vector<std::pair<std::string, uint64_t>> after {
+	    {"heap-in-use", 400ull << 20}, {"shader-store", 30ull << 20}};
+	EXPECT_EQ(Common::MemAccount::FormatGrowth(before, after, 2),
+	          "heap-in-use +300MiB, shader-store +20MiB");
+	EXPECT_EQ(Common::MemAccount::FormatGrowth(after, before), "nothing");
+}
+
+TEST(MemAccount, LimitGuardDropsThenStopsOnlyWhileOver) {
+	using Action = Common::MemAccount::LimitGuard::Action;
+	Common::MemAccount::LimitGuard off(0);
+	EXPECT_EQ(off.Step(0, 1000), Action::None);
+	EXPECT_EQ(off.Step(20000, 1000), Action::None);
+
+	Common::MemAccount::LimitGuard guard(100, 10000);
+	EXPECT_EQ(guard.Step(1000, 100), Action::None);
+	EXPECT_EQ(guard.Step(2000, 101), Action::DropCaches);
+	EXPECT_EQ(guard.Step(11999, 101), Action::None);
+	// Dropping back under resets the grace timer.
+	EXPECT_EQ(guard.Step(12000, 90), Action::None);
+	EXPECT_EQ(guard.Step(13000, 150), Action::DropCaches);
+	EXPECT_EQ(guard.Step(22999, 150), Action::None);
+	EXPECT_EQ(guard.Step(23000, 150), Action::Stop);
+}
+
+TEST(GuestPark, RegistryCountsThreadsAndFlagsFirstAtEachPc) {
+	Common::GuestPark::Registry registry;
+	EXPECT_EQ(registry.Count(), 0u);
+
+	const auto first = registry.Add(0x1000, 0x0, 11, "worker-a");
+	EXPECT_EQ(first.count, 1u);
+	EXPECT_TRUE(first.first_at_pc);
+	EXPECT_EQ(first.at_pc, 1u);
+
+	const auto repeat = registry.Add(0x1000, 0x8, 12, "worker-b");
+	EXPECT_EQ(repeat.count, 2u);
+	EXPECT_FALSE(repeat.first_at_pc);
+	EXPECT_EQ(repeat.at_pc, 2u);
+
+	const auto other = registry.Add(0x2000, 0x10, 13, nullptr);
+	EXPECT_EQ(other.count, 3u);
+	EXPECT_TRUE(other.first_at_pc);
+	EXPECT_EQ(other.at_pc, 1u);
+	EXPECT_EQ(registry.Count(), 3u);
+
+	for (size_t i = 0; i < Common::GuestPark::Registry::kCapacity; i++) {
+		(void)registry.Add(0x3000 + i * 4, 0, static_cast<int32_t>(100 + i), "fill");
+	}
+	EXPECT_EQ(registry.Count(), 3u + Common::GuestPark::Registry::kCapacity);
+}
+
+TEST(Config, ParseTraceCallsFilterHandlesOffAllAndNamedLibraries) {
+	const auto off = Config::ParseTraceCallsFilter("");
+	EXPECT_FALSE(off.enabled);
+	EXPECT_TRUE(Config::ParseTraceCallsFilter("0").libraries.empty());
+	EXPECT_FALSE(Config::ParseTraceCallsFilter("0").enabled);
+	EXPECT_FALSE(Config::ParseTraceCallsFilter(",,,").enabled);
+
+	const auto all = Config::ParseTraceCallsFilter("all");
+	EXPECT_TRUE(all.enabled);
+	EXPECT_TRUE(all.all);
+	EXPECT_TRUE(all.libraries.empty());
+
+	const auto named = Config::ParseTraceCallsFilter("libA,,libB");
+	EXPECT_TRUE(named.enabled);
+	EXPECT_FALSE(named.all);
+	ASSERT_EQ(named.libraries.size(), 2u);
+	EXPECT_EQ(named.libraries[0], "libA");
+	EXPECT_EQ(named.libraries[1], "libB");
+}
+
+TEST(Libs, PowerOfTwoRateLimitMatchesFirstFourAndPowersOfTwo) {
+	EXPECT_FALSE(Libs::ShouldLogPowerOfTwo(0));
+	for (uint64_t n = 1; n <= 4; n++) {
+		EXPECT_TRUE(Libs::ShouldLogPowerOfTwo(n));
+	}
+	EXPECT_FALSE(Libs::ShouldLogPowerOfTwo(5));
+	EXPECT_FALSE(Libs::ShouldLogPowerOfTwo(7));
+	EXPECT_TRUE(Libs::ShouldLogPowerOfTwo(8));
+	EXPECT_FALSE(Libs::ShouldLogPowerOfTwo(9));
+	EXPECT_TRUE(Libs::ShouldLogPowerOfTwo(16));
+	EXPECT_TRUE(Libs::ShouldLogPowerOfTwo(32));
+	EXPECT_FALSE(Libs::ShouldLogPowerOfTwo(33));
+}
+
+TEST(Libs, CallRingWrapsAroundAndIteratesOldestFirst) {
+	Libs::CallRing ring;
+	for (uint64_t i = 0; i < Libs::kCallRingSize + 10; i++) {
+		const uint64_t args[6] = {i, i + 1, 0, 0, 0, 0};
+		auto&          rec     = ring.Push("library", "Func", args, 0x1000 + i);
+		rec.result             = i * 2;
+		rec.completed          = true;
+	}
+	EXPECT_EQ(ring.count, Libs::kCallRingSize);
+	size_t seen = 0;
+	ring.ForEachOldestFirst([&](const Libs::CallRecord& rec, size_t idx) {
+		EXPECT_EQ(idx, seen);
+		EXPECT_EQ(rec.args[0], 10u + seen);
+		EXPECT_EQ(rec.result, (10u + seen) * 2u);
+		EXPECT_EQ(rec.guest_ret_addr, 0x1000u + 10u + seen);
+		seen++;
+	});
+	EXPECT_EQ(seen, Libs::kCallRingSize);
+}
+
+TEST(FpEnv, ControlComparisonIgnoresStickyFlagsAndReservedBits) {
+	const Common::FpEnv guest = Common::GuestFpEnv;
+	Common::FpEnv        dirty = guest;
+	dirty.mxcsr |= 0x3fu;   // sticky exception flags
+	dirty.control |= 0x00c0u; // reserved + infinity-control bits
+	EXPECT_TRUE(Common::SameFpControl(guest, dirty));
+	dirty.mxcsr ^= 1u << 15u; // flush-to-zero
+	EXPECT_FALSE(Common::SameFpControl(guest, dirty));
+	dirty = guest;
+	dirty.control ^= 0x0400u; // rounding
+	EXPECT_FALSE(Common::SameFpControl(guest, dirty));
+	EXPECT_STREQ(Common::FpCheckSiteName(Common::FpCheckSite::ThreadStart), "thread-start");
+	EXPECT_STREQ(Common::FpCheckSiteName(Common::FpCheckSite::SignalHandler), "signal-handler");
+}
+
+TEST(FpEnv, ReadWriteRoundTripsTheGuestControlState) {
+	const auto saved = Common::ReadFpEnv();
+	Common::WriteFpEnv(Common::GuestFpEnv);
+	const auto now = Common::ReadFpEnv();
+	EXPECT_TRUE(Common::SameFpControl(now, Common::GuestFpEnv));
+	Common::WriteFpEnv(saved);
+	EXPECT_TRUE(Common::SameFpControl(Common::ReadFpEnv(), saved));
+}
+
+KYTY_SYSV_ABI int ThunkTestFails(int a, const void* p) {
+	return a + (p != nullptr ? 1 : 0) - 100;
+}
+KYTY_SYSV_ABI double ThunkTestHalf(double x) {
+	return x * 0.5;
+}
+KYTY_SYSV_ABI void ThunkTestVoid(uint64_t* out) {
+	*out += 1;
+}
+
+// Restores the thunk switches a test changed.
+struct ThunkSwitches {
+	bool trace = Libs::g_trace_calls_enabled;
+	bool fp    = Libs::g_fp_env_check_enabled;
+	~ThunkSwitches() {
+		Libs::g_trace_calls_enabled  = trace;
+		Libs::g_fp_env_check_enabled = fp;
+	}
+};
+
+template <auto Fn>
+using TestThunk = Libs::LibThunkHelper<Fn, Libs::FixedString("libTest"), Libs::FixedString("fn"),
+                                       decltype(Fn)>;
+
+TEST(LibThunk, ExportIsTheFunctionItselfOnlyWithBothSwitchesOff) {
+	ThunkSwitches saved;
+	const auto    fn    = reinterpret_cast<uint64_t>(&ThunkTestFails);
+	const auto    thunk = reinterpret_cast<uint64_t>(&TestThunk<&ThunkTestFails>::Call);
+	for (int mask = 0; mask < 4; mask++) {
+		Libs::g_trace_calls_enabled  = (mask & 1) != 0;
+		Libs::g_fp_env_check_enabled = (mask & 2) != 0;
+		EXPECT_EQ((Libs::MakeLibThunk<&ThunkTestFails, Libs::FixedString("libTest"),
+		                              Libs::FixedString("fn")>()),
+		          mask == 0 ? fn : thunk);
+	}
+}
+
+TEST(LibThunk, TraceAndFpCheckWorkAloneAndTogether) {
+	ThunkSwitches saved;
+	const auto&   ring = Libs::GetThreadCallRing();
+	int           dummy {};
+	uint64_t      counter = 0;
+	for (int mask = 0; mask < 4; mask++) {
+		const bool trace             = (mask & 1) != 0;
+		const bool fp                = (mask & 2) != 0;
+		Libs::g_trace_calls_enabled  = trace;
+		Libs::g_fp_env_check_enabled = fp;
+		const auto ring_count        = ring.count;
+		const auto ring_next         = ring.next;
+		const auto float_calls       = Libs::FloatReturnCalls();
+
+		EXPECT_EQ(TestThunk<&ThunkTestFails>::Call(7, &dummy), -92);
+		EXPECT_EQ(TestThunk<&ThunkTestHalf>::Call(3.0), 1.5);
+		TestThunk<&ThunkTestVoid>::Call(&counter);
+
+		// The trace records all three calls in this thread's ring, results included.
+		const auto recorded = (ring.next + Libs::kCallRingSize - ring_next) % Libs::kCallRingSize;
+		EXPECT_EQ(recorded, trace ? 3u : 0u) << "mask " << mask;
+		if (trace) {
+			EXPECT_EQ(ring.count, std::min<size_t>(ring_count + 3, Libs::kCallRingSize));
+			const auto& first = ring.entries[ring_next];
+			EXPECT_STREQ(first.library, "libTest");
+			EXPECT_EQ(first.args[0], 7u);
+			EXPECT_EQ(first.args[1], reinterpret_cast<uint64_t>(&dummy));
+			EXPECT_EQ(first.result, static_cast<uint64_t>(static_cast<uint32_t>(-92)));
+			EXPECT_TRUE(first.completed);
+			EXPECT_TRUE(ring.entries[(ring_next + 2) % Libs::kCallRingSize].completed);
+		}
+		// The FP check notes the double result.
+		EXPECT_EQ(Libs::FloatReturnCalls() - float_calls, fp ? 1u : 0u) << "mask " << mask;
+	}
+	EXPECT_EQ(counter, 4u);
+}
 
 } // namespace
 

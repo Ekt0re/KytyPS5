@@ -26,6 +26,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -147,6 +148,133 @@ bool AllZero(std::span<const uint8_t> bytes) {
 	// Compared with itself shifted by one: all bytes equal the first, which is zero.
 	return bytes.empty() ||
 	       (bytes[0] == 0 && std::memcmp(bytes.data(), bytes.data() + 1, bytes.size() - 1) == 0);
+}
+
+// A JSON string literal of text (Windows paths have backslashes).
+std::string JsonString(std::string_view text) {
+	std::string out = "\"";
+	for (const char c: text) {
+		if (c == '"' || c == '\\') {
+			out += '\\';
+			out += c;
+		} else if (static_cast<unsigned char>(c) < 0x20) {
+			out += fmt::format("\\u{:04x}", static_cast<unsigned char>(c));
+		} else {
+			out += c;
+		}
+	}
+	return out + "\"";
+}
+
+// The image a video out port shows (RGBA8), read back from the GPU; defined with the replay.
+bool ReadDisplay(int handle, std::vector<uint8_t>& rgba, uint32_t& width, uint32_t& height);
+
+// An RGBA8 image as <name>.png and, with raw, <name>.rgba (the pixels, row by row).
+bool WriteImage(const std::filesystem::path& directory, const char* name,
+                const std::vector<uint8_t>& rgba, uint32_t width, uint32_t height,
+                bool raw_too = true) {
+	const auto png = (directory / (std::string(name) + ".png")).string();
+	const bool ok  = stbi_write_png(png.c_str(), static_cast<int>(width), static_cast<int>(height),
+	                                4, rgba.data(), static_cast<int>(width * 4)) != 0;
+	if (!raw_too) return ok;
+	std::ofstream raw(directory / (std::string(name) + ".rgba"), std::ios::binary);
+	raw.write(reinterpret_cast<const char*>(rgba.data()),
+	          static_cast<std::streamsize>(rgba.size()));
+	return ok && static_cast<bool>(raw);
+}
+
+// How far a replayed image is from the game's (after AnyPS5 tools/frame_replay_compare.py): the
+// share of identical pixels, the largest and mean channel difference and the PSNR over RGB.
+// Effects that depend on timing (temporal antialiasing, particles) differ between runs, so a
+// replay matches the game visually rather than exactly.
+struct ImageMatch {
+	double   identical = 0.0; // share of pixels with all of R, G and B equal
+	uint32_t max_diff  = 0;
+	double   mean_diff = 0.0;
+	double   psnr      = 0.0; // dB over RGB; infinite (reported as null) when identical
+};
+
+ImageMatch CompareImages(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
+                         std::vector<uint8_t>* diff) {
+	ImageMatch match;
+	const auto pixels = std::min(a.size(), b.size()) / 4;
+	if (pixels == 0) return match;
+	uint64_t same = 0;
+	uint64_t sum  = 0;
+	double   sq   = 0.0;
+	if (diff != nullptr) diff->assign(pixels * 4, 0);
+	for (uint64_t pixel = 0; pixel < pixels; pixel++) {
+		uint32_t largest = 0;
+		for (uint32_t channel = 0; channel < 3; channel++) {
+			const auto d = static_cast<uint32_t>(
+			    std::abs(int {a[pixel * 4 + channel]} - int {b[pixel * 4 + channel]}));
+			largest = std::max(largest, d);
+			sum += d;
+			sq += static_cast<double>(d) * d;
+		}
+		match.max_diff = std::max(match.max_diff, largest);
+		if (largest == 0) same++;
+		if (diff != nullptr) {
+			// Differences in red, scaled up so that small ones show; the rest dimmed grey.
+			auto*      out = diff->data() + pixel * 4;
+			const auto grey =
+			    static_cast<uint8_t>((a[pixel * 4] + a[pixel * 4 + 1] + a[pixel * 4 + 2]) / 12);
+			out[0] = largest != 0 ? static_cast<uint8_t>(std::min(255u, 64u + largest * 8u)) : grey;
+			out[1] = largest != 0 ? 0 : grey;
+			out[2] = largest != 0 ? 0 : grey;
+			out[3] = 255;
+		}
+	}
+	match.identical = static_cast<double>(same) / static_cast<double>(pixels);
+	match.mean_diff = static_cast<double>(sum) / static_cast<double>(pixels * 3);
+	const auto mse  = sq / static_cast<double>(pixels * 3);
+	match.psnr      = mse > 0.0 ? 10.0 * std::log10(255.0 * 255.0 / mse) : INFINITY;
+	return match;
+}
+
+// Frame times of a pass and of the passes after the first, which compile nothing the first did
+// not: the median and spread are what an A/B comparison of two builds should use.
+struct FrameStats {
+	size_t count  = 0;
+	double median = 0.0;
+	double mean   = 0.0;
+	double p95    = 0.0;
+	double min    = 0.0;
+	double max    = 0.0;
+	double stdev  = 0.0;
+};
+
+FrameStats Stats(std::vector<double> values) {
+	FrameStats stats;
+	stats.count = values.size();
+	if (values.empty()) return stats;
+	std::sort(values.begin(), values.end());
+	const auto at = [&](double q) {
+		const auto index = q * static_cast<double>(values.size() - 1);
+		const auto low   = static_cast<size_t>(index);
+		const auto high  = std::min(low + 1, values.size() - 1);
+		return values[low] + (values[high] - values[low]) * (index - static_cast<double>(low));
+	};
+	stats.median = at(0.5);
+	stats.p95    = at(0.95);
+	stats.min    = values.front();
+	stats.max    = values.back();
+	double sum   = 0.0;
+	for (const auto value: values)
+		sum += value;
+	stats.mean = sum / static_cast<double>(values.size());
+	double sq  = 0.0;
+	for (const auto value: values)
+		sq += (value - stats.mean) * (value - stats.mean);
+	stats.stdev = values.size() > 1 ? std::sqrt(sq / static_cast<double>(values.size() - 1)) : 0.0;
+	return stats;
+}
+
+std::string StatsJson(const FrameStats& stats) {
+	return fmt::format("{{\"count\":{},\"median\":{:.4f},\"mean\":{:.4f},\"p95\":{:.4f},"
+	                   "\"min\":{:.4f},\"max\":{:.4f},\"stdev\":{:.4f}}}",
+	                   stats.count, stats.median, stats.mean, stats.p95, stats.min, stats.max,
+	                   stats.stdev);
 }
 
 // Guest memory as the guest wrote it, without faulting on pages the GPU caches protect.
@@ -287,6 +415,12 @@ public:
 	void Record(Call call) {
 		std::lock_guard lock(m_mutex);
 		if (m_state == State::Done) return;
+		// The main port (bus type 0), whose image the capture keeps as the replay's reference.
+		if (call.kind == CallKind::VideoOut && call.args.size() >= 4 &&
+		    static_cast<VideoOutCallKind>(call.args[0]) == VideoOutCallKind::Open &&
+		    call.args[1] == 0 && m_main_handle < 0) {
+			m_main_handle = static_cast<int>(call.args[3]);
+		}
 		auto flips       = Flips().load(std::memory_order_acquire);
 		bool started_now = false;
 		// The shaders mapped before the capture are written when it starts.
@@ -704,17 +838,40 @@ private:
 		return true;
 	}
 
+	// The image the main port shows once the GPU has finished the recorded frames: what the
+	// replay's last image is compared with (KYTY_FRAME_CAPTURE_REFERENCE=0 skips it).
+	void WriteReference() {
+		if (EnvNumber("KYTY_FRAME_CAPTURE_REFERENCE", 1) == 0 || m_main_handle < 0) return;
+		if (!DrainGpu()) {
+			std::fprintf(stderr, "[frame-capture] no reference image: the GPU did not finish\n");
+			return;
+		}
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+		while (VideoOut::VideoOutIsFlipPending(m_main_handle) > 0 &&
+		       std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		std::vector<uint8_t> rgba;
+		if (!ReadDisplay(m_main_handle, rgba, m_reference_width, m_reference_height) ||
+		    !WriteImage(m_directory, "reference", rgba, m_reference_width, m_reference_height)) {
+			std::fprintf(stderr, "[frame-capture] no reference image: the display was not read\n");
+			m_reference_width = m_reference_height = 0;
+		}
+	}
+
 	void Finish() {
 		Call end;
 		end.kind = CallKind::End;
 		if (!Write(std::move(end))) return;
 		m_calls.close();
+		WriteReference();
 		std::ofstream header(m_directory / "header.json");
 		header << "{\"magic\":\"kyty-frame-capture\",\"version\":" << CaptureVersion
 		       << ",\"start_flip\":" << m_start_flips << ",\"frames\":" << m_frames
 		       << ",\"calls\":" << m_ordinal << ",\"ranges\":" << m_ranges.size()
 		       << ",\"guest_bytes\":" << m_total_bytes << ",\"snapshot_bytes\":" << m_snapshot_bytes
-		       << ",\"call_bytes\":" << m_call_bytes << "}\n";
+		       << ",\"call_bytes\":" << m_call_bytes << ",\"reference_width\":" << m_reference_width
+		       << ",\"reference_height\":" << m_reference_height << "}\n";
 		m_state = State::Done;
 		m_ranges.clear();
 		std::fprintf(stderr,
@@ -764,6 +921,9 @@ private:
 	uint64_t                    m_total_bytes    = 0;
 	uint64_t                    m_snapshot_bytes = 0;
 	uint64_t                    m_call_bytes     = 0;
+	int                         m_main_handle    = -1;
+	uint32_t                    m_reference_width  = 0;
+	uint32_t                    m_reference_height = 0;
 };
 
 Recorder* Active() {
@@ -843,6 +1003,79 @@ std::vector<Call> ReadCalls(const std::filesystem::path& path) {
 constexpr uint32_t ShaderFileHeader = 0x34333231;
 constexpr uint32_t ShaderVersion    = 0x18;
 
+// The shaders of a capture, as listed by its Shader calls or found in its memory: --replay-shaders.
+struct CapturedShader {
+	uint64_t code;
+	uint32_t type;
+	uint32_t bytes;
+};
+
+std::mutex& ShaderListMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+std::vector<CapturedShader>& ShaderList() {
+	static std::vector<CapturedShader> list;
+	return list;
+}
+
+void NoteShader(uint64_t code, uint32_t type, uint32_t bytes) {
+	std::lock_guard lock(ShaderListMutex());
+	ShaderList().push_back({code, type, bytes});
+}
+
+// The guest stage of a ShaderBinaryType (gpu_defs.h).
+const char* ShaderStageName(uint32_t type) {
+	static constexpr const char* NAMES[] = {"cs", "ps", "gs", "hs", "gs_front", "hs_front", "gs_back",
+	                                        "hs_back", "fs"};
+	return type < std::size(NAMES) ? NAMES[type] : "unknown";
+}
+
+// Each distinct code once as <dir>/<stage>-<hash>.bin, and one JSON object per line per shader
+// in shaders.jsonl: the hash is the one the shader store, KYTY_TRACE_SHADERS and pipeline names
+// use. These are all the shaders the game had created, not only the ones the frames draw with.
+void DumpShaders(const std::filesystem::path& directory) {
+	std::filesystem::create_directories(directory);
+	std::vector<CapturedShader> list;
+	{
+		std::lock_guard lock(ShaderListMutex());
+		list = ShaderList();
+	}
+	std::sort(list.begin(), list.end(),
+	          [](const CapturedShader& a, const CapturedShader& b) { return a.code < b.code; });
+	list.erase(std::unique(list.begin(), list.end(),
+	                       [](const CapturedShader& a, const CapturedShader& b) {
+		                       return a.code == b.code;
+	                       }),
+	           list.end());
+	std::ofstream                json(directory / "shaders.jsonl");
+	std::map<uint64_t, uint32_t> seen; // hash -> registrations
+	uint64_t                     written_bytes = 0;
+	std::vector<uint8_t>         code;
+	for (const auto& shader: list) {
+		code.resize(shader.bytes);
+		if (!ReadGuest(shader.code, code.data(), shader.bytes)) continue;
+		uint32_t   hashed = 0;
+		const auto hash =
+		    ShaderCodeHash(reinterpret_cast<const uint32_t*>(code.data()), shader.bytes, &hashed);
+		const auto same = seen[hash]++;
+		if (same == 0) {
+			std::ofstream out(directory / fmt::format("{}-{:016x}.bin", ShaderStageName(shader.type), hash),
+			                  std::ios::binary);
+			out.write(reinterpret_cast<const char*>(code.data()), shader.bytes);
+			written_bytes += shader.bytes;
+		}
+		json << fmt::format("{{\"code\":\"0x{:x}\",\"type\":{},\"stage\":\"{}\",\"bytes\":{},"
+		                    "\"program_bytes\":{},\"hash\":\"{:016x}\",\"same_code_before\":{}}}\n",
+		                    shader.code, shader.type, ShaderStageName(shader.type), shader.bytes, hashed,
+		                    hash, same);
+	}
+	std::printf("[replay] %zu shaders the game created, %zu distinct (%.1f MiB) written to %s\n",
+	            list.size(), seen.size(), static_cast<double>(written_bytes) / (1u << 20u),
+	            directory.string().c_str());
+}
+
 std::atomic<uint64_t>& ShadersFound() {
 	static std::atomic<uint64_t> found {0};
 	return found;
@@ -882,6 +1115,7 @@ void RegisterShaderAt(uint64_t address) {
 	map.scratch_size_dwords = header.scratch_size_dw_per_thread;
 	ShaderMapUserData(code, map);
 	ShadersFound().fetch_add(1, std::memory_order_relaxed);
+	NoteShader(code, header.type, header.shader_size);
 }
 
 // Captures that list their shaders need no scan.
@@ -1392,6 +1626,17 @@ void RunReplay(const ReplayOptions& options) {
 		            listed != 0 ? "as the game mapped them" : "found by scanning memory", calls.size(),
 		            static_cast<double>(NowNs() - load_start) / 1e9);
 		std::printf("[replay] resident after load: %.2f GiB\n", RssGiB());
+		for (const auto& call: calls) {
+			if (call.kind == CallKind::Shader && call.args.size() >= 7) {
+				NoteShader(static_cast<uint64_t>(call.args[0]), static_cast<uint32_t>(call.args[1]),
+				           static_cast<uint32_t>(call.args[5]));
+			}
+		}
+		if (!options.shaders.empty()) {
+			DumpShaders(options.shaders);
+			std::fflush(stdout);
+			std::quick_exit(0);
+		}
 
 		auto& gpu         = Gpu();
 		int   main_handle = -1;
@@ -1423,7 +1668,14 @@ void RunReplay(const ReplayOptions& options) {
 		}
 		std::map<int64_t, int> handles; // recorded handle -> replay handle
 		std::ofstream          report(options.output / "replay.json");
-		report << "{\"capture\":\"" << dir.string() << "\",\"passes\":[";
+		report << "{\"capture\":" << JsonString(dir.string()) << ",\"passes\":[";
+		// Frame intervals (flip to flip) and pass times of the passes after the first, which
+		// compile nothing new; with one pass, that pass.
+		std::vector<double> steady_frames;
+		std::vector<double> steady_passes;
+		std::vector<double> steady_memory;
+		std::vector<double> steady_gpu_cpu;
+		uint32_t            passes_done = 0;
 		for (uint32_t pass = 0; pass < std::max(1u, options.repeat); pass++) {
 			if (pass != 0) LoadSnapshot(dir / "snapshot.bin", true);
 			Pacing pacing;
@@ -1442,6 +1694,10 @@ void RunReplay(const ReplayOptions& options) {
 			}
 			bool       started     = false;
 			uint64_t   submissions = 0;
+			// Replay overhead inside the pass: recorded memory written between GPU packets (wall
+			// time of each synchronous step), which the game itself did not wait for.
+			uint64_t   memory_records = 0;
+			uint64_t   memory_ns      = 0;
 			const auto gpu_cpu_start     = GpuThreadCpuNs();
 			const auto process_cpu_start = CpuNs(true);
 			const auto pass_start        = NowNs();
@@ -1454,8 +1710,11 @@ void RunReplay(const ReplayOptions& options) {
 						// buffer before it released the REWIND in front of it, but the pages of a
 						// record are in no such order, and a GPU that ran meanwhile would follow
 						// the released REWIND into a buffer that is not there yet.
-						const auto pages = Blob(call);
+						const auto pages        = Blob(call);
+						const auto memory_start = NowNs();
 						gpu.SendCommandSync([&] { ApplyPages(pages); });
+						memory_ns += NowNs() - memory_start;
+						memory_records++;
 						break;
 					}
 					case CallKind::Submit: {
@@ -1599,40 +1858,96 @@ void RunReplay(const ReplayOptions& options) {
 			            pass + 1, static_cast<double>(pass_ns) / 1e9, submissions, flips.size(),
 			            pacing.timeouts, RssGiB());
 			std::printf("[replay]   pacing: %" PRIu64 " waits ended with the GPU parked\n", pacing.stalls);
+			std::printf("[replay]   memory: %" PRIu64 " records written in %.1f ms (replay overhead)\n",
+			            memory_records, static_cast<double>(memory_ns) / 1e6);
 			// CPU times do not depend on what else the machine runs, unlike the wall time.
 			std::printf("[replay]   CPU: GPU command thread %.3f s, process %.3f s\n",
 			            static_cast<double>(gpu_cpu_ns) / 1e9, static_cast<double>(process_cpu_ns) / 1e9);
 			report << (pass != 0 ? "," : "") << "{\"seconds\":" << static_cast<double>(pass_ns) / 1e9
 			       << ",\"gpu_thread_cpu_seconds\":" << static_cast<double>(gpu_cpu_ns) / 1e9
 			       << ",\"process_cpu_seconds\":" << static_cast<double>(process_cpu_ns) / 1e9
+			       << ",\"memory_records\":" << memory_records
+			       << ",\"memory_ms\":" << static_cast<double>(memory_ns) / 1e6
 			       << ",\"submissions\":" << submissions << ",\"timeouts\":" << pacing.timeouts
 			       << ",\"stalls\":" << pacing.stalls << ",\"finished\":" << (finished ? "true" : "false")
 			       << ",\"flip_ms\":[";
+			std::vector<double> intervals;
 			for (size_t i = 0; i < flips.size(); i++) {
 				const auto ms = static_cast<double>(flips[i] - (i == 0 ? pass_start : flips[i - 1])) / 1e6;
 				report << (i != 0 ? "," : "") << ms;
 				std::printf("[replay]   frame %zu: %.1f ms\n", i + 1, ms);
+				// The first flip also counts the pass's set-up; only flip-to-flip intervals.
+				if (i != 0) intervals.push_back(ms);
 			}
-			report << "]}";
+			report << "],\"frames\":" << StatsJson(Stats(intervals)) << "}";
+			passes_done++;
+			const bool steady = options.repeat <= 1 || pass != 0;
+			if (finished && steady) {
+				steady_frames.insert(steady_frames.end(), intervals.begin(), intervals.end());
+				steady_passes.push_back(static_cast<double>(pass_ns) / 1e6);
+				steady_gpu_cpu.push_back(static_cast<double>(gpu_cpu_ns) / 1e6);
+				steady_memory.push_back(static_cast<double>(memory_ns) / 1e6);
+			}
 			if (!finished) break;
 		}
-		report << "]}\n";
+		report << "]";
+		{
+			const auto frames = Stats(steady_frames);
+			const auto passes = Stats(steady_passes);
+			const auto gpu    = Stats(steady_gpu_cpu);
+			report << ",\"steady\":{\"passes\":" << steady_passes.size()
+			       << ",\"frame_ms\":" << StatsJson(frames) << ",\"pass_ms\":" << StatsJson(passes)
+			       << ",\"gpu_thread_cpu_ms\":" << StatsJson(gpu)
+			       << ",\"memory_ms\":" << StatsJson(Stats(steady_memory)) << "}";
+			std::printf(
+			    "[replay] steady (%zu of %u passes): frame %.2f ms median, p95 %.2f, stdev %.2f "
+			    "(%zu intervals); pass %.1f ms median, of it %.1f ms writing recorded memory; GPU "
+			    "command thread CPU %.1f ms median\n",
+			    steady_passes.size(), passes_done, frames.median, frames.p95, frames.stdev,
+			    frames.count, passes.median, Stats(steady_memory).median, gpu.median);
+		}
 		// The image the main port shows at the end.
 		std::vector<uint8_t> rgba;
 		uint32_t             width  = 0;
 		uint32_t             height = 0;
 		if (main_handle >= 0 && ReadDisplay(main_handle, rgba, width, height)) {
-			const auto png = (options.output / "frame.png").string();
-			stbi_write_png(png.c_str(), static_cast<int>(width), static_cast<int>(height), 4,
-			               rgba.data(), static_cast<int>(width * 4));
-			std::ofstream raw(options.output / "frame.rgba", std::ios::binary);
-			raw.write(reinterpret_cast<const char*>(rgba.data()), static_cast<std::streamsize>(rgba.size()));
-			std::printf("[replay] display %ux%u written to %s (hash %016" PRIx64 ")\n", width, height,
-			            png.c_str(), XXH3_64bits(rgba.data(), rgba.size()));
+			WriteImage(options.output, "frame", rgba, width, height);
+			std::printf("[replay] display %ux%u written to %s (hash %016" PRIx64 ")\n", width,
+			            height, (options.output / "frame.png").string().c_str(),
+			            XXH3_64bits(rgba.data(), rgba.size()));
+			// Against the image the game showed at the end of the capture, when it has one.
+			const auto reference = dir / "reference.rgba";
+			if (std::filesystem::exists(reference)) {
+				const auto expected = ReadFile(reference);
+				if (expected.size() == rgba.size()) {
+					std::vector<uint8_t> diff;
+					const auto           match = CompareImages(expected, rgba, &diff);
+					WriteImage(options.output, "diff", diff, width, height, false);
+					const auto psnr = std::isfinite(match.psnr) ? fmt::format("{:.2f}", match.psnr)
+					                                            : std::string("null");
+					report
+					    << ",\"image\":"
+					    << fmt::format(
+					           "{{\"width\":{},\"height\":{},\"identical\":{:.6f},\"max_diff\":{},"
+					           "\"mean_diff\":{:.4f},\"psnr_db\":{}}}",
+					           width, height, match.identical, match.max_diff, match.mean_diff,
+					           psnr);
+					std::printf(
+					    "[replay] image vs game: %.2f%% identical pixels, max channel diff %u, "
+					    "mean %.3f, PSNR %s dB (diff.png)\n",
+					    match.identical * 100.0, match.max_diff, match.mean_diff,
+					    std::isfinite(match.psnr) ? psnr.c_str() : "inf");
+				} else {
+					std::printf(
+					    "[replay] reference image has another size (%zu bytes, replay %zu)\n",
+					    expected.size(), rgba.size());
+				}
+			}
 		} else {
 			std::printf("[replay] no display image to read\n");
 			exit_code = 2;
 		}
+		report << ",\"exit_code\":" << exit_code << "}\n";
 	}
 	std::fflush(stdout);
 	std::fflush(stderr);

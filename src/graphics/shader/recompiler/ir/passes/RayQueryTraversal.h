@@ -9,7 +9,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // nested under an instance leaf of a TLAS walk, or a walk over a stack the wave shares. Every
 // iteration takes one candidate triangle into the loop's own triangle test, any-hit and commit
 // code, or into copies of a shared-stack walk's instance and commit tests, which keep the hit
-// state. Without a valid mirror the loop traverses as before. Returns the loops it drives.
-[[nodiscard]] uint32_t TraceTraversalsWithRayQueries(Program& program);
+// state. Without a valid mirror the loop traverses as before. Returns the loops it drives; `left`,
+// when given, gets the BVH intersections inside loops that it leaves to the guest walk.
+[[nodiscard]] uint32_t TraceTraversalsWithRayQueries(Program& program, uint32_t* left = nullptr);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

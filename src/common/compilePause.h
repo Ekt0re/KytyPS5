@@ -139,6 +139,46 @@ struct Scope {
 	Scope& operator=(const Scope&) = delete;
 };
 
+// Tracks a presented-frame stall for KYTY_DEFER_NEW_TARGETS. The caller skips Update while the
+// threshold is zero, so the default path neither reads the clock nor changes this state.
+struct FrameStallTracker {
+	enum class Change : uint8_t { None, Started, Ended };
+
+	uint64_t frame    = ~uint64_t {0};
+	uint64_t since_ms = 0;
+	bool     stalled  = false;
+	// Draws actually skipped because the stall made them deferrable.
+	uint64_t deferred       = 0;
+	uint64_t deferred_total = 0;
+
+	void NoteDeferred() {
+		deferred++;
+		deferred_total++;
+	}
+
+	bool Update(uint64_t frame_now, uint64_t now_ms, uint32_t stall_ms, Change* change) {
+		Change edge = Change::None;
+		if (stall_ms == 0) {
+			if (change != nullptr) *change = edge;
+			return false;
+		}
+		if (frame_now != frame) {
+			if (stalled) edge = Change::Ended;
+			frame    = frame_now;
+			since_ms = now_ms;
+			stalled  = false;
+		}
+		const bool want = now_ms >= since_ms && now_ms - since_ms >= stall_ms;
+		if (want && !stalled) {
+			stalled  = true;
+			deferred = 0;
+			edge     = Change::Started;
+		}
+		if (change != nullptr) *change = edge;
+		return stalled;
+	}
+};
+
 } // namespace Common::CompilePause
 
 #endif

@@ -46,6 +46,11 @@ target_link_libraries(common
 if(APPLE)
 	# hostStats.cpp reads GPU utilization from the IOAccelerator registry entries.
 	target_link_libraries(common PRIVATE "-framework CoreFoundation" "-framework IOKit")
+elseif(WIN32)
+	# faultReport.cpp resolves host fault modules, symbols and stack frames with DbgHelp.
+	target_link_libraries(common PRIVATE dbghelp)
+elseif(LINUX)
+	target_link_libraries(common PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 get_property(inc_headers TARGET common PROPERTY INCLUDE_DIRECTORIES)

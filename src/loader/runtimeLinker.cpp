@@ -1,11 +1,14 @@
 #include "loader/runtimeLinker.h"
+#include "graphics/host_gpu/renderer/cache/readbackOrigin.h"
 
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/faultReport.h"
 #include "common/file.h"
 #include "common/fpEnv.h"
+#include "common/guestPark.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/platform/sysDbg.h"
@@ -17,8 +20,10 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/fileSystem.h"
+#include "kernel/guestWait.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/libs.h"
 #include "kytyGitVersion.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
@@ -53,6 +58,7 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <sys/uio.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 #endif
@@ -668,6 +674,24 @@ static bool RageAssertBypassEnabled() {
 	return enabled;
 }
 
+// KYTY_GUEST_FAULT_PARK=1, off by default: an unresolved fault whose pc is inside a guest module
+// parks that guest thread (logging the full crash report with guest code bytes and stack once per
+// pc) instead of ending the process. Faults in emulator/driver code still end the process.
+static bool GuestFaultParkEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GUEST_FAULT_PARK");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static std::string FormatGuestModuleOffset(RuntimeLinker* rt, uint64_t vaddr) {
+	if (auto* p = rt->FindProgramByAddr(vaddr); p != nullptr) {
+		return fmt::format("{}+0x{:x}", p->file_name.filename().string(), vaddr - p->base_vaddr);
+	}
+	return "not in a loaded module";
+}
+
 static bool TryBypassGuestTrap(const Common::HostException::ExceptionInfo& info) {
 	if (!RageAssertBypassEnabled() ||
 	    info.type != Common::HostException::ExceptionType::AccessViolation) {
@@ -706,7 +730,8 @@ static bool TryBypassGuestTrap(const Common::HostException::ExceptionInfo& info)
 }
 
 // The fault context, also kept in _Logs/crash_<time>.txt (after Axellito/VIKyng bcee3021).
-static void WriteCrashReport(const Common::HostException::ExceptionInfo& exception_info) {
+static void WriteCrashReport(const Common::HostException::ExceptionInfo& exception_info,
+                             bool extended_guest_dump = false) {
 	const auto* info = &exception_info;
 	char thread_name[64] = "(host thread)";
 	if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
@@ -721,6 +746,19 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 	                 static_cast<unsigned>(info->type), info->native_code, info->exception_address,
 	                 static_cast<unsigned>(info->access_violation_type),
 	                 info->access_violation_vaddr);
+	// A pc outside every guest module is emulator or driver code: extend the report with host
+	// module, symbol, thread tag and call chain.
+	if (Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(info->exception_address) ==
+	    nullptr) {
+		Common::FaultReport::Registers regs {};
+		regs.pc             = info->exception_address;
+		regs.rsp            = info->rsp;
+		regs.rbp            = info->rbp;
+		regs.native_context = info->native_context;
+		Common::FaultReport::WriteHostContext(
+		    regs, {[](void* user, const char* text) { static_cast<std::string*>(user)->append(text); },
+		           &r});
+	}
 	r += fmt::format("rax={:016x} rbx={:016x} rcx={:016x} rdx={:016x}\n"
 	                 "rsi={:016x} rdi={:016x} rbp={:016x} rsp={:016x}\n"
 	                 "r8 ={:016x} r9 ={:016x} r10={:016x} r11={:016x}\n"
@@ -736,16 +774,90 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 		}
 		r += "\n";
 	}
-	if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
+	// As many of the 32 words at rsp as are readable: rsp near the top of a stack would otherwise
+	// leave out every word, the caller's return address among them.
+	int stack_words = 0;
+	while (stack_words < 32 &&
+	       IsReadableRange(info->rsp + static_cast<uint64_t>(stack_words) * sizeof(uint64_t),
+	                       sizeof(uint64_t))) {
+		stack_words++;
+	}
+	if (stack_words != 0) {
+		auto*      rt    = Common::Singleton<RuntimeLinker>::Instance();
 		const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 		r += "stack:";
-		for (int i = 0; i < 32; i++) {
+		for (int i = 0; i < stack_words; i++) {
 			r += fmt::format("{}{:016x}", (i % 4 == 0) ? "\n " : " ", stack[i]);
 		}
 		r += "\n";
+		// Words that point into a guest module: return addresses, read without the extended dump.
+		for (int i = 0; i < stack_words; i++) {
+			if (rt->FindProgramByAddr(stack[i]) != nullptr) {
+				r += fmt::format(" [rsp+0x{:x}] {}\n", i * 8, FormatGuestModuleOffset(rt, stack[i]));
+			}
+		}
+	}
+	if (extended_guest_dump) {
+		auto* rt = Common::Singleton<RuntimeLinker>::Instance();
+		r += fmt::format("guest pc = {}\n", FormatGuestModuleOffset(rt, info->exception_address));
+		constexpr uint64_t SPAN  = 0x400;
+		constexpr uint64_t ROW   = 16;
+		const uint64_t     start = info->exception_address >= SPAN / 2
+		                               ? info->exception_address - SPAN / 2
+		                               : 0;
+		r += fmt::format("guest code (0x{:016x} .. 0x{:016x}, pc at +0x{:x}):\n", start,
+		                 start + SPAN, info->exception_address - start);
+		for (uint64_t row = start; row < start + SPAN; row += ROW) {
+			r += fmt::format(" {:016x}:", row);
+			if (!IsReadableRange(row, ROW)) {
+				r += " not readable\n";
+				continue;
+			}
+			const auto* bytes = reinterpret_cast<const uint8_t*>(row);
+			for (uint64_t i = 0; i < ROW; i++) {
+				r += fmt::format(" {:02x}", bytes[i]);
+			}
+			r += "\n";
+		}
+		r += "guest stack code pointers (rsp upward):\n";
+		int named = 0;
+		for (int i = 0; i < 192 && named < 32; i++) {
+			const uint64_t addr = info->rsp + static_cast<uint64_t>(i) * sizeof(uint64_t);
+			if (!IsReadableRange(addr, sizeof(uint64_t))) {
+				break;
+			}
+			const uint64_t value = *reinterpret_cast<const uint64_t*>(addr);
+			if (rt->FindProgramByAddr(value) != nullptr) {
+				r += fmt::format(" rsp+0x{:03x} {:016x} = {}\n", i * sizeof(uint64_t), value,
+				                 FormatGuestModuleOffset(rt, value));
+				named++;
+			}
+		}
+		if (named == 0) {
+			r += " (none)\n";
+		}
 	}
 	r += "modules (base / size / name; * holds pc):\n";
 	Common::Singleton<RuntimeLinker>::Instance()->DescribeModules(info->exception_address, r);
+	// The last library calls of the faulting thread, for the call that led here. Every value in a
+	// record was copied on the host at call time; no guest memory is read by this reporter.
+	if (Config::TraceCallsEnabled()) {
+		r += "recent library calls on faulting thread (oldest -> newest):\n";
+		Libs::GetThreadCallRing().ForEachOldestFirst([&](const Libs::CallRecord& rec, size_t idx) {
+			r += fmt::format(" [{:3}] {}::{}(0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}, 0x{:x}) = ",
+			                 idx, rec.library, rec.function, rec.args[0], rec.args[1], rec.args[2],
+			                 rec.args[3], rec.args[4], rec.args[5]);
+			r += rec.completed ? fmt::format("0x{:x}", rec.result) : "<in-flight>";
+			r += fmt::format(" ret=0x{:016x}", rec.guest_ret_addr);
+			const auto* program =
+			    Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(rec.guest_ret_addr);
+			if (program != nullptr) {
+				r += fmt::format(" ({}+0x{:x})", program->file_name.filename().string(),
+				                 rec.guest_ret_addr - program->base_vaddr);
+			}
+			r += "\n";
+		});
+	}
 	// Which call each guest thread waits in: a watchdog abort or hang shows what stalled.
 	r += Libs::LibKernel::DumpGuestThreads();
 	std::fwrite(r.data(), 1, r.size(), stdout);
@@ -770,8 +882,35 @@ static void WriteCrashReport(const Common::HostException::ExceptionInfo& excepti
 	}
 }
 
+// The FP control state guest code faulted with, when it is not the one guest threads start with
+// (one line per thread; a fault in emulator code is not asked).
+static void CheckGuestFaultFpEnv(const Common::HostException::ExceptionInfo& info) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
+	const auto* context = static_cast<const ucontext_t*>(info.native_context);
+	if (context == nullptr || context->uc_mcontext.fpregs == nullptr) {
+		return;
+	}
+	const Common::FpEnv env {context->uc_mcontext.fpregs->mxcsr, context->uc_mcontext.fpregs->cwd};
+	if (!Common::FpControlFirstDeviation(Common::FpCheckSite::GuestFault, env) ||
+	    Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(info.exception_address) ==
+	        nullptr) {
+		return;
+	}
+	const auto* program =
+	    Common::Singleton<RuntimeLinker>::Instance()->FindProgramByAddr(info.exception_address);
+	std::printf("[fpenv] site=guest-fault thread=%d pc=%s+0x%016" PRIx64
+	            " mxcsr=0x%04x x87=0x%04x expected mxcsr=0x%04x x87=0x%04x (first on this thread)\n",
+	            Libs::LibKernel::PthreadGetthreadid(), program->file_name.filename().string().c_str(),
+	            info.exception_address - program->base_vaddr, env.mxcsr, env.control,
+	            Common::GuestFpEnv.mxcsr, Common::GuestFpEnv.control);
+#else
+	(void)info;
+#endif
+}
+
 bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
+	CheckGuestFaultFpEnv(exception_info);
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
@@ -795,6 +934,16 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			// needs no readback. Otherwise the load retries once its fault is handled, or
 			// reads zero.
 			uint32_t value = 0;
+			if (Libs::Graphics::ShaderRecompiler::IR::SrtSpeculativeThread()) {
+				// A walk ahead of the command thread (lookahead) never handles GPU faults or
+				// reads back: it takes the backing's bytes, which the command thread checks
+				// (and rejects while the GPU owns them) before it uses the walk.
+				(void)Libs::LibKernel::Memory::TryReadBacking(info->r10, &value, sizeof(value));
+				Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
+				return true;
+			}
+			const Libs::Graphics::ReadbackOrigin::Scope origin(
+			    Libs::Graphics::ReadbackOrigin::Origin::Srt);
 			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&
 			    Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 				Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
@@ -819,6 +968,36 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 	}
 	if (TryBypassGuestTrap(exception_info)) {
 		return true;
+	}
+	auto*      rt   = Common::Singleton<RuntimeLinker>::Instance();
+	const bool park = GuestFaultParkEnabled() && rt->FindProgramByAddr(info->exception_address) != nullptr;
+	if (park) {
+		char       thread_name[64] = "(host thread)";
+		const auto self            = Libs::LibKernel::PthreadSelfOrNull();
+		const int32_t tid          = self != nullptr ? Libs::LibKernel::PthreadGetthreadid() : 0;
+		if (self != nullptr && Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
+			std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
+		}
+		const auto added = Common::GuestPark::Global().Add(
+		    info->exception_address, info->access_violation_vaddr, tid, thread_name);
+		const auto where = FormatGuestModuleOffset(rt, info->exception_address);
+		if (added.first_at_pc) {
+			WriteCrashReport(exception_info, true);
+		} else {
+			std::printf("[park] thread '%s' (id %d) faulted again at pc=0x%016" PRIx64
+			            " = %s (%u threads at this pc); full report was printed for the first\n",
+			            thread_name, tid, info->exception_address, where.c_str(), added.at_pc);
+		}
+		std::printf("[park] thread '%s' (id %d) parked for good: pc=0x%016" PRIx64
+		            " = %s access=%u address=0x%016" PRIx64 "\n[park] %u guest threads parked\n",
+		            thread_name, tid, info->exception_address, where.c_str(),
+		            static_cast<unsigned>(info->access_violation_type),
+		            info->access_violation_vaddr, added.count);
+		std::fflush(stdout);
+		const Libs::LibKernel::GuestWaitScope parked_wait(
+		    "parked-fault", info->exception_address,
+		    static_cast<int64_t>(info->access_violation_vaddr));
+		Common::GuestPark::ParkForever();
 	}
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes, the top of its stack and the modules.
@@ -1712,6 +1891,39 @@ uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
 	return size;
 }
 
+// Appends the code addresses that relative relocations store (virtual tables, tables of function
+// pointers): functions only reached through such pointers are neither listed in .eh_frame nor
+// called directly. Executable segments hold no data, so these addresses are function entries.
+static void AddRelocatedCodeAddresses(Program* program,
+                                      const std::vector<std::pair<uint64_t, uint64_t>>& segments,
+                                      std::vector<uintptr_t>* function_starts,
+                                      std::vector<uintptr_t>* relocated = nullptr) {
+	auto*       elf        = program->elf.get();
+	Elf64_Rela* rela       = nullptr;
+	uint64_t    rela_bytes = 0;
+	GetDynDataOs(elf, &rela, DT_OS_RELA);
+	GetDynData(elf, program->base_vaddr, &rela, DT_RELA);
+	GetDynValue(elf, &rela_bytes, DT_OS_RELASZ);
+	GetDynValue(elf, &rela_bytes, DT_RELASZ);
+	if (rela == nullptr) {
+		return;
+	}
+	for (uint64_t index = 0; index < rela_bytes / sizeof(Elf64_Rela); index++) {
+		if (rela[index].GetType() != R_X86_64_RELATIVE) {
+			continue;
+		}
+		const uint64_t address = program->base_vaddr + rela[index].r_addend;
+		if (std::ranges::any_of(segments, [address](const auto& segment) {
+			    return address >= segment.first && address < segment.first + segment.second;
+		    })) {
+			function_starts->push_back(address);
+			if (relocated != nullptr) {
+				relocated->push_back(address);
+			}
+		}
+	}
+}
+
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	KYTY_PROFILER_FUNCTION();
@@ -1777,6 +1989,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	     "mapped_size            = 0x%016" PRIx64 "\n",
 	     program->base_vaddr, program->base_size, program->base_size_aligned, program->mapped_size);
 
+	Common::FaultReport::RefreshModules();
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
@@ -1853,16 +2066,64 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		                                &function_starts) &&
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
+		const auto patch_begin = std::chrono::steady_clock::now();
+		// The functions .eh_frame lists, with their ranges, and the code addresses only relocations
+		// name. Of those, the ones strictly inside a listed range (jump-table targets: GTA VI's
+		// eboot has 567 in two functions) are dropped, as PatchGuestInstructions() drops the call
+		// and LEA targets there: a start in the middle of a function would split its analysis.
+		std::vector<std::pair<uintptr_t, uintptr_t>> listed_ranges;
+		uint64_t                                     listed_count             = function_starts.size();
+		uint64_t                                     relocated_count          = 0;
+		uint64_t                                     relocated_inside_listed  = 0;
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
 			    module_name));
+		} else {
+			DecodeEhFrameFunctionRanges(eh_frame_header_addr, eh_frame_header_size,
+			                            program->base_vaddr, program->base_size, &listed_ranges);
+			std::vector<uintptr_t> relocated;
+			AddRelocatedCodeAddresses(program, executable_segments, &function_starts, &relocated);
+			function_starts.erase(
+			    std::remove_if(function_starts.begin() + static_cast<std::ptrdiff_t>(listed_count),
+			                   function_starts.end(),
+			                   [&](uintptr_t start) {
+				                   return IsInsideListedFunction(listed_ranges, start);
+			                   }),
+			    function_starts.end());
+			std::vector<uintptr_t> listed(function_starts.begin(),
+			                              function_starts.begin() +
+			                                  static_cast<std::ptrdiff_t>(listed_count));
+			std::ranges::sort(listed);
+			std::ranges::sort(relocated);
+			relocated.erase(std::ranges::unique(relocated).begin(), relocated.end());
+			for (const uintptr_t address: relocated) {
+				if (!std::ranges::binary_search(listed, address)) {
+					++relocated_count;
+					relocated_inside_listed += IsInsideListedFunction(listed_ranges, address);
+				}
+			}
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(
 			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
-			    GetGuestInstructionHostFeatures(), tsc_multiplier);
+			    GetGuestInstructionHostFeatures(), tsc_multiplier, listed_ranges);
+			totals.function_count += result.function_count;
+			totals.called_function_count += result.called_function_count;
+			totals.lea_function_count += result.lea_function_count;
+			totals.called_inside_listed_count += result.called_inside_listed_count;
+			totals.red_zone_function_count += result.red_zone_function_count;
+			totals.memory_instruction_count += result.memory_instruction_count;
+			totals.patched_memory_instruction_count += result.patched_memory_instruction_count;
+			totals.short_memory_instruction_count += result.short_memory_instruction_count;
+			totals.stack_dependent_memory_instruction_count +=
+			    result.stack_dependent_memory_instruction_count;
+			totals.control_flow_memory_instruction_count +=
+			    result.control_flow_memory_instruction_count;
+			totals.unrelocatable_memory_instruction_count +=
+			    result.unrelocatable_memory_instruction_count;
+			totals.trampoline_bytes += result.trampoline_bytes;
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -1870,17 +2131,38 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			totals.clwb += result.clwb;
 			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
-				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 " (%" PRIu64
+				     " found through calls), red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-				     module_name.c_str(),
-				     result.function_count, result.red_zone_function_count,
+				     module_name.c_str(), result.function_count, result.called_function_count,
+				     result.red_zone_function_count,
 				     result.memory_instruction_count, result.patched_memory_instruction_count,
 				     result.short_memory_instruction_count,
 				     result.stack_dependent_memory_instruction_count,
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (protect_memory_faults && have_function_starts) {
+			const auto patch_ms = std::chrono::duration<double, std::milli>(
+			                          std::chrono::steady_clock::now() - patch_begin)
+			                          .count();
+			const auto trampoline_area = program->base_vaddr + program->base_size_aligned;
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Red-zone patcher: {}: functions={} (eh_frame={}, relocations={}, calls={}, lea={}; "
+			    "dropped inside a listed function: relocations={}, calls/lea={}), red_zone={}, memory={}, "
+			    "patched={}, short={}, stack={}, control={}, unrelocatable={}, "
+			    "trampolines={} bytes of {} at {:#x}, time={:.0f} ms\n",
+			    module_name, totals.function_count, listed_count, relocated_count,
+			    totals.called_function_count - totals.lea_function_count, totals.lea_function_count,
+			    relocated_inside_listed, totals.called_inside_listed_count,
+			    totals.red_zone_function_count, totals.memory_instruction_count,
+			    totals.patched_memory_instruction_count, totals.short_memory_instruction_count,
+			    totals.stack_dependent_memory_instruction_count,
+			    totals.control_flow_memory_instruction_count,
+			    totals.unrelocatable_memory_instruction_count, totals.trampoline_bytes,
+			    program->instruction_trampoline_size, trampoline_area, patch_ms));
 		}
 		if (totals.rdtsc.found != 0) {
 			Log::WriteToConsoleAndLog(

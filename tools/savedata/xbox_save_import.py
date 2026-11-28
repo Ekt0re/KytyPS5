@@ -142,7 +142,6 @@ def import_saves(source: Path, output: Path, title_id: str, with_settings: bool)
         when = datetime.datetime.fromtimestamp(info["time"], datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         print(f"import {name:<24} {len(data):>7} bytes  ASAV v{info['version']} type {info['type']}  "
               f"{when}  {info['title']!r}  (from {version_dir.parent.name}\\{version_dir.name})")
-    print(f"done: {output.resolve()}")
     return 0
 
 
@@ -163,19 +162,31 @@ def main() -> int:
     if args.base and args.base.resolve() == args.output.resolve():
         print("--base must be another folder than the output (import into a copy instead)", file=sys.stderr)
         return 1
-    if args.output.exists() and any(args.output.iterdir()):
-        if not args.force:
-            print(f"{args.output} is not empty; pass --force to replace it", file=sys.stderr)
-            return 1
-        shutil.rmtree(args.output)
+    if args.output.exists() and any(args.output.iterdir()) and not args.force:
+        print(f"{args.output} is not empty; pass --force to replace it", file=sys.stderr)
+        return 1
+    # The set is built next to the output and swapped in only when the import succeeded, so a
+    # missing source or a bad checksum leaves an existing save folder as it was.
+    staging = args.output.with_name(args.output.name + ".importing")
+    if staging.exists():
+        shutil.rmtree(staging)
     if args.base:
-        shutil.copytree(args.base, args.output)
+        shutil.copytree(args.base, staging)
     if args.source.is_file() and zipfile.is_zipfile(args.source):
         with tempfile.TemporaryDirectory() as temp:
             with zipfile.ZipFile(args.source) as archive:
                 archive.extractall(temp)
-            return import_saves(Path(temp), args.output, args.title_id, args.with_settings)
-    return import_saves(args.source, args.output, args.title_id, args.with_settings)
+            result = import_saves(Path(temp), staging, args.title_id, args.with_settings)
+    else:
+        result = import_saves(args.source, staging, args.title_id, args.with_settings)
+    if result != 0:
+        shutil.rmtree(staging, ignore_errors=True)
+        return result
+    if args.output.exists():
+        shutil.rmtree(args.output)
+    staging.rename(args.output)
+    print(f"done: {args.output.resolve()}")
+    return 0
 
 
 if __name__ == "__main__":

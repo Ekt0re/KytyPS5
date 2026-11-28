@@ -148,6 +148,12 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
 	} else if (bits == 64u) {
 		buffer = &state.storage_buffers[3];
 	}
+	// Modules whose buffers all became runtime-table roots never define a storage-buffer
+	// descriptor, so the element-type cache can still be empty when an LDS/scratch access
+	// needs a StorageBuffer pointer. Declare the pointee type before emitting the pointer.
+	if (buffer->element_type == 0) {
+		StorageBufferType(state, *buffer, bits);
+	}
 	if (buffer->element_pointer_type == 0) {
 		buffer->element_pointer_type =
 		    TypePointer(state, spv::StorageClassStorageBuffer, buffer->element_type);
@@ -157,6 +163,10 @@ uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits) {
 
 uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
+}
+
+uint32_t TypePhysicalU64Pointer(EmitterState& state) {
+	return TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU64(state));
 }
 
 uint32_t TypePhysicalU32BufferPointer(EmitterState& state) {
@@ -229,7 +239,11 @@ void DefineDescriptors(EmitterState& state) {
 	auto& counts = bindings.descriptor_counts;
 	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
 	for (auto& buffer: info.buffers) {
-		buffer.descriptor_index = buffer.live ? buffer_count++ : UINT32_MAX;
+		const bool runtime_table =
+		    buffer.indirect_root != IR::BufferResource::NoIndirectBuffer &&
+		    IR::IsIndirectBufferRuntimeTable(
+		        info.buffers[buffer.indirect_root].indirect_mapping_offset);
+		buffer.descriptor_index = (buffer.live && !runtime_table) ? buffer_count++ : UINT32_MAX;
 	}
 	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
 	for (auto& image: info.images) {
@@ -269,7 +283,8 @@ void DefineDescriptors(EmitterState& state) {
 	}
 	if (info.ray_query) {
 		bindings.ray_query_dword = bindings.memory_offset_dword;
-		bindings.memory_offset_dword += 2u;
+		bindings.memory_offset_dword +=
+		    2u * std::max<uint32_t>(static_cast<uint32_t>(info.ray_query_tlases.size()), 1u);
 	}
 	bindings.push_data_start_dword =
 	    state.push_data.StartFor(bindings.ShaderDataDwords(), state.program.stage);

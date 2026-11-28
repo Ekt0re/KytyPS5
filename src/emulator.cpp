@@ -6,6 +6,7 @@
 #include "common/file.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/memAccount.h"
 #include "common/parallelFor.h"
 #include "common/profiler.h"
 #include "common/singleton.h"
@@ -102,6 +103,7 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
 	subsystems.Initialize<Log::Lifecycle>();
+	subsystems.Initialize<Common::MemAccount::Lifecycle>();
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
@@ -163,6 +165,7 @@ void RunReplay(const RunOptions& options) {
 	replay.capture = options.replay;
 	replay.output  = options.replay_out.empty() ? options.replay / "replay" : options.replay_out;
 	replay.repeat  = options.replay_repeat;
+	replay.shaders = options.replay_shaders;
 	std::thread([replay] { Libs::Graphics::FrameCapture::RunReplay(replay); }).detach();
 	Libs::Graphics::WindowRun();
 	std::quick_exit(0);

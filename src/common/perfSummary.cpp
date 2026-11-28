@@ -1,7 +1,11 @@
 #include "common/perfSummary.h"
 
+#include "common/faultStats.h"
+#include "common/frameHoles.h"
+
 #include <array>
 #include <chrono>
+#include <deque>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +27,11 @@ namespace Common::PerfSummary {
 namespace {
 
 constexpr auto N = static_cast<size_t>(Counter::Count);
+constexpr auto G = static_cast<size_t>(Gauge::Count);
+
+constexpr std::array<const char*, G> g_gauge_names = {"park_mb_peak", "vram_mb_peak"};
+// The highest level of each gauge since the start (for the total line).
+std::array<std::atomic<uint64_t>, G> g_gauge_run_peaks {};
 
 // Names follow the Counter order.
 constexpr std::array<const char*, N> g_names = {
@@ -30,7 +39,8 @@ constexpr std::array<const char*, N> g_names = {
     "read_faults",   "buf_readbacks", "tex_readbacks", "tex_lookups",     "buf_lookups",
     "desc_writes",   "heap_desc_writes", "pipe_lookups", "pipe_created",  "amm_maps",
     "amm_unmaps",    "gpu_unmaps",  "heap_rebinds", "heap_lookups",       "heap_range_skips",
-    "depth_recreates", "barriers",    "layout_transitions",
+    "depth_recreates", "depth_recreate_us", "img_created", "img_destroyed", "park_hits",
+    "park_misses",   "park_cap_evicts", "barriers",    "layout_transitions",
      "rb_calls",  "rb_batches",  "rb_submits",          "rb_fused",
     "rb_extra_bufs", "rb_neighbour", "rb_handler_us", "rb_flush_us",   "rb_submit_us",
     "rb_wait_us",    "rb_copy_us",    "rb_write_calls", "rb_write_us",
@@ -41,12 +51,28 @@ constexpr std::array<const char*, N> g_names = {
     "rb_path_det", "rb_path_det_wait_us", "rb_path_det_total_us",
     "rb_path_flush", "rb_path_flush_wait_us", "rb_path_flush_total_us",
     "rb_cq_submits", "rb_cq_fence_us", "rb_cq_gpu_busy",
+    "zc_resolve_us", "zc_release_us", "zc_fences", "zc_fence_skips", "zc_fence_us",
+    "zc_read_waits", "zc_wait_us", "zc_wait_drops", "zc_state_kib",
+    "zc_open_waits", "zc_saved",
+    "f_wait_gpu_us", "f_wait_guest_us", "f_materialize_us",
+    "f_module_lookups", "f_module_hits", "f_module_misses",
+    "f_handler_us", "f_invalidate_us", "f_protect_us", "f_lock_wait_us", "f_fast_skips",
+    "f_storm_marked", "f_storm_kept", "f_storm_expired",
+    "rec_records", "rec_drains", "rec_drain_us",
+    "rb_o_guest_calls", "rb_o_guest_waits", "rb_o_guest_wait_us", "rb_o_srt_calls", "rb_o_srt_waits", "rb_o_srt_wait_us", "rb_o_pm4_calls", "rb_o_pm4_waits", "rb_o_pm4_wait_us", "rb_o_cmdwr_calls", "rb_o_cmdwr_waits", "rb_o_cmdwr_wait_us", "rb_o_args_calls", "rb_o_args_waits", "rb_o_args_wait_us", "rb_o_shader_calls", "rb_o_shader_waits", "rb_o_shader_wait_us", "rb_o_tex_calls", "rb_o_tex_waits", "rb_o_tex_wait_us", "rb_o_other_calls", "rb_o_other_waits", "rb_o_other_wait_us",
+    "rb_tick_early", "rb_tick_skipped", "rb_hot_notes", "rb_hot_flushes",
+    "rb_mirror_hits", "rb_mirror_misses", "rb_mirror_wait_us", "rb_mirror_copies",
+    "la_jobs", "la_resolved", "la_resolve_fails", "la_resolve_heap", "la_resolve_us", "la_dropped",
+    "la_lookups", "la_hits", "la_miss_none", "la_miss_changed", "la_miss_gpu", "la_miss_unread",
+    "la_reval_us", "la_reval_bytes", "la_verified", "la_verify_mismatches",
 };
 
 struct Sample {
 	std::chrono::steady_clock::time_point time;
 	std::array<uint64_t, N>               counters {};
+	std::array<uint64_t, G>               gauges {};
 	double   gpu_cpu_ms       = 0.0;
+	double   rec_cpu_ms       = 0.0; // The recording thread (KYTY_RECORDER=1).
 	uint64_t gpu_instr_user   = 0;
 	uint64_t gpu_instr_kernel = 0;
 	uint64_t gpu_csw_vol      = 0;
@@ -64,6 +90,19 @@ uint32_t          g_period  = 10;
 Sample            g_first;
 std::atomic<bool> g_total_printed {false};
 
+// KYTY_FRAME_COST=1: the existing reporter also prints one [frame] line per interval. The warning
+// fires once after ten seconds of consecutive windows with more module misses than hits.
+bool   g_frame_cost     = false;
+double g_frame_bad_secs = 0.0;
+bool   g_frame_warned   = false;
+// KYTY_FAULT_STATS=1: the existing reporter also prints one [fault] group per interval.
+bool g_fault_stats = false;
+// KYTY_FRAME_HOLES=1: completed frames hand their skip counts to this queue; only the reporter
+// writes the lines. Bounded so a long run with many incomplete frames cannot grow without limit.
+constexpr size_t         kMaxQueuedHoleLines = 64;
+std::deque<std::string>  g_hole_lines;
+uint64_t                 g_hole_lines_dropped = 0;
+
 // The GPU thread, set by RegisterGpuThread. Its CPU time, instructions and context switches
 // come from Linux interfaces; other hosts report the counters only ("na" for the rest).
 std::atomic<bool> g_gpu_registered {false};
@@ -73,6 +112,9 @@ int               g_fd_kernel = -1; // In kernel mode; needs perf_event_paranoid
 #if defined(__linux__)
 
 clockid_t g_gpu_clock    = 0;
+clockid_t         g_rec_clock    = 0;
+double            g_rec_cpu_base = 0.0;
+std::atomic<bool> g_rec_registered {false};
 pid_t     g_gpu_tid      = 0;
 double    g_gpu_cpu_base = 0.0;
 
@@ -131,6 +173,9 @@ void TakeHost(Sample& s) {
 		s.gpu_instr_kernel = ReadCounter(g_fd_kernel);
 		ReadThreadSwitches(g_gpu_tid, s.gpu_csw_vol, s.gpu_csw_invol);
 	}
+	if (g_rec_registered.load(std::memory_order_acquire)) {
+		s.rec_cpu_ms = ClockMs(g_rec_clock) - g_rec_cpu_base;
+	}
 	rusage usage {};
 	if (getrusage(RUSAGE_SELF, &usage) == 0) {
 		s.proc_cpu_ms = static_cast<double>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1e3 +
@@ -153,6 +198,15 @@ Sample Take() {
 	s.time = std::chrono::steady_clock::now();
 	for (size_t i = 0; i < N; i++) {
 		s.counters[i] = Detail::g_counters[i].load(std::memory_order_relaxed);
+	}
+	// A gauge's peak restarts with each sample.
+	for (size_t i = 0; i < G; i++) {
+		s.gauges[i]     = Detail::g_gauge_peaks[i].exchange(0, std::memory_order_relaxed);
+		auto& run_peak  = g_gauge_run_peaks[i];
+		auto  seen      = run_peak.load(std::memory_order_relaxed);
+		while (seen < s.gauges[i] &&
+		       !run_peak.compare_exchange_weak(seen, s.gauges[i], std::memory_order_relaxed)) {
+		}
 	}
 	TakeHost(s);
 	return s;
@@ -182,8 +236,16 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 	for (size_t i = 0; i < N; i++) {
 		add(" %s=%" PRIu64, g_names[i], to.counters[i] - from.counters[i]);
 	}
+	for (size_t i = 0; i < G; i++) {
+		add(" %s=%" PRIu64, g_gauge_names[i], to.gauges[i]);
+	}
 #if defined(__linux__)
 	add(" gpu_cpu_ms=%.0f", gpu_ms);
+	if (g_rec_registered.load(std::memory_order_acquire)) {
+		// Busy share: CPU time of the recording thread per wall second (its short spins count).
+		const double rec_ms = to.rec_cpu_ms - from.rec_cpu_ms;
+		add(" rec_cpu_ms=%.0f rec_busy=%.3f", rec_ms, rec_ms / (secs > 0.0 ? secs * 1e3 : 1.0));
+	}
 #else
 	line += " gpu_cpu_ms=na";
 #endif
@@ -243,6 +305,70 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 	}
 	line += '\n';
 	std::fputs(line.c_str(), stdout);
+	if (g_frame_cost) {
+		const auto wait_gpu     = count(Counter::FrameWaitGpuUs);
+		const auto wait_guest   = count(Counter::FrameWaitGuestUs);
+		const auto materialize  = count(Counter::FrameMaterializeUs);
+		const auto lookups      = count(Counter::FrameModuleLookups);
+		const auto hits         = count(Counter::FrameModuleHits);
+		const auto misses       = count(Counter::FrameModuleMisses);
+		const auto frame_line = Detail::FormatFrameLine(secs, flips, wait_gpu, wait_guest,
+		                                              materialize, lookups, hits, misses);
+		std::fputs(frame_line.c_str(), stdout);
+		// A module miss streak is only interesting after the store has had time to settle: one
+		// window of more misses than hits is normal while it loads. Ten consecutive seconds is
+		// the same rule our original frame reporter used.
+		if (misses > hits && (hits + misses) != 0) {
+			g_frame_bad_secs += secs;
+		} else {
+			g_frame_bad_secs = 0.0;
+		}
+		const auto warning = Detail::FormatFrameWarning(hits, misses, g_frame_bad_secs);
+		if (!warning.empty() && !g_frame_warned) {
+			g_frame_warned = true;
+			std::fputs(warning.c_str(), stdout);
+		}
+	}
+	if (g_fault_stats) {
+		const auto writes   = count(Counter::WriteFaults);
+		const auto reads    = count(Counter::ReadFaults);
+		const auto handler  = count(Counter::FaultHandlerUs);
+		const auto invalidate = count(Counter::FaultInvalidateUs);
+		const auto protect  = count(Counter::FaultProtectUs);
+		const auto lock_wait = count(Counter::FaultLockWaitUs);
+		const auto fast     = count(Counter::FaultFastSkips);
+		const auto marked   = count(Counter::FaultStormMarked);
+		const auto kept     = count(Counter::FaultStormKept);
+		const auto expired  = count(Counter::FaultStormExpired);
+		const auto line2    = Detail::FormatFaultLine(secs, writes, reads, handler, invalidate,
+		                                          protect, lock_wait, fast, marked, kept, expired);
+		std::fputs(line2.c_str(), stdout);
+		// The hot-block table is drained here, never from the fault handler. Blocks are noted at
+		// the existing HandleFault counting site, so the rate and the blocks describe the same
+		// interval without counting faults twice.
+		std::array<Detail::FaultBlock, FaultStats::FaultHotBlocks::kTop> blocks {};
+		uint64_t dropped = 0;
+		const auto used  = FaultStats::g_hot_blocks.TakeTop(blocks, dropped);
+		const auto hot   = Detail::FormatFaultHotLine(blocks.data(), used, dropped);
+		std::fputs(hot.c_str(), stdout);
+	}
+	if (Detail::g_frame_holes.load(std::memory_order_relaxed)) {
+		std::deque<std::string> pending;
+		uint64_t                dropped = 0;
+		{
+			std::lock_guard lock(g_mutex);
+			pending.swap(g_hole_lines);
+			std::swap(dropped, g_hole_lines_dropped);
+		}
+		if (dropped != 0) {
+			std::fprintf(stdout, "[frame-holes] %llu older lines dropped (queue holds %zu)\n",
+			             static_cast<unsigned long long>(dropped), kMaxQueuedHoleLines);
+		}
+		for (const auto& hole: pending) {
+			std::fputs(hole.c_str(), stdout);
+			std::fputc('\n', stdout);
+		}
+	}
 	std::fflush(stdout);
 }
 
@@ -250,7 +376,10 @@ void PrintTotal() {
 	if (g_total_printed.exchange(true)) {
 		return;
 	}
-	const auto now  = Take();
+	auto now = Take();
+	for (size_t i = 0; i < G; i++) {
+		now.gauges[i] = g_gauge_run_peaks[i].load(std::memory_order_relaxed);
+	}
 	const auto secs = std::chrono::duration<double>(now.time - g_first.time).count();
 	char       tag[48];
 	std::snprintf(tag, sizeof(tag), "total t=%.0f", secs);
@@ -259,18 +388,134 @@ void PrintTotal() {
 
 } // namespace
 
+void NoteFrameHolesFrame(uint64_t frame) {
+	if (!FrameHolesEnabled()) {
+		return;
+	}
+	const auto snap = FrameHoles::Global().TakeSnapshot();
+	const auto line = Detail::FormatFrameHolesLine(frame, snap);
+	if (line.empty()) {
+		return;
+	}
+	std::lock_guard lock(g_mutex);
+	if (g_hole_lines.size() >= kMaxQueuedHoleLines) {
+		g_hole_lines.pop_front();
+		g_hole_lines_dropped++;
+	}
+	g_hole_lines.push_back(line);
+}
+
+namespace Detail {
+
+std::string FormatFrameLine(double secs, uint64_t frames, uint64_t wait_gpu_us,
+                            uint64_t wait_guest_us, uint64_t materialize_us,
+                            uint64_t module_lookups, uint64_t module_hits,
+                            uint64_t module_misses) {
+	const auto per_frame_ms = [frames](uint64_t micros) {
+		return frames == 0 ? 0.0
+		                   : static_cast<double>(micros) / static_cast<double>(frames) * 1e-3;
+	};
+	const auto total_ms = [](uint64_t micros) { return static_cast<double>(micros) * 1e-3; };
+	char       text[512];
+	std::snprintf(text, sizeof(text),
+	    "[frame] secs=%.1f frames=%" PRIu64
+	    " wait_gpu_ms=%.3f wait_guest_ms=%.3f materialize_ms=%.3f"
+	    " ms/frame wait_gpu=%.3f wait_guest=%.3f materialize=%.3f"
+	    " module_lookups=%" PRIu64 " module_hits=%" PRIu64 " module_misses=%" PRIu64 "\n",
+	    secs, frames, total_ms(wait_gpu_us), total_ms(wait_guest_us), total_ms(materialize_us),
+	    per_frame_ms(wait_gpu_us), per_frame_ms(wait_guest_us), per_frame_ms(materialize_us),
+	    module_lookups, module_hits, module_misses);
+	return text;
+}
+
+std::string FormatFrameWarning(uint64_t hits, uint64_t misses, double sustained_seconds) {
+	if (sustained_seconds < 10.0 || misses <= hits || (hits + misses) == 0) {
+		return {};
+	}
+	char text[512];
+	std::snprintf(text, sizeof(text),
+	    "[frame] WARNING module-misses: module lookups missed more often than they hit for "
+	    "%.0f s (last window hits=%" PRIu64 " misses=%" PRIu64
+	    "); modules that exist are not found, each use requests a new translation\n",
+	    sustained_seconds, hits, misses);
+	return text;
+}
+
+std::string FormatFaultLine(double secs, uint64_t writes, uint64_t reads, uint64_t handler_us,
+                            uint64_t invalidate_us, uint64_t protect_us, uint64_t lock_wait_us,
+                            uint64_t fast_skips, uint64_t marked, uint64_t kept,
+                            uint64_t expired) {
+	const auto per_s = [secs](uint64_t value) {
+		return secs > 0.0 ? static_cast<double>(value) / secs : 0.0;
+	};
+	const auto ms_per_s = [secs](uint64_t micros) {
+		return secs > 0.0 ? static_cast<double>(micros) / 1e3 / secs : 0.0;
+	};
+	char text[512];
+	std::snprintf(text, sizeof(text),
+	    "[fault] secs=%.1f write=%.0f/s read=%.0f/s handler_ms/s=%.1f invalidate_ms/s=%.1f "
+	    "protect_ms/s=%.1f lock_wait_ms/s=%.1f fast_skip=%.0f/s "
+	    "storm(marked=%" PRIu64 " kept=%" PRIu64 " expired=%" PRIu64 ")\n",
+	    secs, per_s(writes), per_s(reads), ms_per_s(handler_us), ms_per_s(invalidate_us),
+	    ms_per_s(protect_us), ms_per_s(lock_wait_us), per_s(fast_skips), marked, kept, expired);
+	return text;
+}
+
+std::string FormatFaultHotLine(const FaultBlock* blocks, size_t count, uint64_t dropped) {
+	std::string line = "[fault] top 64K blocks:";
+	char        text[64];
+	for (size_t i = 0; i < count; i++) {
+		std::snprintf(text, sizeof(text), " 0x%" PRIx64 "=%" PRIu64, blocks[i].address,
+		              blocks[i].count);
+		line += text;
+	}
+	if (dropped != 0) {
+		std::snprintf(text, sizeof(text), " (untracked %" PRIu64 ")", dropped);
+		line += text;
+	}
+	line += '\n';
+	return line;
+}
+
+std::string FormatFrameHolesLine(uint64_t frame, const FrameHoles::Snapshot& snapshot) {
+	return FrameHoles::Tracker::FormatLine(frame, snapshot);
+}
+
+} // namespace Detail
+
 void Start() {
 	std::lock_guard lock(g_mutex);
 	if (g_started) {
 		return;
 	}
-	const char* env = std::getenv("KYTY_PERF_SUMMARY");
-	if (env == nullptr || env[0] == '\0' || env[0] == '0') {
+	const char* env        = std::getenv("KYTY_PERF_SUMMARY");
+	const char* frame_env  = std::getenv("KYTY_FRAME_COST");
+	const bool  frame_cost = frame_env != nullptr && frame_env[0] != '\0' && frame_env[0] != '0';
+	const char* fault_env  = std::getenv("KYTY_FAULT_STATS");
+	const bool  fault_stats =
+	    fault_env != nullptr && fault_env[0] != '\0' && fault_env[0] != '0';
+	const char* holes_env  = std::getenv("KYTY_FRAME_HOLES");
+	const bool  frame_holes =
+	    holes_env != nullptr && holes_env[0] != '\0' && holes_env[0] != '0';
+	if ((env == nullptr || env[0] == '\0' || env[0] == '0') && !frame_cost && !fault_stats &&
+	    !frame_holes) {
 		return;
 	}
-	g_started = true;
-	if (const auto period = std::strtoul(env, nullptr, 10); period >= 2) {
-		g_period = static_cast<uint32_t>(period);
+	g_started     = true;
+	g_frame_cost  = frame_cost;
+	g_fault_stats = fault_stats;
+	Detail::g_frame_holes.store(frame_holes, std::memory_order_relaxed);
+	FrameHoles::SetEnabled(frame_holes);
+	bool explicit_period = false;
+	if (env != nullptr && env[0] != '\0' && env[0] != '0') {
+		if (const auto period = std::strtoul(env, nullptr, 10); period >= 2) {
+			g_period         = static_cast<uint32_t>(period);
+			explicit_period = true;
+		}
+	}
+	// The frame, fault and hole lines are a five-second window unless the caller chose a period.
+	if ((frame_cost || fault_stats || frame_holes) && !explicit_period) {
+		g_period = 5;
 	}
 	Detail::g_enabled.store(true, std::memory_order_relaxed);
 	g_first = Take();
@@ -290,6 +535,17 @@ void Start() {
 			last = now;
 		}
 	}).detach();
+}
+
+void RegisterRecorderThread() {
+#if defined(__linux__)
+	if (!Detail::g_enabled.load(std::memory_order_relaxed) || g_rec_registered.load(std::memory_order_acquire)) {
+		return;
+	}
+	pthread_getcpuclockid(pthread_self(), &g_rec_clock);
+	g_rec_cpu_base = ClockMs(g_rec_clock);
+	g_rec_registered.store(true, std::memory_order_release);
+#endif
 }
 
 void RegisterGpuThread() {

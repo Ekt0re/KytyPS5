@@ -5,6 +5,29 @@
 
 namespace Libs::Graphics {
 
+namespace {
+
+class MemoryStamp final: public ShaderRecompiler::IR::MemoryChangeStamp {
+public:
+	struct Region {
+		RegionManager* manager   = nullptr;
+		uint64_t       generation = 0;
+	};
+
+	explicit MemoryStamp(std::vector<Region> regions): m_regions(std::move(regions)) {}
+
+	[[nodiscard]] bool Unchanged() const override {
+		return std::ranges::all_of(m_regions, [](const Region& region) {
+			return region.manager->Generation() == region.generation;
+		});
+	}
+
+private:
+	std::vector<Region> m_regions;
+};
+
+} // namespace
+
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
@@ -78,6 +101,42 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
 	});
+}
+
+std::shared_ptr<ShaderRecompiler::IR::MemoryChangeStamp> MemoryTracker::Track(uint64_t address,
+                                                                           uint64_t size,
+                                                                           uint32_t max_pages) {
+	if (size == 0) return std::make_shared<MemoryStamp>(std::vector<MemoryStamp::Region> {});
+	ValidateRange(address, size);
+	const auto first_page = address / TRACKER_PAGE_SIZE;
+	const auto last_page  = (address + size - 1u) / TRACKER_PAGE_SIZE;
+	if (max_pages == 0 || last_page - first_page + 1u > max_pages) return {};
+
+	std::vector<MemoryStamp::Region> regions;
+	uint64_t remaining = size;
+	uint64_t index     = address / TRACKER_REGION_SIZE;
+	uint64_t offset    = address % TRACKER_REGION_SIZE;
+	while (remaining != 0) {
+		const auto bytes   = std::min(TRACKER_REGION_SIZE - offset, remaining);
+		auto*      manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) return {};
+		{
+			std::scoped_lock lock(manager->lock);
+			if (manager->IsModified<DirtySource::Cpu>(offset, bytes) ||
+			    manager->IsModified<DirtySource::Gpu>(offset, bytes)) {
+				return {};
+			}
+			manager->EnableStampGeneration();
+			regions.push_back({manager, manager->Generation()});
+		}
+		remaining -= bytes;
+		offset = 0;
+		index++;
+	}
+	// Clean pages are already write-watched by the upload transition that cleared their dirty
+	// state. A stamp observes that region-owned watch; taking another counted reference here would
+	// outlive the stamp and keep the page protected after it became CPU-dirty.
+	return std::make_shared<MemoryStamp>(std::move(regions));
 }
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {

@@ -17,6 +17,8 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return;
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return;
 		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
+		case O::S_CMOV_B32:
+		case O::S_CMOVK_I32: S_CMOV_B32(inst); return;
 		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
 		case O::S_GETREG_B32:
 			if (program.stage != ShaderType::Compute ||
@@ -34,20 +36,62 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
 			return;
-		case O::S_ANDN1_SAVEEXEC_B32:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
+		case O::S_OR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false);
+			return;
+		case O::S_XOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false);
+			return;
+		case O::S_ANDN2_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, false);
 			return;
 		case O::S_ORN2_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, false);
 			return;
+		case O::S_NAND_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false, true);
+			return;
+		case O::S_NOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false, true);
+			return;
+		case O::S_XNOR_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false, true);
+			return;
+		case O::S_ANDN1_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
+			return;
+		case O::S_ORN1_SAVEEXEC_B32:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, false);
+			return;
 		case O::S_AND_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
+			return;
+		case O::S_OR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true);
+			return;
+		case O::S_XOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true);
+			return;
+		case O::S_ANDN2_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true);
+			return;
+		case O::S_ORN2_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, true);
+			return;
+		case O::S_NAND_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true, true);
+			return;
+		case O::S_NOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true, true);
+			return;
+		case O::S_XNOR_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true, true);
 			return;
 		case O::S_ANDN1_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true);
 			return;
-		case O::S_ORN2_SAVEEXEC_B64:
-			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, true);
+		case O::S_ORN1_SAVEEXEC_B64:
+			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, true);
 			return;
 		case O::S_ADD_U32: ADD_U32(inst, false, false); return;
 		case O::S_ADDC_U32: ADD_U32(inst, false, true); return;
@@ -257,6 +301,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BFE_U32: return S_BFE_U32(inst, false);
 		case O::S_BFE_I32: return S_BFE_U32(inst, true);
 		case O::S_BFE_U64: return S_BFE_U64(inst);
+		case O::S_BFE_I64: return S_BFE_I64(inst);
 		case O::S_BITCMP0_B32: return S_BITCMP_B32(inst, false);
 		case O::S_BITCMP1_B32: return S_BITCMP_B32(inst, true);
 		case O::S_BITCMP0_B64: return S_BITCMP_B64(inst, false);

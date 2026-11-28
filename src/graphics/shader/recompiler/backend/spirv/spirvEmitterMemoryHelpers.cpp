@@ -82,7 +82,10 @@ uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource) {
-	const auto mapping = ConstantU32(state, mapping_offset);
+	auto mapping = ConstantU32(state, IR::IndirectBufferMappingOffset(mapping_offset));
+	if (IR::IsIndirectBufferRuntimeTable(mapping_offset)) {
+		mapping = EmitAddU32(state, mapping, ConstantU32(state, 3u));
+	}
 	const auto count = LoadFlattenedSrt(state, mapping);
 	if (search_iterations == 0u) {
 		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
@@ -90,7 +93,7 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
 		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
 		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
-		                          ConstantU32(state, mapping_offset + 1u));
+		                          EmitAddU32(state, mapping, ConstantU32(state, 1u)));
 		return Select(state, TypeU32(state), valid, LoadFlattenedSrt(state, entry),
 		              ConstantU32(state, default_resource));
 	}
@@ -127,6 +130,45 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	return Select(state, TypeU32(state), match, resource, ConstantU32(state, default_resource));
 }
 
+uint32_t EmitLoadIndirectBufferTableEntry(EmitterState& state, uint32_t selected,
+                                          uint32_t mapping_offset) {
+	const auto base = ConstantU32(state, IR::IndirectBufferMappingOffset(mapping_offset));
+	const auto bda_low = LoadFlattenedSrt(state, base);
+	const auto bda_high = LoadFlattenedSrt(state, EmitAddU32(state, base, ConstantU32(state, 1u)));
+	const auto entries = LoadFlattenedSrt(state, EmitAddU32(state, base, ConstantU32(state, 2u)));
+	const auto nonzero = Binary(state, spv::OpINotEqual, TypeBool(state), selected,
+	                            ConstantU32(state, 0u));
+	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), selected, entries);
+	const auto valid = Binary(state, spv::OpLogicalAnd, TypeBool(state), nonzero, in_range);
+	const auto vector_type = TypeU32Vector(state, 4u);
+	return EmitValueOrDefaultIfCondition(state, valid, vector_type,
+	    ConstantU32CompositeZero(state, 4u), [&]() {
+		    const auto index = Binary(state, spv::OpISub, TypeU32(state), selected,
+		                              ConstantU32(state, 1u));
+		    const auto offset = Binary(state, spv::OpShiftLeftLogical, TypeU64(state),
+		                               Unary(state, spv::OpUConvert, TypeU64(state), index),
+		                               ConstantU32(state, 4u));
+		    const auto address = Binary(state, spv::OpIAdd, TypeU64(state),
+		                                PackU64(state, bda_low, bda_high), offset);
+		    const auto load = [&](uint64_t byte_offset) {
+			    const auto pointer_address = byte_offset == 0u
+			        ? address
+			        : Binary(state, spv::OpIAdd, TypeU64(state), address,
+			                 ConstantU64(state, byte_offset));
+			    const auto pointer = Unary(state, spv::OpConvertUToPtr,
+			                              TypePhysicalU32Pointer(state), pointer_address);
+			    const auto value = state.builder.AllocateId();
+			    state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+			                              spv::MemoryAccessAlignedMask, 4u);
+			    return value;
+		    };
+		    const auto result = state.builder.AllocateId();
+		    state.builder.AddFunction(spv::OpCompositeConstruct, vector_type, result,
+		                              load(0u), load(4u), load(8u), load(12u));
+		    return result;
+	    });
+}
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,
@@ -154,6 +196,14 @@ Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::
 	return state.program.info.buffers[mem.resource].descriptor_format;
 }
 
+bool EmptyIndirectBufferCandidate(const EmitterState& state, uint32_t resource) {
+	const auto& buffer  = state.program.info.buffers[resource];
+	const auto& sources = state.program.descriptor_sources;
+	return buffer.packed_stride == 0u && buffer.source < sources.size() &&
+	       sources[buffer.source].indirect_descriptor &&
+	       sources[buffer.source].indirect_descriptor->sources.empty();
+}
+
 uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resource) {
 	const auto& buffers = state.program.info.buffers;
 	const auto& root = buffers[resource];
@@ -161,10 +211,10 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 	    root.indirect_resources.size() < 2u) {
 		return UINT32_MAX;
 	}
-	const auto first = root.packed_stride == 0u ? 1u : 0u;
+	const auto  first          = EmptyIndirectBufferCandidate(state, resource) ? 1u : 0u;
 	const auto representative = root.indirect_resources[first];
 	const auto& shared = buffers[representative];
-	if (shared.packed_stride == 0u) return UINT32_MAX;
+	if (EmptyIndirectBufferCandidate(state, representative)) return UINT32_MAX;
 	uint32_t next_child_slot = UINT32_MAX;
 	for (uint32_t ordinal = first; ordinal < root.indirect_resources.size(); ++ordinal) {
 		const auto& candidate = buffers[root.indirect_resources[ordinal]];
@@ -176,6 +226,14 @@ uint32_t SharedIndirectBufferResource(const EmitterState& state, uint32_t resour
 		if (ordinal != 0u) next_child_slot = candidate.descriptor_index + 1u;
 	}
 	return representative;
+}
+
+bool IsRuntimeTableIndirectBuffer(const EmitterState& state, uint32_t resource) {
+	if (resource >= state.program.info.buffers.size()) return false;
+	const auto& buffer = state.program.info.buffers[resource];
+	return buffer.indirect_root != IR::BufferResource::NoIndirectBuffer &&
+	       IR::IsIndirectBufferRuntimeTable(
+	           state.program.info.buffers[buffer.indirect_root].indirect_mapping_offset);
 }
 
 void EmitMemoryBindings(EmitterState& state) {
@@ -300,11 +358,14 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	const bool non_uniform = array_index != 0u;
 	const auto static_index = state.program.info.buffers.at(mem.resource).descriptor_index;
 	if (!non_uniform) array_index = ConstantU32(state, static_index);
+	const bool coherent = mem.coherent ||
+	                      (state.workgroup_buffer_coherence && mem.resource < state.program.info.buffers.size() &&
+	                       state.program.info.buffers[mem.resource].written);
 	MemoryResourceAccess access {.kind             = mem.kind,
 	                             .descriptor_index = array_index,
 	                             .non_uniform      = non_uniform,
-	                             .memory_access    = mem.coherent ? spv::MemoryAccessVolatileMask
-	                                                              : spv::MemoryAccessMaskNone};
+	                             .memory_access    = coherent ? spv::MemoryAccessVolatileMask
+	                                                          : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
 	                          buffer.variable, array_index);
@@ -427,8 +488,8 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitStorageElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                     uint32_t index) {
 	// The descriptor range ends where access.length does.
-	if (state.profile.robust_buffer_access && (access.kind == IR::ResourceKind::Buffer ||
-	                                           access.kind == IR::ResourceKind::ScalarBuffer)) {
+	if (!access.physical_address && state.profile.robust_buffer_access &&
+	    (access.kind == IR::ResourceKind::Buffer || access.kind == IR::ResourceKind::ScalarBuffer)) {
 		return ConstantBool(state, true);
 	}
 	return EmitMemoryElementInBounds(state, access, index);
@@ -461,6 +522,20 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type) {
+	if (access.physical_address) {
+		const auto shift = access.element_bits == 8u   ? 0u
+		    : access.element_bits == 16u ? 1u : access.element_bits == 64u ? 3u : 2u;
+		const auto byte_index = Binary(state, spv::OpShiftLeftLogical, TypeU64(state),
+		    Unary(state, spv::OpUConvert, TypeU64(state), index), ConstantU32(state, shift));
+		const auto address = Binary(state, spv::OpIAdd, TypeU64(state), access.object_pointer,
+		                            byte_index);
+		const auto element_type = state.builder.Type(spv::OpTypeInt, access.element_bits, 0u);
+		const auto physical_type =
+		    TypePointer(state, spv::StorageClassPhysicalStorageBuffer, element_type);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, physical_type, pointer, address);
+		return pointer;
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                          ConstantU32(state, 0), index);
@@ -648,7 +723,7 @@ uint32_t EncodeFormattedStoreComponent(EmitterState& state, const Format::Buffer
 		if (data_bits != 16u && IR::F16StoreClampEnabled()) data = EmitClampToHalfRangeBits(state, data);
 		const auto pair = EmitCompositeConstructF32x2(
 		    state, EmitBitCastF32U32(state, data), ConstantF32Value(state, 0.0f));
-		return EmitPackHalf2x16(state, pair);
+		return EmitPackHalf2x16Native(state, pair);
 	}
 	return data;
 }

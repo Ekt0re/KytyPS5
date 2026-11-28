@@ -119,6 +119,15 @@ public:
 		                   [this](size_t word, uint64_t mask) { return (Load(word) & mask) != 0; });
 	}
 
+	// Whether every bit of [start, end) is set (an empty range counts as all set).
+	[[nodiscard]] bool All(size_t start, size_t end) const {
+		if (start >= end) {
+			return true;
+		}
+		return !ForEachWord(start, end,
+		                    [this](size_t word, uint64_t mask) { return (Load(word) & mask) != mask; });
+	}
+
 	[[nodiscard]] Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};
