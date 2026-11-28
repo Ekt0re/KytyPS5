@@ -553,6 +553,11 @@ add_executable(readback_batch_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(readback_batch_tests PRIVATE ${inc_headers})
 
+add_executable(readback_wait_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ReadbackWaitTests.cpp"
+)
+target_include_directories(readback_wait_tests PRIVATE ${inc_headers})
+
 add_executable(slot_vector_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SlotVectorTests.cpp"
 )
@@ -899,6 +904,7 @@ if(BUILD_TESTING)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME readback_batch COMMAND $<TARGET_FILE:readback_batch_tests>)
 	add_test(NAME skip_taint COMMAND $<TARGET_FILE:skip_taint_tests>)
+	add_test(NAME readback_wait COMMAND $<TARGET_FILE:readback_wait_tests>)
 	add_test(NAME shader_store COMMAND $<TARGET_FILE:shader_store_tests>)
 	add_test(NAME common COMMAND $<TARGET_FILE:common_tests>)
 	add_test(NAME draw_indirect_count COMMAND $<TARGET_FILE:draw_indirect_count_tests>)
@@ -1058,6 +1064,7 @@ if(BUILD_TESTING)
 		lru_cache_tests
 		readback_batch_tests
 		skip_taint_tests
+		readback_wait_tests
 		shader_store_tests
 		common_tests
 		draw_indirect_count_tests
