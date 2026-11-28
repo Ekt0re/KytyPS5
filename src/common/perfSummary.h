@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -14,6 +15,9 @@
 // KYTY_FRAME_COST=1 also prints one [frame] line per interval (5 s by default): presented frames
 // and the wall-time split into GPU wait, guest wait and resource materialisation, plus a one-shot
 // module-miss warning. It uses this same reporter, never a second thread. Off by default.
+// KYTY_FAULT_STATS=1 also prints [fault] rate lines from this same reporter (5 s by default):
+// write/read fault rates, handler/protection/lock-wait cost and the hottest 64 KiB blocks. The
+// fault-storm thresholds come from KYTY_FAULT_STORM_FAULTS/_FRAMES/_HOLD and are off by default.
 namespace Common::PerfSummary {
 
 enum class Counter {
@@ -99,6 +103,16 @@ enum class Counter {
 	FrameModuleLookups, // Shader-module lookups (Program::FindModule).
 	FrameModuleHits,    // Lookups that found a module.
 	FrameModuleMisses,  // Lookups that did not find one.
+	// KYTY_FAULT_STATS=1: cost and outcomes of the write-fault path. WriteFaults/ReadFaults above
+	// are counted at the existing RenderContext::HandleFault site and are not counted again here.
+	FaultHandlerUs,   // Microseconds in HandleFault (all paths).
+	FaultInvalidateUs, // ... in BufferCache::InvalidateMemory (part of the handler).
+	FaultProtectUs,   // ... in guest memory protection (part of the handler).
+	FaultLockWaitUs,  // ... waiting for a region tracking lock.
+	FaultFastSkips,   // Faults on already CPU-dirty pages: no lock was taken.
+	FaultStormMarked, // Pages the fault-storm rule marked as always dirty.
+	FaultStormKept,   // Marked pages kept unwatched this interval.
+	FaultStormExpired, // Marked pages that were re-armed this interval.
 	Count
 };
 
@@ -127,6 +141,17 @@ std::string FormatFrameLine(double secs, uint64_t frames, uint64_t wait_gpu_us,
                             uint64_t module_lookups, uint64_t module_hits,
                             uint64_t module_misses);
 std::string FormatFrameWarning(uint64_t hits, uint64_t misses, double sustained_seconds);
+struct FaultBlock {
+	uint64_t address; // Aligned down to 64 KiB.
+	uint64_t count;
+};
+
+// Pure formatters shared by the reporter and the unit test. Values are interval totals; rates and
+// milliseconds per second are derived from `secs`. Returned strings end in a newline.
+std::string FormatFaultLine(double secs, uint64_t writes, uint64_t reads, uint64_t handler_us,
+                            uint64_t invalidate_us, uint64_t protect_us, uint64_t lock_wait_us,
+                            uint64_t fast_skips, uint64_t marked, uint64_t kept, uint64_t expired);
+std::string FormatFaultHotLine(const FaultBlock* blocks, size_t count, uint64_t dropped);
 
 } // namespace Detail
 

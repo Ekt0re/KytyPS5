@@ -304,9 +304,24 @@ void TestTrackerSizedRandomizedDifferential() {
   }
 }
 
+void TestAllRange() {
+  Common::BitArray<256> bits;
+  Check(bits.All(10, 10), "empty range was not all set");
+  Check(!bits.All(0, 256), "empty array reported all set");
+  bits.SetRange(60, 200);
+  Check(bits.All(60, 200) && bits.All(63, 65) && bits.All(100, 101),
+        "set range was not all set");
+  Check(!bits.All(59, 200) && !bits.All(60, 201) && !bits.All(0, 256),
+        "range with an unset edge reported all set");
+  bits.Unset(130);
+  Check(!bits.All(60, 200) && bits.All(60, 130) && bits.All(131, 200),
+        "range with an unset hole reported all set");
+}
+
 } // namespace
 
 int main() {
+  TestAllRange();
   TestPointAndRangeOperations();
   TestMaskedConstructionAndBitwiseOperations();
   TestRangeDiscoveryAndIteration();

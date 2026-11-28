@@ -3,6 +3,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/faultStats.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -81,6 +82,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_occlusion_queries(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitFaultWindow();
+	Common::FaultStats::ConfigureStorm();
 	m_pipeline_cache.SetHeapRows(&m_buffer_cache.GetHeapRows());
 	if (graphics.ray_query_enabled) {
 		m_ray_tracing = std::make_unique<RayTracing>(*this);
@@ -129,6 +131,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// Fault count is taken at the existing PerfSummary site below; this timer and the hot-block
+	// table only add the cost and the address distribution, never a second count.
+	Common::PerfSummary::ScopedMicros fault_timer(Common::PerfSummary::Counter::FaultHandlerUs);
+	Common::FaultStats::SetFrame(static_cast<uint32_t>(GetGpu().GetFrameNum()));
+	Common::FaultStats::g_hot_blocks.Note(fault_vaddr);
 	// The access retries once the image write-backs over its page land.
 	if (WaitWriteBacks(fault_vaddr, fault_size)) {
 		return true;

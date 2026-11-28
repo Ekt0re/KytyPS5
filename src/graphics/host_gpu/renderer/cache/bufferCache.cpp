@@ -5,6 +5,7 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/faultStats.h"
 #include "common/logging/log.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
@@ -521,10 +522,12 @@ BufferCache::~BufferCache() {
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
+	const auto started = Common::FaultStats::NowNs();
 	WaitZeroCopyReads(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 	QueueBdaSync(vaddr, size);
+	Common::FaultStats::NoteInvalidate(Common::FaultStats::NowNs() - started);
 }
 
 void BufferCache::InvalidateWriteWindow(uint64_t vaddr, uint64_t size) {
@@ -1254,6 +1257,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     ImageId image) {
+	Common::FaultStats::SetFrame(static_cast<uint32_t>(m_scheduler.Context().GetGpu().GetFrameNum()));
 	if (buffer.IsZeroCopy()) {
 		// Guest memory is the buffer: nothing to upload. A write still marks the range GPU-owned
 		// until it finishes, which clears its CPU-dirty state first (the tracker keeps them apart).

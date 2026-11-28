@@ -1,5 +1,7 @@
 #include "common/perfSummary.h"
 
+#include "common/faultStats.h"
+
 #include <array>
 #include <chrono>
 #include <cinttypes>
@@ -46,6 +48,8 @@ constexpr std::array<const char*, N> g_names = {
     "zc_open_waits", "zc_saved",
     "f_wait_gpu_us", "f_wait_guest_us", "f_materialize_us",
     "f_module_lookups", "f_module_hits", "f_module_misses",
+    "f_handler_us", "f_invalidate_us", "f_protect_us", "f_lock_wait_us", "f_fast_skips",
+    "f_storm_marked", "f_storm_kept", "f_storm_expired",
 };
 
 struct Sample {
@@ -74,6 +78,8 @@ std::atomic<bool> g_total_printed {false};
 bool   g_frame_cost     = false;
 double g_frame_bad_secs = 0.0;
 bool   g_frame_warned   = false;
+// KYTY_FAULT_STATS=1: the existing reporter also prints one [fault] group per interval.
+bool g_fault_stats = false;
 
 // The GPU thread, set by RegisterGpuThread. Its CPU time, instructions and context switches
 // come from Linux interfaces; other hosts report the counters only ("na" for the rest).
@@ -278,6 +284,29 @@ void Print(const char* tag, const Sample& from, const Sample& to) {
 			std::fputs(warning.c_str(), stdout);
 		}
 	}
+	if (g_fault_stats) {
+		const auto writes   = count(Counter::WriteFaults);
+		const auto reads    = count(Counter::ReadFaults);
+		const auto handler  = count(Counter::FaultHandlerUs);
+		const auto invalidate = count(Counter::FaultInvalidateUs);
+		const auto protect  = count(Counter::FaultProtectUs);
+		const auto lock_wait = count(Counter::FaultLockWaitUs);
+		const auto fast     = count(Counter::FaultFastSkips);
+		const auto marked   = count(Counter::FaultStormMarked);
+		const auto kept     = count(Counter::FaultStormKept);
+		const auto expired  = count(Counter::FaultStormExpired);
+		const auto line2    = Detail::FormatFaultLine(secs, writes, reads, handler, invalidate,
+		                                          protect, lock_wait, fast, marked, kept, expired);
+		std::fputs(line2.c_str(), stdout);
+		// The hot-block table is drained here, never from the fault handler. Blocks are noted at
+		// the existing HandleFault counting site, so the rate and the blocks describe the same
+		// interval without counting faults twice.
+		std::array<Detail::FaultBlock, FaultStats::FaultHotBlocks::kTop> blocks {};
+		uint64_t dropped = 0;
+		const auto used  = FaultStats::g_hot_blocks.TakeTop(blocks, dropped);
+		const auto hot   = Detail::FormatFaultHotLine(blocks.data(), used, dropped);
+		std::fputs(hot.c_str(), stdout);
+	}
 	std::fflush(stdout);
 }
 
@@ -330,6 +359,42 @@ std::string FormatFrameWarning(uint64_t hits, uint64_t misses, double sustained_
 	return text;
 }
 
+std::string FormatFaultLine(double secs, uint64_t writes, uint64_t reads, uint64_t handler_us,
+                            uint64_t invalidate_us, uint64_t protect_us, uint64_t lock_wait_us,
+                            uint64_t fast_skips, uint64_t marked, uint64_t kept,
+                            uint64_t expired) {
+	const auto per_s = [secs](uint64_t value) {
+		return secs > 0.0 ? static_cast<double>(value) / secs : 0.0;
+	};
+	const auto ms_per_s = [secs](uint64_t micros) {
+		return secs > 0.0 ? static_cast<double>(micros) / 1e3 / secs : 0.0;
+	};
+	char text[512];
+	std::snprintf(text, sizeof(text),
+	    "[fault] secs=%.1f write=%.0f/s read=%.0f/s handler_ms/s=%.1f invalidate_ms/s=%.1f "
+	    "protect_ms/s=%.1f lock_wait_ms/s=%.1f fast_skip=%.0f/s "
+	    "storm(marked=%" PRIu64 " kept=%" PRIu64 " expired=%" PRIu64 ")\n",
+	    secs, per_s(writes), per_s(reads), ms_per_s(handler_us), ms_per_s(invalidate_us),
+	    ms_per_s(protect_us), ms_per_s(lock_wait_us), per_s(fast_skips), marked, kept, expired);
+	return text;
+}
+
+std::string FormatFaultHotLine(const FaultBlock* blocks, size_t count, uint64_t dropped) {
+	std::string line = "[fault] top 64K blocks:";
+	char        text[64];
+	for (size_t i = 0; i < count; i++) {
+		std::snprintf(text, sizeof(text), " 0x%" PRIx64 "=%" PRIu64, blocks[i].address,
+		              blocks[i].count);
+		line += text;
+	}
+	if (dropped != 0) {
+		std::snprintf(text, sizeof(text), " (untracked %" PRIu64 ")", dropped);
+		line += text;
+	}
+	line += '\n';
+	return line;
+}
+
 } // namespace Detail
 
 void Start() {
@@ -340,11 +405,15 @@ void Start() {
 	const char* env        = std::getenv("KYTY_PERF_SUMMARY");
 	const char* frame_env  = std::getenv("KYTY_FRAME_COST");
 	const bool  frame_cost = frame_env != nullptr && frame_env[0] != '\0' && frame_env[0] != '0';
-	if ((env == nullptr || env[0] == '\0' || env[0] == '0') && !frame_cost) {
+	const char* fault_env  = std::getenv("KYTY_FAULT_STATS");
+	const bool  fault_stats =
+	    fault_env != nullptr && fault_env[0] != '\0' && fault_env[0] != '0';
+	if ((env == nullptr || env[0] == '\0' || env[0] == '0') && !frame_cost && !fault_stats) {
 		return;
 	}
-	g_started    = true;
-	g_frame_cost = frame_cost;
+	g_started     = true;
+	g_frame_cost  = frame_cost;
+	g_fault_stats = fault_stats;
 	bool explicit_period = false;
 	if (env != nullptr && env[0] != '\0' && env[0] != '0') {
 		if (const auto period = std::strtoul(env, nullptr, 10); period >= 2) {
@@ -352,8 +421,8 @@ void Start() {
 			explicit_period = true;
 		}
 	}
-	// The frame line is a five-second window unless the caller chose a reporter period.
-	if (frame_cost && !explicit_period) {
+	// The frame and fault lines are a five-second window unless the caller chose a reporter period.
+	if ((frame_cost || fault_stats) && !explicit_period) {
 		g_period = 5;
 	}
 	Detail::g_enabled.store(true, std::memory_order_relaxed);
