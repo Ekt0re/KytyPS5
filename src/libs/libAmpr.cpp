@@ -847,10 +847,12 @@ static int CheckCommandBufferRecordSpaceLocked(uint64_t command_buffer, CommandB
 		                     ? static_cast<uint32_t>(ReadCommandBufferUnchecked<int32_t>(
 		                           command_buffer + COMMAND_BUFFER_NUM_OFFSET))
 		                     : 0u;
-		const auto seq = NextAmprSeq();
-		const auto tid = Common::Thread::GetThreadIdUnique();
-		RecordLifecycleEventLocked(state, "Append(EBUSY)", seq, tid, num,
-		                           LibKernel::KERNEL_ERROR_EBUSY);
+		if (AmprLifecycleLogEnabled()) {
+			const auto seq = NextAmprSeq();
+			const auto tid = Common::Thread::GetThreadIdUnique();
+			RecordLifecycleEventLocked(state, "Append(EBUSY)", seq, tid, num,
+			                           LibKernel::KERNEL_ERROR_EBUSY);
+		}
 		LogAmprEbusyLocked(op, command_buffer, state, record_size, num, true,
 		                   LibKernel::KERNEL_ERROR_EBUSY);
 		return LibKernel::KERNEL_ERROR_EBUSY;
@@ -1374,7 +1376,7 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 	const uint64_t end = amm ? bytes : state.write_offset;
 	const int      submit_rc =
 	    (end == 0 || end > state.write_offset) ? LibKernel::KERNEL_ERROR_EINVAL : OK;
-	{
+	if (AmprLifecycleLogEnabled()) {
 		// TryGetCommandBufferState copies the state; the ring lives on the stored copy.
 		std::scoped_lock lock(g_command_buffer_mutex);
 		const auto       alias = g_command_buffer_aliases.find(command_buffer);
@@ -1392,13 +1394,11 @@ static int QueueCommandBuffer(Engine engine, uint64_t command_buffer, uint32_t b
 				it->second.last_submit_seq = seq;
 			}
 			RecordLifecycleEventLocked(it->second, op_name, seq, tid, num, submit_rc);
-			if (AmprLifecycleLogEnabled()) {
-				LOGF("[ampr][life] seq=%" PRIu64 " op=%s cb=0x%" PRIx64 " arg=0x%" PRIx64
-				     " tid=%d write_offset=0x%" PRIx64 " bytes=0x%x size=0x%" PRIx64
-				     " num=%u rc=0x%08x\n",
-				     seq, op_name, key, command_buffer, tid, it->second.write_offset, bytes,
-				     it->second.size, num, static_cast<uint32_t>(submit_rc));
-			}
+			LOGF("[ampr][life] seq=%" PRIu64 " op=%s cb=0x%" PRIx64 " arg=0x%" PRIx64
+			     " tid=%d write_offset=0x%" PRIx64 " bytes=0x%x size=0x%" PRIx64
+			     " num=%u rc=0x%08x\n",
+			     seq, op_name, key, command_buffer, tid, it->second.write_offset, bytes,
+			     it->second.size, num, static_cast<uint32_t>(submit_rc));
 		}
 	}
 	if (submit_rc != OK) {
@@ -1566,10 +1566,12 @@ static int KYTY_SYSV_ABI CommandBufferSetBuffer(void* command_buffer, void* buff
 		if (GetOrCreateCommandBufferStateLocked(command_buffer_addr, &it)) {
 			const auto num = static_cast<uint32_t>(
 			    ReadCommandBufferUnchecked<int32_t>(command_buffer_addr + COMMAND_BUFFER_NUM_OFFSET));
-			const auto seq = NextAmprSeq();
-			const auto tid = Common::Thread::GetThreadIdUnique();
-			RecordLifecycleEventLocked(it->second, "SetBuffer(EBUSY)", seq, tid, num,
-			                           LibKernel::KERNEL_ERROR_EBUSY);
+			if (AmprLifecycleLogEnabled()) {
+				const auto seq = NextAmprSeq();
+				const auto tid = Common::Thread::GetThreadIdUnique();
+				RecordLifecycleEventLocked(it->second, "SetBuffer(EBUSY)", seq, tid, num,
+				                           LibKernel::KERNEL_ERROR_EBUSY);
+			}
 			LogAmprEbusyLocked("SetBuffer", command_buffer_addr, it->second, size, num, false,
 			                   LibKernel::KERNEL_ERROR_EBUSY);
 		}
@@ -1581,17 +1583,15 @@ static int KYTY_SYSV_ABI CommandBufferSetBuffer(void* command_buffer, void* buff
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	{
-		const auto seq   = NextAmprSeq();
-		const auto tid   = Common::Thread::GetThreadIdUnique();
+	if (AmprLifecycleLogEnabled()) {
+		const auto seq = NextAmprSeq();
+		const auto tid = Common::Thread::GetThreadIdUnique();
 		auto&      state = g_command_buffers[command_buffer_addr];
 		state.last_setbuf_seq = seq;
 		RecordLifecycleEventLocked(state, "SetBuffer", seq, tid, 0u, OK);
-		if (AmprLifecycleLogEnabled()) {
-			LOGF("[ampr][life] seq=%" PRIu64 " op=SetBuffer cb=0x%" PRIx64 " buf=0x%" PRIx64
-			     " tid=%d write_offset=0x%" PRIx64 " size=0x%" PRIx64 " rc=0x0\n",
-			     seq, command_buffer_addr, state.buffer, tid, state.write_offset, state.size);
-		}
+		LOGF("[ampr][life] seq=%" PRIu64 " op=SetBuffer cb=0x%" PRIx64 " buf=0x%" PRIx64
+		     " tid=%d write_offset=0x%" PRIx64 " size=0x%" PRIx64 " rc=0x0\n",
+		     seq, command_buffer_addr, state.buffer, tid, state.write_offset, state.size);
 	}
 
 	return OK;
@@ -1614,19 +1614,19 @@ static int KYTY_SYSV_ABI CommandBufferReset(void* command_buffer) {
 		return LibKernel::KERNEL_ERROR_EPERM;
 	}
 
-	const auto prev_offset = it->second.write_offset;
-	const auto prev_num    = static_cast<uint32_t>(
-	    ReadCommandBufferUnchecked<int32_t>(command_buffer_addr + COMMAND_BUFFER_NUM_OFFSET));
 	if (!WriteCommandBufferPointersLocked(command_buffer_addr, it->second.buffer,
 	                                      it->second.size)) {
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-	const auto seq = NextAmprSeq();
-	const auto tid = Common::Thread::GetThreadIdUnique();
-	it->second.last_reset_seq = seq;
-	RecordLifecycleEventLocked(it->second, "Reset", seq, tid, 0u, OK);
 	if (AmprLifecycleLogEnabled()) {
+		const auto prev_offset = it->second.write_offset;
+		const auto prev_num    = static_cast<uint32_t>(
+		    ReadCommandBufferUnchecked<int32_t>(command_buffer_addr + COMMAND_BUFFER_NUM_OFFSET));
+		const auto seq = NextAmprSeq();
+		const auto tid = Common::Thread::GetThreadIdUnique();
+		it->second.last_reset_seq = seq;
+		RecordLifecycleEventLocked(it->second, "Reset", seq, tid, 0u, OK);
 		LOGF("[ampr][life] seq=%" PRIu64 " op=Reset cb=0x%" PRIx64 " buf=0x%" PRIx64
 		     " tid=%d prev_offset=0x%" PRIx64 " prev_num=%u write_offset=0x0 size=0x%" PRIx64
 		     " rc=0x0\n",
