@@ -945,6 +945,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME shader_cfg_indirect_formatted_stores
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --indirect-formatted-stores-only)
+	add_test(NAME shader_cfg_finite_buffer_descriptors
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --finite-buffer-descriptors-only)
 	add_test(NAME shader_corpus COMMAND $<TARGET_FILE:shader_check> --self-test)
 	add_test(NAME driver_repro COMMAND $<TARGET_FILE:driver_repro> --self-test)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -1020,6 +1022,8 @@ if(BUILD_TESTING)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_compute_indirect_formatted_stores
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-formatted-stores-only)
+	add_test(NAME shader_recompiler_compute_finite_buffer_descriptors
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --finite-buffer-descriptors-only)
 	add_test(NAME image_heap COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-heap-only)
 	add_test(NAME shader_recompiler_tessellation
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)

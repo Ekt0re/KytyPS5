@@ -7786,6 +7786,53 @@ void TestIndirectFormattedStoreTypedIr() {
       Libs::Graphics::DstSel(4, 5, 6, 7));
 }
 
+void TestFiniteBufferDescriptorPhiAtomic() {
+  constexpr uint32_t no_offset_register = 125u << 25u;
+  constexpr uint32_t first_descriptor_offset = 16u;
+  constexpr uint32_t second_descriptor_offset = 32u;
+  constexpr uint32_t s_load_dwordx4_s20_from_s0 = EncodeSmem0(0x02, 20, 0);
+  constexpr uint32_t s4_descriptor = 4u / 4u;
+  constexpr uint32_t s20_descriptor = 20u / 4u;
+  constexpr uint32_t buffer_load_dword = 0x0c;
+  constexpr uint32_t buffer_atomic_add = 0x32;
+  constexpr uint32_t v_cmp_lt_u32_vcc_1_v1 = EncodeVopc(0xc1, 129, 1);
+  constexpr uint32_t s_cbranch_vccz_over_second_load = EncodeSopp(0x06, 2);
+  constexpr uint32_t op_atomic_iadd = 234u;
+  const uint32_t shader[] = {
+      s_load_dwordx4_s20_from_s0, no_offset_register | first_descriptor_offset,
+      EncodeMubuf0(buffer_load_dword, 0, false), EncodeMubuf1(1, s4_descriptor, 0),
+      v_cmp_lt_u32_vcc_1_v1,
+      s_cbranch_vccz_over_second_load,
+      s_load_dwordx4_s20_from_s0, no_offset_register | second_descriptor_offset,
+      EncodeMubuf0(buffer_atomic_add, 0, false), EncodeMubuf1(0, s20_descriptor, 0),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 12> table{};
+  table[first_descriptor_offset / 4u] = 0x2000u;
+  table[first_descriptor_offset / 4u + 2u] = 4u;
+  table[second_descriptor_offset / 4u] = 0x3000u;
+  table[second_descriptor_offset / 4u + 2u] = 4u;
+  const auto table_address = reinterpret_cast<uint64_t>(table.data());
+  const std::array<uint32_t, 8> user_data{static_cast<uint32_t>(table_address),
+                                          static_cast<uint32_t>(table_address >> 32u), 0u, 0u,
+                                          0x4000u, 0u, 4u, 0u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = user_data;
+  for (const uint32_t second_stride : {0u, 4u}) {
+    table[second_descriptor_offset / 4u + 1u] = second_stride << 16u;
+    const auto result = RecompileForTest(shader, options);
+    const auto &buffers = result.program.info.buffers;
+    Check(!result.program.info.uses_dma && buffers.size() == 3u,
+          "finite Phi atomic did not bind both candidate buffers");
+    Check(std::ranges::count_if(buffers, [](const auto &buffer) { return buffer.atomic; }) == 2,
+          "a finite Phi candidate is not tracked as atomically written");
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto atomics = SpirvInstructionOpcodeCount(result.spirv, op_atomic_iadd);
+    Check(second_stride == 0u ? atomics >= 1u : atomics == 2u,
+          "finite Phi atomic does not act on the chosen buffer");
+  }
+}
+
 void TestCapturedBufferAtomicsX2() {
   using ShaderRecompiler::IR::ValueOpcode;
   struct Case {
@@ -14633,6 +14680,16 @@ int main(int argc, char** argv) {
 #endif
     EnsureConfigInitialized();
     TestIndirectFormattedStoreTypedIr();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--finite-buffer-descriptors-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_FINITE_BUFFER_DESCRIPTORS", "1");
+#else
+    setenv("KYTY_FINITE_BUFFER_DESCRIPTORS", "1", 1);
+#endif
+    EnsureConfigInitialized();
+    TestFiniteBufferDescriptorPhiAtomic();
     return 0;
   }
 
