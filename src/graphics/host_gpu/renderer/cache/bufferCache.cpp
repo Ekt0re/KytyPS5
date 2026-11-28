@@ -254,9 +254,16 @@ bool BufferCache::ReadBackInPlace(Buffer& buffer, uint64_t vaddr, uint64_t size)
 	m_gpu_modified_ranges.ForEachInRange(
 	    vaddr, size, [&](uint64_t begin, uint64_t end) { dirty += end - begin; });
 	const auto current_tick = m_scheduler.CurrentTick();
-	const auto write_tick   = std::max(buffer.readback_write_tick, m_address_write_tick);
-	const bool unsubmitted  = HasUnsubmittedWrite(vaddr, size) || m_address_writes_pending ||
-	                          m_address_write_tick == current_tick;
+	// The tick of the write itself, per range (RecordPendingWrites), not the tick at which the
+	// buffer was bound: the scheduler can submit between the bind and the dispatch that writes,
+	// and the write then sits in a later tick than readback_write_tick.
+	const auto needed = NeededTick(vaddr, size);
+	if (needed == ReadbackWait::UnknownTick) {
+		return false;
+	}
+	const auto write_tick  = std::max(buffer.readback_write_tick, needed);
+	const bool unsubmitted = HasUnsubmittedWrite(vaddr, size) || m_address_writes_pending ||
+	                         m_address_write_tick == current_tick || write_tick >= current_tick;
 	if (!ReadbackBatch::CanReadInPlace({.enabled           = m_inplace_readback,
 	                                    .host_readable     = buffer.IsHostReadable(),
 	                                    .dirty_bytes       = dirty,
