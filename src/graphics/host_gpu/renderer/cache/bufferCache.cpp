@@ -322,6 +322,50 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 	using Common::PerfSummary::Counter;
 	using Common::PerfSummary::ScopedMicros;
 	const bool copy_queue = detached && CopyQueue();
+	// rb_tick_wait: the copy waits for the tick that last wrote its bytes; a flush and wait makes
+	// the range hot, so its next writer is submitted at once.
+	RefreshReadbackWaitToggles();
+	uint64_t wait_tick = 0;
+	if (m_tick_wait) {
+		const auto tick        = m_scheduler.CurrentTick();
+		uint64_t   begin       = UINT64_MAX;
+		uint64_t   end         = 0;
+		uint64_t   needed      = m_address_write_tick;
+		bool       unknown     = false;
+		bool       unsubmitted = false;
+		for (const auto& part: parts) {
+			for (const auto& copy: part.copies) {
+				const auto address = part.buffer_address + copy.srcOffset;
+				begin              = std::min(begin, address);
+				end                = std::max(end, address + copy.size);
+				if (!detached && HasUnsubmittedWrite(address, copy.size)) {
+					unsubmitted = true;
+				}
+				if (!unknown) {
+					const auto latest = m_write_ticks.Latest(address, address + copy.size);
+					unknown           = latest == ReadbackWait::UnknownTick;
+					needed            = std::max(needed, latest);
+				}
+			}
+		}
+		if (!detached) {
+			const bool device_address =
+			    !unsubmitted && (m_address_writes_pending || m_address_write_tick == tick);
+			if (unsubmitted || device_address) {
+				m_hot_writers.NoteWait(begin, end, device_address, true, TRACKER_PAGE_SIZE);
+				Common::PerfSummary::Add(Common::PerfSummary::Counter::RbHotNotes);
+			}
+		} else {
+			m_hot_writers.NoteWait(begin, end, needed != 0 && needed == m_address_write_tick, false,
+			                       TRACKER_PAGE_SIZE);
+			if (copy_queue && !unknown && needed + 1 < tick) {
+				wait_tick = std::max<uint64_t>(needed, 1);
+				Common::PerfSummary::Add(Common::PerfSummary::Counter::RbTickEarly);
+				Common::PerfSummary::Add(Common::PerfSummary::Counter::RbTickSkipped,
+				                         tick - 1 - wait_tick);
+			}
+		}
+	}
 	const auto path       = ReadbackBatch::ChooseReadbackPath(
         {.detached   = detached,
 	           .copy_queue = copy_queue,
@@ -365,9 +409,12 @@ void BufferCache::DownloadParts(std::vector<DownloadPart>& parts, uint64_t total
 		}
 		{
 			ScopedMicros path_wait_timer(counters.wait);
-			(void)m_scheduler.SubmitOnCopyQueue(record);
+			(void)m_scheduler.SubmitOnCopyQueue(record, wait_tick);
 			ScopedMicros wait_timer(Counter::RbWaitUs);
-			m_scheduler.WaitPriorityOperations(tick - 1);
+			// Earlier asynchronous publications of these bytes land first; those of later ticks
+			// hold other bytes (a download takes its bytes out of the dirty set, so bytes dirty
+			// again were written at or after its tick, which wait_tick covers).
+			m_scheduler.WaitPriorityOperations(wait_tick != 0 ? wait_tick : tick - 1);
 		}
 		// KYTY_COPY_QUEUE_FLUSH=1: the open command buffer is still submitted (without a wait), as
 		// the detached path does.
@@ -459,9 +506,29 @@ void BufferCache::MarkUnsubmittedWrite(uint64_t vaddr, uint64_t size) {
 		m_unsubmitted_tick = tick;
 	}
 	m_unsubmitted_writes.Add(vaddr, size);
+	// Kept whatever the toggles say, so switching rb_tick_wait or rb_mirror on finds them current.
+	m_write_ticks.Assign(vaddr, vaddr + size, tick);
+	if (m_mirror_on && !m_mirror_index.Empty() && m_mirror_index.MarkWritten(vaddr, size, tick)) {
+		// A line read recently is read again soon: let the GPU start on its writer now.
+		m_flush_throttle.Request();
+	}
 }
 
 void BufferCache::RecordPendingWrites() {
+	RefreshReadbackWaitToggles();
+	if (m_tick_wait && !m_hot_writers.Empty()) {
+		bool hot = m_address_writes_pending && m_hot_writers.DeviceAddressHot();
+		m_pending_writes.ForEach([&](uint64_t begin, uint64_t end) {
+			hot = hot || m_hot_writers.Intersects(begin, end - begin);
+		});
+		if (hot) {
+			m_flush_throttle.Request();
+		}
+	}
+	// Device-address writes name no range: every mirror line is stale after them.
+	if (m_mirror_on && m_address_writes_pending && m_mirror_index.RecentlyHit()) {
+		m_flush_throttle.Request();
+	}
 	m_pending_writes.ForEach(
 	    [this](uint64_t begin, uint64_t end) { MarkUnsubmittedWrite(begin, end - begin); });
 	m_pending_writes.Clear();
@@ -506,6 +573,17 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 		                      : value[0] == '2' ? DetachedReadback::NoSubmit
 		                                        : DetachedReadback::Submit;
 	}
+	// KYTY_RB_TICK_WAIT=1 / KYTY_RB_MIRROR=1 (default off), overridden by toggles rb_tick_wait and
+	// rb_mirror when the toggle file has those lines.
+	if (const char* value = std::getenv("KYTY_RB_TICK_WAIT"); value != nullptr) {
+		m_tick_wait_env = value[0] == '1';
+	}
+	if (const char* value = std::getenv("KYTY_RB_MIRROR"); value != nullptr) {
+		m_mirror_env = value[0] == '1';
+	}
+	m_tick_wait = m_tick_wait_env;
+	m_mirror_on = m_mirror_env;
+	m_scheduler.SetSubmitHook(&BufferCache::OnSubmit, this);
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -533,6 +611,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	m_scheduler.SetSubmitHook(nullptr, nullptr);
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -1524,6 +1603,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
 	RecordPendingWrites();
+	FlushIfRequested();
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -1564,6 +1644,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	                                    : std::pair {&m_gds_buffer, dst_vaddr};
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 	RecordPendingWrites();
+	FlushIfRequested();
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
@@ -1758,6 +1839,200 @@ void BufferCache::SynchronizeBda(const RangeSet& mapped) {
 	});
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::SyncBdaUploadBytes, total_size);
 	UploadCopies(uploads, copies, total_size);
+}
+
+void BufferCache::RefreshReadbackWaitToggles() {
+	if (!Common::RuntimeToggles::Enabled()) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now < m_readback_wait_next) {
+		return;
+	}
+	m_readback_wait_next = now + std::chrono::milliseconds(250);
+	const int tick_wait  = Common::RuntimeToggles::Find("rb_tick_wait");
+	const int mirror     = Common::RuntimeToggles::Find("rb_mirror");
+	m_tick_wait          = tick_wait < 0 ? m_tick_wait_env : tick_wait == 1;
+	const bool mirror_on = mirror < 0 ? m_mirror_env : mirror == 1;
+	if (m_mirror_on && !mirror_on) {
+		// Off: lines stop following writes, so none may be used when it comes back on.
+		m_mirror_index = {};
+	}
+	m_mirror_on = mirror_on;
+	if (!m_tick_wait && !m_mirror_on) {
+		m_flush_throttle.Cancel();
+	}
+}
+
+void BufferCache::FlushIfRequested() {
+	if (!m_flush_throttle.Requested()) {
+		return;
+	}
+	const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch())
+	                        .count();
+	if (m_flush_throttle.Take(m_scheduler.CurrentTick(), now_us)) {
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::RbHotFlushes);
+		m_scheduler.Flush();
+	}
+}
+
+uint64_t BufferCache::NeededTick(uint64_t vaddr, uint64_t size) const {
+	uint64_t needed  = m_address_write_tick;
+	bool     unknown = false;
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+		if (unknown) {
+			return;
+		}
+		const auto latest = m_write_ticks.Latest(start, end);
+		unknown           = latest == ReadbackWait::UnknownTick;
+		needed            = std::max(needed, latest);
+	});
+	return unknown ? ReadbackWait::UnknownTick : needed;
+}
+
+void BufferCache::OnSubmit(void* self) {
+	static_cast<BufferCache*>(self)->RecordMirrorCopies();
+}
+
+void BufferCache::RecordMirrorCopies() {
+	if (!m_mirror_on || !m_mirror || !m_mirror_index.HasDirty() || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	const auto tick   = m_scheduler.CurrentTick();
+	const auto copies = m_mirror_index.TakeDirty(tick, [this](uint64_t line) {
+		// Lines outside one cached VRAM buffer stay unmirrored (their reads take the readback path).
+		const auto* owner = m_page_table.Find(line >> PageTable::kPageBits);
+		if (owner == nullptr || IsBufferInvalid(*owner)) {
+			return false;
+		}
+		const auto& buffer = m_slot_buffers[*owner];
+		return !buffer.IsZeroCopy() && buffer.Handle() &&
+		       buffer.IsInBounds(line, ReadbackWait::MirrorIndex::LineSize);
+	});
+	if (copies.empty()) {
+		return;
+	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// Every earlier write of the command buffer, and the earlier copies into the mirror slots.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	std::vector<vk::BufferCopy> regions;
+	const Buffer*               source = nullptr;
+	const auto                  flush  = [&] {
+        if (!regions.empty()) {
+            native.copyBuffer(source->Handle(), m_mirror->Handle(),
+			                                    static_cast<uint32_t>(regions.size()), regions.data());
+            regions.clear();
+        }
+	};
+	for (const auto& [line, slot]: copies) {
+		const auto& buffer = m_slot_buffers[*m_page_table.Find(line >> PageTable::kPageBits)];
+		if (&buffer != source) {
+			flush();
+			source = &buffer;
+		}
+		regions.emplace_back(buffer.Offset(line), uint64_t {slot} * ReadbackWait::MirrorIndex::LineSize,
+		                     ReadbackWait::MirrorIndex::LineSize);
+	}
+	flush();
+	// The copies, and every later command that writes the copied buffers, after them.
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eTransferRead;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eMemoryWrite |
+	                      vk::AccessFlagBits::eMemoryRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eAllCommands,
+	                       {}, 1, &after, 0, nullptr, 0, nullptr);
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbMirrorCopies, copies.size());
+}
+
+bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
+	using ReadbackWait::MirrorIndex;
+	RefreshReadbackWaitToggles();
+	if (!m_mirror_on || size == 0 || size > MirrorIndex::MaxRead || !GuestGpu::IsGpuThread() ||
+	    !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	const auto miss = [] {
+		Common::PerfSummary::Add(Common::PerfSummary::Counter::RbMirrorMisses);
+		return false;
+	};
+	// Writes of the operation being recorded or of the open command buffer, and device-address
+	// writes being recorded, are not copied yet.
+	if (m_address_writes_pending || HasUnsubmittedWrite(vaddr, size)) {
+		return miss();
+	}
+	const auto first = Common::AlignDown(vaddr, MirrorIndex::LineSize);
+	const auto last  = Common::AlignUp(vaddr + size, MirrorIndex::LineSize);
+	const auto* owner = m_page_table.Find(first >> PageTable::kPageBits);
+	if (owner == nullptr || IsBufferInvalid(*owner)) {
+		return miss();
+	}
+	const auto& buffer = m_slot_buffers[*owner];
+	if (buffer.IsZeroCopy() || !buffer.IsInBounds(first, last - first)) {
+		return miss();
+	}
+	const auto needed = NeededTick(vaddr, size);
+	if (needed == ReadbackWait::UnknownTick) {
+		return miss();
+	}
+	if (!m_mirror) {
+		m_mirror = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                    vk::BufferUsageFlagBits::eTransferDst,
+		                                    uint64_t {MirrorIndex::MaxLines} * MirrorIndex::LineSize);
+	}
+	const auto current = m_scheduler.CurrentTick();
+	const auto found   = m_mirror_index.Find(vaddr, size, needed, current);
+	if (!found.held || found.wait >= current) {
+		return miss();
+	}
+	{
+		Common::PerfSummary::ScopedMicros timer(Common::PerfSummary::Counter::RbMirrorWaitUs);
+		const auto origin = CountersOf(ReadbackOrigin::Current());
+		Common::PerfSummary::ScopedMicros origin_timer(origin.wait_us);
+		m_scheduler.Wait(found.wait);
+		// As a readback: earlier asynchronous publications of these bytes land first.
+		m_scheduler.WaitPriorityOperations(std::max(needed, found.wait));
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size)) {
+		return miss();
+	}
+	const auto* mapped = m_mirror->Mapped().data();
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+		while (start < end) {
+			const auto line   = Common::AlignDown(start, MirrorIndex::LineSize);
+			const auto chunk  = std::min(end, line + MirrorIndex::LineSize) - start;
+			const auto slot   = found.slots[(line - first) / MirrorIndex::LineSize];
+			const auto offset = uint64_t {slot} * MirrorIndex::LineSize + (start - line);
+			m_mirror->Invalidate(offset, chunk);
+			std::memcpy(static_cast<uint8_t*>(data) + (start - vaddr), mapped + offset, chunk);
+			Libs::LibKernel::Memory::WriteBacking(start, mapped + offset, chunk);
+			start += chunk;
+		}
+	});
+	// The bytes are clean now: later reads take them from the backing store until the GPU writes
+	// them again. Tracker pages left without GPU-written bytes go back to the CPU, as after a
+	// download (a GPU-dirty page always holds dirty bytes).
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	ForgetColorMetadataChecks(vaddr, size);
+	const auto page_end = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	for (auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE); page < page_end;
+	     page += TRACKER_PAGE_SIZE) {
+		if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+		    m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+		}
+	}
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbMirrorMisses, uint64_t(-1));
+	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbMirrorHits);
+	return true;
 }
 
 } // namespace Libs::Graphics

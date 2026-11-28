@@ -153,6 +153,16 @@ enum class Counter {
 	RbOOtherCalls,
 	RbOOtherWaits,
 	RbOOtherWaitUs,
+	// KYTY_RB_TICK_WAIT / toggle rb_tick_wait and KYTY_RB_MIRROR / toggle rb_mirror (BufferCache,
+	// ported from TheCruZ KytyEmu d81455ac).
+	RbTickEarly,   // Copy-queue readbacks that waited for their writer's tick, older than the last submitted.
+	RbTickSkipped, // ... submitted ticks they did not wait for (sum).
+	RbHotNotes,    // Readbacks that flushed for a writer still being recorded (made its range hot).
+	RbHotFlushes,  // Submissions requested after an operation wrote hot ranges or mirrored lines.
+	RbMirrorHits,  // Reads answered from the readback mirror (no readback).
+	RbMirrorMisses, // Mirror reads that fell back to a readback.
+	RbMirrorWaitUs, // Microseconds mirror hits waited for the copy's tick.
+	RbMirrorCopies, // Mirror lines copied at the end of command buffers.
 	Count
 };
 

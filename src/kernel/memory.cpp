@@ -934,6 +934,10 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
 			const Graphics::ReadbackOrigin::Scope origin(Graphics::ReadbackOrigin::Origin::Shader,
 			                                             true);
+			// rb_mirror: small repeated reads take the GPU's bytes from the readback mirror.
+			if (buffers.TryReadMirroredGpuWrites(vaddr, data, size)) {
+				return true;
+			}
 			buffers.ReadMemory(vaddr, size);
 		}
 	}

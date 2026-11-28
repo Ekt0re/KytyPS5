@@ -933,6 +933,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetBufferCache().FlushIfRequested();
 }
 
 // KYTY_INDIRECT_ARGS_WINDOW=0 reads indirect arguments from memory as recorded, as before.
@@ -1146,6 +1147,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	m_context.GetBufferCache().RecordPendingWrites();
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	m_context.GetBufferCache().FlushIfRequested();
 }
 
 } // namespace Libs::Graphics

@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/readbackBatch.h"
+#include "graphics/host_gpu/renderer/cache/readbackWait.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/cache/zeroCopyFence.h"
 
@@ -18,6 +19,7 @@
 #include <chrono>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <unordered_map>
@@ -150,6 +152,16 @@ public:
 	void RecordPendingWrites();
 	// A program with address writes is bound; its writes can reach any range.
 	void NoteAddressWrites() noexcept { m_address_writes_pending = true; }
+	// At the end of a draw, dispatch, fill or copy: submits the command buffer when the operation
+	// wrote memory that readbacks keep waiting for (toggle rb_tick_wait; at most once per
+	// millisecond), so the readback that follows finds its writer submitted instead of flushing
+	// and waiting for everything recorded.
+	void FlushIfRequested();
+	// GPU thread: reads [vaddr, vaddr + size) (at most 256 bytes), taking the bytes the GPU wrote
+	// from the host-visible mirror of 64-byte lines the command thread reads again and again
+	// (toggle rb_mirror). False when the mirror does not hold the GPU's current bytes yet: the
+	// caller reads them back, and the lines are mirrored from the next submission on.
+	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
 	// Called on the GPU thread when a guest CPU write faults into GPU-written memory.
 	void SetCpuWriteListener(std::function<void(uint64_t, uint64_t)> listener) {
 		m_cpu_write_listener = std::move(listener);
@@ -250,6 +262,21 @@ private:
 	[[nodiscard]] bool CanDownloadDetached(uint64_t                        buffer_address,
 	                                       std::span<const vk::BufferCopy> copies);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	// Re-reads the rb_tick_wait and rb_mirror settings at most every 250 ms.
+	void               RefreshReadbackWaitToggles();
+	// KYTY_RB_TICK_WAIT / toggle rb_tick_wait (default off): copy-queue readbacks wait on the GPU
+	// for the tick that last wrote their bytes (ReadbackWait::WriteTicks) instead of every
+	// submitted tick, and operations writing ranges whose readbacks had to flush are submitted at
+	// once (ReadbackWait::HotWriters).
+	[[nodiscard]] bool TickWait() const noexcept { return m_tick_wait; }
+	// KYTY_RB_MIRROR / toggle rb_mirror (default off): see TryReadMirroredGpuWrites().
+	[[nodiscard]] bool Mirror() const noexcept { return m_mirror_on; }
+	// The submitted tick after which [vaddr, vaddr + size)'s GPU-written bytes are final: their
+	// writers and device-address writers. UnknownTick when a written part has no tick.
+	[[nodiscard]] uint64_t NeededTick(uint64_t vaddr, uint64_t size) const;
+	// Scheduler submit hook: copies the mirror's lines written in this command buffer.
+	static void        OnSubmit(void* self);
+	void               RecordMirrorCopies();
 
 	// Zero-copy guest memory (KYTY_ZERO_COPY=1, VK_EXT_external_memory_host). A buffer the CPU
 	// keeps faulting on is rebuilt over guest memory itself, so GPU writes land there. Its pages
@@ -304,6 +331,17 @@ private:
 	RangeSet                                          m_unsubmitted_writes;
 	uint64_t                                          m_unsubmitted_tick       = 0;
 	uint64_t                                          m_address_write_tick     = 0;
+	// Ported from TheCruZ KytyEmu d81455ac/2fdd7744 (readbackWait.h).
+	ReadbackWait::WriteTicks                          m_write_ticks;
+	ReadbackWait::HotWriters                          m_hot_writers;
+	ReadbackWait::FlushThrottle                       m_flush_throttle;
+	ReadbackWait::MirrorIndex                         m_mirror_index;
+	std::unique_ptr<Buffer>                           m_mirror;
+	bool                                              m_tick_wait_env = false;
+	bool                                              m_mirror_env    = false;
+	bool                                              m_tick_wait     = false;
+	bool                                              m_mirror_on     = false;
+	std::chrono::steady_clock::time_point             m_readback_wait_next {};
 	bool                                              m_address_writes_pending = false;
 	enum class DetachedReadback { Off, Submit, NoSubmit };
 	DetachedReadback                                  m_detached_readback = DetachedReadback::Submit;

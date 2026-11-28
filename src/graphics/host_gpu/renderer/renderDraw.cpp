@@ -1423,6 +1423,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		buffer.EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
 	}
+	m_context.GetBufferCache().FlushIfRequested();
 }
 
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need the CPU:

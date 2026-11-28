@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <queue>
@@ -55,11 +56,15 @@ public:
 	// the current one (the master timeline, not the open command buffer, which stays open and is
 	// not submitted), and waits for it on the host. False, with nothing recorded, without a copy
 	// queue. Only from the thread that records the current command buffer.
+	// `wait_tick` (0: every tick handed out before the current one): the submitted tick whose
+	// completion the copy waits for on the GPU, when the caller knows its sources were last written
+	// there (BufferCache, toggle rb_tick_wait).
 	template <typename Record>
-	bool SubmitOnCopyQueue(Record&& record) {
+	bool SubmitOnCopyQueue(Record&& record, uint64_t wait_tick = 0) {
 		if (!HasCopyQueue()) {
 			return false;
 		}
+		m_copy_wait_tick = wait_tick != 0 ? std::min(wait_tick, CurrentTick() - 1) : CurrentTick() - 1;
 		record(BeginCopyQueue());
 		EndCopyQueue();
 		return true;
@@ -95,6 +100,13 @@ public:
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
+	// Called on the GPU thread before each submission of the current command buffer, while it
+	// still takes commands (BufferCache records its readback-mirror copies there).
+	using SubmitHook = void (*)(void* userdata);
+	void SetSubmitHook(SubmitHook hook, void* userdata) noexcept {
+		m_submit_hook      = hook;
+		m_submit_hook_data = userdata;
+	}
 
 private:
 	class CommandPool {
@@ -159,6 +171,9 @@ private:
 	vk::CommandPool              m_copy_pool         = nullptr;
 	vk::CommandBuffer            m_copy_command      = nullptr;
 	vk::Fence                    m_copy_fence        = nullptr;
+	uint64_t                     m_copy_wait_tick    = 0;
+	SubmitHook                   m_submit_hook       = nullptr;
+	void*                        m_submit_hook_data  = nullptr;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;

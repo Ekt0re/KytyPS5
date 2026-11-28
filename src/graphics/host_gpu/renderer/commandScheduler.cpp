@@ -130,7 +130,7 @@ vk::CommandBuffer CommandScheduler::BeginDetached() {
 	}
 	// With the command recorder, earlier ticks may still wait on its thread for their submission:
 	// the copy must follow them on the queue.
-	if (Recorder::Enabled() && m_master.SubmittedTick() + 1 < m_master.CurrentTick()) {
+	if (Recorder::Enabled() && m_master.SubmittedTick() < m_copy_wait_tick) {
 		Recorder::SyncAll();
 	}
 	vk::CommandBufferBeginInfo begin {};
@@ -229,7 +229,7 @@ vk::CommandBuffer CommandScheduler::BeginCopyQueue() {
 	}
 	// With the command recorder, earlier ticks may still wait on its thread for their submission:
 	// their timeline signals must be submitted before the copy waits on them.
-	if (Recorder::Enabled() && m_master.SubmittedTick() + 1 < m_master.CurrentTick()) {
+	if (Recorder::Enabled() && m_master.SubmittedTick() < m_copy_wait_tick) {
 		Recorder::SyncAll();
 	}
 	vk::CommandBufferBeginInfo begin {};
@@ -245,7 +245,7 @@ void CommandScheduler::EndCopyQueue() {
 	RequireVulkanSuccess(m_copy_command.end(), "end copy-queue command buffer");
 	// Every tick handed out before the open one: the same work a detached copy on the universal
 	// queue would follow, as a GPU-side wait on the master timeline (free when it has finished).
-	const uint64_t                wait_value = m_master.CurrentTick() - 1;
+	const uint64_t                wait_value = m_copy_wait_tick;
 	const vk::Semaphore           wait_semaphore = m_master.Handle();
 	const vk::PipelineStageFlags  wait_stage     = vk::PipelineStageFlagBits::eTransfer;
 	vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -625,6 +625,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 uint64_t CommandScheduler::SubmitWith(SubmitInfo submit, const DetachedPrefix* prefix) {
 	EXIT_IF(m_command.IsInvalid());
+	if (m_submit_hook != nullptr) {
+		m_submit_hook(m_submit_hook_data);
+	}
 
 	m_command.EndRendering();
 	std::vector<vk::CommandBuffer> buffers;
