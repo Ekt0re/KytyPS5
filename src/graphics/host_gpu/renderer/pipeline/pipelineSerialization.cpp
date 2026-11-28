@@ -24,9 +24,11 @@
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <ranges>
+#include <utility>
 #include <xxhash.h>
 #include <zstd.h>
 
@@ -269,6 +271,24 @@ volatile std::sig_atomic_t g_precompile_interrupted = 0;
 
 bool PrecompileMode() {
 	return g_precompile_mode.load(std::memory_order_relaxed);
+}
+
+// KYTY_PRECOMPILE_SHARD=<i>/<n> (measuring driver throughput across processes, after simnJS
+// 78959548d's helper processes): a precompile creates only the stored pipelines whose module id
+// (compute) or key hash (graphics) is i modulo n, and runs without writing the store, so n
+// precompiles of one store can run at once. {0, 1} otherwise.
+std::pair<uint64_t, uint64_t> PrecompileShard() {
+	static const std::pair<uint64_t, uint64_t> shard = []() -> std::pair<uint64_t, uint64_t> {
+		const char* env = std::getenv("KYTY_PRECOMPILE_SHARD");
+		uint64_t    i = 0, n = 0;
+		if (env == nullptr || std::sscanf(env, "%llu/%llu", reinterpret_cast<unsigned long long*>(&i),
+		                                  reinterpret_cast<unsigned long long*>(&n)) != 2 ||
+		    n < 2 || i >= n) {
+			return {0, 1};
+		}
+		return {i, n};
+	}();
+	return PrecompileMode() ? shard : std::pair<uint64_t, uint64_t> {0, 1};
 }
 
 // --restamp-shader-store: the store of another stamp is checked against this translator.
@@ -530,6 +550,16 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
 			compute.push_back(module);
 		}
+	}
+	if (const auto [shard, shards] = PrecompileShard(); shards > 1) {
+		// The other shards' pipelines are left to the other processes.
+		std::erase_if(compute, [&](const ShaderModule* module) { return module->id % shards != shard; });
+		std::erase_if(graphics, [&](const auto& entry) {
+			return GraphicsPipelineKeyHash {}(*entry.first) % shards != shard;
+		});
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "Shader precompile: shard {} of {}: {} compute and {} graphics pipelines\n", shard, shards,
+		    compute.size(), graphics.size()));
 	}
 	const bool sync = SyncWarmUp();
 	if (RestampMode()) {
@@ -1578,7 +1608,8 @@ void PipelineCache::SetPrecompileMode() {
 bool PipelineCache::Precompile() {
 	using Clock      = std::chrono::steady_clock;
 	const auto start = Clock::now();
-	if (!m_store) {
+	// A shard (KYTY_PRECOMPILE_SHARD) only reads the store: the other shards' processes share it.
+	if (!m_store && PrecompileShard().second < 2) {
 		Log::WriteToConsoleAndLog(
 		    "Shader precompile: no shader store (a Release build and a title id are needed, and no "
 		    "other process may be writing it)\n");
