@@ -103,6 +103,47 @@ struct SrtWalkerGuardStats {
 void SetSrtWalkerGuardCounting(bool counting);
 SrtWalkerGuardStats GetSrtWalkerGuardStats();
 
+// Walk state a thread supplies in place of a plan's own (ResourcePlan's mutable scratch), so that
+// a thread other than the command thread can walk and materialize a plan the command thread uses
+// at the same time (lookahead). While a ScopedWalkScratch is alive on a thread, every walk and
+// materialization on that thread uses `scratch` for every plan; Prepare() sizes it for one plan
+// (call it whenever the plan changes). `loads` receives the (address, value) of every guest load
+// of the walks, as the walker saw them.
+struct WalkScratch {
+	std::vector<uint64_t>                   srt_scratch;
+	std::vector<uint32_t>                   material_keys;
+	std::vector<ResourcePlan::SelectorKeys> selector_keys;
+	std::vector<ScanCacheEntry>             scan_cache;
+	std::vector<std::pair<uint64_t, uint32_t>> loads;
+	const ResourcePlan*                     prepared = nullptr;
+
+	void Prepare(const ResourcePlan& plan);
+};
+
+class ScopedWalkScratch {
+public:
+	explicit ScopedWalkScratch(WalkScratch& scratch);
+	~ScopedWalkScratch();
+	ScopedWalkScratch(const ScopedWalkScratch&)            = delete;
+	ScopedWalkScratch& operator=(const ScopedWalkScratch&) = delete;
+
+private:
+	WalkScratch* m_previous;
+};
+
+// The scratch of plan that walks on this thread use.
+std::vector<uint64_t>&                   PlanSrtScratch(const ResourcePlan& plan);
+std::vector<uint32_t>&                   PlanMaterialKeys(const ResourcePlan& plan);
+std::vector<ResourcePlan::SelectorKeys>& PlanSelectorKeys(const ResourcePlan& plan);
+std::vector<ScanCacheEntry>&             PlanScanCache(const ResourcePlan& plan);
+
+// A thread that walks ahead of the command thread (lookahead). Its walks must not touch host
+// state the command thread owns: walker loads that would fault are completed from the backing
+// (the fault handler asks SrtSpeculativeThread()), materialization failures are not logged and
+// its time is not counted as the command thread's.
+void SetSrtSpeculativeThread(bool speculative);
+bool SrtSpeculativeThread();
+
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
@@ -129,7 +170,8 @@ bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
 // only evaluates the values, with every block reachable.
 void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
 // Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
-// one DWORD range per guest load. False when a reachable read is unknown.
+// one DWORD range per guest load. False when a reachable read is unknown. With a WalkScratch in
+// place, its `loads` also receive each guest load's address and value.
 bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
              std::vector<std::pair<uint64_t, uint64_t>>* reads);
 // Results of the last walk; false when unknown.

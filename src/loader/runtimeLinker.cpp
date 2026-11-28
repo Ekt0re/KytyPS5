@@ -919,6 +919,14 @@ bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_
 			// needs no readback. Otherwise the load retries once its fault is handled, or
 			// reads zero.
 			uint32_t value = 0;
+			if (Libs::Graphics::ShaderRecompiler::IR::SrtSpeculativeThread()) {
+				// A walk ahead of the command thread (lookahead) never handles GPU faults or
+				// reads back: it takes the backing's bytes, which the command thread checks
+				// (and rejects while the GPU owns them) before it uses the walk.
+				(void)Libs::LibKernel::Memory::TryReadBacking(info->r10, &value, sizeof(value));
+				Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length, value);
+				return true;
+			}
 			const Libs::Graphics::ReadbackOrigin::Scope origin(
 			    Libs::Graphics::ReadbackOrigin::Origin::Srt);
 			if (!Libs::LibKernel::Memory::TryReadBufferBacking(info->r10, &value, sizeof(value)) &&

@@ -63,6 +63,7 @@ namespace {
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 
 bool SpecializationFail(std::string_view message) {
+	if (SrtSpeculativeThread()) return false; // A walk ahead fails quietly; the command thread walks.
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
 	return false;
@@ -670,9 +671,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_
 	const bool buffer_selector = validate_buffer_keys != nullptr && byte_keys && selector != nullptr;
 	const bool absolute_offsets = byte_keys && !buffer_selector;
 	auto* selector_keys = selector != nullptr
-	    ? &program.selector_keys[program.selector_groups[source_index]] : nullptr;
-	auto& keys = selector_keys != nullptr ? selector_keys->values : program.material_keys;
-	auto& byte_offsets = program.material_keys;
+	    ? &PlanSelectorKeys(program)[program.selector_groups[source_index]] : nullptr;
+	auto& keys = selector_keys != nullptr ? selector_keys->values : PlanMaterialKeys(program);
+	auto& byte_offsets = PlanMaterialKeys(program);
 	const auto children_begin = descriptors.size();
 	const auto root_resource = specializations[resource_index];
 	std::unordered_map<DescriptorValue, uint32_t, DescriptorValueHash> interned;
@@ -952,7 +953,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_
 			}
 			// Affine SMEM offsets wrap in U32 before adding the aligned immediate.
 			// Image heaps retain one bulk snapshot and their absolute byte-offset mapping.
-			auto& heap_words = program.material_keys;
+			auto& heap_words = PlanMaterialKeys(program);
 			if (bulk) {
 				heap_words.resize(table_size / 4u);
 				if (!ReadScalarTable(table_base, table_size, 0u, runtime, heap_words))
@@ -996,7 +997,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_
 				if (!heap_rows.rows.empty())
 					cache_key.content_hash ^= XXH3_64bits_withSeed(
 					    heap_rows.rows.data(), heap_rows.rows.size() * sizeof(uint32_t), 1u);
-				for (auto& entry: program.scan_cache) {
+				for (auto& entry: PlanScanCache(program)) {
 					if (entry.SameInputs(cache_key)) {
 						cache_slot = &entry;
 						cache_hit  = entry.content_hash == cache_key.content_hash;
@@ -1096,9 +1097,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan& program, uint32_t source_
 			}
 			if (cache_eligible && !cache_hit && !runtime_table_mode) {
 				if (cache_slot == nullptr) {
-					if (program.scan_cache.size() >= ScanCacheEntry::MaxEntries)
-						program.scan_cache.clear();
-					cache_slot = &program.scan_cache.emplace_back();
+					auto& scan_cache = PlanScanCache(program);
+					if (scan_cache.size() >= ScanCacheEntry::MaxEntries) scan_cache.clear();
+					cache_slot = &scan_cache.emplace_back();
 				}
 				cache_key.children.clear();
 				for (auto it = descriptors.begin() + static_cast<std::ptrdiff_t>(children_begin);
@@ -2012,8 +2013,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           bool capture_specialization_reads) {
 	Common::PerfSummary::ScopedMicros frame_timer(
-	    Common::PerfSummary::Counter::FrameMaterializeUs);
-	for (auto& keys: program.selector_keys) keys.resolved = false;
+	    Common::PerfSummary::Counter::FrameMaterializeUs, !SrtSpeculativeThread());
+	for (auto& keys: PlanSelectorKeys(program)) keys.resolved = false;
 	if (!program.resource_tracking_complete) return false;
 	const auto uses_workgroup_count = [](const DescriptorSource& source) {
 		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
