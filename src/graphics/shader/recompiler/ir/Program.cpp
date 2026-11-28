@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 #include <xbyak/xbyak.h>
+#include <array>
 #include <cstdlib>
 #include <map>
 #include <new>
@@ -57,8 +58,44 @@ bool IsRuntimeRead(ValueOpcode opcode) {
 	       AddressOpcodeInfoOf(opcode).access == AddressAccess::Read;
 }
 
+struct InstPairHash {
+	size_t operator()(const std::pair<const Inst*, const Inst*>& pair) const noexcept {
+		const auto a = reinterpret_cast<uintptr_t>(pair.first);
+		const auto b = reinterpret_cast<uintptr_t>(pair.second);
+		return std::hash<uintptr_t> {}(a ^ (b * 0x9e3779b97f4a7c15ull + (a << 6u) + (a >> 2u)));
+	}
+};
+
+struct EquivalentVisited {
+	static constexpr size_t InlineCapacity = 16;
+
+	std::array<std::pair<const Inst*, const Inst*>, InlineCapacity> inline_pairs {};
+	size_t                                                          inline_count = 0;
+	std::unordered_set<std::pair<const Inst*, const Inst*>, InstPairHash> overflow;
+
+	bool Insert(const Inst* lhs, const Inst* rhs) {
+		const std::pair pair {lhs, rhs};
+		if (overflow.empty()) {
+			for (size_t i = 0; i < inline_count; ++i) {
+				if (inline_pairs[i] == pair) {
+					return false;
+				}
+			}
+			if (inline_count < InlineCapacity) {
+				inline_pairs[inline_count++] = pair;
+				return true;
+			}
+			overflow.reserve(InlineCapacity * 2u);
+			for (size_t i = 0; i < inline_count; ++i) {
+				overflow.insert(inline_pairs[i]);
+			}
+		}
+		return overflow.insert(pair).second;
+	}
+};
+
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
-                     std::vector<std::pair<const Inst*, const Inst*>>& visited) {
+                     EquivalentVisited& visited) {
 	left  = left.Resolve();
 	right = right.Resolve();
 	if (left == right) {
@@ -73,10 +110,9 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 	    lhs->NumArgs() != rhs->NumArgs()) {
 		return false;
 	}
-	if (std::ranges::find(visited, std::pair {lhs, rhs}) != visited.end()) {
+	if (!visited.Insert(lhs, rhs)) {
 		return true;
 	}
-	visited.emplace_back(lhs, rhs);
 	if (IsRuntimeRead(lhs->GetOpcode())) {
 		const auto li = lhs->Flags<MemoryFlags>().index;
 		const auto ri = rhs->Flags<MemoryFlags>().index;
@@ -158,7 +194,21 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 }
 
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
-	std::vector<std::pair<const Inst*, const Inst*>> visited;
+	left  = left.Resolve();
+	right = right.Resolve();
+	if (left == right) {
+		return true;
+	}
+	if (left.IsImmediate() || right.IsImmediate() || left.GetType() != right.GetType()) {
+		return false;
+	}
+	const auto* lhs = left.TryInstruction();
+	const auto* rhs = right.TryInstruction();
+	if (lhs == nullptr || rhs == nullptr || lhs->GetOpcode() != rhs->GetOpcode() ||
+	    lhs->NumArgs() != rhs->NumArgs()) {
+		return false;
+	}
+	EquivalentVisited visited;
 	return EquivalentValue(program, left, right, visited);
 }
 

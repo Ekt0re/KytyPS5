@@ -80,26 +80,6 @@ float Value::F32Value() const {
 	return std::bit_cast<float>(imm_u32);
 }
 
-bool Value::operator==(const Value& other) const {
-	if (type != other.type) {
-		return false;
-	}
-	switch (type) {
-		case Type::Void: return true;
-		case Type::Opaque: return inst == other.inst;
-		case Type::ScalarReg: return scalar_reg == other.scalar_reg;
-		case Type::VectorReg: return vector_reg == other.vector_reg;
-		case Type::U1: return imm_u1 == other.imm_u1;
-		case Type::U8: return imm_u8 == other.imm_u8;
-		case Type::U16:
-		case Type::F16: return imm_u16 == other.imm_u16;
-		case Type::U32:
-		case Type::F32: return imm_u32 == other.imm_u32;
-		case Type::U64: return imm_u64 == other.imm_u64;
-		default: return false;
-	}
-}
-
 Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
     : opcode(value_opcode),
       num_args(value_opcode == ValueOpcode::Phi ? PhiArity
@@ -130,14 +110,6 @@ Type Inst::GetType() const {
 
 bool Inst::MayHaveSideEffects() const {
 	return HasSideEffects(opcode);
-}
-
-bool Inst::HasUses() const {
-	return !uses.empty();
-}
-
-size_t Inst::UseCount() const {
-	return uses.size();
 }
 
 size_t Inst::NumPhiBlocks() const {
