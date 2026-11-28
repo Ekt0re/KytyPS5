@@ -2030,7 +2030,6 @@ bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t 
 			m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
 		}
 	}
-	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbMirrorMisses, uint64_t(-1));
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::RbMirrorHits);
 	return true;
 }
