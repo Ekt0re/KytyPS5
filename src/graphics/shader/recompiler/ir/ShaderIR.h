@@ -105,6 +105,18 @@ struct MemoryInfo {
 		       !typed && !formatted && data_bits == 32u;
 	}
 
+	// KYTY_COHERENT_PAIR_STORE (default 1): a GLC/DLC DWORD pair store is one 64-bit atomic
+	// store (see StoreRawBufferPair()); 0 stores the two DWORDs apart, as before. Read once;
+	// part of the generated code, so change KYTY_SHADER_CACHE_STAMP when switching it.
+	[[nodiscard]] bool IsCoherentBufferPairStore(ValueOpcode opcode) const {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_COHERENT_PAIR_STORE");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled && kind == ResourceKind::Buffer && opcode == ValueOpcode::StoreBufferU32x2 &&
+		       coherent && !typed && !formatted && data_bits == 32u;
+	}
+
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		if (typed) {
 			return formatted && data_bits == 32u &&
