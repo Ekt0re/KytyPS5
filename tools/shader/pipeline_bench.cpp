@@ -173,7 +173,17 @@ struct Device {
 	uint32_t max_push_constants       = 128;
 };
 
+// With `robust`, robust buffer and image access as the emulator enables them (robustBufferAccess,
+// robustBufferAccess2, robustImageAccess2); without, both buffer features off.
+bool g_robust = false;
+// --uab: sets other than 0 are update-after-bind heaps (ImageHeap).
+bool g_uab = false;
+// --reserve all|low (ReserveAddressSpace).
+std::string g_reserve;
+void ReserveAddressSpace(bool low);
+
 bool CreateDevice(Device& out) {
+	if (!g_reserve.empty()) ReserveAddressSpace(g_reserve == "low");
 	HMODULE library = LoadLibraryA("vulkan-1.dll");
 	if (library == nullptr) return false;
 	g_get_instance_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
@@ -274,13 +284,14 @@ bool CreateDevice(Device& out) {
 	}
 	g_vkGetPhysicalDeviceFeatures2(physical, &features);
 	// Features that change how the driver compiles or need a capture/replay set-up stay off.
-	features.features.robustBufferAccess          = VK_FALSE;
+	features.features.robustBufferAccess          = g_robust ? features.features.robustBufferAccess : VK_FALSE;
 	acceleration.accelerationStructureCaptureReplay = VK_FALSE;
 	acceleration.accelerationStructureIndirectBuild = VK_FALSE;
 	acceleration.accelerationStructureHostCommands  = VK_FALSE;
 	f12.bufferDeviceAddressCaptureReplay          = VK_FALSE;
 	f12.bufferDeviceAddressMultiDevice            = VK_FALSE;
-	robust.robustBufferAccess2                    = VK_FALSE;
+	robust.robustBufferAccess2                    = g_robust ? robust.robustBufferAccess2 : VK_FALSE;
+	if (!g_robust) robust.robustImageAccess2 = VK_FALSE;
 	const float             priority = 1.0f;
 	VkDeviceQueueCreateInfo queue {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
 	queue.queueFamilyIndex = family;
@@ -298,6 +309,14 @@ bool CreateDevice(Device& out) {
 	DEVICE_FUNCS(LOAD)
 #undef LOAD
 	return true;
+}
+
+// Exceptions raised in this process (a vectored handler counts them and passes them on): the
+// emulator's own vectored handler sees every one the driver raises first.
+std::atomic<uint64_t> g_exceptions {0};
+LONG CALLBACK CountException(EXCEPTION_POINTERS*) {
+	g_exceptions.fetch_add(1, std::memory_order_relaxed);
+	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 int64_t Now() {
@@ -352,6 +371,38 @@ void SetThrottle(HANDLE process, const std::string& mode) {
 	SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
 }
 
+// --reserve: before the device is created, reserves the free address space the emulator takes
+// for the guest (0x40000 up to 0xfc00000000, as kernel/memoryAddressSpace.inc), so the driver
+// allocates as it does inside the emulator. `low`: below 4 GiB only.
+void ReserveAddressSpace(bool low) {
+	const uint64_t end      = low ? 0x100000000ull : 0xfc00000000ull;
+	uint64_t       next     = 0x40000ull;
+	uint64_t       reserved = 0;
+	while (next < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<uintptr_t>(next)), &info,
+		                 sizeof(info)) == 0) {
+			break;
+		}
+		const auto base       = reinterpret_cast<uint64_t>(info.BaseAddress);
+		const auto region_end = std::min(end, base + info.RegionSize);
+		if (region_end <= next) break;
+		if (info.State == MEM_FREE) {
+			const auto from = (next + 0xffffull) & ~0xffffull;
+			const auto to   = region_end & ~0xffffull;
+			if (to > from && VirtualAlloc(reinterpret_cast<void*>(static_cast<uintptr_t>(from)),
+			                              static_cast<size_t>(to - from), MEM_RESERVE,
+			                              PAGE_NOACCESS) != nullptr) {
+				reserved += to - from;
+			}
+		}
+		next = region_end;
+	}
+	std::printf("reserved %llu GiB of address space\n",
+	            static_cast<unsigned long long>(reserved >> 30));
+}
+
+
 struct Options {
 	std::filesystem::path dir;
 	size_t                top      = 28;
@@ -396,6 +447,8 @@ struct Sample {
 	int64_t start = 0, end = 0;
 	bool    performance = false;
 	bool    ok          = false;
+	// Raised in the process meanwhile (all threads).
+	uint64_t exceptions = 0;
 };
 
 Sample Create(const Device& device, const Module& module, size_t index,
@@ -424,6 +477,20 @@ Sample Create(const Device& device, const Module& module, size_t index,
 		if (set == 0 && set0 <= device.max_push_descriptors && device.max_push_descriptors != 0) {
 			info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
 		}
+		// --uab: a set other than 0 is a bindless heap, like the emulator's image heap.
+		std::vector<VkDescriptorBindingFlags>       flags(list.size(), 0);
+		VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info {
+		    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+		if (g_uab && set != 0) {
+			for (auto& f: flags) {
+				f = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+				    VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+			}
+			flags_info.bindingCount  = static_cast<uint32_t>(flags.size());
+			flags_info.pBindingFlags = flags.data();
+			info.pNext               = &flags_info;
+			info.flags |= VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+		}
 		info.bindingCount = static_cast<uint32_t>(list.size());
 		info.pBindings    = list.data();
 		g_vkCreateDescriptorSetLayout(device.device, &info, nullptr, &layouts[set]);
@@ -445,10 +512,12 @@ Sample Create(const Device& device, const Module& module, size_t index,
 	VkPipeline pipeline = VK_NULL_HANDLE;
 	const auto cpu      = GetCurrentProcessorNumber();
 	sample.performance  = cpu < performance.size() && performance[cpu];
-	sample.start        = Now();
+	const auto exceptions = g_exceptions.load();
+	sample.start          = Now();
 	sample.ok = g_vkCreateComputePipelines(device.device, VK_NULL_HANDLE, 1, &info, nullptr,
 	                                       &pipeline) == VK_SUCCESS;
-	sample.end = Now();
+	sample.end        = Now();
+	sample.exceptions = g_exceptions.load() - exceptions;
 	if (pipeline != VK_NULL_HANDLE) g_vkDestroyPipeline(device.device, pipeline, nullptr);
 	g_vkDestroyPipelineLayout(device.device, layout, nullptr);
 	for (const auto l: layouts) {
@@ -459,10 +528,11 @@ Sample Create(const Device& device, const Module& module, size_t index,
 }
 
 void PrintSample(const Module& module, const Sample& s, uint32_t worker) {
-	std::printf("pipe %s words %zu ms %.0f worker %u core %s start %lld end %lld%s\n",
+	std::printf("pipe %s words %zu ms %.0f worker %u core %s start %lld end %lld exceptions %llu%s\n",
 	            module.name.c_str(), module.words.size(), Ms(s.end - s.start), worker,
 	            s.performance ? "P" : "E", static_cast<long long>(s.start),
-	            static_cast<long long>(s.end), s.ok ? "" : " FAILED");
+	            static_cast<long long>(s.end), static_cast<unsigned long long>(s.exceptions),
+	            s.ok ? "" : " FAILED");
 	std::fflush(stdout);
 }
 
@@ -591,6 +661,7 @@ int RunParent(const Options& options, int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
+	AddVectoredExceptionHandler(1, CountException);
 	Options options;
 	for (int i = 1; i < argc; i++) {
 		const std::string arg  = argv[i];
@@ -601,6 +672,9 @@ int main(int argc, char** argv) {
 		else if (arg == "--procs") options.procs = std::strtoul(next, nullptr, 10), i++;
 		else if (arg == "--salt") options.salt = std::strtoul(next, nullptr, 10), i++;
 		else if (arg == "--throttle") options.throttle = next, i++;
+		else if (arg == "--robust") g_robust = true;
+		else if (arg == "--uab") g_uab = true;
+		else if (arg == "--reserve") g_reserve = next, i++;
 		else if (arg == "--counter") options.counter = next, i++;
 		else if (arg == "--child") options.child = std::strtoul(next, nullptr, 10), i++;
 		else if (options.dir.empty()) options.dir = arg;
