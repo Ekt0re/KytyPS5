@@ -7,6 +7,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "common/perfAb.h"
 #include "common/perfSummary.h"
 #include "common/profiler.h"
 #include "common/runtimeToggles.h"
@@ -305,7 +306,7 @@ bool TextureCache::MayHaveImages(uint64_t address, uint64_t size) const noexcept
 		const char* value = std::getenv("KYTY_IMAGE_PAGE_COUNTS");
 		return value == nullptr || value[0] != '0';
 	}();
-	return !enabled || MayCoverImages(address, size);
+	return !Common::PerfAb::Apply(enabled) || MayCoverImages(address, size);
 }
 
 void TextureCache::RegisterImage(ImageId id) {
@@ -400,7 +401,7 @@ void TextureCache::TouchImage(Image& image) {
 		const char* value = std::getenv("KYTY_LRU_TOUCH_ONCE");
 		return value == nullptr || value[0] != '0';
 	}();
-	if (image.registered && (!once || image.lru_tick < m_gc_tick)) {
+	if (image.registered && (!Common::PerfAb::Apply(once) || image.lru_tick < m_gc_tick)) {
 		image.lru_tick = m_gc_tick;
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}

@@ -18,6 +18,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/memAccount.h"
+#include "common/perfAb.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -315,7 +316,7 @@ void GraphicContext::DeleteImage(VulkanImage& image) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(allocator == nullptr || image.image == nullptr || image.allocation == nullptr);
 
-	if (AsyncImageDestroy()) {
+	if (Common::PerfAb::Apply(AsyncImageDestroy())) {
 		Graveyard().Push(allocator, image.image, image.allocation);
 	} else {
 		vmaDestroyImage(allocator, image.image, image.allocation);
