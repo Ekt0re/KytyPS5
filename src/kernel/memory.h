@@ -178,6 +178,9 @@ bool                   BackingContentChangedSince(uint64_t generation, uint64_t 
 [[nodiscard]] uint64_t BackingAliasSize();
 [[nodiscard]] uint64_t BackingOffset(uint64_t vaddr);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether the GPU wrote bytes of the range that guest memory does not hold yet (the condition
+// under which TryReadBufferBacking reads back). Off the GPU thread: true.
+bool                   HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 // The GPU thread reads through the backing on GPU-dirty pages when no image write-back is pending.
 // A buffer readback is needed only for GPU-written bytes in the requested range.
 void                   ReadGuestMemory(uint64_t vaddr, void* data, uint64_t size);

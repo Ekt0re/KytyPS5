@@ -60,6 +60,9 @@ constexpr std::array<const char*, N> g_names = {
     "rb_o_guest_calls", "rb_o_guest_waits", "rb_o_guest_wait_us", "rb_o_srt_calls", "rb_o_srt_waits", "rb_o_srt_wait_us", "rb_o_pm4_calls", "rb_o_pm4_waits", "rb_o_pm4_wait_us", "rb_o_cmdwr_calls", "rb_o_cmdwr_waits", "rb_o_cmdwr_wait_us", "rb_o_args_calls", "rb_o_args_waits", "rb_o_args_wait_us", "rb_o_shader_calls", "rb_o_shader_waits", "rb_o_shader_wait_us", "rb_o_tex_calls", "rb_o_tex_waits", "rb_o_tex_wait_us", "rb_o_other_calls", "rb_o_other_waits", "rb_o_other_wait_us",
     "rb_tick_early", "rb_tick_skipped", "rb_hot_notes", "rb_hot_flushes",
     "rb_mirror_hits", "rb_mirror_misses", "rb_mirror_wait_us", "rb_mirror_copies",
+    "la_jobs", "la_resolved", "la_resolve_fails", "la_resolve_heap", "la_resolve_us", "la_dropped",
+    "la_lookups", "la_hits", "la_miss_none", "la_miss_changed", "la_miss_gpu", "la_miss_unread",
+    "la_reval_us", "la_reval_bytes", "la_verified", "la_verify_mismatches",
 };
 
 struct Sample {

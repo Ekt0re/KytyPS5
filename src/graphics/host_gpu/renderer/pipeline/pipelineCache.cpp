@@ -190,9 +190,29 @@ bool CanMemoizePlan(const ShaderRecompiler::IR::ResourcePlan& plan) {
 }
 
 // SRT walker loads from pages that share GPU-written bytes: served like the fault handler serves
-// them, without the fault.
+// them, without the fault. A walk ahead (lookahead) takes the backing's bytes, which the command
+// thread checks before it uses the walk.
 static bool GuardedWalkerLoad(uint64_t address, uint32_t& value) {
+	if (ShaderRecompiler::IR::SrtSpeculativeThread()) {
+		return Libs::LibKernel::Memory::TryReadBacking(address, &value, sizeof(value));
+	}
 	return Libs::LibKernel::Memory::TryReadBufferBacking(address, &value, sizeof(value));
+}
+
+// What lookahead reads and checks through: the backing store (as the walks here read it when the
+// GPU owns none of the bytes) and the buffer cache's GPU-written ranges.
+static Lookahead::Hooks LookaheadHooks() {
+	return {
+	    .read      = [](uint64_t address, void* data, uint64_t size) {
+                return Libs::LibKernel::Memory::TryReadBacking(address, data, size);
+	    },
+	    .view      = [](uint64_t address, uint64_t size) {
+                return Libs::LibKernel::Memory::TryGetBackingView(address, size);
+	    },
+	    .gpu_owned = [](uint64_t address, uint64_t size) {
+		    return Libs::LibKernel::Memory::HasGpuDirtyBytes(address, size);
+	    },
+	};
 }
 
 // The walker guard is on by default. KYTY_WALKER_GUARD=0 turns it off, =verify also walks plainly
@@ -395,7 +415,62 @@ bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRu
 
 
 bool PipelineCache::Program::Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
-                                         ShaderRecompiler::IR::MemoryChangeSource* memory_changes) {
+                                         ShaderRecompiler::IR::MemoryChangeSource* memory_changes,
+                                         Lookahead* lookahead) {
+	using Common::PerfSummary::Add;
+	using Common::PerfSummary::Counter;
+	if (lookahead == nullptr || !this->lookahead || !lookahead->Active()) {
+		return MaterializeHere(runtime, memory_changes);
+	}
+	Add(Counter::LaLookups);
+	Lookahead::Outcome                     outcome = Lookahead::Outcome::MissNone;
+	std::unique_ptr<Lookahead::Resolution> resolution;
+	{
+		Common::PerfSummary::ScopedMicros timer(Counter::LaRevalidateUs);
+		resolution = lookahead->Take(this, runtime, outcome);
+	}
+	switch (outcome) {
+		case Lookahead::Outcome::Hit: Add(Counter::LaHits); break;
+		case Lookahead::Outcome::MissNone: Add(Counter::LaMissNone); break;
+		case Lookahead::Outcome::MissChanged: Add(Counter::LaMissChanged); break;
+		case Lookahead::Outcome::MissGpu: Add(Counter::LaMissGpu); break;
+		case Lookahead::Outcome::MissUnread: Add(Counter::LaMissUnread); break;
+	}
+	if (resolution == nullptr) {
+		return MaterializeHere(runtime, memory_changes);
+	}
+	if (lookahead->GetMode() == Lookahead::Mode::Verify) {
+		// The walk here decides; the resolution must agree with it.
+		const bool done = MaterializeHere(runtime, memory_changes);
+		Add(Counter::LaVerified);
+		if (done && !Lookahead::SameResult(resources, specialization, resolution->resources,
+		                                   resolution->specialization)) {
+			Add(Counter::LaVerifyMismatches);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr,
+				             "[lookahead] MISMATCH shader %016" PRIx64 " base %016" PRIx64
+				             ": buffers %d images %d samplers %d srt %d specialization %d (%zu reads"
+				             " logged)\n",
+				             resource_plan.shader_hash, runtime.shader_base,
+				             resources.buffers != resolution->resources.buffers,
+				             resources.images != resolution->resources.images,
+				             resources.samplers != resolution->resources.samplers,
+				             resources.flattened_srt != resolution->resources.flattened_srt,
+				             !(specialization == resolution->specialization),
+				             resolution->log.RangeCount());
+			}
+		}
+		return done;
+	}
+	resources      = resolution->resources;
+	specialization = resolution->specialization;
+	materialization_memo.current = 0;
+	return true;
+}
+
+bool PipelineCache::Program::MaterializeHere(const ShaderRecompiler::IR::SrtRuntime& runtime,
+                                             ShaderRecompiler::IR::MemoryChangeSource* memory_changes) {
 	static const uint32_t entries =
 	    EnvironmentCount("KYTY_MATERIALIZE_MEMO_ENTRIES", 1u, 4096u);
 	static const uint32_t stamp_pages =
@@ -447,8 +522,8 @@ template <bool HasCalls>
 ShaderModule* PipelineCache::Program::FindModule(
     const ShaderRecompiler::IR::SrtRuntime& runtime,
     ShaderRecompiler::IR::PushData::Window push_data,
-    ShaderRecompiler::IR::MemoryChangeSource* memory_changes) {
-	EXIT_IF(!Materialize(runtime, memory_changes));
+    ShaderRecompiler::IR::MemoryChangeSource* memory_changes, Lookahead* lookahead) {
+	EXIT_IF(!Materialize(runtime, memory_changes, lookahead));
 	Common::PerfSummary::Add(Common::PerfSummary::Counter::FrameModuleLookups);
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
@@ -836,6 +911,12 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			                 ShaderRecompiler::StageName(stage));
 		}
 		if (m_lookup_key_ready) {
+			if (const auto found = m_program_cache.find(m_lookup_key);
+			    found != m_program_cache.end() && found->second.lookahead) {
+				// Walks ahead may still read its plan: it stays, skipped.
+				found->second.skip_dispatch = true;
+				return nullptr;
+			}
 			m_program_cache.erase(m_lookup_key);
 			m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
 		}
@@ -932,7 +1013,8 @@ const ShaderModule* PipelineCache::GetProgramImpl(const ShaderParams& params, In
 				module = cached.FindModule<true>(runtime, push_data, m_memory_changes);
 			}
 		} else {
-			module = cached.FindModule<false>(runtime, push_data, m_memory_changes);
+			module = cached.FindModule<false>(runtime, push_data, m_memory_changes, m_lookahead.get());
+			if (m_lookahead != nullptr && !cached.lookahead_checked) PublishForLookahead(entry->first, cached);
 		}
 		if (module != nullptr) return bind(*module);
 	}
@@ -1257,6 +1339,106 @@ void PipelineCache::TranslateComputeAhead(const HW::CsStageRegisters& regs,
 	m_translators.Post([this, job = std::move(job)] { TranslateAhead(*job); });
 }
 
+// KYTY_LOOKAHEAD. Programs the resolve thread may walk: never removed (see the skip paths), their
+// plan never replaced (no call source, no stored plan left to take), and walks that do not need
+// command-thread state the walk ahead cannot use (call-source reads, heap rows).
+void PipelineCache::PublishForLookahead(const ProgramKey& key, Program& program) {
+	// Decided once: none of this changes for a program without a call source or stored plan.
+	if (program.stored_plan == nullptr) program.lookahead_checked = true;
+	if (program.call_source != nullptr || program.skip_dispatch || program.stored_plan != nullptr ||
+	    program.resource_plan.srt_code == nullptr || !program.resource_plan.source_reads.empty() ||
+	    !program.resource_plan.resource_tracking_complete || MayUseHeapRows(program.resource_plan)) {
+		return;
+	}
+	program.lookahead = true;
+	std::scoped_lock lock(m_lookahead_mutex);
+	m_lookahead_programs.emplace(key, &program);
+}
+
+// The toggle lookahead=0|1 in KYTY_TOGGLE_FILE switches it at run time (checked every 256
+// program lookups).
+void PipelineCache::UpdateLookahead() {
+	if (m_lookahead == nullptr || !Common::RuntimeToggles::Enabled()) return;
+	static uint32_t calls = 0;
+	if ((calls++ & 0xffu) != 0) return;
+	const int toggle = Common::RuntimeToggles::Find("lookahead");
+	if (toggle >= 0) m_lookahead->SetActive(toggle != 0);
+}
+
+void PipelineCache::LookaheadStage(ShaderType stage, const ShaderParams& params,
+                                   const std::vector<uint32_t>& static_state) {
+	if (params.code.empty() || params.user_data_count > 40u) return;
+	LookaheadJob job;
+	{
+		// Equal keys hash equally; the key is built only to find the program.
+		ProgramKey key {.stage           = stage,
+		                .hash            = params.hash,
+		                .user_data_count = params.user_data_count,
+		                .static_state    = static_state};
+		std::scoped_lock lock(m_lookahead_mutex);
+		const auto found = m_lookahead_programs.find(key);
+		if (found == m_lookahead_programs.end()) return;
+		job.program = found->second;
+		job.plan    = &found->second->resource_plan;
+	}
+	job.shader_base     = params.Base();
+	job.user_data_count = params.user_data_count;
+	std::copy_n(params.user_data.begin(), params.user_data_count, job.user_data.begin());
+	return m_lookahead->Enqueue(std::move(job));
+}
+
+void PipelineCache::LookaheadCompute(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator,
+                                     bool async_compute, const uint32_t* groups,
+                                     uint64_t indirect_args) {
+	if (!LookaheadActive() || regs.data_addr == 0 || m_ahead_stop) return;
+	const bool thread_dimensions =
+	    (dispatch_initiator & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	// The command processor reads such indirect arguments and dispatches directly.
+	if (groups == nullptr && (thread_dimensions || indirect_args == 0 || (indirect_args & 3u) != 0)) {
+		return;
+	}
+	// The same input as DispatchDirect or DispatchIndirect, as TranslateComputeAhead prepares it.
+	HW::ComputeShaderInfo info {.cs_regs = regs};
+	info.cs_regs.wave_size = Pm4::ComputeWaveSize(dispatch_initiator);
+	ShaderComputeInputInfo input;
+	ShaderParams           params;
+	input.async_compute              = async_compute;
+	input.dispatch_thread_dimensions = thread_dimensions;
+	input.host_subgroup_size         = m_compute_subgroup_size;
+	if (!TryPrepareProgram(info, input, params) || params.user_data_count > 40u) return;
+	input.lds_storage = input.lds_size_dwords * 4u > m_max_compute_shared_memory;
+	LookaheadJob job;
+	{
+		ProgramKey key {.stage           = ShaderType::Compute,
+		                .hash            = params.hash,
+		                .user_data_count = params.user_data_count};
+		BuildStageStaticKey(input, key.static_state);
+		std::scoped_lock lock(m_lookahead_mutex);
+		const auto found = m_lookahead_programs.find(key);
+		if (found == m_lookahead_programs.end()) return;
+		job.program = found->second;
+		job.plan    = &found->second->resource_plan;
+	}
+	job.shader_base     = params.Base();
+	job.user_data_count = params.user_data_count;
+	std::copy_n(params.user_data.begin(), params.user_data_count, job.user_data.begin());
+	// The runtime GetProgramImpl gives a dispatch: three counts, zero for an indirect one.
+	job.workgroup_count_size = 3;
+	if (groups != nullptr) {
+		const uint32_t group_sizes[] = {regs.num_thread_x, regs.num_thread_y, regs.num_thread_z};
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			job.workgroup_counts[axis] = groups[axis];
+			if (thread_dimensions) {
+				const auto size  = std::max(group_sizes[axis], 1u);
+				job.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
+			}
+		}
+	} else {
+		job.indirect_args_address = indirect_args;
+	}
+	m_lookahead->Enqueue(std::move(job));
+}
+
 static bool GraphicsAheadEnabled() {
 	static const bool enabled = std::getenv("KYTY_NO_GRAPHICS_AHEAD") == nullptr &&
 	                            std::getenv("KYTY_NO_TRANSLATE_AHEAD") == nullptr;
@@ -1329,6 +1511,7 @@ void PipelineCache::TranslateGraphicsAhead(const HW::Context& context, const HW:
 		}
 		ProgramKey key {.stage = stage, .hash = params.hash, .user_data_count = params.user_data_count};
 		BuildStageStaticKey(input, key.static_state);
+		if (LookaheadActive()) LookaheadStage(stage, params, key.static_state);
 		job->params.code      = {};
 		job->params.back_code = {};
 		QueueAhead(std::move(job), std::move(key));
@@ -1586,12 +1769,19 @@ PipelineCache::PipelineCache(GraphicContext& graphics,
 		PipelineCacheLog("{}", CreateStats::Line());
 	}
 	MarkProgramsKnown();
+	if (const auto mode = Lookahead::EnvMode(); mode != Lookahead::Mode::Off) {
+		m_lookahead = std::make_unique<Lookahead>(mode, LookaheadHooks());
+		std::printf("Lookahead: resource walks ahead of the command thread (%s)\n",
+		            mode == Lookahead::Mode::Verify ? "verify" : "on");
+	}
 }
 
 PipelineCache::~PipelineCache() {
 	// Queued translations and background pipelines are dropped; running ones end before
 	// anything they use goes.
 	m_ahead_stop = true;
+	// The resolve thread reads programs' plans.
+	m_lookahead.reset();
 	*m_deferred_stop = true;
 	StopStoreDecoders();
 	m_replayers.reset();
@@ -2031,6 +2221,7 @@ bool PipelineCache::PrepareGraphicsStages(const HW::Context& context, const HW::
 
 void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state) {
 	UpdateWalkerGuard();
+	UpdateLookahead();
 	MergeReplayed();
 	GraphicsStageInputs inputs;
 	if (!PrepareGraphicsStages(command.GetRegisters(), command.GetUserConfig(), command.GetShaders(),
@@ -2071,6 +2262,7 @@ void PipelineCache::GetGraphicsPrograms(const CommandBuffer& command, DrawRender
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
 	UpdateWalkerGuard();
+	UpdateLookahead();
 	MergeReplayed();
 	input_info.host_subgroup_size = m_compute_subgroup_size;
 	const auto        params      = PrepareProgram(regs, input_info);
@@ -2091,7 +2283,8 @@ bool PipelineCache::RetryComputeProgram(const HW::ComputeShaderInfo& regs,
 	// translation again. Other programs and stored records are untouched.
 	std::erase_if(m_program_cache, [&](const auto& entry) {
 		return entry.first.stage == ShaderType::Compute && entry.first.hash == params.hash &&
-		       entry.second.skip_dispatch && entry.second.modules.empty();
+		       entry.second.skip_dispatch && entry.second.modules.empty() &&
+		       !entry.second.lookahead;
 	});
 	return GetComputeProgram(regs, input_info) != nullptr;
 }

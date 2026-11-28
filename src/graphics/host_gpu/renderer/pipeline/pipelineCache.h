@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
+#include "graphics/host_gpu/renderer/pipeline/lookahead.h"
 #include "graphics/host_gpu/renderer/pipeline/materializationMemo.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderLookupIndex.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderStoreLock.h"
@@ -416,6 +417,13 @@ public:
 	// draws are left to the command thread.
 	void TranslateGraphicsAhead(const HW::Context& context, const HW::UserConfig& user_config,
 	                            const HW::Shader& shaders, bool indirect);
+	// KYTY_LOOKAHEAD: queues the resource walk of a dispatch a scan found (any thread). `groups`
+	// are DISPATCH_DIRECT's dimensions, or null for an indirect dispatch at `indirect_args`.
+	void LookaheadCompute(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator,
+	                      bool async_compute, const uint32_t* groups, uint64_t indirect_args);
+	[[nodiscard]] bool LookaheadActive() const {
+		return m_lookahead != nullptr && m_lookahead->Active();
+	}
 
 private:
 	friend struct PipelineCacheTestAccess;
@@ -432,6 +440,9 @@ private:
 		std::deque<ShaderModule>                     modules;
 		ShaderLookupIndex<ShaderModule>              module_index;
 		bool                                         skip_dispatch = false;
+		// Walked ahead of the command thread (KYTY_LOOKAHEAD): see PublishForLookahead.
+		bool                                         lookahead = false;
+		bool                                         lookahead_checked = false;
 		// A program from the shader store whose resource plan is still in its first record.
 		std::shared_ptr<StoredModule>                stored_plan;
 		// Programs with calls: the resource plans of the earlier links call_source keeps, by link
@@ -441,13 +452,17 @@ private:
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
 		bool Materialize(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                 ShaderRecompiler::IR::MemoryChangeSource* memory_changes);
+		                 ShaderRecompiler::IR::MemoryChangeSource* memory_changes,
+		                 Lookahead* lookahead = nullptr);
+		bool MaterializeHere(const ShaderRecompiler::IR::SrtRuntime& runtime,
+		                     ShaderRecompiler::IR::MemoryChangeSource* memory_changes);
 		// The only path that adds a module to `modules`; keeps the optional lookup index complete.
 		ShaderModule& Adopt(ShaderModule&& module);
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         ShaderRecompiler::IR::PushData::Window push_data,
-		                         ShaderRecompiler::IR::MemoryChangeSource* memory_changes);
+		                         ShaderRecompiler::IR::MemoryChangeSource* memory_changes,
+		                         Lookahead* lookahead = nullptr);
 	};
 
 	struct ProgramKey {
@@ -542,6 +557,15 @@ private:
 	// Queued, running and finished translations not taken yet, oldest first, and their number.
 	std::deque<std::shared_ptr<AheadJob>> m_ahead_pending;
 	std::atomic<bool>                     m_ahead_stop = false;
+	// KYTY_LOOKAHEAD: the resolver, and the programs the command thread lets it walk (by key;
+	// programs are never removed while published, and a published program's plan never changes).
+	std::unique_ptr<Lookahead>                              m_lookahead;
+	std::mutex                                              m_lookahead_mutex;
+	std::unordered_map<ProgramKey, Program*, ProgramKeyHash> m_lookahead_programs;
+	void PublishForLookahead(const ProgramKey& key, Program& program);
+	void UpdateLookahead();
+	void LookaheadStage(ShaderType stage, const ShaderParams& params,
+	                    const std::vector<uint32_t>& static_state);
 	// Unoptimized pipelines replaced by their optimized builds (in-flight commands use them).
 	std::vector<vk::Pipeline>             m_replaced_pipelines;
 	// Set at destruction: background pipeline creations not started yet are dropped.

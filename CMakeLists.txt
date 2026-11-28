@@ -645,9 +645,18 @@ add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/guestReadLog.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/lookahead.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak)
+target_link_libraries(resource_materialization_tests fmt::fmt xbyak::xbyak xxhash)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
+
+add_executable(guest_read_log_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/GuestReadLogTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/guestReadLog.cpp"
+)
+target_link_libraries(guest_read_log_tests xxhash)
+target_include_directories(guest_read_log_tests PRIVATE ${inc_headers})
 
 add_executable(materialization_memo_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/MaterializationMemoTests.cpp"
@@ -962,6 +971,7 @@ if(BUILD_TESTING)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME materialization_memo COMMAND $<TARGET_FILE:materialization_memo_tests>)
+	add_test(NAME guest_read_log COMMAND $<TARGET_FILE:guest_read_log_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
 	add_test(NAME event_queue_lifetime COMMAND $<TARGET_FILE:event_queue_lifetime_tests>)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
@@ -1134,6 +1144,7 @@ if(BUILD_TESTING)
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		materialization_memo_tests
+		guest_read_log_tests
 		resource_tracking_tests
 		event_queue_lifetime_tests
 		kernel_file_system_tests

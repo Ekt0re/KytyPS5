@@ -146,13 +146,22 @@ private:
 				break;
 			}
 			case Pm4::IT_DISPATCH_DIRECT:
-				if (body.size() == 4) m_sink.Found(m_regs, body[3]);
+				if (body.size() == 4) m_sink.FoundDispatch(m_regs, body[3], body.data(), 0);
 				break;
 			case Pm4::IT_DISPATCH_INDIRECT:
 				if (header == 0xc0021600u) {
-					m_sink.Found(m_regs, body[2]);
+					m_sink.FoundDispatch(m_regs, body[2], nullptr,
+					                     body[0] | (static_cast<uint64_t>(body[1]) << 32u));
 				} else if (header == 0xc0011600u) {
-					m_sink.Found(m_regs, body[1]);
+					m_sink.FoundDispatch(m_regs, body[1], nullptr,
+					                     m_dispatch_base != 0 ? m_dispatch_base + body[0] : 0);
+				}
+				break;
+			case Pm4::IT_SET_BASE:
+				// As CpOpSetBase: base 1 of the compute shader type is the indirect dispatch base.
+				if (KYTY_PM4_LEN(header) == 4u && body.size() == 3 && (body[0] & 0xfu) == 1u &&
+				    ((header >> 1u) & 0x3u) == 1u) {
+					m_dispatch_base = (body[1] & ~0x7ull) | (static_cast<uint64_t>(body[2] & 0xffffu) << 32u);
 				}
 				break;
 			case Pm4::IT_INDIRECT_BUFFER: {
@@ -172,6 +181,7 @@ private:
 	ComputePrescanSink&   m_sink;
 	CommandProcessor*     m_shadow;
 	uint64_t              m_budget = CopyBudgetDw;
+	uint64_t              m_dispatch_base = 0;
 };
 
 } // namespace

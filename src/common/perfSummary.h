@@ -163,6 +163,23 @@ enum class Counter {
 	RbMirrorMisses, // Mirror reads that fell back to a readback.
 	RbMirrorWaitUs, // Microseconds mirror hits waited for the copy's tick.
 	RbMirrorCopies, // Mirror lines copied at the end of command buffers.
+	// KYTY_LOOKAHEAD=1|verify (toggle lookahead): resource walks resolved ahead of the command thread.
+	LaJobs,         // Draw and dispatch programs queued for a walk ahead.
+	LaResolved,     // Walks ahead that produced a resolution.
+	LaResolveFails, // Walks ahead that failed (unreadable memory, torn reads, failed walk).
+	LaResolveHeap,  // Walks ahead dropped because the walk needs the image heap or heap rows.
+	LaResolveUs,    // Microseconds the resolve thread spent walking.
+	LaDropped,      // Jobs and resolutions dropped unused (too old, table full).
+	LaLookups,      // Command-thread materializations of programs walked ahead.
+	LaHits,         // ... that used a resolution.
+	LaMissNone,     // ... that found no resolution for their inputs.
+	LaMissChanged,  // ... whose resolution read bytes that changed since.
+	LaMissGpu,      // ... whose resolution read bytes the GPU owns now.
+	LaMissUnread,   // ... whose resolution read bytes that cannot be read now.
+	LaRevalidateUs, // Microseconds of command-thread revalidation (hits and misses).
+	LaRevalidateBytes, // Bytes it compared.
+	LaVerified,     // KYTY_LOOKAHEAD=verify: hits walked inline again and compared.
+	LaVerifyMismatches, // ... whose resources or specialization differed.
 	Count
 };
 

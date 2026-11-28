@@ -178,6 +178,13 @@ void GuestGpu::Prescan(uint32_t queue_id, std::span<const uint32_t> commands) {
 		void Found(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator) override {
 			cache.TranslateComputeAhead(regs, dispatch_initiator, async_compute);
 		}
+		void FoundDispatch(const HW::CsStageRegisters& regs, uint32_t dispatch_initiator,
+		                   const uint32_t* groups, uint64_t indirect_args) override {
+			cache.TranslateComputeAhead(regs, dispatch_initiator, async_compute);
+			if (cache.LookaheadActive()) {
+				cache.LookaheadCompute(regs, dispatch_initiator, async_compute, groups, indirect_args);
+			}
+		}
 		void FoundDraw(CommandProcessor& shadow, bool indirect) override {
 			cache.TranslateGraphicsAhead(shadow.GetCtx(), shadow.GetUcfg(), shadow.GetShCtx(),
 			                             indirect);
