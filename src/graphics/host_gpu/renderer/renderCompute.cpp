@@ -793,8 +793,8 @@ BufferProbeRunner& GetBufferProbe() {
 } // namespace
 
 // Records the dispatch, at submission if its pipeline is still compiling.
-// KYTY_DUMP_CS=<hash>[,...] with KYTY_DUMP_CS_FRAME=<first frame> (diagnostic): for every
-// listed dispatch in frames [first, first+1], copy each bound storage buffer range before and
+// KYTY_DUMP_CS=<hash>[,...] (diagnostic, KYTY_DUMP_CS_AFTER_S below): for every
+// listed dispatch of two frames, copy each bound storage buffer range before and
 // after the dispatch into a host buffer (KYTY_DUMP_CS_MB, default 1024) and write it, with an
 // index of descriptors, user data and dimensions, to kyty_cs_dump.{bin,txt} ~10 s later.
 namespace CsDump {
@@ -825,8 +825,6 @@ static bool Enabled() {
 			if (end == text) break;
 			text = *end == ',' ? end + 1 : end;
 		}
-		const char* frame = std::getenv("KYTY_DUMP_CS_FRAME");
-		st.first_frame    = frame != nullptr ? std::strtoull(frame, nullptr, 10) : 0;
 		return !st.hashes.empty();
 	}();
 	return enabled;
@@ -896,14 +894,73 @@ static std::vector<Copy> Plan(GraphicContext& graphics, uint64_t frame, uint64_t
 	std::vector<Copy> copies;
 	if (!Enabled()) return copies;
 	auto& st = Get();
-	if (frame < st.first_frame || frame > st.first_frame + 1) return copies;
-	if (std::find(st.hashes.begin(), st.hashes.end(), hash) == st.hashes.end()) return copies;
+	// KYTY_DUMP_CS_AFTER_S=<seconds> (default 90) after the first dispatch: the first listed
+	// dispatch from then on picks the frame; that frame and the next are dumped.
+	static const int64_t start_ms = NowMs();
+	static const int64_t after_ms = [] {
+		const char* text = std::getenv("KYTY_DUMP_CS_AFTER_S");
+		return (text != nullptr ? std::strtoll(text, nullptr, 10) : 90) * 1000;
+	}();
+	// KYTY_DUMP_CS_ADDR=<guest address>: also every dispatch that binds a buffer containing it.
+	static const uint64_t watch = [] {
+		const char* text = std::getenv("KYTY_DUMP_CS_ADDR");
+		return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+	}();
+	bool listed = std::find(st.hashes.begin(), st.hashes.end(), hash) != st.hashes.end();
+	if (!listed && watch != 0) {
+		for (const auto& source: bindings.buffer_sources) {
+			if (source.address <= watch && watch < source.address + source.size) listed = true;
+		}
+	}
+	if (!listed) return copies;
+	static bool seen = false;
+	if (!seen) {
+		seen = true;
+		std::fprintf(stderr, "KYTY_DUMP_CS: first listed dispatch 0x%016" PRIx64 " at frame %" PRIu64 ", %" PRId64 " ms\n",
+		             hash, frame, NowMs() - start_ms);
+	}
+	if (NowMs() - start_ms < after_ms) return copies;
+	// KYTY_DUMP_CS_FRAMES=<n> frames from the first one, every KYTY_DUMP_CS_EVERY=<k>-th.
+	static const uint64_t frames = [] {
+		const char* text = std::getenv("KYTY_DUMP_CS_FRAMES");
+		return text != nullptr ? std::strtoull(text, nullptr, 10) : 2ull;
+	}();
+	static const uint64_t every = [] {
+		const char* text = std::getenv("KYTY_DUMP_CS_EVERY");
+		return text != nullptr ? std::max<uint64_t>(1, std::strtoull(text, nullptr, 10)) : 1ull;
+	}();
+	if (st.first_frame == 0) {
+		st.first_frame = frame;
+		std::fprintf(stderr, "KYTY_DUMP_CS: dumping %" PRIu64 " frames from %" PRIu64 " every %" PRIu64 "\n",
+		             frames, frame, every);
+	}
+	if (frame < st.first_frame || frame >= st.first_frame + frames ||
+	    (frame - st.first_frame) % every != 0)
+		return copies;
+	static uint64_t logged_frame = 0;
+	if (logged_frame != frame) {
+		logged_frame = frame;
+		std::fprintf(stderr, "KYTY_DUMP_CS: frame %" PRIu64 " at %" PRId64 " ms\n", frame, NowMs() - start_ms);
+	}
 	if (!Allocate(graphics)) return copies;
+	// KYTY_DUMP_CS_POST_ONLY=1: snapshot each range after the dispatch only (the first
+	// dispatch also before), and each host range once per dispatch.
+	static const bool post_only = [] {
+		const char* text = std::getenv("KYTY_DUMP_CS_POST_ONLY");
+		return text != nullptr && text[0] == '1';
+	}();
+	const bool with_pre = !post_only || st.seq == 0;
+	// KYTY_DUMP_CS_CAP_KB: copy at most this much of each range (from its start).
+	static const uint64_t cap = [] {
+		const char* text = std::getenv("KYTY_DUMP_CS_CAP_KB");
+		return text != nullptr ? std::strtoull(text, nullptr, 10) << 10u : 256ull << 20u;
+	}();
 	uint64_t need = 0;
 	for (const auto& b: bindings.buffers) {
-		if (b.buffer && b.range != VK_WHOLE_SIZE) need += 2 * ((std::min<uint64_t>(b.range, 256ull << 20u) + 255u) & ~uint64_t {255});
+		if (b.buffer && b.range != VK_WHOLE_SIZE) need += 2 * ((std::min<uint64_t>(b.range, cap) + 255u) & ~uint64_t {255});
 	}
-	if (st.used + need > st.capacity) return copies;
+	// Guest byte copies (KYTY_DUMP_CS_GUEST) take at most as much again.
+	if (st.used + 2 * need + 256 * bindings.buffers.size() > st.capacity) return copies;
 	std::fprintf(st.index, "D seq=%u frame=%" PRIu64 " hash=%016" PRIx64 " groups=%u,%u,%u threads=%u,%u,%u\n",
 	             st.seq++, frame, hash, gx, gy, gz, threads[0], threads[1], threads[2]);
 	std::fprintf(st.index, "U");
@@ -924,13 +981,36 @@ static std::vector<Copy> Plan(GraphicContext& graphics, uint64_t frame, uint64_t
 			std::fprintf(st.index, "B %zu none guest=%" PRIx64 " gsize=%" PRIx64 "\n", i, guest, gsize);
 			continue;
 		}
-		Copy c {b.buffer, b.offset, std::min<uint64_t>(b.range, 256ull << 20u), 0, 0};
-		c.pre  = st.used;
-		st.used += (c.size + 255u) & ~uint64_t {255};
+		bool duplicate = false;
+		for (const auto& other: copies) {
+			if (other.src == b.buffer && other.src_offset == b.offset) {
+				std::fprintf(st.index, "B %zu same-as pre=%" PRIx64 " post=%" PRIx64 "\n", i, other.pre, other.post);
+				duplicate = true;
+				break;
+			}
+		}
+		if (duplicate) continue;
+		Copy c {b.buffer, b.offset, std::min<uint64_t>(b.range, cap), UINT64_MAX, 0};
+		if (with_pre) {
+			c.pre = st.used;
+			st.used += (c.size + 255u) & ~uint64_t {255};
+		}
 		c.post = st.used;
 		st.used += (c.size + 255u) & ~uint64_t {255};
 		std::fprintf(st.index, "B %zu guest=%" PRIx64 " gsize=%" PRIx64 " size=%" PRIx64 " pre=%" PRIx64 " post=%" PRIx64 "\n",
 		             i, guest, gsize, c.size, c.pre, c.post);
+		// KYTY_DUMP_CS_GUEST=1: also the guest (CPU) bytes of the range when the dispatch is recorded.
+		static const bool guest_bytes = [] {
+			const char* text = std::getenv("KYTY_DUMP_CS_GUEST");
+			return text != nullptr && text[0] == '1';
+		}();
+		if (guest_bytes && guest != 0 && c.size <= (8ull << 20u) && st.used + c.size + 256 <= st.capacity) {
+			const uint64_t at = st.used;
+			if (LibKernel::Memory::TryReadBacking(guest, st.mapped + at, c.size)) {
+				st.used += (c.size + 255u) & ~uint64_t {255};
+				std::fprintf(st.index, "G %zu guest=%" PRIx64 " size=%" PRIx64 " at=%" PRIx64 "\n", i, guest, c.size, at);
+			}
+		}
 		copies.push_back(c);
 	}
 	st.last_ms.store(NowMs());
@@ -945,6 +1025,7 @@ static void Record(vk::CommandBuffer command, const std::vector<Copy>& copies, b
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
 	                        {}, barrier, nullptr, nullptr);
 	for (const auto& c: copies) {
+		if (!post && c.pre == UINT64_MAX) continue;
 		vk::BufferCopy region {c.src_offset, post ? c.post : c.pre, c.size};
 		command.copyBuffer(c.src, Get().buffer, region);
 	}
@@ -1728,10 +1809,14 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		     args.y, args.z, input_info.threads_num[0], input_info.threads_num[1],
 		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size());
 	}
+	const auto dump = CsDump::Plan(m_context.GetGraphics(), m_context.GetGpu().GetFrameNum(),
+	                               program.shader_hash, bindings, *input_info.stage.resources,
+	                               args.x, args.y, args.z, input_info.threads_num);
 	RecordDispatch(buffer, pipeline,
 	               [args = dispatch_args.buffer, offset = dispatch_args.offset, direct,
-	                counts   = args, graphics = &m_context.GetGraphics(),
+	                counts   = args, graphics = &m_context.GetGraphics(), dump,
 	                cs_hash  = program.shader_hash](vk::CommandBuffer command, vk::Pipeline handle) {
+		               CsDump::Record(command, dump, false);
 		               command.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
 		               const auto crumb = GpuBreadcrumbs::Begin(*graphics, command, 'C', cs_hash);
 		               if (SkipComputeDispatch(cs_hash)) {
@@ -1741,6 +1826,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 			               command.dispatchIndirect(args, offset);
 		               }
 		               GpuBreadcrumbs::End(*graphics, command, crumb);
+		               CsDump::Record(command, dump, true);
 	               });
 	vk_buffer = buffer.StateHandle();
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);

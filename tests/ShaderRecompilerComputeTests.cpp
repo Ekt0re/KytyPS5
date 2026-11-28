@@ -41268,6 +41268,9 @@ std::vector<TestCase> BufferLoadFormatD16XCases() {
   };
   constexpr LoadCase inputs[] = {
       {"BufferLoadFormatD16XFloat16", F::k16Float, 0x7e63c000u, 0xabcdc000u},
+      // f16 bits through 16-bit integer views (GTA VI face network): raw bits.
+      {"BufferLoadFormatD16XUint16Bits", F::k16UInt, 0x7e63bc01u, 0xabcdbc01u},
+      {"BufferLoadFormatD16XSint16Bits", F::k16SInt, 0x7e63bc01u, 0xabcdbc01u},
       {"BufferLoadFormatD16XFloat32", F::k32Float, 0x3f000000u, 0xabcd3800u},
       {"BufferLoadFormatD16XUint32", F::k32UInt, 0x1234fffeu, 0xabcdffffu},
       {"BufferLoadFormatD16XUintAtMax", F::k32UInt, 0x0000ffffu, 0xabcdffffu},
@@ -41342,6 +41345,10 @@ std::vector<TestCase> BufferLoadFormatD16VectorCases() {
        {0x3f800000u, 0x3f000000u, 0u, 0xc0000000u}, {0x38003c00u, 0xc0000000u}},
       {"BufferLoadFormatD16XyzwFloat16", F::k16_16_16_16Float,
        {0x38003c00u, 0xc0000000u}, {0x38003c00u, 0xc0000000u}},
+      {"BufferLoadFormatD16XyzwUint16Bits", F::k16_16_16_16UInt,
+       {0xbc003c01u, 0x80017bffu}, {0xbc003c01u, 0x80017bffu}, DstSel(4, 5, 6, 7), 8},
+      {"BufferLoadFormatD16XyzwSint16Bits", F::k16_16_16_16SInt,
+       {0xbc003c01u, 0x80017bffu}, {0xbc003c01u, 0x80017bffu}, DstSel(4, 5, 6, 7), 8},
       {"BufferLoadFormatD16XyzwUintSaturates", F::k32_32_32_32UInt,
        {0u, 0x10000u, 0xffffu, 7u}, {0xffff0000u, 0x0007ffffu}},
       {"BufferLoadFormatD16XyzwSintSaturates", F::k32_32_32_32SInt,
@@ -41437,6 +41444,12 @@ std::vector<TestCase> BufferStoreFormatD16Cases() {
   };
   constexpr StoreCase inputs[] = {
       {"BufferStoreFormatD16XFloat16", F::k16Float, {0x7e63c000u}, {0xffffc000u}},
+      {"BufferStoreFormatD16XUint16Bits", F::k16UInt, {0x7e63bc01u}, {0xffffbc01u}},
+      {"BufferStoreFormatD16XSint16Bits", F::k16SInt, {0x7e63bc01u}, {0xffffbc01u}},
+      {"BufferStoreFormatD16XyzwUint16Bits", F::k16_16_16_16UInt,
+       {0xbc003c01u, 0x80017bffu}, {0xbc003c01u, 0x80017bffu}, 2, 0x87u},
+      {"BufferStoreFormatD16XyzwSint16Bits", F::k16_16_16_16SInt,
+       {0xbc003c01u, 0x80017bffu}, {0xbc003c01u, 0x80017bffu}, 2, 0x87u},
       {"BufferStoreFormatD16XFloat32", F::k32Float, {0x7e633800u}, {0x3f000000u}},
       {"BufferStoreFormatD16XUint32", F::k32UInt, {0x7e63fffeu}, {0x0000fffeu}},
       {"BufferStoreFormatD16XSint32", F::k32SInt, {0x7e63fffeu}, {0xfffffffeu}},
@@ -62643,6 +62656,20 @@ int main(int argc, char **argv) {
   CheckDynamicRenderingState();
   CheckDepthTargetFootprints();
 #else
+  if (argc == 2 && std::strcmp(argv[1], "--list-cases") == 0) {
+    for (const auto &test : MakeCases()) std::printf("%s\n", test.name);
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--case") == 0) {
+    VulkanHarness vulkan;
+    uint32_t ran = 0;
+    for (const auto &test : MakeCases()) {
+      if (std::strcmp(test.name, argv[2]) != 0) continue;
+      RunCase(&vulkan, test);
+      ran++;
+    }
+    return ran != 0 ? 0 : 3;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--cases") == 0) {
     VulkanHarness vulkan;
     uint32_t ran = 0;
