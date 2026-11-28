@@ -1431,6 +1431,41 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		     draw.index_count, draw.instance_count, emit.indirect.count, mesh_groups,
 		     mesh_task ? 1 : 0, static_cast<uint32_t>(ucfg.GetPrimType()), m_targets.color_count,
 		     static_cast<bool>(m_targets.depth.image_id) ? 1 : 0);
+		// With KYTY_DUMP_CS_ADDR ranges: the resources of every vertex stage that binds one, to
+		// replay the stage offline on dumped buffers.
+		for (uint32_t i = 0; i < vertex_stages.size() && !ShaderTrace::WatchRanges().empty(); i++) {
+			const auto& sources = bindings.vertex[i].buffer_sources;
+			bool        hit     = false;
+			std::string ranges;
+			for (const auto& source: sources) {
+				hit = hit || ShaderTrace::Watched(source.address, source.size);
+				ranges += fmt::format(" {:x}+{:x}", source.address, source.size);
+			}
+			if (i == 0 && !mesh_active) {
+				const auto& input = state.vertex_info[0];
+				for (int v = 0; v < input.buffers_num; v++) {
+					const auto size = VertexBufferDescriptorSize(v, input);
+					hit = hit || (size != 0 && ShaderTrace::Watched(input.buffers[v].addr, size));
+					ranges += fmt::format(" vb{}={:x}+{:x}", v, input.buffers[v].addr, size);
+				}
+			}
+			const auto* res = vertex_stages[i].stage.resources;
+			if (!hit || res == nullptr) continue;
+			std::string text = fmt::format("TRACE-RES f={} stage={} hash=0x{:016x} idx_addr=0x{:x} idx_size={} "
+			                               "vertex_offset={} first_instance={}\nTRACE-RES B{}\nTRACE-RES U",
+			                               frame, i, vertex_stages[i].stage.module->info.shader_hash,
+			                               index_source.address, index_source.guest_element_size,
+			                               emit.vertex_offset, emit.first_instance, ranges);
+			for (auto u: res->user_data) text += fmt::format(" {:08x}", u);
+			text += "\nTRACE-RES F";
+			for (auto u: res->flattened_srt) text += fmt::format(" {:08x}", u);
+			for (size_t b = 0; b < res->buffers.size(); b++) {
+				text += fmt::format("\nTRACE-RES V {}", b);
+				for (uint32_t w = 0; w < res->buffers[b].dword_count; w++)
+					text += fmt::format(" {:08x}", res->buffers[b].dwords[w]);
+			}
+			LOGF("%s\n", text.c_str());
+		}
 	}
 	auto* const    graphics = &m_context.GetGraphics();
 	const auto record = [=, &occlusion_queries, primitive = ucfg.GetPrimType(),

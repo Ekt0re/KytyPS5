@@ -901,15 +901,12 @@ static std::vector<Copy> Plan(GraphicContext& graphics, uint64_t frame, uint64_t
 		const char* text = std::getenv("KYTY_DUMP_CS_AFTER_S");
 		return (text != nullptr ? std::strtoll(text, nullptr, 10) : 90) * 1000;
 	}();
-	// KYTY_DUMP_CS_ADDR=<guest address>: also every dispatch that binds a buffer containing it.
-	static const uint64_t watch = [] {
-		const char* text = std::getenv("KYTY_DUMP_CS_ADDR");
-		return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
-	}();
+	// KYTY_DUMP_CS_ADDR=<hex address>[+<hex size>][,...]: also every dispatch that binds a buffer
+	// overlapping one of these ranges (shaderTrace.h).
 	bool listed = std::find(st.hashes.begin(), st.hashes.end(), hash) != st.hashes.end();
-	if (!listed && watch != 0) {
+	if (!listed && !ShaderTrace::WatchRanges().empty()) {
 		for (const auto& source: bindings.buffer_sources) {
-			if (source.address <= watch && watch < source.address + source.size) listed = true;
+			if (ShaderTrace::Watched(source.address, source.size)) listed = true;
 		}
 	}
 	if (!listed) return copies;
@@ -931,6 +928,7 @@ static std::vector<Copy> Plan(GraphicContext& graphics, uint64_t frame, uint64_t
 	}();
 	if (st.first_frame == 0) {
 		st.first_frame = frame;
+		ShaderTrace::SetDumpWindow(frame, frames, every);
 		std::fprintf(stderr, "KYTY_DUMP_CS: dumping %" PRIu64 " frames from %" PRIu64 " every %" PRIu64 "\n",
 		             frames, frame, every);
 	}
